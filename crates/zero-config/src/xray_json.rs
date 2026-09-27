@@ -1355,16 +1355,20 @@ fn parse_wireguard_reserved(value: Option<&Value>, path: &str) -> R<[u8; 3]> {
                 .map(|item| item.as_u64().filter(|v| *v <= 255).map(|v| v as u8))
                 .collect::<Option<_>>()
                 .ok_or_else(|| format!("{path}.settings.reserved must be three bytes"))?;
-            <[u8; 3]>::try_from(bytes).map_err(|_| format!("{path}.settings.reserved must be three bytes"))
+            <[u8; 3]>::try_from(bytes)
+                .map_err(|_| format!("{path}.settings.reserved must be three bytes"))
         }
         Some(Value::String(text)) => {
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(text.trim())
                 .map_err(|_| format!("{path}.settings.reserved is not base64"))?;
-            <[u8; 3]>::try_from(bytes).map_err(|_| format!("{path}.settings.reserved must be three bytes"))
+            <[u8; 3]>::try_from(bytes)
+                .map_err(|_| format!("{path}.settings.reserved must be three bytes"))
         }
-        Some(_) => Err(format!("{path}.settings.reserved must be an array or base64 text")),
+        Some(_) => Err(format!(
+            "{path}.settings.reserved must be an array or base64 text"
+        )),
     }
 }
 

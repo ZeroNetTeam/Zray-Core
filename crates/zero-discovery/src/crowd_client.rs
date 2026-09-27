@@ -128,7 +128,10 @@ pub fn picks(rankings: &Rankings, net: &str, limit: usize) -> Vec<RankedServer> 
             continue;
         };
         for server in &ranking.servers {
-            if server.id.is_empty() || server.link.is_empty() || out.iter().any(|s| s.id == server.id) {
+            if server.id.is_empty()
+                || server.link.is_empty()
+                || out.iter().any(|s| s.id == server.id)
+            {
                 continue;
             }
             out.push(server.clone());
@@ -152,7 +155,12 @@ pub fn clean_ips(rankings: &Rankings, net: &str) -> Vec<RankedIp> {
 /// The report body. `net` names the network when the relay cannot see it
 /// (a report sent through the tunnel); `None` lets the relay file it under
 /// the ISP it sees.
-pub fn report_body(nonce: &str, net: Option<&str>, results: &[TestResult], clean: &[CleanIp]) -> String {
+pub fn report_body(
+    nonce: &str,
+    net: Option<&str>,
+    results: &[TestResult],
+    clean: &[CleanIp],
+) -> String {
     let mut ordered: Vec<&TestResult> = results.iter().collect();
     // Successes first: the relay keeps a limited number.
     ordered.sort_by_key(|result| !result.ok);
@@ -198,7 +206,10 @@ pub async fn report(
         let url = format!("{}/v1/report", relay.trim_end_matches('/'));
         match zero_net::post(&url, "application/json", body.as_bytes(), &limits).await {
             Ok(answer) => {
-                let net = serde_json::from_slice::<Answer>(&answer).ok().map(|a| a.net).filter(|n| !n.is_empty());
+                let net = serde_json::from_slice::<Answer>(&answer)
+                    .ok()
+                    .map(|a| a.net)
+                    .filter(|n| !n.is_empty());
                 return Ok(net);
             }
             Err(error) => last = format!("{relay}: {error}"),
@@ -241,12 +252,36 @@ mod tests {
             v: 1,
             ..Rankings::default()
         };
-        rankings.nets.insert("cell:43211".into(), NetRanking { servers: vec![server("a")], clean_ips: vec![] });
-        rankings.nets.insert("mcc:432".into(), NetRanking { servers: vec![server("b"), server("a")], clean_ips: vec![] });
-        rankings.nets.insert("all".into(), NetRanking { servers: vec![server("c")], clean_ips: vec![] });
-        let ids: Vec<_> = picks(&rankings, "cell:43211", 10).into_iter().map(|s| s.id).collect();
+        rankings.nets.insert(
+            "cell:43211".into(),
+            NetRanking {
+                servers: vec![server("a")],
+                clean_ips: vec![],
+            },
+        );
+        rankings.nets.insert(
+            "mcc:432".into(),
+            NetRanking {
+                servers: vec![server("b"), server("a")],
+                clean_ips: vec![],
+            },
+        );
+        rankings.nets.insert(
+            "all".into(),
+            NetRanking {
+                servers: vec![server("c")],
+                clean_ips: vec![],
+            },
+        );
+        let ids: Vec<_> = picks(&rankings, "cell:43211", 10)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
         assert_eq!(ids, ["a", "b", "c"]);
-        let ids: Vec<_> = picks(&rankings, "asn:58224", 10).into_iter().map(|s| s.id).collect();
+        let ids: Vec<_> = picks(&rankings, "asn:58224", 10)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
         assert_eq!(ids, ["c"]);
         assert_eq!(picks(&rankings, "cell:43211", 2).len(), 2);
     }
@@ -254,13 +289,23 @@ mod tests {
     #[test]
     fn a_report_puts_successes_first_and_names_the_network_only_when_asked() {
         let results = vec![
-            TestResult { id: "bad".into(), ok: false, ms: 0 },
-            TestResult { id: "good".into(), ok: true, ms: 120 },
+            TestResult {
+                id: "bad".into(),
+                ok: false,
+                ms: 0,
+            },
+            TestResult {
+                id: "good".into(),
+                ok: true,
+                ms: 120,
+            },
         ];
-        let body: serde_json::Value = serde_json::from_str(&report_body("n", None, &results, &[])).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&report_body("n", None, &results, &[])).unwrap();
         assert_eq!(body["results"][0]["id"], "good");
         assert!(body.get("net").is_none());
-        let body: serde_json::Value = serde_json::from_str(&report_body("n", Some("any"), &results, &[])).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&report_body("n", Some("any"), &results, &[])).unwrap();
         assert_eq!(body["net"], "any");
         assert_eq!(body["v"], 1);
     }
@@ -297,25 +342,55 @@ mod tests {
                 }
             }
             let answer = br#"{"ok":true,"net":"asn:58224"}"#;
-            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", answer.len());
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                answer.len()
+            );
             stream.write_all(head.as_bytes()).await.unwrap();
             stream.write_all(answer).await.unwrap();
             String::from_utf8(request).unwrap()
         });
         // Plain http relays are refused outright; this one is only for the test.
-        let refused = report(&[format!("http://127.0.0.1:{port}")], "n", None, &[TestResult { id: "a".into(), ok: true, ms: 1 }], &[]).await;
+        let refused = report(
+            &[format!("http://127.0.0.1:{port}")],
+            "n",
+            None,
+            &[TestResult {
+                id: "a".into(),
+                ok: true,
+                ms: 1,
+            }],
+            &[],
+        )
+        .await;
         assert!(refused.is_err());
         // Drive the POST helper directly against the local relay.
-        let body = report_body("n", None, &[TestResult { id: "a".into(), ok: true, ms: 1 }], &[]);
+        let body = report_body(
+            "n",
+            None,
+            &[TestResult {
+                id: "a".into(),
+                ok: true,
+                ms: 1,
+            }],
+            &[],
+        );
         let answer = zero_net::post(
             &format!("http://127.0.0.1:{port}/v1/report"),
             "application/json",
             body.as_bytes(),
-            &FetchLimits { max_bytes: 4096, timeout: Duration::from_secs(5), max_redirects: 0 },
+            &FetchLimits {
+                max_bytes: 4096,
+                timeout: Duration::from_secs(5),
+                max_redirects: 0,
+            },
         )
         .await
         .unwrap();
-        assert_eq!(serde_json::from_slice::<Answer>(&answer).unwrap().net, "asn:58224");
+        assert_eq!(
+            serde_json::from_slice::<Answer>(&answer).unwrap().net,
+            "asn:58224"
+        );
         let request = server.await.unwrap();
         assert!(request.starts_with("POST /v1/report HTTP/1.1\r\n"));
         assert!(request.contains("Content-Type: application/json"));

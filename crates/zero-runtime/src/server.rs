@@ -528,7 +528,9 @@ impl Server {
         // applications already hold must survive it, though, or every
         // address they cached would lead nowhere.
         if next.client_resolver.has_fake() {
-            let adopted = (*next.client_resolver).clone().adopt_fake_state(&current.client_resolver);
+            let adopted = (*next.client_resolver)
+                .clone()
+                .adopt_fake_state(&current.client_resolver);
             next.resolver = Arc::new(adopted.without_fake());
             next.client_resolver = Arc::new(adopted);
         }
@@ -5506,7 +5508,11 @@ mod tests {
         // a synthetic address.
         assert!(!server.resolver().has_fake());
         assert_eq!(
-            server.resolver().lookup("pinned.example", strategy).await.unwrap(),
+            server
+                .resolver()
+                .lookup("pinned.example", strategy)
+                .await
+                .unwrap(),
             vec!["203.0.113.7".parse::<std::net::IpAddr>().unwrap()]
         );
 
@@ -5527,7 +5533,11 @@ mod tests {
                 443,
             ))
             .await;
-        assert_eq!(after.address, zero_core::Address::domain("app.example"), "the mapping was lost on reload");
+        assert_eq!(
+            after.address,
+            zero_core::Address::domain("app.example"),
+            "the mapping was lost on reload"
+        );
         assert!(!server.resolver().has_fake());
     }
 

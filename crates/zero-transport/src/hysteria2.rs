@@ -265,8 +265,10 @@ async fn connect_authenticated_with(
 }
 
 /// The HTTP/3 authentication exchange on a fresh connection.
-async fn authenticate_client(connection: &h3_quinn::quinn::Connection, password: &str) -> Result<(), String> {
-
+async fn authenticate_client(
+    connection: &h3_quinn::quinn::Connection,
+    password: &str,
+) -> Result<(), String> {
     let (mut driver, mut requests) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
         .await
         .map_err(|error| format!("Hysteria2 HTTP/3 setup: {error}"))?;
@@ -357,7 +359,9 @@ pub async fn exchange_udp(
 
 /// The session a Hysteria2 UDP datagram belongs to.
 fn udp_session(datagram: &[u8]) -> Option<u32> {
-    datagram.get(..4).map(|id| u32::from_be_bytes(id.try_into().unwrap()))
+    datagram
+        .get(..4)
+        .map(|id| u32::from_be_bytes(id.try_into().unwrap()))
 }
 
 /// One datagram exchange on a pooled connection. The error says whether a
@@ -368,14 +372,21 @@ async fn exchange_on(
     payload: &[u8],
 ) -> Result<(Destination, Vec<u8>), (String, bool)> {
     let connection = &pooled.connection;
-    let max_size = connection
-        .max_datagram_size()
-        .ok_or_else(|| ("Hysteria2 peer does not support QUIC datagrams".to_string(), false))?;
+    let max_size = connection.max_datagram_size().ok_or_else(|| {
+        (
+            "Hysteria2 peer does not support QUIC datagrams".to_string(),
+            false,
+        )
+    })?;
     let session_id = rand::random::<u32>();
     let packet_id = rand::random::<u16>();
-    let datagram = encode_udp_datagram(session_id, packet_id, destination, payload).map_err(|e| (e, false))?;
+    let datagram =
+        encode_udp_datagram(session_id, packet_id, destination, payload).map_err(|e| (e, false))?;
     if datagram.len() > max_size {
-        return Err(("Hysteria2 UDP payload exceeds the negotiated datagram size".into(), false));
+        return Err((
+            "Hysteria2 UDP payload exceeds the negotiated datagram size".into(),
+            false,
+        ));
     }
     let mut registration = pooled.register(session_id, udp_session);
     connection
@@ -389,7 +400,10 @@ async fn exchange_on(
                 }
             }
         }
-        Err(("Hysteria2 connection closed before the UDP response".to_string(), true))
+        Err((
+            "Hysteria2 connection closed before the UDP response".to_string(),
+            true,
+        ))
     })
     .await
     .map_err(|_| ("Hysteria2 UDP response timed out".to_string(), false))?

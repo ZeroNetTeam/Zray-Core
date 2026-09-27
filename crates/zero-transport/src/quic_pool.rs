@@ -48,7 +48,9 @@ fn now_ms() -> u64 {
 }
 
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Extracts the session a response datagram belongs to (`None`: not a
@@ -147,8 +149,12 @@ impl Drop for Registration {
 
 async fn read_datagrams(connection: Connection, pooled: Weak<Pooled>, session_of: SessionOf) {
     while let Ok(datagram) = connection.read_datagram().await {
-        let Some(pooled) = pooled.upgrade() else { return };
-        let Some(session) = session_of(&datagram) else { continue };
+        let Some(pooled) = pooled.upgrade() else {
+            return;
+        };
+        let Some(session) = session_of(&datagram) else {
+            continue;
+        };
         let waiter = lock(&pooled.waiters).get(&session).cloned();
         if let Some(waiter) = waiter {
             let _ = waiter.send(datagram);
@@ -158,7 +164,12 @@ async fn read_datagrams(connection: Connection, pooled: Weak<Pooled>, session_of
 
 /// The pool key: protocol, server addresses, TLS parameters and a hash of
 /// the credentials. Two outbounds that differ in any of them never share.
-pub fn key(protocol: &str, addrs: &[SocketAddr], tls: &impl std::fmt::Debug, secret: &[u8]) -> String {
+pub fn key(
+    protocol: &str,
+    addrs: &[SocketAddr],
+    tls: &impl std::fmt::Debug,
+    secret: &[u8],
+) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     format!("{tls:?}").hash(&mut hasher);
@@ -195,7 +206,10 @@ pub fn evict(key: &str, pooled: &Arc<Pooled>) {
     let slot = lock(&POOL).get(key).cloned();
     if let Some(slot) = slot {
         if let Ok(mut held) = slot.try_lock() {
-            if held.as_ref().is_some_and(|current| Arc::ptr_eq(current, pooled)) {
+            if held
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, pooled))
+            {
                 *held = None;
             }
         }
@@ -206,7 +220,9 @@ pub fn evict(key: &str, pooled: &Arc<Pooled>) {
 async fn reap(key: String, pooled: Weak<Pooled>) {
     loop {
         tokio::time::sleep(REAP_INTERVAL).await;
-        let Some(current) = pooled.upgrade() else { return };
+        let Some(current) = pooled.upgrade() else {
+            return;
+        };
         if !current.alive() {
             evict(&key, &current);
             return;
@@ -230,7 +246,9 @@ pub fn rebind_all() -> usize {
     for slot in slots {
         // A dial in progress is on the new network already.
         let Ok(held) = slot.try_lock() else { continue };
-        let Some(pooled) = held.as_ref() else { continue };
+        let Some(pooled) = held.as_ref() else {
+            continue;
+        };
         if !pooled.alive() {
             continue;
         }
@@ -240,7 +258,9 @@ pub fn rebind_all() -> usize {
             (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
         };
         let _runtime = pooled.runtime.enter();
-        match zero_core::platform::bind_protected_udp(bind).and_then(|socket| pooled.endpoint.rebind(socket)) {
+        match zero_core::platform::bind_protected_udp(bind)
+            .and_then(|socket| pooled.endpoint.rebind(socket))
+        {
             Ok(()) => moved += 1,
             Err(error) => {
                 tracing::debug!(%error, "QUIC migration: could not rebind; the connection will be re-dialled");
@@ -259,7 +279,11 @@ pub fn live_connections() -> usize {
     let slots: Vec<Slot> = lock(&POOL).values().cloned().collect();
     slots
         .iter()
-        .filter(|slot| slot.try_lock().ok().is_some_and(|held| held.as_ref().is_some_and(|p| p.alive())))
+        .filter(|slot| {
+            slot.try_lock()
+                .ok()
+                .is_some_and(|held| held.as_ref().is_some_and(|p| p.alive()))
+        })
         .count()
 }
 
@@ -268,12 +292,20 @@ pub fn live_connections_to(server: SocketAddr) -> usize {
     let needle = server.to_string();
     let slots: Vec<Slot> = lock(&POOL)
         .iter()
-        .filter(|(key, _)| key.split('|').nth(1).is_some_and(|addrs| addrs.split(',').any(|a| a == needle)))
+        .filter(|(key, _)| {
+            key.split('|')
+                .nth(1)
+                .is_some_and(|addrs| addrs.split(',').any(|a| a == needle))
+        })
         .map(|(_, slot)| slot.clone())
         .collect();
     slots
         .iter()
-        .filter(|slot| slot.try_lock().ok().is_some_and(|held| held.as_ref().is_some_and(|p| p.alive())))
+        .filter(|slot| {
+            slot.try_lock()
+                .ok()
+                .is_some_and(|held| held.as_ref().is_some_and(|p| p.alive()))
+        })
         .count()
 }
 
@@ -282,7 +314,11 @@ pub fn close_all_to(server: SocketAddr) {
     let needle = server.to_string();
     let slots: Vec<(String, Slot)> = lock(&POOL)
         .iter()
-        .filter(|(key, _)| key.split('|').nth(1).is_some_and(|addrs| addrs.split(',').any(|a| a == needle)))
+        .filter(|(key, _)| {
+            key.split('|')
+                .nth(1)
+                .is_some_and(|addrs| addrs.split(',').any(|a| a == needle))
+        })
         .map(|(key, slot)| (key.clone(), slot.clone()))
         .collect();
     for (key, slot) in slots {
@@ -302,11 +338,18 @@ mod tests {
         let a: SocketAddr = "192.0.2.1:443".parse().unwrap();
         let b: SocketAddr = "192.0.2.2:443".parse().unwrap();
         let base = key("hysteria2", &[a, b], &"sni=x", b"pw");
-        assert_eq!(base, key("hysteria2", &[b, a], &"sni=x", b"pw"), "address order does not matter");
+        assert_eq!(
+            base,
+            key("hysteria2", &[b, a], &"sni=x", b"pw"),
+            "address order does not matter"
+        );
         assert_ne!(base, key("tuic", &[a, b], &"sni=x", b"pw"));
         assert_ne!(base, key("hysteria2", &[a], &"sni=x", b"pw"));
         assert_ne!(base, key("hysteria2", &[a, b], &"sni=y", b"pw"));
         assert_ne!(base, key("hysteria2", &[a, b], &"sni=x", b"other"));
-        assert!(!base.contains("pw"), "the credential itself is never part of the key");
+        assert!(
+            !base.contains("pw"),
+            "the credential itself is never part of the key"
+        );
     }
 }

@@ -26,8 +26,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 /// "no key compiled in" ([`key_configured`] is false) as "do not verify"
 /// rather than "reject" (see `Crowd`/discovery), which keeps a keyless build
 /// connecting.
-pub const PUBLIC_KEY_HEX: &str =
-    "1d2375dcc22a761d95ab5005f576d4673738e128a37f60b68660417ea086e9e8";
+pub const PUBLIC_KEY_HEX: &str = "1d2375dcc22a761d95ab5005f576d4673738e128a37f60b68660417ea086e9e8";
 
 /// Line prefix of a detached signature file.
 const PREFIX: &str = "ed25519:";

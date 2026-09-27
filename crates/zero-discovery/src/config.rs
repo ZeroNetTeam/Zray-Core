@@ -689,10 +689,15 @@ mod tests {
     fn fakedns_answers_applications_but_not_domain_scoped_tiers() {
         let config = build_config(&json!({"links": [REALITY], "dns": {"fakedns": true}})).unwrap();
         let servers = config["dns"]["servers"].as_array().unwrap();
-        let fake = servers.iter().position(|s| s["address"] == "fakedns").expect("fakedns server");
+        let fake = servers
+            .iter()
+            .position(|s| s["address"] == "fakedns")
+            .expect("fakedns server");
         // Every domain-scoped tier comes first, the catch-all remote after it.
         assert!(servers[..fake].iter().all(|s| s.get("domains").is_some()));
-        assert!(servers[fake + 1..].iter().any(|s| s.get("domains").is_none()));
+        assert!(servers[fake + 1..]
+            .iter()
+            .any(|s| s.get("domains").is_none()));
         let compiled = compile(&config);
         assert!(compiled
             .dns
@@ -706,7 +711,11 @@ mod tests {
             json!({"links": [REALITY], "mode": "proxy", "dns": {"fakedns": true}}),
         ] {
             let config = build_config(&request).unwrap();
-            assert!(!config["dns"]["servers"].as_array().unwrap().iter().any(|s| s["address"] == "fakedns"));
+            assert!(!config["dns"]["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["address"] == "fakedns"));
         }
     }
 
@@ -833,7 +842,9 @@ mod tests {
         // The balancer exists even though only one link was supplied.
         assert_eq!(compiled.routing.balancers.len(), 1);
         assert_eq!(
-            compiled.expand_balancer(&compiled.routing.balancers[0]).len(),
+            compiled
+                .expand_balancer(&compiled.routing.balancers[0])
+                .len(),
             SMART_FRAGMENT_LENGTHS.len()
         );
     }

@@ -2152,13 +2152,17 @@ mod tests {
         tokio::spawn(async move {
             let mut buffer = [0u8; 512];
             loop {
-                let Ok((len, peer)) = socket.recv_from(&mut buffer).await else { return };
+                let Ok((len, peer)) = socket.recv_from(&mut buffer).await else {
+                    return;
+                };
                 let mut response = buffer[..len].to_vec();
                 response[2] = 0x81;
                 response[3] = 0x80;
                 response[6] = 0;
                 response[7] = 1;
-                response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 93, 184, 216, 34]);
+                response.extend_from_slice(&[
+                    0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 93, 184, 216, 34,
+                ]);
                 let _ = socket.send_to(&response, peer).await;
             }
         });
@@ -2183,26 +2187,49 @@ mod tests {
         let resolver = Resolver::new(settings.clone());
         assert!(resolver.has_fake());
 
-        let client = resolver.lookup("proxy.example", QueryStrategy::UseIpv4).await.unwrap();
-        assert!(matches!(client[0], IpAddr::V4(v4) if v4.octets()[0] == 198 && v4.octets()[1] == 18));
+        let client = resolver
+            .lookup("proxy.example", QueryStrategy::UseIpv4)
+            .await
+            .unwrap();
+        assert!(
+            matches!(client[0], IpAddr::V4(v4) if v4.octets()[0] == 198 && v4.octets()[1] == 18)
+        );
 
         let real = resolver.without_fake();
         assert!(!real.has_fake());
-        let answer = real.lookup("proxy.example", QueryStrategy::UseIpv4).await.unwrap();
+        let answer = real
+            .lookup("proxy.example", QueryStrategy::UseIpv4)
+            .await
+            .unwrap();
         assert_eq!(answer, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
         // Memoized: the same view (and cache) every time.
         assert!(Arc::ptr_eq(&real.cache, &resolver.without_fake().cache));
         // A synthetic address is still reversible, on the client resolver only.
-        assert_eq!(resolver.reverse_fake(client[0]).await.as_deref(), Some("proxy.example"));
+        assert_eq!(
+            resolver.reverse_fake(client[0]).await.as_deref(),
+            Some("proxy.example")
+        );
 
         // A reload with changed DNS settings builds a new resolver; adopting
         // the old FakeDNS state keeps the address the application holds.
         let replacement = Resolver::new(settings).adopt_fake_state(&resolver);
-        assert_eq!(replacement.reverse_fake(client[0]).await.as_deref(), Some("proxy.example"));
-        let again = replacement.lookup("proxy.example", QueryStrategy::UseIpv4).await.unwrap();
+        assert_eq!(
+            replacement.reverse_fake(client[0]).await.as_deref(),
+            Some("proxy.example")
+        );
+        let again = replacement
+            .lookup("proxy.example", QueryStrategy::UseIpv4)
+            .await
+            .unwrap();
         assert_eq!(again, client);
-        let other = replacement.lookup("other.example", QueryStrategy::UseIpv4).await.unwrap();
-        assert_ne!(other, client, "the adopted pool continues, it does not restart");
+        let other = replacement
+            .lookup("other.example", QueryStrategy::UseIpv4)
+            .await
+            .unwrap();
+        assert_ne!(
+            other, client,
+            "the adopted pool continues, it does not restart"
+        );
     }
 
     #[tokio::test]

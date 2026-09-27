@@ -524,7 +524,11 @@ async fn quic_udp_sessions_share_a_connection_without_crossing() {
         for task in futures::future::join_all(sessions).await {
             task.unwrap();
         }
-        assert_eq!(zero_transport::quic_pool::live_connections_to(tunnel.relay), 1, "{protocol}");
+        assert_eq!(
+            zero_transport::quic_pool::live_connections_to(tunnel.relay),
+            1,
+            "{protocol}"
+        );
     }
 }
 
@@ -538,12 +542,19 @@ async fn a_quic_connection_survives_moving_to_a_new_socket() {
         let mut before = socks_connect(tunnel.socks, tunnel.echo).await.unwrap();
         round_trip(&mut before, &payload(1, 2048)).await;
 
-        assert!(zero_transport::quic_pool::rebind_all() >= 1, "{protocol}: nothing was migrated");
+        assert!(
+            zero_transport::quic_pool::rebind_all() >= 1,
+            "{protocol}: nothing was migrated"
+        );
 
         round_trip(&mut before, &payload(2, 256 * 1024)).await;
         let mut after = socks_connect(tunnel.socks, tunnel.echo).await.unwrap();
         round_trip(&mut after, &payload(3, 2048)).await;
-        assert_eq!(zero_transport::quic_pool::live_connections_to(tunnel.relay), 1, "{protocol}");
+        assert_eq!(
+            zero_transport::quic_pool::live_connections_to(tunnel.relay),
+            1,
+            "{protocol}"
+        );
     }
 }
 
@@ -559,7 +570,11 @@ async fn transfers_in_flight_survive_a_migration() {
                 tokio::spawn(async move {
                     let mut stream = socks_connect(socks, echo).await.unwrap();
                     for round in 0..4u8 {
-                        round_trip(&mut stream, &payload(seed.wrapping_mul(7).wrapping_add(round), 256 * 1024)).await;
+                        round_trip(
+                            &mut stream,
+                            &payload(seed.wrapping_mul(7).wrapping_add(round), 256 * 1024),
+                        )
+                        .await;
                     }
                 })
             })
@@ -584,12 +599,14 @@ async fn zero_rtt_hysteria2_server(echo: SocketAddr) -> SocketAddr {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(PRIVATE_KEY.as_bytes()).unwrap();
-    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .unwrap();
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .unwrap();
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.max_early_data_size = u32::MAX;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
@@ -623,10 +640,7 @@ async fn hysteria2_reconnects_in_zero_rtt_when_the_server_allows_it() {
     let server = zero_rtt_hysteria2_server(echo).await;
     let mut tls = zero_security::TlsParams::new(SERVER_NAME);
     tls.extra_roots = vec![CA_CERTIFICATE.as_bytes().to_vec()];
-    let destination = zero_core::Destination::tcp(
-        zero_core::Address::Ip(echo.ip()),
-        echo.port(),
-    );
+    let destination = zero_core::Destination::tcp(zero_core::Address::Ip(echo.ip()), echo.port());
 
     async fn echo_once(mut stream: zero_core::BoxStream, body: &[u8]) {
         stream.write_all(body).await.unwrap();

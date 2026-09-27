@@ -623,13 +623,22 @@ async fn packet_on(
     payload: &[u8],
 ) -> Result<(Destination, Vec<u8>), (String, bool)> {
     let connection = &pooled.connection;
-    let max_datagram = connection
-        .max_datagram_size()
-        .ok_or_else(|| ("TUIC peer does not support QUIC datagrams".to_string(), false))?;
+    let max_datagram = connection.max_datagram_size().ok_or_else(|| {
+        (
+            "TUIC peer does not support QUIC datagrams".to_string(),
+            false,
+        )
+    })?;
     let association_id: u16 = rand::random();
     let packet_id = rand::random();
-    let packets = encode_packet_fragments(max_datagram, association_id, packet_id, destination, payload)
-        .map_err(|error| (error, false))?;
+    let packets = encode_packet_fragments(
+        max_datagram,
+        association_id,
+        packet_id,
+        destination,
+        payload,
+    )
+    .map_err(|error| (error, false))?;
     let mut registration = pooled.register(u32::from(association_id), packet_association);
     for packet in packets {
         connection
@@ -639,7 +648,9 @@ async fn packet_on(
     timeout(Duration::from_secs(5), async {
         let mut reassembler: Option<PacketReassembler> = None;
         while let Some(data) = registration.receiver.recv().await {
-            let Ok(fragment) = decode_packet_fragment(&data) else { continue };
+            let Ok(fragment) = decode_packet_fragment(&data) else {
+                continue;
+            };
             if fragment.association != association_id {
                 continue;
             }
@@ -656,7 +667,10 @@ async fn packet_on(
                 Err(error) => return Err((error, false)),
             }
         }
-        Err(("TUIC connection closed before the PACKET response".to_string(), true))
+        Err((
+            "TUIC connection closed before the PACKET response".to_string(),
+            true,
+        ))
     })
     .await
     .map_err(|_| ("TUIC PACKET response timed out".to_string(), false))?

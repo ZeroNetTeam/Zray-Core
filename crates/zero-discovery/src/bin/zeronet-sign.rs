@@ -34,7 +34,9 @@ fn run() -> Result<(), String> {
         Some("keygen") => keygen(),
         Some("sign") => sign_files(args.collect()),
         Some("verify") => verify_file(args.collect()),
-        Some(other) => Err(format!("unknown command {other:?}; use keygen, sign or verify")),
+        Some(other) => Err(format!(
+            "unknown command {other:?}; use keygen, sign or verify"
+        )),
         None => Err("a command is required: keygen, sign or verify".into()),
     }
 }
@@ -112,8 +114,8 @@ fn verify_file(args: Vec<String>) -> Result<(), String> {
     let file = file.ok_or("a file to verify is required")?;
     let body = std::fs::read(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
     let sig_path = format!("{file}.sig");
-    let sig = std::fs::read_to_string(&sig_path)
-        .map_err(|e| format!("cannot read {sig_path}: {e}"))?;
+    let sig =
+        std::fs::read_to_string(&sig_path).map_err(|e| format!("cannot read {sig_path}: {e}"))?;
     if sign::verify_with(&key, &body, &sig) {
         eprintln!("{file}: signature valid");
         Ok(())

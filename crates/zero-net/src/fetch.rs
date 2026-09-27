@@ -261,20 +261,29 @@ pub async fn post_with_headers(
     limits: &FetchLimits,
 ) -> Result<Vec<u8>, FetchError> {
     let target = parse_target(url)?;
-    if headers.iter().any(|(k, v)| k.contains(['\r', '\n']) || v.contains(['\r', '\n'])) {
+    if headers
+        .iter()
+        .any(|(k, v)| k.contains(['\r', '\n']) || v.contains(['\r', '\n']))
+    {
         return Err(FetchError::Protocol("header contains a line break".into()));
     }
     let agent = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
-        .map_or_else(|| format!("zray-core/{}", env!("CARGO_PKG_VERSION")), |(_, v)| (*v).to_string());
+        .map_or_else(
+            || format!("zray-core/{}", env!("CARGO_PKG_VERSION")),
+            |(_, v)| (*v).to_string(),
+        );
     let mut head = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {agent}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         target.request_target,
         host_header(&target),
         body.len(),
     );
-    for (name, value) in headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("user-agent")) {
+    for (name, value) in headers
+        .iter()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("user-agent"))
+    {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("\r\n");
@@ -301,7 +310,11 @@ async fn fetch_once(
 }
 
 /// Connect to `target` (TLS when it is https) and exchange one request.
-async fn send_once(target: &Target, request: &[u8], limits: &FetchLimits) -> Result<Outcome, FetchError> {
+async fn send_once(
+    target: &Target,
+    request: &[u8],
+    limits: &FetchLimits,
+) -> Result<Outcome, FetchError> {
     // Resolved first so the socket exists before it connects: the host has to
     // be given the chance to exempt it from the tunnel, and
     // `TcpStream::connect` offers no such moment (`zero_core::platform`).

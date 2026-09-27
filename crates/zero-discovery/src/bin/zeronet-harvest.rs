@@ -398,7 +398,10 @@ async fn crawl_telegram(
                 );
                 continue;
             }
-            eprintln!("telegram {name}: {} links (persian {persian}, seed {is_seed})", found.len());
+            eprintln!(
+                "telegram {name}: {} links (persian {persian}, seed {is_seed})",
+                found.len()
+            );
             state.channels.insert(
                 name.clone(),
                 ChannelState {

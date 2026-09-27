@@ -112,6 +112,9 @@ pub struct StreamIo {
     wake: Arc<Notify>,
 }
 
+/// Cached resolver answers: the address list with the moment it was fetched.
+type DnsCache = Arc<StdMutex<HashMap<String, (Vec<IpAddr>, Instant)>>>;
+
 /// A running tunnel. Cheap to clone; the driver stops when every clone is
 /// gone or after [`IDLE_SHUTDOWN`] with nothing open.
 #[derive(Clone)]
@@ -122,7 +125,7 @@ pub struct WgStack {
     dns: SocketAddr,
     family_v4: bool,
     family_v6: bool,
-    cache: Arc<StdMutex<HashMap<String, (Vec<IpAddr>, Instant)>>>,
+    cache: DnsCache,
 }
 
 impl WgStack {
@@ -171,12 +174,18 @@ impl WgStack {
             .send(Command::Connect { destination, reply })
             .map_err(|_| "WireGuard tunnel is closed".to_string())?;
         self.wake.notify_one();
-        let io = answer.await.map_err(|_| "WireGuard tunnel is closed".to_string())??;
+        let io = answer
+            .await
+            .map_err(|_| "WireGuard tunnel is closed".to_string())??;
         Ok(stream_from(io))
     }
 
     /// Send one UDP datagram through the tunnel and wait for the answer.
-    pub async fn exchange_udp(&self, destination: SocketAddr, payload: &[u8]) -> Result<(SocketAddr, Vec<u8>), String> {
+    pub async fn exchange_udp(
+        &self,
+        destination: SocketAddr,
+        payload: &[u8],
+    ) -> Result<(SocketAddr, Vec<u8>), String> {
         let (reply, answer) = oneshot::channel();
         self.commands
             .send(Command::Udp {
@@ -186,7 +195,9 @@ impl WgStack {
             })
             .map_err(|_| "WireGuard tunnel is closed".to_string())?;
         self.wake.notify_one();
-        answer.await.map_err(|_| "WireGuard tunnel is closed".to_string())?
+        answer
+            .await
+            .map_err(|_| "WireGuard tunnel is closed".to_string())?
     }
 
     /// Resolve `name` with the resolver inside the tunnel, so the lookup is
@@ -233,12 +244,22 @@ impl WgStack {
                 cache.clear();
             }
         }
-        cache.insert(key, (addresses.clone(), Instant::now() + ttl.max(Duration::from_secs(10))));
+        cache.insert(
+            key,
+            (
+                addresses.clone(),
+                Instant::now() + ttl.max(Duration::from_secs(10)),
+            ),
+        );
         Ok(addresses)
     }
 
     /// Connect to a host (name or address) and port through the tunnel.
-    pub async fn connect_host(&self, host: &zero_core::Address, port: u16) -> Result<zero_core::BoxStream, String> {
+    pub async fn connect_host(
+        &self,
+        host: &zero_core::Address,
+        port: u16,
+    ) -> Result<zero_core::BoxStream, String> {
         let addresses = match host {
             zero_core::Address::Ip(ip) => vec![*ip],
             zero_core::Address::Domain(name) => self.resolve(name).await?,
@@ -294,7 +315,9 @@ pub fn rebind_all() -> usize {
 }
 
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn bind_for(peer: SocketAddr) -> Result<UdpSocket, String> {
@@ -305,8 +328,11 @@ fn bind_for(peer: SocketAddr) -> Result<UdpSocket, String> {
     };
     // Protected: the tunnel's own packets must reach the real network, not
     // the VPN they may be standing in for.
-    let socket = zero_core::platform::bind_protected_udp(bind).map_err(|error| format!("WireGuard UDP bind: {error}"))?;
-    socket.set_nonblocking(true).map_err(|error| format!("WireGuard UDP bind: {error}"))?;
+    let socket = zero_core::platform::bind_protected_udp(bind)
+        .map_err(|error| format!("WireGuard UDP bind: {error}"))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|error| format!("WireGuard UDP bind: {error}"))?;
     UdpSocket::from_std(socket).map_err(|error| format!("WireGuard UDP bind: {error}"))
 }
 
@@ -367,7 +393,10 @@ impl QueueDevice {
     }
 
     fn buffer(&mut self) -> Vec<u8> {
-        let mut buffer = self.spare.pop().unwrap_or_else(|| Vec::with_capacity(TUNNEL_MTU));
+        let mut buffer = self
+            .spare
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(TUNNEL_MTU));
         buffer.clear();
         buffer
     }
@@ -405,10 +434,19 @@ impl TxToken for Tx<'_> {
 }
 
 impl Device for QueueDevice {
-    type RxToken<'a> = Rx where Self: 'a;
-    type TxToken<'a> = Tx<'a> where Self: 'a;
+    type RxToken<'a>
+        = Rx
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = Tx<'a>
+    where
+        Self: 'a;
 
-    fn receive(&mut self, _now: smoltcp::time::Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(
+        &mut self,
+        _now: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let packet = self.inbound.pop_front()?;
         Some((Rx(packet), Tx(self)))
     }
@@ -427,6 +465,12 @@ impl Device for QueueDevice {
 
 // ------------------------------------------------------------------ driver
 
+/// A TCP connect waiting for its handshake answer: the reply channel, the
+/// deadline it must answer by, and the half-open stream the answer belongs to.
+type StreamReply = Option<(oneshot::Sender<Result<StreamIo, String>>, Instant, StreamIo)>;
+/// A UDP exchange waiting for its answer.
+type UdpReply = Option<oneshot::Sender<Result<(SocketAddr, Vec<u8>), String>>>;
+
 struct TcpSlot {
     handle: SocketHandle,
     /// Chunks the application sent, not yet in the socket.
@@ -434,12 +478,12 @@ struct TcpSlot {
     pending: Option<(Bytes, usize)>,
     down: Option<mpsc::Sender<Bytes>>,
     /// Waiting for the handshake: the connect's answer and its deadline.
-    reply: Option<(oneshot::Sender<Result<StreamIo, String>>, Instant, StreamIo)>,
+    reply: StreamReply,
 }
 
 struct UdpSlot {
     handle: SocketHandle,
-    reply: Option<oneshot::Sender<Result<(SocketAddr, Vec<u8>), String>>>,
+    reply: UdpReply,
     deadline: Instant,
 }
 
@@ -486,7 +530,11 @@ impl Driver {
         );
         let mut device = QueueDevice::new();
         let started = Instant::now();
-        let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, smoltcp::time::Instant::from_millis(0));
+        let mut iface = Interface::new(
+            Config::new(HardwareAddress::Ip),
+            &mut device,
+            smoltcp::time::Instant::from_millis(0),
+        );
         iface.update_ip_addrs(|addresses| {
             for address in &params.addresses {
                 let prefix = if address.is_ipv4() { 32 } else { 128 };
@@ -496,7 +544,9 @@ impl Driver {
         // A point-to-point link: everything goes to the peer. On an IP
         // medium the gateway is never resolved, so any address serves.
         if params.addresses.iter().any(IpAddr::is_ipv4) {
-            let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Addr::new(169, 254, 0, 1));
+            let _ = iface
+                .routes_mut()
+                .add_default_ipv4_route(Ipv4Addr::new(169, 254, 0, 1));
         }
         if params.addresses.iter().any(IpAddr::is_ipv6) {
             let _ = iface
@@ -567,7 +617,7 @@ impl Driver {
             tokio::select! {
                 received = self.socket.recv_from(&mut network) => {
                     if let Ok((length, source)) = received {
-                        self.from_network(&mut network[..length], source).await;
+                        self.on_network_datagram(&mut network[..length], source).await;
                     }
                 }
                 command = self.commands.recv() => match command {
@@ -621,7 +671,12 @@ impl Driver {
         self.last_activity = Instant::now();
         match command {
             Command::Connect { destination, reply } => {
-                if !self.params.addresses.iter().any(|a| a.is_ipv4() == destination.is_ipv4()) {
+                if !self
+                    .params
+                    .addresses
+                    .iter()
+                    .any(|a| a.is_ipv4() == destination.is_ipv4())
+                {
                     let _ = reply.send(Err(format!("the tunnel has no address for {destination}")));
                     return;
                 }
@@ -658,14 +713,25 @@ impl Driver {
                 payload,
                 reply,
             } => {
-                let local = self.params.addresses.iter().find(|a| a.is_ipv4() == destination.is_ipv4()).copied();
+                let local = self
+                    .params
+                    .addresses
+                    .iter()
+                    .find(|a| a.is_ipv4() == destination.is_ipv4())
+                    .copied();
                 let Some(_) = local else {
                     let _ = reply.send(Err(format!("the tunnel has no address for {destination}")));
                     return;
                 };
                 let mut socket = udp::Socket::new(
-                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 8 * 1024]),
-                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 2], vec![0u8; payload.len().max(512)]),
+                    udp::PacketBuffer::new(
+                        vec![udp::PacketMetadata::EMPTY; 4],
+                        vec![0u8; 8 * 1024],
+                    ),
+                    udp::PacketBuffer::new(
+                        vec![udp::PacketMetadata::EMPTY; 2],
+                        vec![0u8; payload.len().max(512)],
+                    ),
                 );
                 let port = self.port();
                 if let Err(error) = socket.bind(port) {
@@ -686,14 +752,20 @@ impl Driver {
             }
             Command::Rebind => match bind_for(self.peer) {
                 Ok(socket) => self.socket = socket,
-                Err(error) => tracing::debug!(%error, "WireGuard rebind failed; keeping the old socket"),
+                Err(error) => {
+                    tracing::debug!(%error, "WireGuard rebind failed; keeping the old socket")
+                }
             },
         }
     }
 
     /// A local port not in use by another socket of this tunnel.
     fn port(&mut self) -> u16 {
-        self.next_port = if self.next_port >= 65000 { 40000 } else { self.next_port + 1 };
+        self.next_port = if self.next_port >= 65000 {
+            40000
+        } else {
+            self.next_port + 1
+        };
         self.next_port
     }
 
@@ -742,7 +814,9 @@ impl Driver {
                             }
                         }
                     }
-                    let Some((chunk, offset)) = slot.pending.as_mut() else { break };
+                    let Some((chunk, offset)) = slot.pending.as_mut() else {
+                        break;
+                    };
                     match socket.send_slice(&chunk[*offset..]) {
                         Ok(sent) => {
                             *offset += sent;
@@ -763,7 +837,9 @@ impl Driver {
                         let _ = socket.recv(|data| (data.len(), ()));
                         continue;
                     };
-                    let Ok(permit) = down.try_reserve() else { break };
+                    let Ok(permit) = down.try_reserve() else {
+                        break;
+                    };
                     let _ = socket.recv(|data| {
                         let n = data.len().min(DOWN_CHUNK);
                         permit.send(Bytes::copy_from_slice(&data[..n]));
@@ -772,7 +848,11 @@ impl Driver {
                     moved = true;
                 }
                 // The peer finished sending: end of stream for the application.
-                if !socket.may_recv() && !socket.can_recv() && slot.down.is_some() && socket.state() != tcp::State::SynSent {
+                if !socket.may_recv()
+                    && !socket.can_recv()
+                    && slot.down.is_some()
+                    && socket.state() != tcp::State::SynSent
+                {
                     slot.down = None;
                 }
                 // The application went away entirely.
@@ -789,12 +869,23 @@ impl Driver {
                 && slot.down.is_none()
                 && slot.up.is_none()
                 && slot.pending.is_none()
-                && matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait | tcp::State::Closing | tcp::State::LastAck | tcp::State::FinWait2 | tcp::State::FinWait1)
+                && matches!(
+                    socket.state(),
+                    tcp::State::Closed
+                        | tcp::State::TimeWait
+                        | tcp::State::Closing
+                        | tcp::State::LastAck
+                        | tcp::State::FinWait2
+                        | tcp::State::FinWait1
+                )
                 && socket.send_queue() == 0;
             if finished {
                 // Let a clean close finish on its own; a socket that no one
                 // needs any more is released right away.
-                if socket.state() == tcp::State::Closed || socket.state() == tcp::State::TimeWait || socket.state() == tcp::State::FinWait2 {
+                if socket.state() == tcp::State::Closed
+                    || socket.state() == tcp::State::TimeWait
+                    || socket.state() == tcp::State::FinWait2
+                {
                     let handle = slot.handle;
                     self.sockets.remove(handle);
                     self.tcp.swap_remove(index);
@@ -812,7 +903,8 @@ impl Driver {
             let mut done = false;
             if let Ok((data, meta)) = socket.recv() {
                 if let Some(reply) = slot.reply.take() {
-                    let from = SocketAddr::new(IpAddr::from(meta.endpoint.addr), meta.endpoint.port);
+                    let from =
+                        SocketAddr::new(IpAddr::from(meta.endpoint.addr), meta.endpoint.port);
                     let _ = reply.send(Ok((from, data.to_vec())));
                 }
                 done = true;
@@ -855,7 +947,7 @@ impl Driver {
         sent
     }
 
-    async fn from_network(&mut self, datagram: &mut [u8], source: SocketAddr) {
+    async fn on_network_datagram(&mut self, datagram: &mut [u8], source: SocketAddr) {
         if source != self.peer {
             return;
         }
@@ -876,7 +968,9 @@ impl Driver {
             }
         };
         let mut clear = std::mem::take(&mut self.clear);
-        let mut state = self.tunnel.decapsulate(Some(source.ip()), packet, &mut clear);
+        let mut state = self
+            .tunnel
+            .decapsulate(Some(source.ip()), packet, &mut clear);
         loop {
             match state {
                 TunnResult::WriteToNetwork(reply) => {
@@ -917,7 +1011,9 @@ impl Driver {
             match amnezia::encode_packet(self.params.obfuscation, packet, &mut self.rng) {
                 Ok(encoded) => {
                     if amnezia::packet_kind(packet) == Some(amnezia::PacketKind::HandshakeInit) {
-                        if let Ok(junk) = amnezia::junk_packets(self.params.obfuscation, &mut self.rng) {
+                        if let Ok(junk) =
+                            amnezia::junk_packets(self.params.obfuscation, &mut self.rng)
+                        {
                             for junk in junk {
                                 let _ = self.socket.send_to(&junk, self.peer).await;
                             }
@@ -993,7 +1089,9 @@ fn dns_answer(message: &[u8], id: u16, qtype: u16) -> Result<(Vec<IpAddr>, Durat
         let rtype = u16::from_be_bytes([header[0], header[1]]);
         let record_ttl = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
         let length = u16::from_be_bytes([header[8], header[9]]) as usize;
-        let data = message.get(at + 10..at + 10 + length).ok_or("truncated DNS data")?;
+        let data = message
+            .get(at + 10..at + 10 + length)
+            .ok_or("truncated DNS data")?;
         if rtype == qtype {
             match (qtype, length) {
                 (1, 4) => out.push(IpAddr::from(<[u8; 4]>::try_from(data).unwrap())),
@@ -1024,7 +1122,14 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let address = socket.local_addr().unwrap();
         tokio::spawn(async move {
-            let mut tunnel = Tunn::new(secret, boringtun::x25519::PublicKey::from(client_public), None, None, 1, None);
+            let mut tunnel = Tunn::new(
+                secret,
+                boringtun::x25519::PublicKey::from(client_public),
+                None,
+                None,
+                1,
+                None,
+            );
             let mut device = QueueDevice::new();
             let started = Instant::now();
             let now = || smoltcp::time::Instant::from_millis(started.elapsed().as_millis() as i64);
@@ -1032,11 +1137,16 @@ mod tests {
             iface.update_ip_addrs(|a| {
                 let _ = a.push(IpCidr::new(IpAddress::from(Ipv4Addr::new(10, 9, 0, 1)), 24));
             });
-            let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Addr::new(10, 9, 0, 254));
+            let _ = iface
+                .routes_mut()
+                .add_default_ipv4_route(Ipv4Addr::new(10, 9, 0, 254));
             let mut sockets = SocketSet::new(Vec::new());
             let mut listeners = Vec::new();
             for _ in 0..6 {
-                let mut tcp = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; 256 * 1024]), tcp::SocketBuffer::new(vec![0; 256 * 1024]));
+                let mut tcp = tcp::Socket::new(
+                    tcp::SocketBuffer::new(vec![0; 256 * 1024]),
+                    tcp::SocketBuffer::new(vec![0; 256 * 1024]),
+                );
                 tcp.listen(7).unwrap();
                 listeners.push(sockets.add(tcp));
             }
@@ -1053,9 +1163,12 @@ mod tests {
             dns.bind(53).unwrap();
             let dns = sockets.add(dns);
             let mut client: Option<SocketAddr> = None;
-            let (mut network, mut out, mut clear) = (vec![0u8; 4096], vec![0u8; 4096], vec![0u8; 4096]);
+            let (mut network, mut out, mut clear) =
+                (vec![0u8; 4096], vec![0u8; 4096], vec![0u8; 4096]);
             loop {
-                let received = tokio::time::timeout(Duration::from_millis(5), socket.recv_from(&mut network)).await;
+                let received =
+                    tokio::time::timeout(Duration::from_millis(5), socket.recv_from(&mut network))
+                        .await;
                 if let Ok(Ok((length, from))) = received {
                     // The client stamps WARP's reserved bytes on every
                     // WireGuard message; anything else (the junk sent before
@@ -1065,14 +1178,16 @@ mod tests {
                     }
                     network[1..4].fill(0);
                     client = Some(from);
-                    let mut state = tunnel.decapsulate(Some(from.ip()), &network[..length], &mut clear);
+                    let mut state =
+                        tunnel.decapsulate(Some(from.ip()), &network[..length], &mut clear);
                     loop {
                         match state {
                             TunnResult::WriteToNetwork(p) => {
                                 socket.send_to(p, from).await.unwrap();
                                 state = tunnel.decapsulate(None, &[], &mut clear);
                             }
-                            TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
+                            TunnResult::WriteToTunnelV4(p, _)
+                            | TunnResult::WriteToTunnelV6(p, _) => {
                                 device.inbound.push_back(p.to_vec());
                                 break;
                             }
@@ -1085,10 +1200,18 @@ mod tests {
                     let tcp = sockets.get_mut::<tcp::Socket>(*handle);
                     if tcp.can_recv() && tcp.can_send() {
                         let room = tcp.send_capacity() - tcp.send_queue();
-                        let data = tcp.recv(|d| { let n = d.len().min(room); (n, d[..n].to_vec()) }).unwrap();
+                        let data = tcp
+                            .recv(|d| {
+                                let n = d.len().min(room);
+                                (n, d[..n].to_vec())
+                            })
+                            .unwrap();
                         tcp.send_slice(&data).unwrap();
                     }
-                    if !tcp.may_recv() && tcp.state() == tcp::State::CloseWait && tcp.send_queue() == 0 {
+                    if !tcp.may_recv()
+                        && tcp.state() == tcp::State::CloseWait
+                        && tcp.send_queue() == 0
+                    {
                         tcp.close();
                     }
                     if tcp.state() == tcp::State::Closed {
@@ -1109,13 +1232,17 @@ mod tests {
                         answer[2] = 0x81;
                         answer[3] = 0x80;
                         answer[7] = 1;
-                        answer.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 10, 9, 0, 1]);
+                        answer.extend_from_slice(&[
+                            0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 10, 9, 0, 1,
+                        ]);
                         dns.send_slice(&answer, meta.endpoint).unwrap();
                     }
                 }
                 iface.poll(now(), &mut device, &mut sockets);
                 while let Some(packet) = device.outbound.pop_front() {
-                    if let (TunnResult::WriteToNetwork(p), Some(to)) = (tunnel.encapsulate(&packet, &mut out), client) {
+                    if let (TunnResult::WriteToNetwork(p), Some(to)) =
+                        (tunnel.encapsulate(&packet, &mut out), client)
+                    {
                         socket.send_to(p, to).await.unwrap();
                     }
                 }
@@ -1136,7 +1263,11 @@ mod tests {
             preshared_key: None,
             addresses: vec![IpAddr::from([10, 9, 0, 2])],
             persistent_keepalive: None,
-            obfuscation: AmneziaParams { junk_count: 3, junk_size: amnezia::RangeU16 { min: 40, max: 70 }, ..AmneziaParams::default() },
+            obfuscation: AmneziaParams {
+                junk_count: 3,
+                junk_size: amnezia::RangeU16 { min: 40, max: 70 },
+                ..AmneziaParams::default()
+            },
             reserved,
             dns: "10.9.0.1:53".parse().unwrap(),
         }
@@ -1145,13 +1276,18 @@ mod tests {
     async fn echo(stream: &mut zero_core::BoxStream, body: &[u8]) {
         stream.write_all(body).await.unwrap();
         let mut back = vec![0u8; body.len()];
-        tokio::time::timeout(Duration::from_secs(20), stream.read_exact(&mut back)).await.expect("echo timed out").unwrap();
+        tokio::time::timeout(Duration::from_secs(20), stream.read_exact(&mut back))
+            .await
+            .expect("echo timed out")
+            .unwrap();
         assert_eq!(back, body);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tcp_udp_and_dns_ride_one_wireguard_session() {
-        let client_public = boringtun::x25519::PublicKey::from(&boringtun::x25519::StaticSecret::from([9u8; 32])).to_bytes();
+        let client_public =
+            boringtun::x25519::PublicKey::from(&boringtun::x25519::StaticSecret::from([9u8; 32]))
+                .to_bytes();
         let reserved = [0x12, 0x34, 0x56];
         let (server, server_public) = peer(client_public, reserved).await;
         let stack = WgStack::start(server, client_params(server_public, reserved)).unwrap();
@@ -1159,7 +1295,10 @@ mod tests {
         // DNS through the tunnel, then TCP to the name.
         let addresses = stack.resolve("echo.test").await.unwrap();
         assert_eq!(addresses, vec![IpAddr::from([10, 9, 0, 1])]);
-        let mut stream = stack.connect_host(&zero_core::Address::domain("echo.test"), 7).await.unwrap();
+        let mut stream = stack
+            .connect_host(&zero_core::Address::domain("echo.test"), 7)
+            .await
+            .unwrap();
         echo(&mut stream, b"hello through wireguard").await;
         // A larger transfer: windows, segmentation and backpressure.
         let big: Vec<u8> = (0..600_000u32).map(|i| (i * 31 % 251) as u8).collect();
@@ -1180,12 +1319,20 @@ mod tests {
         }
 
         // UDP.
-        let (from, answer) = stack.exchange_udp("10.9.0.1:7".parse().unwrap(), b"ping").await.unwrap();
+        let (from, answer) = stack
+            .exchange_udp("10.9.0.1:7".parse().unwrap(), b"ping")
+            .await
+            .unwrap();
         assert_eq!(answer, b"ping");
         assert_eq!(from, "10.9.0.1:7".parse::<SocketAddr>().unwrap());
 
         // A closed port fails fast rather than hanging.
-        let refused = tokio::time::timeout(Duration::from_secs(15), stack.connect("10.9.0.1:9".parse().unwrap())).await.unwrap();
+        let refused = tokio::time::timeout(
+            Duration::from_secs(15),
+            stack.connect("10.9.0.1:9".parse().unwrap()),
+        )
+        .await
+        .unwrap();
         assert!(refused.is_err());
 
         // A network change: a new socket, same session, still working.

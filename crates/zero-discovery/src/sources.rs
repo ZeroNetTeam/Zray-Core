@@ -15,7 +15,13 @@ pub struct NamedSource {
     pub source: FeedSource,
 }
 
-fn source(id: &str, name: &'static str, url: String, tier: u32, sig_url: Option<String>) -> NamedSource {
+fn source(
+    id: &str,
+    name: &'static str,
+    url: String,
+    tier: u32,
+    sig_url: Option<String>,
+) -> NamedSource {
     NamedSource {
         name,
         source: FeedSource {
@@ -31,21 +37,71 @@ fn source(id: &str, name: &'static str, url: String, tier: u32, sig_url: Option<
 pub fn builtin() -> Vec<NamedSource> {
     let verified = "https://cdn.jsdelivr.net/gh/zeghostwriter/ZeroNet@crowd-data/verified.txt";
     vec![
-        source("zeronet", "ZeroNet verified", verified.into(), 0, Some(format!("{verified}.sig"))),
-        source("limilco", "liMilCo", format!("{RAW}/liMilCo/v2r/main/new_configs.txt"), 1, None),
-        source("sinavm", "SVM", format!("{RAW}/sinavm/SVM/main/lite/subscriptions/xray/base64/mix"), 1, None),
         source(
-            "anonymou3",
-            "Multi Proxy (tested)",
-            format!("{RAW}/4n0nymou3/multi-proxy-config-fetcher/main/configs/proxy_configs_tested.txt"),
+            "zeronet",
+            "ZeroNet verified",
+            verified.into(),
+            0,
+            Some(format!("{verified}.sig")),
+        ),
+        source(
+            "limilco",
+            "liMilCo",
+            format!("{RAW}/liMilCo/v2r/main/new_configs.txt"),
             1,
             None,
         ),
-        source("radikal", "0xRadikal", format!("{RAW}/0xRadikal/Free-v2ray-Configs/main/all/configs.txt"), 2, None),
-        source("epodonios", "Epodonios", format!("{RAW}/Epodonios/v2ray-configs/main/All_Configs_Sub.txt"), 2, None),
-        source("delta", "Delta-Kronecker", format!("{RAW}/Delta-Kronecker/V2ray-Config/main/config/all_configs.txt"), 3, None),
-        source("mheidari", "mheidari98", format!("{RAW}/mheidari98/.proxy/main/all"), 3, None),
-        source("f0rc3run", "F0rc3Run", format!("{RAW}/F0rc3Run/F0rc3Run/main/Best-Results/sub.txt"), 3, None),
+        source(
+            "sinavm",
+            "SVM",
+            format!("{RAW}/sinavm/SVM/main/lite/subscriptions/xray/base64/mix"),
+            1,
+            None,
+        ),
+        source(
+            "anonymou3",
+            "Multi Proxy (tested)",
+            format!(
+                "{RAW}/4n0nymou3/multi-proxy-config-fetcher/main/configs/proxy_configs_tested.txt"
+            ),
+            1,
+            None,
+        ),
+        source(
+            "radikal",
+            "0xRadikal",
+            format!("{RAW}/0xRadikal/Free-v2ray-Configs/main/all/configs.txt"),
+            2,
+            None,
+        ),
+        source(
+            "epodonios",
+            "Epodonios",
+            format!("{RAW}/Epodonios/v2ray-configs/main/All_Configs_Sub.txt"),
+            2,
+            None,
+        ),
+        source(
+            "delta",
+            "Delta-Kronecker",
+            format!("{RAW}/Delta-Kronecker/V2ray-Config/main/config/all_configs.txt"),
+            3,
+            None,
+        ),
+        source(
+            "mheidari",
+            "mheidari98",
+            format!("{RAW}/mheidari98/.proxy/main/all"),
+            3,
+            None,
+        ),
+        source(
+            "f0rc3run",
+            "F0rc3Run",
+            format!("{RAW}/F0rc3Run/F0rc3Run/main/Best-Results/sub.txt"),
+            3,
+            None,
+        ),
     ]
 }
 
@@ -53,7 +109,9 @@ pub fn builtin() -> Vec<NamedSource> {
 pub fn enabled(disabled: &[String], max_tier: u32) -> Vec<FeedSource> {
     builtin()
         .into_iter()
-        .filter(|named| named.source.tier <= max_tier && !disabled.iter().any(|id| id == &named.source.id))
+        .filter(|named| {
+            named.source.tier <= max_tier && !disabled.iter().any(|id| id == &named.source.id)
+        })
         .map(|named| named.source)
         .collect()
 }

@@ -130,8 +130,13 @@ async fn verify_body(sig_url: &str, body: &[u8], timeout: Duration) -> Result<bo
         timeout,
         max_redirects: 5,
     };
-    match zero_net::fetch_with(sig_url, &limits, &Validators::default(), &FetchOptions::default())
-        .await
+    match zero_net::fetch_with(
+        sig_url,
+        &limits,
+        &Validators::default(),
+        &FetchOptions::default(),
+    )
+    .await
     {
         Ok(Fetched::Body { body: sig, .. }) => {
             let line = String::from_utf8_lossy(&sig);
