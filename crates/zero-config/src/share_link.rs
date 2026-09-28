@@ -133,6 +133,12 @@ fn parse_link_inner(link: &str) -> Result<ShareLink, String> {
         "hysteria2" | "hy2" => parse_hysteria2(rest),
         "tuic" => parse_tuic(rest),
         "wireguard" | "wg" => parse_wireguard(rest),
+        // Reserved for ZeroNet's own share format, which is not released
+        // yet. Refused by name so such a link is not mistaken for a typo.
+        "zerov1" => Err(
+            "zerov1:// links are reserved for a future ZeroNet format and are not supported yet"
+                .into(),
+        ),
         _ => Err(format!("unsupported share link scheme {scheme:?}")),
     }
 }

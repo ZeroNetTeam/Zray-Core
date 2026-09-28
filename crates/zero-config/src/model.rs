@@ -426,9 +426,14 @@ pub struct FragmentConfig {
 
 impl Default for FragmentConfig {
     fn default() -> Self {
+        // Plain TCP segments of the first write, 40-80 bytes, 1 ms apart.
+        // Measured 2026-09-28 from Tehran (FANAP) against a throttled
+        // workers.dev edge: `tlshello` record re-framing got 0 of 3 through,
+        // this got 3 of 3; with no gap the pieces coalesce into one segment
+        // and fail, and pieces of 200+ bytes got 1 of 3.
         Self {
-            packets: FragmentPackets::TlsHello,
-            length: RangeU32::new(100, 200),
+            packets: FragmentPackets::Range { from: 1, to: 1 },
+            length: RangeU32::new(40, 80),
             delay: RangeDuration::millis(1, 1),
             max_split: RangeU32::new(0, 0),
         }

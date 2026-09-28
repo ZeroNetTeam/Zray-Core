@@ -76,9 +76,10 @@ struct BuildRequest {
     block_ads: bool,
     block_quic: bool,
     evasion: String,
-    /// ClientHello fragment packets for `strong`/`smart` evasion: `tlshello`
-    /// (the default, cheapest) or a write range such as `1-1` — the fallback
-    /// BPB documents for when `tlshello` fragmentation stops getting through.
+    /// ClientHello fragment packets for `strong`/`smart` evasion: a write
+    /// range, `1-1` by default (plain TCP segments of the ClientHello), or
+    /// `tlshello` (TLS record re-framing), which stopped getting through in
+    /// Iran — 0 of 3 against 3 of 3, measured 2026-09-28.
     fragment_packets: String,
     /// Inject a decoy ClientHello carrying an allow-listed SNI (raw fake-SNI
     /// desync) on every TLS/REALITY outbound. Needs CAP_NET_RAW at runtime; the
@@ -107,7 +108,7 @@ impl Default for BuildRequest {
             block_ads: true,
             block_quic: true,
             evasion: "auto".into(),
-            fragment_packets: "tlshello".into(),
+            fragment_packets: "1-1".into(),
             sni_spoof: false,
             dns: DnsRequest::default(),
             log_level: "warning".into(),
@@ -181,7 +182,7 @@ impl Default for DnsRequest {
             remote: "google".into(),
             custom: String::new(),
             local: "google".into(),
-            anti_sanction: "shecan".into(),
+            anti_sanction: "auto".into(),
             custom_anti_sanction: String::new(),
             fakedns: true,
         }
@@ -221,13 +222,14 @@ pub fn build_config_with_assets(
             ))
         }
     };
-    // Fragment packets for strong/smart evasion: the cheap default `tlshello`,
-    // or a write-count range such as `1-1` — BPB's documented fallback for when
-    // ISPs learn to pass fragmented tlshello. Validated here so the error names
-    // the field rather than surfacing from the compiler.
+    // Fragment packets for strong/smart evasion: a write-count range (`1-1`,
+    // the default) or `tlshello`. Validated here so the error names the field
+    // rather than surfacing from the compiler.
     let fragment_packets = {
         let value = request.fragment_packets.trim();
-        if value.is_empty() || value == "tlshello" {
+        if value.is_empty() {
+            "1-1".to_string()
+        } else if value == "tlshello" {
             "tlshello".to_string()
         } else if zero_config::RangeU32::parse(value).is_some() {
             value.to_string()
@@ -328,7 +330,7 @@ pub fn build_config_with_assets(
                     push(&mut outbounds, Some(length));
                 }
             }
-            Evasion::Strong if can_fragment => push(&mut outbounds, Some("100-200")),
+            Evasion::Strong if can_fragment => push(&mut outbounds, Some("40-80")),
             // No fragmentation (Off, or a REALITY/QUIC link) — but the outbound
             // still carries the SNI decoy when spoofing is on.
             _ => push(&mut outbounds, None),

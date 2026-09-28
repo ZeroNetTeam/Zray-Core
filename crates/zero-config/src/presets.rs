@@ -126,10 +126,21 @@ impl LocalDns {
 /// originates from an Iranian address — hence `DirectVia` rather than `Proxy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AntiSanctionDns {
+    /// Every provider below, measured on each network by the runtime
+    /// (`zero_runtime::sanction_dns`): the one that actually relays is used,
+    /// and a name it does not relay goes through the tunnel instead of to a
+    /// service that would refuse an Iranian address.
+    Auto,
+    /// The only provider that relayed Google and AI services when measured
+    /// from Tehran (FANAP) on 2026-09-28.
+    Bertina,
     Shecan,
     Electro,
     Begzar,
     Radar,
+    /// The academic network's resolver: answered honestly (not poisoned) when
+    /// measured, but relays nothing.
+    Ipm,
     /// Resolve sanctioned names with the ordinary local resolver. Correct when
     /// the user is not on an Iranian address at all.
     None,
@@ -138,10 +149,13 @@ pub enum AntiSanctionDns {
 impl AntiSanctionDns {
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "bertina" => Self::Bertina,
             "shecan" => Self::Shecan,
             "electro" => Self::Electro,
             "begzar" => Self::Begzar,
             "radar" => Self::Radar,
+            "ipm" => Self::Ipm,
             "none" | "off" => Self::None,
             _ => return None,
         })
@@ -149,20 +163,35 @@ impl AntiSanctionDns {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
+            Self::Bertina => "bertina",
             Self::Shecan => "shecan",
             Self::Electro => "electro",
             Self::Begzar => "begzar",
             Self::Radar => "radar",
+            Self::Ipm => "ipm",
             Self::None => "none",
         }
     }
 
     pub fn servers(self) -> &'static [&'static str] {
         match self {
+            // One address per provider: the runtime measures each, and one
+            // provider's second address adds a probe without adding a choice.
+            Self::Auto => &[
+                "193.186.32.32",
+                "178.22.122.100",
+                "78.157.42.100",
+                "194.225.152.10",
+                "185.55.226.26",
+                "10.202.10.10",
+            ],
+            Self::Bertina => &["193.186.32.32"],
             Self::Shecan => &["178.22.122.100", "185.51.200.2"],
             Self::Electro => &["78.157.42.100", "78.157.42.101"],
             Self::Begzar => &["185.55.226.26", "185.55.225.25"],
             Self::Radar => &["10.202.10.10", "10.202.10.11"],
+            Self::Ipm => &["194.225.152.10"],
             Self::None => &[],
         }
     }
@@ -197,6 +226,12 @@ pub const SANCTIONED_DOMAINS: &[&str] = &[
     "ansys.com",
     "tableau.com",
     "sandbox.google.com",
+    // Google's AI services refuse Iranian addresses (gemini.google.com: 403
+    // direct, 200 through a relay, measured 2026-09-28).
+    "gemini.google.com",
+    "aistudio.google.com",
+    "notebooklm.google.com",
+    "generativelanguage.googleapis.com",
     "developer.android.com",
     "android.com",
     "cloud.google.com",
@@ -308,7 +343,7 @@ impl Default for IranPreset {
             remote_dns: RemoteDns::Google,
             custom_remote_dns: None,
             local_dns: LocalDns::Google,
-            anti_sanction_dns: AntiSanctionDns::Shecan,
+            anti_sanction_dns: AntiSanctionDns::Auto,
             custom_anti_sanction_dns: None,
             block_ads: true,
             fragment: false,
@@ -368,8 +403,8 @@ impl IranPreset {
                         // evasion is layered on rather than folded into it.
                         object.entry("evasion").or_insert_with(|| {
                             json!({"fragment": {
-                                "packets": "tlshello",
-                                "length": "100-200",
+                                "packets": "1-1",
+                                "length": "40-80",
                                 "interval": "1-1",
                             }})
                         });
@@ -606,12 +641,14 @@ fn apply_fragment(outbound: &mut serde_json::Map<String, Value>) {
     if has_ech {
         return;
     }
-    stream.entry("fragment").or_insert_with(|| {
-        json!({
-            "packets": "tlshello",
-            "length": "100-200",
+    // `finalmask` is the key the parser reads; a bare `streamSettings.fragment`
+    // was silently ignored, so this preset used to fragment nothing.
+    stream.entry("finalmask").or_insert_with(|| {
+        json!({"tcp": [{"type": "fragment", "settings": {
+            "packets": "1-1",
+            "length": "40-80",
             "interval": "1-1",
-        })
+        }}]})
     });
 }
 
@@ -887,9 +924,20 @@ mod tests {
             fragment: true,
             ..IranPreset::default()
         };
-        let built = preset.build();
-        let stream = &built["outbounds"][0]["streamSettings"];
-        assert_eq!(stream["fragment"]["packets"], json!("tlshello"));
+        // Checked on the parsed config, not the JSON: the preset once wrote a
+        // key the parser ignored, and a JSON-shape test passed regardless.
+        let (config, _) = parse_config(&preset.build()).unwrap();
+        let fragment = config.outbounds[0]
+            .stream
+            .evasion
+            .tcp_fragment
+            .as_ref()
+            .expect("fragmentation must reach a JSON outbound");
+        assert_eq!(
+            fragment.packets,
+            crate::FragmentPackets::Range { from: 1, to: 1 }
+        );
+        assert_eq!((fragment.length.min, fragment.length.max), (40, 80));
 
         let mut ech = vless_outbound();
         ech["streamSettings"] = json!({
@@ -904,7 +952,7 @@ mod tests {
         };
         let built = preset.build();
         assert!(built["outbounds"][0]["streamSettings"]
-            .get("fragment")
+            .get("finalmask")
             .is_none());
     }
 
@@ -954,8 +1002,11 @@ mod tests {
             .tcp_fragment
             .as_ref()
             .expect("fragmentation must reach a link-form outbound");
-        assert_eq!(fragment.length.min, 100);
-        assert_eq!(fragment.length.max, 200);
+        assert_eq!(
+            fragment.packets,
+            crate::FragmentPackets::Range { from: 1, to: 1 }
+        );
+        assert_eq!((fragment.length.min, fragment.length.max), (40, 80));
 
         // Off by default: fragmentation costs a round trip, so it is a rung
         // the planner climbs to, not a permanent tax.

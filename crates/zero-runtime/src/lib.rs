@@ -4,10 +4,13 @@
 //! others. This is where a session becomes a stacked connection.
 
 pub mod api;
+pub mod cdn_check;
 mod dns_out;
 pub mod outbound;
 pub mod relay;
+pub mod sanction_dns;
 pub mod server;
+pub mod warm;
 
 pub use relay::{relay, RelayOutcome, Transferred};
 
@@ -45,5 +48,8 @@ pub use server::{asset_specs_for, asset_store_for, Server, ServerConfig};
 /// streams they carry survive the switch. Returns how many moved. Safe to
 /// call from any thread.
 pub fn migrate_quic_connections() -> usize {
+    // A new network may treat the Cloudflare CDN differently.
+    cdn_check::NETWORK_CHANGED.notify_waiters();
+    warm::network_changed();
     zero_transport::quic_pool::rebind_all() + zero_protocol::wg_stack::rebind_all()
 }

@@ -29,6 +29,8 @@ pub struct Stats {
     pub blocked: AtomicU64,
     pub uploaded: AtomicU64,
     pub downloaded: AtomicU64,
+    /// What works for Cloudflare CDN outbounds here ([`crate::cdn_check`]).
+    pub cdn: AtomicU8,
     /// TCP sessions currently being served. A graceful drain waits for this to
     /// reach zero before the process exits.
     pub active: AtomicU64,
@@ -49,7 +51,13 @@ impl Stats {
             blocked: self.blocked.load(Ordering::Relaxed),
             uploaded: self.uploaded.load(Ordering::Relaxed),
             downloaded: self.downloaded.load(Ordering::Relaxed),
+            cdn: self.cdn_condition(),
+            cdn_notice: self.cdn_condition().notice(),
         }
+    }
+
+    pub fn cdn_condition(&self) -> crate::cdn_check::CdnCondition {
+        crate::cdn_check::CdnCondition::from_u8(self.cdn.load(Ordering::Relaxed))
     }
 
     /// Accumulate one relay's bytes against its inbound tag and, when the
@@ -134,6 +142,10 @@ pub struct StatsSnapshot {
     pub blocked: u64,
     pub uploaded: u64,
     pub downloaded: u64,
+    /// What works for Cloudflare CDN outbounds on this network.
+    pub cdn: crate::cdn_check::CdnCondition,
+    /// One sentence for the user about it, when there is something to say.
+    pub cdn_notice: Option<&'static str>,
 }
 
 pub struct ServerConfig {
@@ -147,6 +159,47 @@ pub struct ServerConfig {
 /// connects and then says nothing -- a slow-loris, or a censor's half-open
 /// probe -- pins a task and a descriptor for as long as it cares to.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A connection to `chain[0]`'s server, carried through every later hop of
+/// `chain` (innermost dialled directly). `chain` has at least two entries.
+async fn carry_to_exit(
+    chain: &[zero_config::Outbound],
+    resolver: &zero_dns::Resolver,
+) -> Result<zero_core::BoxStream, zero_core::Failure> {
+    let server = |hop: &zero_config::Outbound| {
+        hop.endpoint()
+            .map(|(address, port)| Destination::tcp(address, port))
+            .ok_or_else(|| {
+                zero_core::Failure::new(
+                    zero_core::FailureKind::LocalPolicy,
+                    zero_core::Stage::SocketConnected,
+                )
+                .with_detail(format!("outbound {} has no endpoint", hop.tag))
+            })
+    };
+    let innermost = chain.len() - 1;
+    let carried = Box::pin(outbound::connect_with_resolver(
+        &chain[innermost],
+        &server(&chain[innermost - 1])?,
+        resolver,
+    ))
+    .await?;
+    let mut carried = outbound::strip_response(&chain[innermost], carried);
+    for index in (1..innermost).rev() {
+        let stream = Box::pin(outbound::connect_over(
+            &chain[index],
+            carried,
+            &server(&chain[index - 1])?,
+        ))
+        .await?;
+        carried = outbound::strip_response(&chain[index], stream);
+    }
+    Ok(carried)
+}
+
+/// Most outbounds one `dialerProxy` chain may pass through, the exit
+/// included. Each hop adds a round trip to every connection.
+const MAX_CHAIN: usize = 4;
 
 /// How many datagrams one UDP ingress may have in flight at once. Each one
 /// waits up to the exchange deadline for its answer, so the ingress must not
@@ -302,6 +355,11 @@ pub struct Server {
     /// Lock-free mirror of the planner rung used when materialising an
     /// outbound for a new session.
     planner_strategy: AtomicU8,
+    /// The anti-sanction resolver measured best on this network, once the
+    /// first measurement is in ([`crate::sanction_dns`]).
+    sanction: StdMutex<Option<crate::sanction_dns::SanctionState>>,
+    /// Connections prepared ahead of need ([`crate::warm`]).
+    warm: Arc<crate::warm::WarmPool>,
     /// Lock-free mirror of the shortest time-triggered reset the planner has
     /// measured, in milliseconds; `0` means no such evidence exists.
     ///
@@ -367,6 +425,8 @@ impl Server {
             selection_counter: AtomicU64::new(0),
             listening: tokio::sync::watch::channel(false).0,
             planner_strategy: AtomicU8::new(zero_observatory::PathStrategy::DirectReality.as_u8()),
+            sanction: StdMutex::new(None),
+            warm: Arc::default(),
             planner_flow_lifetime_ms: AtomicU64::new(0),
             stats: Arc::new(Stats::default()),
         }
@@ -589,6 +649,14 @@ impl Server {
         let me = Arc::clone(&self);
         background.0.push(tokio::spawn(async move {
             me.run_strategy_descent().await;
+        }));
+        let me = Arc::clone(&self);
+        background.0.push(tokio::spawn(async move {
+            me.run_cdn_watch().await;
+        }));
+        let me = Arc::clone(&self);
+        background.0.push(tokio::spawn(async move {
+            me.run_sanction_watch().await;
         }));
         for (idx, inbound) in initial.config.inbounds.iter().enumerate() {
             let addr = SocketAddr::new(
@@ -1566,14 +1634,12 @@ impl Server {
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
                     | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_) => {
-                        let s = outbound::connect_with_resolver(
-                            &ob,
-                            &accepted.destination,
-                            &self.resolver(),
-                        )
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::AmneziaWireguard(_) => {
+                        let s = self
+                            .open_outbound(&ob, &accepted.destination)
+                            .await
+                            .map_err(|e| e.to_string())?;
                         outbound::strip_response(&ob, s)
                     }
                     other => {
@@ -1802,14 +1868,12 @@ impl Server {
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
                     | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_) => {
-                        let stream = outbound::connect_with_resolver(
-                            &outbound,
-                            &destination,
-                            &self.resolver(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::AmneziaWireguard(_) => {
+                        let stream = self
+                            .open_outbound(&outbound, &destination)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         outbound::strip_response(&outbound, stream)
                     }
                     other => {
@@ -2165,14 +2229,12 @@ impl Server {
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
                     | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_) => {
-                        let stream = outbound::connect_with_resolver(
-                            &outbound,
-                            &destination,
-                            &self.resolver(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::AmneziaWireguard(_) => {
+                        let stream = self
+                            .open_outbound(&outbound, &destination)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         outbound::strip_response(&outbound, stream)
                     }
                     OutboundProtocol::Blackhole => {
@@ -2270,14 +2332,12 @@ impl Server {
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
                     | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_) => {
-                        let stream = outbound::connect_with_resolver(
-                            &outbound,
-                            &destination,
-                            &self.resolver(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::AmneziaWireguard(_) => {
+                        let stream = self
+                            .open_outbound(&outbound, &destination)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         outbound::strip_response(&outbound, stream)
                     }
                     OutboundProtocol::Blackhole => {
@@ -2361,14 +2421,12 @@ impl Server {
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
                     | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_) => {
-                        let stream = outbound::connect_with_resolver(
-                            &outbound,
-                            &destination,
-                            &self.resolver(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::AmneziaWireguard(_) => {
+                        let stream = self
+                            .open_outbound(&outbound, &destination)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         outbound::strip_response(&outbound, stream)
                     }
                     OutboundProtocol::Blackhole => {
@@ -2769,14 +2827,12 @@ impl Server {
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
                     | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_) => {
-                        let stream = outbound::connect_with_resolver(
-                            &outbound,
-                            &request.destination,
-                            &self.resolver(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::AmneziaWireguard(_) => {
+                        let stream = self
+                            .open_outbound(&outbound, &request.destination)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         outbound::strip_response(&outbound, stream)
                     }
                     OutboundProtocol::Blackhole => {
@@ -3088,14 +3144,12 @@ impl Server {
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
                     | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_) => {
-                        let stream = outbound::connect_with_resolver(
-                            &outbound,
-                            &destination,
-                            &self.resolver(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::AmneziaWireguard(_) => {
+                        let stream = self
+                            .open_outbound(&outbound, &destination)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         outbound::strip_response(&outbound, stream)
                     }
                     other => {
@@ -3169,14 +3223,12 @@ impl Server {
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
                     | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_) => {
-                        let stream = outbound::connect_with_resolver(
-                            &outbound,
-                            &request.destination,
-                            &self.resolver(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::AmneziaWireguard(_) => {
+                        let stream = self
+                            .open_outbound(&outbound, &request.destination)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         outbound::strip_response(&outbound, stream)
                     }
                     OutboundProtocol::Blackhole => {
@@ -3299,14 +3351,12 @@ impl Server {
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
                     | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_) => {
-                        let stream = outbound::connect_with_resolver(
-                            &outbound,
-                            &destination,
-                            &self.resolver(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::AmneziaWireguard(_) => {
+                        let stream = self
+                            .open_outbound(&outbound, &destination)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         outbound::strip_response(&outbound, stream)
                     }
                     OutboundProtocol::Blackhole => {
@@ -3537,6 +3587,15 @@ impl Server {
         outbound: &zero_config::Outbound,
         datagram: &socks::UdpDatagram,
     ) -> Result<(Destination, Vec<u8>), String> {
+        // Datagrams cannot follow a `dialerProxy` chain yet. Sending them
+        // straight to the server instead would show its address to the very
+        // network the chain exists to hide it from, so refuse.
+        if outbound.stream.sockopt.dialer_proxy.is_some() {
+            return Err(format!(
+                "outbound {} runs through dialerProxy, which does not carry UDP yet",
+                outbound.tag
+            ));
+        }
         if outbound.mux.enabled {
             let carrier = outbound::connect_mux_carrier_with_resolver(outbound, &self.resolver())
                 .await
@@ -3744,18 +3803,242 @@ impl Server {
                 .and_then(|addresses| addresses.into_iter().next()),
             _ => None,
         };
-        self.router().route(ctx, resolved)
+        let decision = self.router().route(ctx, resolved);
+        self.adapt_sanctioned(ctx, decision).await
+    }
+
+    /// A sanctioned name goes direct only through a resolver measured to
+    /// relay it here, and only when that resolver's answer is its relay.
+    /// Otherwise a direct connection would reach the service from an Iranian
+    /// address and be refused, so the name goes the default way (the tunnel).
+    /// Until the first measurement, the configured behaviour stands.
+    async fn adapt_sanctioned(&self, ctx: &SessionContext, decision: Decision) -> Decision {
+        let Decision::DirectVia { resolver } = &decision else {
+            return decision;
+        };
+        if resolver.as_ref() != crate::sanction_dns::TAG {
+            return decision;
+        }
+        let Some(state) = self
+            .sanction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return decision;
+        };
+        let tunnel = || {
+            let config = self.config();
+            match config.default_outbound() {
+                Some(outbound) => Decision::Outbound(outbound.tag.clone()),
+                None => Decision::Block,
+            }
+        };
+        let Some(pinned) = state.pinned_tag() else {
+            return tunnel();
+        };
+        let Some(domain) = ctx.destination.address.as_domain() else {
+            return Decision::DirectVia {
+                resolver: pinned.into(),
+            };
+        };
+        let answers = self
+            .resolver()
+            .for_tag(&pinned)
+            .lookup(domain, zero_config::dns::QueryStrategy::UseIpv4)
+            .await
+            .unwrap_or_default();
+        if state.relays(&answers) {
+            Decision::DirectVia {
+                resolver: pinned.into(),
+            }
+        } else {
+            debug!(%domain, "anti-sanction resolver does not relay this name; using the tunnel");
+            tunnel()
+        }
+    }
+
+    /// What this server has measured about built-in techniques on the
+    /// current network, as `(method id, worked)` for the crowd report. Only
+    /// ids from the fixed vocabulary; nothing about the user's own configs.
+    pub fn method_observations(&self) -> Vec<(&'static str, bool)> {
+        let mut observed = crate::cdn_check::observations(self.stats.cdn_condition()).to_vec();
+        let sanction = self
+            .sanction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(id) = sanction.as_ref().and_then(crate::sanction_dns::method_id) {
+            observed.push((id, true));
+        }
+        observed
+    }
+
+    /// Keep the anti-sanction measurement current: at start, after a network
+    /// change, and every [`crate::sanction_dns::RECHECK`].
+    async fn run_sanction_watch(self: Arc<Self>) {
+        use crate::sanction_dns;
+        loop {
+            let candidates = sanction_dns::candidates(&self.config().dns);
+            if !candidates.is_empty() {
+                let state = sanction_dns::probe(&candidates).await;
+                let mut slot = self
+                    .sanction
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if slot.as_ref() != Some(&state) {
+                    info!(
+                        chosen = ?state.chosen,
+                        relay = ?state.relay,
+                        candidates = candidates.len(),
+                        "anti-sanction resolver measured"
+                    );
+                }
+                *slot = Some(state);
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(sanction_dns::RECHECK) => {}
+                _ = crate::cdn_check::NETWORK_CHANGED.notified() => {}
+            }
+        }
+    }
+
+    /// Open `outbound` to `destination`, following `sockopt.dialerProxy`
+    /// and using a warm carrier when one is ready ([`crate::warm`]).
+    ///
+    /// A chain is resolved hop by hop — each hop's own `dialerProxy` too — so
+    /// every server behind the first is reached only through the one before
+    /// it and never dialled directly. Loops and chains deeper than
+    /// [`MAX_CHAIN`] are refused before anything is dialled.
+    async fn open_outbound(
+        &self,
+        outbound: &zero_config::Outbound,
+        destination: &Destination,
+    ) -> Result<zero_core::BoxStream, zero_core::Failure> {
+        if !outbound::warmable(outbound) {
+            return self.open_cold(outbound, destination).await;
+        }
+        let key = crate::warm::key(outbound);
+        if let Some(carrier) = self.warm.take(key) {
+            match outbound::finish_carrier(outbound, carrier, destination).await {
+                Ok(stream) => {
+                    debug!(outbound = %outbound.tag, "used a warm carrier");
+                    self.prepare_carrier(outbound, key);
+                    return Ok(stream);
+                }
+                // A carrier that died unnoticed costs a retry, not a request.
+                Err(error) => debug!(outbound = %outbound.tag, %error, "warm carrier failed"),
+            }
+        }
+        let opened = self.open_cold(outbound, destination).await;
+        if opened.is_ok() {
+            self.prepare_carrier(outbound, key);
+        }
+        opened
+    }
+
+    /// Open `outbound` with nothing prepared.
+    async fn open_cold(
+        &self,
+        outbound: &zero_config::Outbound,
+        destination: &Destination,
+    ) -> Result<zero_core::BoxStream, zero_core::Failure> {
+        if outbound.stream.sockopt.dialer_proxy.is_none() {
+            return outbound::connect_with_resolver(outbound, destination, &self.resolver()).await;
+        }
+        let chain = self.resolve_chain(outbound)?;
+        let resolver = self.resolver();
+        Box::pin(outbound::within_setup_deadline(async {
+            let carried = Box::pin(carry_to_exit(&chain, &resolver)).await?;
+            Box::pin(outbound::connect_over(&chain[0], carried, destination)).await
+        }))
+        .await
+    }
+
+    /// The outbounds a connection through `outbound` passes: `outbound`
+    /// (the exit) first, then each hop that carries the one before it.
+    fn resolve_chain(
+        &self,
+        outbound: &zero_config::Outbound,
+    ) -> Result<Vec<zero_config::Outbound>, zero_core::Failure> {
+        use zero_core::{Failure, FailureKind, Stage};
+        let refuse = |detail: String| {
+            Failure::new(FailureKind::LocalPolicy, Stage::SocketConnected).with_detail(detail)
+        };
+        let mut chain = vec![outbound.clone()];
+        let mut next = outbound.stream.sockopt.dialer_proxy.clone();
+        while let Some(tag) = next {
+            if chain.iter().any(|hop| *hop.tag == *tag) {
+                return Err(refuse(format!("dialerProxy loop through {tag:?}")));
+            }
+            if chain.len() >= MAX_CHAIN {
+                return Err(refuse(format!(
+                    "dialerProxy chain is longer than {MAX_CHAIN} hops"
+                )));
+            }
+            let hop = self
+                .pick_outbound(&tag)
+                .ok_or_else(|| refuse(format!("dialerProxy {tag:?} is not a usable outbound")))?;
+            next = hop.stream.sockopt.dialer_proxy.clone();
+            chain.push(hop);
+        }
+        Ok(chain)
+    }
+
+    /// Prepare the next connection for `outbound` in the background, unless
+    /// one is ready or on its way, or the pool is full.
+    fn prepare_carrier(&self, outbound: &zero_config::Outbound, key: u64) {
+        if !self.warm.begin(key) {
+            return;
+        }
+        let chain = match self.resolve_chain(outbound) {
+            Ok(chain) => chain,
+            Err(_) => {
+                self.warm.finish(key, None);
+                return;
+            }
+        };
+        let resolver = self.resolver();
+        let pool = Arc::clone(&self.warm);
+        tokio::spawn(async move {
+            let opened = Box::pin(outbound::within_setup_deadline(async {
+                let exit = &chain[0];
+                let (secured, host) = if chain.len() == 1 {
+                    Box::pin(outbound::open_secured(exit, &resolver)).await?
+                } else {
+                    let carried = Box::pin(carry_to_exit(&chain, &resolver)).await?;
+                    Box::pin(outbound::secure_over(exit, carried)).await?
+                };
+                Box::pin(outbound::open_carrier(exit, secured, &host)).await
+            }))
+            .await;
+            pool.finish(key, opened.ok());
+        });
     }
 
     fn pick_outbound(&self, tag: &str) -> Option<zero_config::Outbound> {
         let config = self.config();
+        let cdn = self.stats.cdn_condition();
         if let Some(o) = config.outbound_by_tag(tag) {
             let mut outbound = o.clone();
             self.apply_planner_strategy(&mut outbound);
+            crate::cdn_check::apply(cdn, &mut outbound);
             return Some(outbound);
         }
         let b = config.balancer_by_tag(tag)?;
-        let members = config.expand_balancer(b);
+        let mut members = config.expand_balancer(b);
+        // With the CDN unusable here, choose among the other members, if
+        // there are any; a balancer of CDN configs only keeps trying them.
+        if cdn == crate::cdn_check::CdnCondition::Blocked {
+            let usable: Vec<_> = members
+                .iter()
+                .copied()
+                .filter(|id| !crate::cdn_check::is_cloudflare_cdn(&config.outbounds[id.0 as usize]))
+                .collect();
+            if !usable.is_empty() {
+                members = usable;
+            }
+        }
         if members.is_empty() {
             return None;
         }
@@ -3794,7 +4077,66 @@ impl Server {
         };
         let mut outbound = config.outbounds[members[index].0 as usize].clone();
         self.apply_planner_strategy(&mut outbound);
+        crate::cdn_check::apply(cdn, &mut outbound);
         Some(outbound)
+    }
+
+    /// Keep [`Stats::cdn`] current: probe one Cloudflare CDN outbound when
+    /// the server starts, when the network changes, and every so often.
+    ///
+    /// Anti-flapping: a working method is adopted at once (a success is
+    /// proof), but "blocked" only after two failed probes in a row, so one bad
+    /// moment on a working network does not switch every CDN config off.
+    async fn run_cdn_watch(self: Arc<Self>) {
+        use crate::cdn_check::{self, CdnCondition};
+        let mut failures = 0u8;
+        loop {
+            let candidate = self
+                .config()
+                .outbounds
+                .iter()
+                .find(|outbound| cdn_check::is_cloudflare_cdn(outbound))
+                .cloned();
+            let wait = match candidate {
+                None => {
+                    self.stats
+                        .cdn
+                        .store(CdnCondition::Unknown.as_u8(), Ordering::Relaxed);
+                    cdn_check::RECHECK
+                }
+                Some(outbound) => {
+                    let found = cdn_check::probe(&outbound, &self.resolver()).await;
+                    let previous = self.stats.cdn_condition();
+                    let adopted = if found == CdnCondition::Blocked {
+                        failures = failures.saturating_add(1);
+                        if failures >= 2 || previous == CdnCondition::Unknown {
+                            CdnCondition::Blocked
+                        } else {
+                            previous
+                        }
+                    } else {
+                        failures = 0;
+                        found
+                    };
+                    if adopted != previous {
+                        info!(outbound = %outbound.tag, from = ?previous, to = ?adopted, "Cloudflare CDN condition changed");
+                    }
+                    self.stats.cdn.store(adopted.as_u8(), Ordering::Relaxed);
+                    match (found, adopted) {
+                        // Confirm a first failure soon rather than in 20 minutes.
+                        (CdnCondition::Blocked, a) if a != CdnCondition::Blocked => {
+                            Duration::from_secs(30)
+                        }
+                        (_, CdnCondition::Blocked) => cdn_check::RECHECK_BLOCKED,
+                        _ => cdn_check::RECHECK,
+                    }
+                }
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = cdn_check::NETWORK_CHANGED.notified() => failures = 0,
+            }
+        }
     }
 
     /// Materialise the planner's current rung for a new session. Every
@@ -4403,7 +4745,8 @@ impl Server {
             OutboundProtocol::Blackhole | OutboundProtocol::Dns => {
                 return Err("outbound cannot be probed".into())
             }
-            _ => outbound::connect_with_resolver(outbound, &target.destination, &self.resolver())
+            _ => self
+                .open_outbound(outbound, &target.destination)
                 .await
                 .map_err(|error| error.to_string())?,
         };

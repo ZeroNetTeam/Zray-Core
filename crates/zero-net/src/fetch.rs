@@ -261,6 +261,48 @@ pub async fn post_with_headers(
     limits: &FetchLimits,
 ) -> Result<Vec<u8>, FetchError> {
     let target = parse_target(url)?;
+    let request = post_request(&target, content_type, headers, body)?;
+    match timeout(limits.timeout, send_once(&target, &request, limits)).await {
+        Err(_) => Err(FetchError::Timeout(limits.timeout)),
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(Outcome::Done(Fetched::Body { body, .. }))) => Ok(body),
+        Ok(Ok(Outcome::Done(Fetched::NotModified))) => Err(FetchError::Status(304)),
+        Ok(Ok(Outcome::Redirect(_))) => Err(FetchError::Status(302)),
+    }
+}
+
+/// [`post_with_headers`] over a connection the caller already opened — one
+/// with a TLS setup this module does not make itself, such as ECH. `url`
+/// supplies the Host header and path; nothing is dialled.
+pub async fn post_over<S>(
+    stream: S,
+    url: &str,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    limits: &FetchLimits,
+) -> Result<Vec<u8>, FetchError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let target = parse_target(url)?;
+    let request = post_request(&target, content_type, headers, body)?;
+    match timeout(limits.timeout, exchange(stream, &request, limits)).await {
+        Err(_) => Err(FetchError::Timeout(limits.timeout)),
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(Outcome::Done(Fetched::Body { body, .. }))) => Ok(body),
+        Ok(Ok(Outcome::Done(Fetched::NotModified))) => Err(FetchError::Status(304)),
+        Ok(Ok(Outcome::Redirect(_))) => Err(FetchError::Status(302)),
+    }
+}
+
+/// The bytes of a POST request to `target`.
+fn post_request(
+    target: &Target,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<Vec<u8>, FetchError> {
     if headers
         .iter()
         .any(|(k, v)| k.contains(['\r', '\n']) || v.contains(['\r', '\n']))
@@ -277,7 +319,7 @@ pub async fn post_with_headers(
     let mut head = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {agent}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         target.request_target,
-        host_header(&target),
+        host_header(target),
         body.len(),
     );
     for (name, value) in headers
@@ -289,13 +331,7 @@ pub async fn post_with_headers(
     head.push_str("\r\n");
     let mut request = head.into_bytes();
     request.extend_from_slice(body);
-    match timeout(limits.timeout, send_once(&target, &request, limits)).await {
-        Err(_) => Err(FetchError::Timeout(limits.timeout)),
-        Ok(Err(error)) => Err(error),
-        Ok(Ok(Outcome::Done(Fetched::Body { body, .. }))) => Ok(body),
-        Ok(Ok(Outcome::Done(Fetched::NotModified))) => Err(FetchError::Status(304)),
-        Ok(Ok(Outcome::Redirect(_))) => Err(FetchError::Status(302)),
-    }
+    Ok(request)
 }
 
 async fn fetch_once(

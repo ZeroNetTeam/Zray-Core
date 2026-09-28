@@ -66,6 +66,21 @@ pub enum ResolverEndpoint {
 }
 
 impl ResolverEndpoint {
+    /// The server's host as written: an address or a name. Empty for the
+    /// system resolver and FakeDNS, which have none.
+    pub fn host(&self) -> String {
+        match self {
+            Self::Udp { address, .. }
+            | Self::Tcp { address, .. }
+            | Self::Dot { address, .. }
+            | Self::Doq { address, .. } => address.host_string(),
+            Self::Doh { host, .. } | Self::Doh2 { host, .. } | Self::Doh3 { host, .. } => {
+                host.to_string()
+            }
+            Self::System | Self::FakeDns => String::new(),
+        }
+    }
+
     /// Parse Xray's server string forms.
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
