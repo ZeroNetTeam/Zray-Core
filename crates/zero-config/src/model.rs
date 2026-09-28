@@ -1450,6 +1450,11 @@ pub struct AssetsConfig {
     pub timeout: Duration,
     /// Refresh on startup even when the cache is inside its TTL.
     pub refresh_on_start: bool,
+    /// Download updates at all. Off, the files already in `directory` are
+    /// loaded and never replaced: for a host that ships its own rule sets
+    /// (the Android app bundles trimmed ones) and must not spend a metered,
+    /// filtered connection re-fetching the full upstream lists.
+    pub auto_update: bool,
     pub files: Box<[AssetFile]>,
 }
 
@@ -1462,6 +1467,7 @@ impl Default for AssetsConfig {
             max_bytes: 64 * 1024 * 1024,
             timeout: Duration::from_secs(120),
             refresh_on_start: false,
+            auto_update: true,
             files: Box::from([]),
         }
     }

@@ -377,6 +377,15 @@ pub(crate) fn retain_profile_certificate_decompressors(
     {
         decompressors.push(&ZstdCertificateDecompressor);
     }
+    if profile
+        .certificate_compression_algorithms
+        .contains(&BROTLI_CERTIFICATE_COMPRESSION)
+        && !decompressors.iter().any(|decompressor| {
+            u16::from(decompressor.algorithm()) == BROTLI_CERTIFICATE_COMPRESSION
+        })
+    {
+        decompressors.push(&BrotliCertificateDecompressor);
+    }
     decompressors.retain(|decompressor| {
         let algorithm = u16::from(decompressor.algorithm());
         profile
@@ -403,6 +412,41 @@ impl rustls::compress::CertDecompressor for ZstdCertificateDecompressor {
 
     fn algorithm(&self) -> CertificateCompressionAlgorithm {
         CertificateCompressionAlgorithm::Zstd
+    }
+}
+
+/// Brotli certificate decompression (what Chrome advertises), decode-only.
+///
+/// rustls' built-in brotli support links the compressor too, which a client
+/// never uses. Output is bounded by the length the server declared (rustls
+/// sizes `output` from it and caps it), so a decompression bomb cannot grow
+/// past it: anything short or long is a failure.
+#[derive(Debug)]
+struct BrotliCertificateDecompressor;
+
+impl rustls::compress::CertDecompressor for BrotliCertificateDecompressor {
+    fn decompress(
+        &self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), rustls::compress::DecompressionFailed> {
+        use std::io::Read;
+        #[cfg(test)]
+        tests::BROTLI_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut reader = brotli_decompressor::Decompressor::new(input, 4096);
+        reader
+            .read_exact(output)
+            .map_err(|_| rustls::compress::DecompressionFailed)?;
+        // Exactly the declared size: one more byte means the length lied.
+        let mut extra = [0u8; 1];
+        match reader.read(&mut extra) {
+            Ok(0) => Ok(()),
+            _ => Err(rustls::compress::DecompressionFailed),
+        }
+    }
+
+    fn algorithm(&self) -> CertificateCompressionAlgorithm {
+        CertificateCompressionAlgorithm::Brotli
     }
 }
 
@@ -958,6 +1002,94 @@ mod tests {
 
     use super::*;
     use crate::utls_profiles::{ECH_GREASE_BORING, ECH_GREASE_FIREFOX};
+
+    /// How often the brotli certificate decompressor ran (tests only).
+    pub(super) static BROTLI_DECODES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Live check against real servers that brotli-compress their chains for
+    /// a Chrome hello. Needs the internet: `cargo test -p zero-security
+    /// real_servers -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn real_servers_hand_us_brotli_certificates_we_can_read() {
+        for host in ["www.google.com", "www.cloudflare.com"] {
+            let before = BROTLI_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+            let tcp = tokio::net::TcpStream::connect((host, 443))
+                .await
+                .expect("tcp");
+            let mut params = crate::tls::TlsParams::new(host);
+            params.fingerprint_name = Some("chrome".into());
+            params.alpn = vec![b"http/1.1".to_vec()];
+            crate::tls::connect(tcp, &params)
+                .await
+                .unwrap_or_else(|e| panic!("{host}: handshake failed: {e:?}"));
+            let after = BROTLI_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+            println!("{host}: brotli certificate decodes {}", after - before);
+        }
+        assert!(
+            BROTLI_DECODES.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "no server sent a brotli-compressed certificate, so this proved nothing"
+        );
+    }
+
+    fn brotli(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let params = brotli::enc::BrotliEncoderParams::default();
+        brotli::BrotliCompress(&mut &data[..], &mut out, &params).unwrap();
+        out
+    }
+
+    #[test]
+    fn brotli_certificates_decode_to_exactly_the_declared_size() {
+        use rustls::compress::CertDecompressor;
+        // A certificate-chain-sized, compressible blob.
+        let chain: Vec<u8> = (0..6000u32)
+            .map(|i| (i % 251) as u8 ^ (i / 97) as u8)
+            .collect();
+        let packed = brotli(&chain);
+        let mut out = vec![0u8; chain.len()];
+        BrotliCertificateDecompressor
+            .decompress(&packed, &mut out)
+            .expect("decodes");
+        assert_eq!(out, chain);
+        // A declared length that is wrong either way is refused.
+        let mut short = vec![0u8; chain.len() - 1];
+        assert!(BrotliCertificateDecompressor
+            .decompress(&packed, &mut short)
+            .is_err());
+        let mut long = vec![0u8; chain.len() + 1];
+        assert!(BrotliCertificateDecompressor
+            .decompress(&packed, &mut long)
+            .is_err());
+        // Garbage is refused, not panicked on.
+        assert!(BrotliCertificateDecompressor
+            .decompress(b"not brotli at all", &mut out)
+            .is_err());
+    }
+
+    #[test]
+    fn a_profile_that_advertises_brotli_can_still_decode_it() {
+        // rustls no longer brings its own brotli; the shaped hello must still
+        // be able to accept what it advertises.
+        let profile =
+            crate::utls_profiles::profile_for_fingerprint("chrome").expect("chrome profile");
+        assert!(profile
+            .certificate_compression_algorithms
+            .contains(&BROTLI_CERTIFICATE_COMPRESSION));
+        let mut decompressors = rustls::compress::default_cert_decompressors().to_vec();
+        retain_profile_certificate_decompressors(profile, &mut decompressors);
+        let offered: Vec<u16> = decompressors
+            .iter()
+            .map(|d| u16::from(d.algorithm()))
+            .collect();
+        for algorithm in profile.certificate_compression_algorithms {
+            assert!(
+                offered.contains(algorithm),
+                "{algorithm:#06x} advertised but not decodable: {offered:?}"
+            );
+        }
+    }
 
     #[test]
     fn the_shuffle_pins_pre_shared_key_and_permutes_the_rest() {

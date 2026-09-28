@@ -778,6 +778,9 @@ fn parse_outbound(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Outbound> {
             if overlay.keepalive.is_some() {
                 outbound.stream.evasion.keepalive = overlay.keepalive;
             }
+            if overlay.sni_desync.is_some() {
+                outbound.stream.evasion.sni_desync = overlay.sni_desync;
+            }
         }
         outbound.validate()?;
         return Ok(outbound);
@@ -2294,7 +2297,37 @@ fn parse_legacy_freedom_evasion(settings: Option<&Value>, path: &str) -> R<Evasi
             &format!("{path}.keepalive"),
         )?);
     }
+    // SNI spoofing: a decoy ClientHello carrying an allow-listed SNI is injected
+    // outside the TCP window so a passive DPI parser reads the decoy while the
+    // real peer discards it. Off unless a fake SNI is named.
+    if let Some(spoof) = settings.get("sniSpoof") {
+        evasion.sni_desync = Some(parse_sni_spoof(spoof, &format!("{path}.sniSpoof"))?);
+    }
     Ok(evasion)
+}
+
+/// `{"fakeSni": "www.example.com", "sequence": 0}` — the decoy SNI (and the
+/// optional out-of-window sequence) for raw fake-ClientHello injection.
+fn parse_sni_spoof(value: &Value, path: &str) -> R<SniDesyncConfig> {
+    let fake_sni = value
+        .get("fakeSni")
+        .or_else(|| value.get("fake_sni"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{path}.fakeSni is required"))?;
+    // Match the injector's own bound (zero_evasion::build_fake_client_hello):
+    // 1..=219 visible bytes, so the decoy hello stays a fixed 517-byte packet.
+    if fake_sni.is_empty() || fake_sni.len() > 219 || !fake_sni.bytes().all(|b| b > 0x20) {
+        return Err(format!("{path}.fakeSni must be 1..=219 visible bytes"));
+    }
+    let sequence = value
+        .get("sequence")
+        .and_then(Value::as_u64)
+        .map(|s| s as u32)
+        .unwrap_or(0);
+    Ok(SniDesyncConfig {
+        fake_sni: fake_sni.into(),
+        sequence,
+    })
 }
 
 /// Evasion layered onto a link-form outbound: `{"fragment": {...},
@@ -2566,6 +2599,11 @@ fn parse_assets(value: &Value, path: &str) -> R<AssetsConfig> {
         Some(Value::Bool(value)) => *value,
         Some(_) => return Err(format!("{path}.refreshOnStart must be a boolean")),
     };
+    let auto_update = match object.get("autoUpdate") {
+        None => defaults.auto_update,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err(format!("{path}.autoUpdate must be a boolean")),
+    };
 
     let files = match object.get("files") {
         None => Vec::new(),
@@ -2592,6 +2630,7 @@ fn parse_assets(value: &Value, path: &str) -> R<AssetsConfig> {
         max_bytes,
         timeout,
         refresh_on_start,
+        auto_update,
         files: files.into_boxed_slice(),
     })
 }

@@ -19,6 +19,7 @@
 //! Every job takes a [`CancellationToken`](tokio_util::sync::CancellationToken)
 //! and bounds its own concurrency; none of them polls or busy-waits.
 
+pub mod cloudflare;
 pub mod config;
 pub mod crowd;
 pub mod crowd_client;
@@ -38,6 +39,7 @@ pub mod test_links;
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub use cloudflare::{front_link, front_via_edges};
 pub use config::{build_config, build_config_with_assets};
 pub use discover::{discover, DiscoverRequest, EndReason};
 pub use events::{batching_sink, EventCallback, EventSink};

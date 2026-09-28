@@ -118,6 +118,12 @@ pub fn inject_fake_client_hello(
             }
             Err(error) => return Err(format!("SNI desync raw socket: {error}")),
         };
+        // The decoy must leave the way the real hello does: copy any routing
+        // mark and interface binding the real connection carries.
+        {
+            use std::os::fd::AsRawFd;
+            copy_route_binding(stream.as_raw_fd(), raw);
+        }
         let destination = sockaddr_in(peer);
         let sent = unsafe {
             libc::sendto(
@@ -146,6 +152,54 @@ pub fn inject_fake_client_hello(
     {
         let _ = (stream, local, peer, payload);
         Ok(false)
+    }
+}
+
+/// Copy `SO_MARK` and `SO_BINDTODEVICE` from `from` onto `to`, best effort: a
+/// connection that routes by mark or interface (to stay out of a TUN) keeps
+/// its decoy on the same path. Nothing to copy is the common case.
+#[cfg(target_os = "linux")]
+fn copy_route_binding(from: libc::c_int, to: libc::c_int) {
+    unsafe {
+        let mut mark: libc::c_int = 0;
+        let mut len = std::mem::size_of_val(&mark) as libc::socklen_t;
+        if libc::getsockopt(
+            from,
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            (&mut mark as *mut libc::c_int).cast(),
+            &mut len,
+        ) == 0
+            && mark != 0
+        {
+            libc::setsockopt(
+                to,
+                libc::SOL_SOCKET,
+                libc::SO_MARK,
+                (&mark as *const libc::c_int).cast(),
+                std::mem::size_of_val(&mark) as libc::socklen_t,
+            );
+        }
+        let mut device = [0u8; libc::IFNAMSIZ];
+        let mut len = device.len() as libc::socklen_t;
+        if libc::getsockopt(
+            from,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            device.as_mut_ptr().cast(),
+            &mut len,
+        ) == 0
+            && len > 0
+            && device[0] != 0
+        {
+            libc::setsockopt(
+                to,
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                device.as_ptr().cast(),
+                len,
+            );
+        }
     }
 }
 

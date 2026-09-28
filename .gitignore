@@ -52,3 +52,6 @@ ZeroNet-Mobile/app/src/main/jniLibs/
 .directory
 *.iml
 .idea/
+
+# Personal Cloudflare Worker deployment (kept local, not in the repo)
+/deploy/cloudflare-worker/

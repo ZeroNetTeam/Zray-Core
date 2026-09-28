@@ -4163,7 +4163,9 @@ impl Server {
                 continue;
             };
             let specs = asset_specs(&assets);
-            if specs.is_empty() {
+            // The host supplies the files itself; they are loaded at start
+            // and never re-fetched.
+            if specs.is_empty() || !assets.auto_update {
                 tokio::time::sleep(assets.refresh_interval).await;
                 continue;
             }
@@ -4406,31 +4408,26 @@ impl Server {
                 .map_err(|error| error.to_string())?,
         };
         let host = target.destination.address.host_string();
-        let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: zray-observatory/1\r\n\r\n",
-            target.path
-        );
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|error| error.to_string())?;
-        stream.flush().await.map_err(|error| error.to_string())?;
-        let mut response = [0u8; 256];
-        let n = stream
-            .read(&mut response)
-            .await
-            .map_err(|error| error.to_string())?;
-        if n == 0 {
-            return Err("probe closed before a response".into());
-        }
-        let line = std::str::from_utf8(&response[..n]).unwrap_or_default();
-        let status = line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|value| value.parse::<u16>().ok())
-            .ok_or_else(|| "probe returned a malformed HTTP status".to_string())?;
-        if !(200..=399).contains(&status) {
-            return Err(format!("probe returned HTTP {status}"));
+        if target.tls {
+            // An https:// probe is a real, certificate-verified TLS request.
+            // It used to send plain HTTP to port 443, which the server just
+            // closes, so every balancer member failed every probe: the
+            // balancer ranked servers (and Smart Fragment variants) at
+            // random and routed browser traffic onto dead ones, and the
+            // evasion ladder could never descend again. It is also the
+            // stronger check: a path that answers plain HTTP but cannot
+            // carry a verified TLS session is exactly what breaks browsing.
+            // Unshaped: the probe already travels inside the tunnel, so its
+            // own hello is not what the network sees.
+            let params = zero_security::TlsParams::new(host.clone())
+                .with_alpn(&["http/1.1"])
+                .with_profile(zero_security::FingerprintProfile::Unshaped);
+            let mut tls = zero_security::connect(stream, &params)
+                .await
+                .map_err(|failure| format!("probe TLS: {failure}"))?;
+            http_probe_status(&mut tls, &host, &target.path).await?;
+        } else {
+            http_probe_status(&mut stream, &host, &target.path).await?;
         }
         Ok(started.elapsed())
     }
@@ -5034,6 +5031,41 @@ fn choose_balancer_index(
 struct ProbeTarget {
     destination: Destination,
     path: String,
+    /// `https://`: the request goes over verified TLS.
+    tls: bool,
+}
+
+/// Send one `GET` and accept a 2xx/3xx status line.
+async fn http_probe_status<S>(stream: &mut S, host: &str, path: &str) -> Result<u16, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: zray-observatory/1\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|error| error.to_string())?;
+    stream.flush().await.map_err(|error| error.to_string())?;
+    let mut response = [0u8; 256];
+    let n = stream
+        .read(&mut response)
+        .await
+        .map_err(|error| error.to_string())?;
+    if n == 0 {
+        return Err("probe closed before a response".into());
+    }
+    let line = std::str::from_utf8(&response[..n]).unwrap_or_default();
+    let status = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| "probe returned a malformed HTTP status".to_string())?;
+    if !(200..=399).contains(&status) {
+        return Err(format!("probe returned HTTP {status}"));
+    }
+    Ok(status)
 }
 
 fn parse_probe_target(value: &str) -> Result<ProbeTarget, String> {
@@ -5055,6 +5087,7 @@ fn parse_probe_target(value: &str) -> Result<ProbeTarget, String> {
     Ok(ProbeTarget {
         destination: Destination::tcp(Address::parse_host(host), port),
         path,
+        tls: url.scheme() == "https",
     })
 }
 
@@ -5440,6 +5473,51 @@ mod tests {
         // A plain SOCKS inbound needs neither TLS nor a transport config.
         assert!(state.inbounds[0].tls.is_none());
         assert!(state.inbounds[0].transport.is_none());
+    }
+
+    #[test]
+    fn an_https_probe_url_is_probed_over_tls() {
+        let https = super::parse_probe_target("https://www.gstatic.com/generate_204").unwrap();
+        assert!(https.tls);
+        assert_eq!(https.destination.port, 443);
+        let http = super::parse_probe_target("http://www.gstatic.com/generate_204").unwrap();
+        assert!(!http.tls);
+        assert_eq!(http.destination.port, 80);
+    }
+
+    /// Live: the balancer's real probe target. Plain HTTP to port 443 (the
+    /// old behaviour) gets no answer; the verified TLS probe gets its 204.
+    /// `cargo test -p zero-runtime https_probe_live -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn https_probe_live_reaches_gstatic_only_over_tls() {
+        let target = super::parse_probe_target("https://www.gstatic.com/generate_204").unwrap();
+        let mut raw = tokio::net::TcpStream::connect(("www.gstatic.com", 443))
+            .await
+            .unwrap();
+        assert!(
+            super::http_probe_status(&mut raw, "www.gstatic.com", &target.path)
+                .await
+                .is_err(),
+            "plain HTTP on 443 unexpectedly answered"
+        );
+        let config = serde_json::json!({
+            "inbounds": [{"tag": "socks", "listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {"servers": ["8.8.8.8"]},
+        });
+        let (generation, _) =
+            zero_config::compile_config(&config, zero_core::GenerationId(1)).unwrap();
+        let server = Arc::new(Server::new(ServerConfig {
+            config: Arc::clone(&generation.config),
+            generation: generation.id,
+        }));
+        let direct = server.config().outbound_by_tag("direct").unwrap().clone();
+        let elapsed = server
+            .probe_outbound(&direct, &target)
+            .await
+            .expect("verified TLS probe succeeds");
+        println!("https probe answered in {elapsed:?}");
     }
 
     fn planner_test_server() -> Arc<Server> {
