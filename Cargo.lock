@@ -2617,8 +2617,6 @@ version = "0.23.40"
 source = "git+https://github.com/aimalygin/shaped-rustls?rev=3a131beaef0183b0cb61e5a9070a703b6be39ed3#3a131beaef0183b0cb61e5a9070a703b6be39ed3"
 dependencies = [
  "aws-lc-rs",
- "brotli",
- "brotli-decompressor",
  "log",
  "once_cell",
  "ring",
@@ -4187,6 +4185,8 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "base64",
+ "brotli",
+ "brotli-decompressor",
  "bytes",
  "chacha20poly1305",
  "ed25519-dalek",
