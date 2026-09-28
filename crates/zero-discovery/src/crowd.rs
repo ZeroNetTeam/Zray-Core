@@ -111,6 +111,50 @@ pub struct NetRanking {
     pub servers: Vec<RankedServer>,
     #[serde(default)]
     pub clean_ips: Vec<RankedIp>,
+    /// How well each built-in technique ([`METHODS`]) works on this network,
+    /// best first. Absent from rankings made before methods were reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<RankedMethod>,
+}
+
+/// One technique's standing on a network.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct RankedMethod {
+    /// One of [`METHODS`].
+    pub id: String,
+    /// Share of recent reports (decayed, one vote per reporter) in which it
+    /// worked, 0–1.
+    pub score: f32,
+    pub reporters: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u32>,
+}
+
+/// The techniques an app may report on, and nothing else. A fixed list is
+/// what keeps method reports free of anything personal: an id names a
+/// built-in way of connecting, never a server, a name or an address.
+///
+/// * `cdn:*` — reaching a Cloudflare CDN config as is, with the ClientHello
+///   split into TCP segments, or with ECH (see `zero_runtime::cdn_check`).
+/// * `sanction:*` — which anti-sanction resolver relayed sanctioned services
+///   (see `zero_runtime::sanction_dns`).
+pub const METHODS: &[&str] = &[
+    "cdn:plain",
+    "cdn:fragment",
+    "cdn:ech",
+    "sanction:bertina",
+    "sanction:shecan",
+    "sanction:electro",
+    "sanction:ipm",
+    "sanction:begzar",
+    "sanction:radar",
+    "sanction:none",
+];
+/// Methods listed per network.
+pub const METHODS_PER_NET: usize = METHODS.len();
+
+pub fn valid_method(id: &str) -> bool {
+    METHODS.contains(&id)
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -227,7 +271,10 @@ struct Scored {
 
 /// Score every item in `reports` (already filtered to one network and one
 /// kind), keeping each reporter's latest report per item.
-fn score(reports: &[&Report], now: i64) -> Vec<Scored> {
+/// Rank `reports` by decayed success, one vote per reporter. Items nobody
+/// got through are dropped unless `keep_failing` — a server that never
+/// works is noise, but a technique that never works is a finding.
+fn score(reports: &[&Report], now: i64, keep_failing: bool) -> Vec<Scored> {
     // item -> reporter -> latest report
     let mut latest: HashMap<&str, HashMap<&str, &Report>> = HashMap::new();
     for report in reports {
@@ -265,7 +312,7 @@ fn score(reports: &[&Report], now: i64) -> Vec<Scored> {
                 }
             }
         }
-        if ok <= 0.0 {
+        if ok <= 0.0 && !keep_failing {
             continue;
         }
         scored.push(Scored {
@@ -307,6 +354,7 @@ pub fn aggregate(
         .filter(|r| match r.kind.as_str() {
             "server" => valid_server_id(&r.item) && known.contains_key(&r.item),
             "ip" => is_cloudflare_ip(&r.item),
+            "method" => valid_method(&r.item),
             _ => false,
         })
         .collect();
@@ -330,7 +378,7 @@ pub fn aggregate(
         let of_kind = |kind: &str| -> Vec<&Report> {
             reports.iter().copied().filter(|r| r.kind == kind).collect()
         };
-        let servers: Vec<RankedServer> = score(&of_kind("server"), now)
+        let servers: Vec<RankedServer> = score(&of_kind("server"), now, false)
             .into_iter()
             .take(SERVERS_PER_NET)
             .map(|s| RankedServer {
@@ -341,7 +389,7 @@ pub fn aggregate(
                 ms: s.ms,
             })
             .collect();
-        let clean_ips: Vec<RankedIp> = score(&of_kind("ip"), now)
+        let clean_ips: Vec<RankedIp> = score(&of_kind("ip"), now, false)
             .into_iter()
             .take(CLEAN_IPS_PER_NET)
             .map(|s| RankedIp {
@@ -351,8 +399,25 @@ pub fn aggregate(
                 ms: s.ms,
             })
             .collect();
-        if !servers.is_empty() || !clean_ips.is_empty() {
-            nets.insert(net, NetRanking { servers, clean_ips });
+        let methods: Vec<RankedMethod> = score(&of_kind("method"), now, true)
+            .into_iter()
+            .take(METHODS_PER_NET)
+            .map(|s| RankedMethod {
+                id: s.item,
+                score: round3(s.score),
+                reporters: s.reporters as u32,
+                ms: s.ms,
+            })
+            .collect();
+        if !servers.is_empty() || !clean_ips.is_empty() || !methods.is_empty() {
+            nets.insert(
+                net,
+                NetRanking {
+                    servers,
+                    clean_ips,
+                    methods,
+                },
+            );
         }
     }
 
@@ -586,6 +651,56 @@ mod tests {
         let net = &aggregate(&reports, &known(), vec![], NOW).nets["cell:43235"];
         assert_eq!(net.clean_ips[0].ip, "104.16.132.229");
         assert!(net.servers.is_empty());
+    }
+
+    #[test]
+    fn methods_are_ranked_with_their_failures_kept() {
+        let reports = vec![
+            report("asn:206065", "r1", "method", "cdn:plain", false, 60),
+            report("asn:206065", "r2", "method", "cdn:plain", false, 60),
+            report("asn:206065", "r1", "method", "cdn:fragment", true, 60),
+            report("asn:206065", "r2", "method", "cdn:fragment", true, 60),
+            report("asn:206065", "r3", "method", "cdn:fragment", true, 60),
+            // Not in the vocabulary: dropped whatever it says.
+            report(
+                "asn:206065",
+                "r1",
+                "method",
+                "vless://secret@203.0.113.1",
+                true,
+                60,
+            ),
+            report(
+                "asn:206065",
+                "r2",
+                "method",
+                "vless://secret@203.0.113.1",
+                true,
+                60,
+            ),
+        ];
+        let net = &aggregate(&reports, &known(), vec![], NOW).nets["asn:206065"];
+        let ids: Vec<_> = net.methods.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["cdn:fragment", "cdn:plain"]);
+        assert!(net.methods[0].score > 0.3);
+        // A technique that never worked is a finding, not noise.
+        assert_eq!(net.methods[1].score, 0.0);
+        assert_eq!(net.methods[1].reporters, 2);
+    }
+
+    #[test]
+    fn a_method_needs_two_reporters() {
+        let reports = vec![report("asn:206065", "r1", "method", "cdn:ech", true, 60)];
+        assert!(!aggregate(&reports, &known(), vec![], NOW)
+            .nets
+            .contains_key("asn:206065"));
+    }
+
+    #[test]
+    fn rankings_without_methods_still_parse() {
+        let old = r#"{"v":1,"generated_at":1,"nets":{"all":{"servers":[],"clean_ips":[]}}}"#;
+        let parsed: Rankings = serde_json::from_str(old).unwrap();
+        assert!(parsed.nets["all"].methods.is_empty());
     }
 
     #[test]

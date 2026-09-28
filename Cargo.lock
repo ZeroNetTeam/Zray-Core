@@ -4125,6 +4125,7 @@ dependencies = [
  "httparse",
  "libc",
  "quinn",
+ "rand 0.8.8",
  "rustls",
  "rustls-pki-types",
  "serde",

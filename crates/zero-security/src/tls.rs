@@ -272,12 +272,19 @@ fn build_client_config(params: &TlsParams) -> Result<ClientConfig, String> {
     if let Some(profile) = profile_for_fingerprint(profile_name) {
         retain_profile_certificate_decompressors(profile, &mut cfg.cert_decompressors);
     }
-    params.profile.apply_client_hello_shape_named(
-        &mut cfg,
-        &params.alpn,
-        params.ech_config_list.is_some(),
-        profile_name,
-    )?;
+    // With ECH the browser shape is left off. The shaping hook cannot tell
+    // the outer ClientHello from the inner one it encrypts, and reshaping
+    // them broke every ECH handshake with Cloudflare ("cannot decrypt peer's
+    // message", measured 2026-09-28). ECH already hides the name the shape
+    // would disguise, so a working handshake is the better trade.
+    if params.ech_config_list.is_none() {
+        params.profile.apply_client_hello_shape_named(
+            &mut cfg,
+            &params.alpn,
+            false,
+            profile_name,
+        )?;
+    }
     Ok(cfg)
 }
 

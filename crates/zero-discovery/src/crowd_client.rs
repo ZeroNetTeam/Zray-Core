@@ -160,6 +160,7 @@ pub fn report_body(
     net: Option<&str>,
     results: &[TestResult],
     clean: &[CleanIp],
+    methods: &[TestResult],
 ) -> String {
     let mut ordered: Vec<&TestResult> = results.iter().collect();
     // Successes first: the relay keeps a limited number.
@@ -170,6 +171,16 @@ pub fn report_body(
         "results": ordered.iter().take(MAX_RESULTS).map(|r| json!({"id": r.id, "ok": r.ok, "ms": r.ms})).collect::<Vec<_>>(),
         "clean": clean.iter().take(MAX_CLEAN).map(|c| json!({"ip": c.ip, "ms": c.ms})).collect::<Vec<_>>(),
     });
+    // Only ids from the fixed vocabulary leave the device.
+    let methods: Vec<_> = methods
+        .iter()
+        .filter(|m| crate::crowd::valid_method(&m.id))
+        .take(crate::crowd::METHODS.len())
+        .map(|m| json!({"id": m.id, "ok": m.ok, "ms": m.ms}))
+        .collect();
+    if !methods.is_empty() {
+        body["methods"] = json!(methods);
+    }
     if let Some(net) = net {
         body["net"] = json!(net);
     }
@@ -191,11 +202,12 @@ pub async fn report(
     net: Option<&str>,
     results: &[TestResult],
     clean: &[CleanIp],
+    methods: &[TestResult],
 ) -> Result<Option<String>, String> {
-    if results.is_empty() && clean.is_empty() {
+    if results.is_empty() && clean.is_empty() && methods.is_empty() {
         return Ok(None);
     }
-    let body = report_body(nonce, net, results, clean);
+    let body = report_body(nonce, net, results, clean, methods);
     let limits = FetchLimits {
         max_bytes: 64 * 1024,
         timeout: Duration::from_secs(10),
@@ -257,6 +269,7 @@ mod tests {
             NetRanking {
                 servers: vec![server("a")],
                 clean_ips: vec![],
+                ..NetRanking::default()
             },
         );
         rankings.nets.insert(
@@ -264,6 +277,7 @@ mod tests {
             NetRanking {
                 servers: vec![server("b"), server("a")],
                 clean_ips: vec![],
+                ..NetRanking::default()
             },
         );
         rankings.nets.insert(
@@ -271,6 +285,7 @@ mod tests {
             NetRanking {
                 servers: vec![server("c")],
                 clean_ips: vec![],
+                ..NetRanking::default()
             },
         );
         let ids: Vec<_> = picks(&rankings, "cell:43211", 10)
@@ -301,11 +316,11 @@ mod tests {
             },
         ];
         let body: serde_json::Value =
-            serde_json::from_str(&report_body("n", None, &results, &[])).unwrap();
+            serde_json::from_str(&report_body("n", None, &results, &[], &[])).unwrap();
         assert_eq!(body["results"][0]["id"], "good");
         assert!(body.get("net").is_none());
         let body: serde_json::Value =
-            serde_json::from_str(&report_body("n", Some("any"), &results, &[])).unwrap();
+            serde_json::from_str(&report_body("n", Some("any"), &results, &[], &[])).unwrap();
         assert_eq!(body["net"], "any");
         assert_eq!(body["v"], 1);
     }
@@ -361,6 +376,7 @@ mod tests {
                 ms: 1,
             }],
             &[],
+            &[],
         )
         .await;
         assert!(refused.is_err());
@@ -373,6 +389,7 @@ mod tests {
                 ok: true,
                 ms: 1,
             }],
+            &[],
             &[],
         );
         let answer = zero_net::post(
@@ -395,5 +412,37 @@ mod tests {
         assert!(request.starts_with("POST /v1/report HTTP/1.1\r\n"));
         assert!(request.contains("Content-Type: application/json"));
         assert!(request.ends_with(&body));
+    }
+
+    #[test]
+    fn only_vocabulary_methods_leave_the_device() {
+        let method = |id: &str, ok| TestResult {
+            id: id.into(),
+            ok,
+            ms: 0,
+        };
+        let body: serde_json::Value = serde_json::from_str(&report_body(
+            "n",
+            None,
+            &[],
+            &[],
+            &[
+                method("cdn:fragment", true),
+                method("cdn:plain", false),
+                method("my-home-wifi", true),
+            ],
+        ))
+        .unwrap();
+        let ids: Vec<_> = body["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["cdn:fragment", "cdn:plain"]);
+        // No methods, no field: older relays see the report they know.
+        let bare: serde_json::Value =
+            serde_json::from_str(&report_body("n", None, &[], &[], &[])).unwrap();
+        assert!(bare.get("methods").is_none());
     }
 }

@@ -410,15 +410,24 @@ impl Resolver {
     ///
     /// Views are memoized: repeated calls for one tag return the same view,
     /// so its cache and in-flight coalescing persist across sessions.
+    ///
+    /// `tag@address` narrows the view to the one server of that tag at that
+    /// address — how a measured choice among several resolvers of one tier
+    /// is applied without rewriting the configuration.
     pub fn for_tag(&self, tag: &str) -> Self {
         if let Some(view) = lock(&self.views).get(tag) {
             return view.clone();
         }
+        let (server_tag, pinned) = match tag.split_once('@') {
+            Some((server_tag, address)) => (server_tag, Some(address)),
+            None => (tag, None),
+        };
         let mut settings = (*self.settings).clone();
         settings.servers = settings
             .servers
             .iter()
-            .filter(|server| server.tag.as_deref() == Some(tag))
+            .filter(|server| server.tag.as_deref() == Some(server_tag))
+            .filter(|server| pinned.is_none_or(|address| server.endpoint.host() == address))
             .cloned()
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -2062,9 +2071,136 @@ fn protected_client_endpoint(bind: std::net::SocketAddr) -> std::io::Result<quin
     )
 }
 
+/// Ask one plain-UDP resolver for `name`'s IPv4 addresses, bypassing every
+/// configured policy, cache and fallback: what *this* server says, and how
+/// long it took. For measuring resolvers against each other, not for
+/// resolving. The socket is protected, so on a phone the probe reaches the
+/// real network rather than the tunnel the process serves.
+pub async fn probe_udp(
+    server: SocketAddr,
+    name: &str,
+    wait: Duration,
+) -> Result<(Vec<IpAddr>, Duration), ResolveError> {
+    let (answer, elapsed) = probe_one(server, name, QueryType::A, wait).await?;
+    Ok((answer.addresses, elapsed))
+}
+
+/// Ask one plain-UDP resolver for `name`'s ECH configuration (the `ech`
+/// parameter of its HTTPS record), bypassing policy and cache. For fetching a
+/// current ECHConfigList before any resolver is configured — WARP
+/// registration runs before the tunnel does.
+pub async fn probe_ech(
+    server: SocketAddr,
+    name: &str,
+    wait: Duration,
+) -> Result<Vec<u8>, ResolveError> {
+    let (answer, _) = probe_one(server, name, QueryType::Https, wait).await?;
+    answer
+        .records
+        .iter()
+        .find_map(|record| parse_https_ech_config(record))
+        .ok_or_else(|| ResolveError::NoData(format!("no ECH configuration for {name}")))
+}
+
+async fn probe_one(
+    server: SocketAddr,
+    name: &str,
+    kind: QueryType,
+    wait: Duration,
+) -> Result<(PacketAnswer, Duration), ResolveError> {
+    let id: u16 = rand::random();
+    let query = build_query(id, &normalize_name(name)?, kind)?;
+    let bind: SocketAddr = if server.is_ipv4() {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let io = |error: std::io::Error| ResolveError::Transport(error.to_string());
+    let socket = zero_core::platform::bind_protected_udp(bind).map_err(io)?;
+    socket.set_nonblocking(true).map_err(io)?;
+    let socket = UdpSocket::from_std(socket).map_err(io)?;
+    let started = Instant::now();
+    socket.send_to(&query, server).await.map_err(io)?;
+    let mut buffer = [0u8; 1500];
+    loop {
+        let left = wait
+            .checked_sub(started.elapsed())
+            .ok_or_else(|| ResolveError::Transport(format!("{server} did not answer")))?;
+        let (length, from) = timeout(left, socket.recv_from(&mut buffer))
+            .await
+            .map_err(|_| ResolveError::Transport(format!("{server} did not answer")))?
+            .map_err(io)?;
+        // Anything else on this socket is not the answer; nor is a reply
+        // that does not parse as one (an on-path injector's forgery can).
+        if from != server {
+            continue;
+        }
+        if let Ok(answer) = parse_response(&buffer[..length], id, kind) {
+            return Ok((answer, started.elapsed()));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn probe_udp_reads_one_servers_answer() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 512];
+            let (length, peer) = server.recv_from(&mut buffer).await.unwrap();
+            let query = &buffer[..length];
+            let mut reply = query.to_vec();
+            reply[2] = 0x81;
+            reply[3] = 0x80;
+            reply[7] = 1; // one answer
+            reply
+                .extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 185, 188, 104, 10]);
+            server.send_to(&reply, peer).await.unwrap();
+        });
+        let (answers, _) = probe_udp(address, "digikala.com", Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(answers, vec![IpAddr::from([185, 188, 104, 10])]);
+    }
+
+    #[tokio::test]
+    async fn pinned_view_keeps_only_that_server() {
+        let settings = DnsSettings {
+            servers: vec![
+                zero_config::dns::DnsServer {
+                    endpoint: zero_config::dns::ResolverEndpoint::parse("193.186.32.32").unwrap(),
+                    domains: Vec::new(),
+                    expect_ips: Vec::new(),
+                    skip_fallback: false,
+                    tag: Some("anti-sanction".into()),
+                },
+                zero_config::dns::DnsServer {
+                    endpoint: zero_config::dns::ResolverEndpoint::parse("178.22.122.100").unwrap(),
+                    domains: Vec::new(),
+                    expect_ips: Vec::new(),
+                    skip_fallback: false,
+                    tag: Some("anti-sanction".into()),
+                },
+            ]
+            .into_boxed_slice(),
+            ..DnsSettings::default()
+        };
+        let resolver = Resolver::new(settings);
+        assert_eq!(
+            resolver.for_tag("anti-sanction").settings().servers.len(),
+            2
+        );
+        let pinned = resolver.for_tag("anti-sanction@178.22.122.100");
+        assert_eq!(pinned.settings().servers.len(), 1);
+        assert_eq!(
+            pinned.settings().servers[0].endpoint,
+            zero_config::dns::ResolverEndpoint::parse("178.22.122.100").unwrap()
+        );
+    }
 
     #[test]
     fn query_contains_one_question_and_requested_type() {

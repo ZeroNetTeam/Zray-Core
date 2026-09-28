@@ -22,6 +22,13 @@
 const MAX_BODY = 8 * 1024;
 const MAX_RESULTS = 40;
 const MAX_CLEAN = 10;
+// The only technique ids a report may carry (zero-discovery `crowd::METHODS`).
+// A fixed list keeps method reports free of anything personal.
+const METHODS = new Set([
+  "cdn:plain", "cdn:fragment", "cdn:ech",
+  "sanction:bertina", "sanction:shecan", "sanction:electro", "sanction:ipm",
+  "sanction:begzar", "sanction:radar", "sanction:none",
+]);
 // Results one address may add per hour. Many people can share a VPN
 // server's address, so this is generous; it is a ceiling for a flood.
 const PER_HOUR = 2000;
@@ -94,6 +101,9 @@ async function report(request, env) {
   }
   for (const c of (Array.isArray(body.clean) ? body.clean : []).slice(0, MAX_CLEAN)) {
     if (isIpv4(c?.ip)) rows.push(["ip", c.ip, true, delay(c.ms)]);
+  }
+  for (const m of (Array.isArray(body.methods) ? body.methods : []).slice(0, METHODS.size)) {
+    if (METHODS.has(m?.id) && typeof m.ok === "boolean") rows.push(["method", m.id, m.ok, m.ok ? delay(m.ms) : null]);
   }
   if (rows.length === 0) return json({ net, accepted: 0 });
 

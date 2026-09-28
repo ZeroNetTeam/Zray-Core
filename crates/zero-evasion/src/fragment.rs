@@ -41,11 +41,13 @@ pub struct FragmentPolicy {
 
 impl Default for FragmentPolicy {
     fn default() -> Self {
-        // BPB's field-tuned defaults (PLAN-02 §3.1).
+        // Plain TCP segments of the first write. BPB's `tlshello` 100-200
+        // stopped getting through in Iran (0/3 vs 3/3, measured 2026-09-28;
+        // see `zero_config::FragmentConfig::default`).
         Self {
-            packets: Packets::TlsHello,
-            length_min: 100,
-            length_max: 200,
+            packets: Packets::Range { from: 1, to: 1 },
+            length_min: 40,
+            length_max: 80,
             interval_min_ms: 1,
             interval_max_ms: 1,
             max_split_min: 0,
@@ -355,8 +357,13 @@ mod tests {
         v
     }
 
+    /// The `tlshello` record planner these tests exercise; the default is
+    /// now plain TCP segments.
     fn policy() -> FragmentPolicy {
         FragmentPolicy {
+            packets: Packets::TlsHello,
+            length_min: 100,
+            length_max: 200,
             interval_min_ms: 1,
             interval_max_ms: 1,
             ..Default::default()

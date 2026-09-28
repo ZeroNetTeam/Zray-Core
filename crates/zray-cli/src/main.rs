@@ -115,10 +115,35 @@ fn cmd_preset(args: &[String]) -> Result<()> {
         bail!("unknown preset {which:?}; the only preset is `iran`");
     }
     let rest = &args[1..];
-    let source = rest
-        .iter()
-        .find(|argument| !argument.starts_with('-'))
-        .context("preset needs a share link, a subscription file, or `-` for stdin")?;
+    // The source is the first argument that is neither a flag nor a flag's
+    // value. `-` (stdin) looks like a flag and must be matched on its own.
+    const VALUE_FLAGS: &[&str] = &[
+        "--anti-sanction",
+        "--asset-dir",
+        "--clean-ip-host",
+        "--clean-ip-ports",
+        "--clean-ip-seed",
+        "--http-port",
+        "--listen",
+        "--local-dns",
+        "-o",
+        "--output",
+        "--remote-dns",
+        "--socks-port",
+    ];
+    let mut source = None;
+    let mut arguments = rest.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "-" || !argument.starts_with('-') {
+            source = Some(argument);
+            break;
+        }
+        if VALUE_FLAGS.contains(&argument.as_str()) {
+            arguments.next();
+        }
+    }
+    let source =
+        source.context("preset needs a share link, a subscription file, or `-` for stdin")?;
 
     let flag = |name: &str| -> Option<&String> {
         rest.iter()

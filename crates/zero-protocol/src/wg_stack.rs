@@ -5,7 +5,9 @@
 //! useful as a fallback — the client needs a TCP/IP stack of its own. This
 //! module runs one: a [`WgStack`] is a single driver task that owns
 //!
-//! * the WireGuard state (boringtun) and its one UDP socket,
+//! * the WireGuard state (boringtun) and its one UDP socket — or, for a
+//!   tunnel that is not WireGuard (MASQUE), a [`PacketLink`] to the task
+//!   that runs that transport,
 //! * a smoltcp interface holding the tunnel address(es),
 //! * every TCP and UDP socket opened through the tunnel.
 //!
@@ -89,6 +91,16 @@ pub struct WgStackParams {
     pub dns: SocketAddr,
 }
 
+/// The packet side of a tunnel whose transport runs in its own task (MASQUE
+/// over HTTP/2): IP packets for the tunnel go out on `up`, packets from it
+/// come in on `down`. When `down` closes for good the stack stops.
+pub struct PacketLink {
+    pub up: mpsc::Sender<Vec<u8>>,
+    pub down: mpsc::Receiver<Vec<u8>>,
+    /// Notified on [`WgStack::rebind`]: the transport should reconnect.
+    pub rebind: Arc<Notify>,
+}
+
 enum Command {
     Connect {
         destination: SocketAddr,
@@ -137,6 +149,27 @@ impl WgStack {
             return Err("WireGuard tunnel has no address".into());
         }
         let socket = bind_for(peer)?;
+        let addresses = params.addresses.clone();
+        let dns = params.dns;
+        let link = Link::WireGuard(Box::new(WgLink::new(socket, peer, params)));
+        Ok(Self::spawn(link, addresses, dns))
+    }
+
+    /// Start a stack over a transport that hands over IP packets itself.
+    /// `addresses` are the tunnel's own addresses, `dns` the resolver
+    /// reached through it.
+    pub fn start_link(
+        addresses: Vec<IpAddr>,
+        dns: SocketAddr,
+        link: PacketLink,
+    ) -> Result<Self, String> {
+        if addresses.is_empty() {
+            return Err("tunnel has no address".into());
+        }
+        Ok(Self::spawn(Link::Packets(link), addresses, dns))
+    }
+
+    fn spawn(link: Link, addresses: Vec<IpAddr>, dns: SocketAddr) -> Self {
         let (commands, receiver) = mpsc::unbounded_channel();
         let wake = Arc::new(Notify::new());
         let alive = Arc::new(AtomicBool::new(true));
@@ -144,17 +177,17 @@ impl WgStack {
             commands,
             wake: Arc::clone(&wake),
             alive: Arc::clone(&alive),
-            dns: params.dns,
-            family_v4: params.addresses.iter().any(IpAddr::is_ipv4),
-            family_v6: params.addresses.iter().any(IpAddr::is_ipv6),
+            dns,
+            family_v4: addresses.iter().any(IpAddr::is_ipv4),
+            family_v6: addresses.iter().any(IpAddr::is_ipv6),
             cache: Arc::default(),
         };
-        let driver = Driver::new(socket, peer, params, receiver, wake);
+        let driver = Driver::new(link, addresses, receiver, wake);
         tokio::spawn(async move {
             driver.run().await;
             alive.store(false, Ordering::Release);
         });
-        Ok(stack)
+        stack
     }
 
     /// Whether the driver is still running.
@@ -487,7 +520,43 @@ struct UdpSlot {
     deadline: Instant,
 }
 
-struct Driver {
+/// Where the stack's packets go: a WireGuard session on a UDP socket, or a
+/// transport task at the other end of a [`PacketLink`].
+enum Link {
+    WireGuard(Box<WgLink>),
+    Packets(PacketLink),
+}
+
+/// What one wait on the link produced.
+enum Incoming {
+    /// A WireGuard datagram of this length, now in the link's buffer.
+    Datagram(usize, SocketAddr),
+    /// A clear IP packet from a packet link.
+    Packet(Vec<u8>),
+    /// Nothing usable (a socket error): carry on.
+    Nothing,
+    /// The packet link's transport is gone for good.
+    Closed,
+}
+
+impl Link {
+    async fn recv(&mut self) -> Incoming {
+        match self {
+            Link::WireGuard(wg) => match wg.socket.recv_from(&mut wg.network).await {
+                Ok((length, source)) => Incoming::Datagram(length, source),
+                Err(_) => Incoming::Nothing,
+            },
+            Link::Packets(link) => match link.down.recv().await {
+                Some(packet) => Incoming::Packet(packet),
+                None => Incoming::Closed,
+            },
+        }
+    }
+}
+
+/// The WireGuard end of a tunnel: boringtun, its UDP socket, and the
+/// AmneziaWG framing if any.
+struct WgLink {
     socket: UdpSocket,
     peer: SocketAddr,
     tunnel: Tunn,
@@ -495,6 +564,17 @@ struct Driver {
     /// Standard WireGuard framing (no AmneziaWG padding or headers): packets
     /// go out without re-encoding, and the reserved bytes apply.
     plain: bool,
+    rng: rand::rngs::StdRng,
+    /// Reused buffers: WireGuard output, decrypted input, network input.
+    out: Vec<u8>,
+    clear: Vec<u8>,
+    network: Vec<u8>,
+}
+
+struct Driver {
+    link: Link,
+    /// The tunnel's own addresses.
+    addresses: Vec<IpAddr>,
     device: QueueDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -502,24 +582,13 @@ struct Driver {
     udp: Vec<UdpSlot>,
     commands: mpsc::UnboundedReceiver<Command>,
     wake: Arc<Notify>,
-    rng: rand::rngs::StdRng,
     next_port: u16,
     started: Instant,
     last_activity: Instant,
-    /// Reused buffers: WireGuard output, decrypted input, network input.
-    out: Vec<u8>,
-    clear: Vec<u8>,
-    network: Vec<u8>,
 }
 
-impl Driver {
-    fn new(
-        socket: UdpSocket,
-        peer: SocketAddr,
-        params: WgStackParams,
-        commands: mpsc::UnboundedReceiver<Command>,
-        wake: Arc<Notify>,
-    ) -> Self {
+impl WgLink {
+    fn new(socket: UdpSocket, peer: SocketAddr, params: WgStackParams) -> Self {
         let tunnel = Tunn::new(
             boringtun::x25519::StaticSecret::from(params.private_key),
             boringtun::x25519::PublicKey::from(params.peer_public_key),
@@ -528,31 +597,6 @@ impl Driver {
             rand::random(),
             None,
         );
-        let mut device = QueueDevice::new();
-        let started = Instant::now();
-        let mut iface = Interface::new(
-            Config::new(HardwareAddress::Ip),
-            &mut device,
-            smoltcp::time::Instant::from_millis(0),
-        );
-        iface.update_ip_addrs(|addresses| {
-            for address in &params.addresses {
-                let prefix = if address.is_ipv4() { 32 } else { 128 };
-                let _ = addresses.push(IpCidr::new(IpAddress::from(*address), prefix));
-            }
-        });
-        // A point-to-point link: everything goes to the peer. On an IP
-        // medium the gateway is never resolved, so any address serves.
-        if params.addresses.iter().any(IpAddr::is_ipv4) {
-            let _ = iface
-                .routes_mut()
-                .add_default_ipv4_route(Ipv4Addr::new(169, 254, 0, 1));
-        }
-        if params.addresses.iter().any(IpAddr::is_ipv6) {
-            let _ = iface
-                .routes_mut()
-                .add_default_ipv6_route(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
-        }
         let standard = AmneziaParams::default();
         let o = params.obfuscation;
         let plain = o.init_padding == standard.init_padding
@@ -569,6 +613,49 @@ impl Driver {
             tunnel,
             params,
             plain,
+            rng: rand::rngs::StdRng::from_entropy(),
+            out: vec![0u8; NETWORK_BUFFER],
+            clear: vec![0u8; NETWORK_BUFFER],
+            network: vec![0u8; NETWORK_BUFFER],
+        }
+    }
+}
+
+impl Driver {
+    fn new(
+        link: Link,
+        addresses: Vec<IpAddr>,
+        commands: mpsc::UnboundedReceiver<Command>,
+        wake: Arc<Notify>,
+    ) -> Self {
+        let mut device = QueueDevice::new();
+        let started = Instant::now();
+        let mut iface = Interface::new(
+            Config::new(HardwareAddress::Ip),
+            &mut device,
+            smoltcp::time::Instant::from_millis(0),
+        );
+        iface.update_ip_addrs(|list| {
+            for address in &addresses {
+                let prefix = if address.is_ipv4() { 32 } else { 128 };
+                let _ = list.push(IpCidr::new(IpAddress::from(*address), prefix));
+            }
+        });
+        // A point-to-point link: everything goes to the peer. On an IP
+        // medium the gateway is never resolved, so any address serves.
+        if addresses.iter().any(IpAddr::is_ipv4) {
+            let _ = iface
+                .routes_mut()
+                .add_default_ipv4_route(Ipv4Addr::new(169, 254, 0, 1));
+        }
+        if addresses.iter().any(IpAddr::is_ipv6) {
+            let _ = iface
+                .routes_mut()
+                .add_default_ipv6_route(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        }
+        Self {
+            link,
+            addresses,
             device,
             iface,
             sockets: SocketSet::new(Vec::new()),
@@ -576,13 +663,9 @@ impl Driver {
             udp: Vec::new(),
             commands,
             wake,
-            rng: rand::rngs::StdRng::from_entropy(),
             next_port: 40000 + rand::random::<u16>() % 20000,
             started,
             last_activity: started,
-            out: vec![0u8; NETWORK_BUFFER],
-            clear: vec![0u8; NETWORK_BUFFER],
-            network: vec![0u8; NETWORK_BUFFER],
         }
     }
 
@@ -594,9 +677,14 @@ impl Driver {
         let mut next_timer = Instant::now();
         loop {
             // Timers first: a handshake that must be (re)sent goes out now.
-            if Instant::now() >= next_timer {
-                self.wireguard_timers().await;
-                next_timer = Instant::now() + WG_TIMER_TICK;
+            if let Link::WireGuard(wg) = &mut self.link {
+                if Instant::now() >= next_timer {
+                    wg.timers().await;
+                    next_timer = Instant::now() + WG_TIMER_TICK;
+                }
+            } else {
+                // A packet link keeps its own timers; nothing to tick here.
+                next_timer = Instant::now() + IDLE_SHUTDOWN;
             }
             self.pump().await;
 
@@ -612,26 +700,29 @@ impl Driver {
             let timer_delay = next_timer.saturating_duration_since(Instant::now());
             let delay = stack_delay.min(timer_delay).max(Duration::from_millis(1));
 
-            let mut network = std::mem::take(&mut self.network);
             let wake = Arc::clone(&self.wake);
             tokio::select! {
-                received = self.socket.recv_from(&mut network) => {
-                    if let Ok((length, source)) = received {
-                        self.on_network_datagram(&mut network[..length], source).await;
+                incoming = self.link.recv() => match incoming {
+                    Incoming::Datagram(length, source) => {
+                        if let Link::WireGuard(wg) = &mut self.link {
+                            wg.on_datagram(length, source, &mut self.device).await;
+                        }
                     }
-                }
+                    Incoming::Packet(packet) => {
+                        self.last_activity = Instant::now();
+                        self.device.inbound.push_back(packet);
+                    }
+                    Incoming::Nothing => {}
+                    Incoming::Closed => return,
+                },
                 command = self.commands.recv() => match command {
                     Some(command) => self.command(command),
                     // Every handle is gone.
-                    None => {
-                        self.network = network;
-                        return;
-                    }
+                    None => return,
                 },
                 _ = wake.notified() => {}
                 _ = tokio::time::sleep(delay) => {}
             }
-            self.network = network;
         }
     }
 
@@ -651,28 +742,11 @@ impl Driver {
         }
     }
 
-    async fn wireguard_timers(&mut self) {
-        loop {
-            match self.tunnel.update_timers(&mut self.out) {
-                TunnResult::WriteToNetwork(packet) => {
-                    let packet = packet.to_vec();
-                    self.send(&packet).await;
-                }
-                TunnResult::Err(boringtun::noise::errors::WireGuardError::ConnectionExpired) => {
-                    // No session for a long while; the next packet starts one.
-                    break;
-                }
-                _ => break,
-            }
-        }
-    }
-
     fn command(&mut self, command: Command) {
         self.last_activity = Instant::now();
         match command {
             Command::Connect { destination, reply } => {
                 if !self
-                    .params
                     .addresses
                     .iter()
                     .any(|a| a.is_ipv4() == destination.is_ipv4())
@@ -714,7 +788,6 @@ impl Driver {
                 reply,
             } => {
                 let local = self
-                    .params
                     .addresses
                     .iter()
                     .find(|a| a.is_ipv4() == destination.is_ipv4())
@@ -750,11 +823,14 @@ impl Driver {
                     deadline: Instant::now() + UDP_TIMEOUT,
                 });
             }
-            Command::Rebind => match bind_for(self.peer) {
-                Ok(socket) => self.socket = socket,
-                Err(error) => {
-                    tracing::debug!(%error, "WireGuard rebind failed; keeping the old socket")
-                }
+            Command::Rebind => match &mut self.link {
+                Link::WireGuard(wg) => match bind_for(wg.peer) {
+                    Ok(socket) => wg.socket = socket,
+                    Err(error) => {
+                        tracing::debug!(%error, "WireGuard rebind failed; keeping the old socket")
+                    }
+                },
+                Link::Packets(link) => link.rebind.notify_one(),
             },
         }
     }
@@ -927,30 +1003,66 @@ impl Driver {
         moved
     }
 
-    /// Encrypt and send every packet the stack produced. Returns whether any went.
+    /// Hand every packet the stack produced to the link. Returns whether any went.
     async fn flush(&mut self) -> bool {
         let mut sent = false;
         while let Some(packet) = self.device.outbound.pop_front() {
-            match self.tunnel.encapsulate(&packet, &mut self.out) {
-                TunnResult::WriteToNetwork(encrypted) => {
-                    let encrypted = encrypted.to_vec();
-                    self.send(&encrypted).await;
-                    sent = true;
+            match &mut self.link {
+                Link::WireGuard(wg) => {
+                    sent |= wg.encapsulate(&packet).await;
+                    self.device.recycle(packet);
                 }
-                // Queued inside boringtun until the handshake completes.
-                TunnResult::Done => {}
-                TunnResult::Err(error) => tracing::debug!(?error, "WireGuard encapsulate"),
-                _ => {}
+                // A full queue drops the packet, as a congested link would;
+                // TCP retransmits. Blocking here would stall every stream.
+                Link::Packets(link) => sent |= link.up.try_send(packet).is_ok(),
             }
-            self.device.recycle(packet);
         }
         sent
     }
+}
 
-    async fn on_network_datagram(&mut self, datagram: &mut [u8], source: SocketAddr) {
+impl WgLink {
+    async fn timers(&mut self) {
+        loop {
+            match self.tunnel.update_timers(&mut self.out) {
+                TunnResult::WriteToNetwork(packet) => {
+                    let packet = packet.to_vec();
+                    self.send(&packet).await;
+                }
+                TunnResult::Err(boringtun::noise::errors::WireGuardError::ConnectionExpired) => {
+                    // No session for a long while; the next packet starts one.
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// Encrypt one packet and send it. Returns whether anything went out.
+    async fn encapsulate(&mut self, packet: &[u8]) -> bool {
+        match self.tunnel.encapsulate(packet, &mut self.out) {
+            TunnResult::WriteToNetwork(encrypted) => {
+                let encrypted = encrypted.to_vec();
+                self.send(&encrypted).await;
+                true
+            }
+            // Queued inside boringtun until the handshake completes.
+            TunnResult::Done => false,
+            TunnResult::Err(error) => {
+                tracing::debug!(?error, "WireGuard encapsulate");
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// A datagram of `length` bytes arrived in `self.network` from `source`.
+    async fn on_datagram(&mut self, length: usize, source: SocketAddr, device: &mut QueueDevice) {
         if source != self.peer {
             return;
         }
+        let mut network = std::mem::take(&mut self.network);
+        let datagram = &mut network[..length];
         let decoded;
         let packet: &[u8] = if self.plain {
             // WARP echoes its reserved bytes; boringtun expects zeros.
@@ -964,7 +1076,10 @@ impl Driver {
                     decoded = normal;
                     &decoded
                 }
-                _ => return,
+                _ => {
+                    self.network = network;
+                    return;
+                }
             }
         };
         let mut clear = std::mem::take(&mut self.clear);
@@ -980,15 +1095,16 @@ impl Driver {
                     state = self.tunnel.decapsulate(None, &[], &mut clear);
                 }
                 TunnResult::WriteToTunnelV4(inner, _) | TunnResult::WriteToTunnelV6(inner, _) => {
-                    let mut buffer = self.device.buffer();
+                    let mut buffer = device.buffer();
                     buffer.extend_from_slice(inner);
-                    self.device.inbound.push_back(buffer);
+                    device.inbound.push_back(buffer);
                     break;
                 }
                 TunnResult::Done | TunnResult::Err(_) => break,
             }
         }
         self.clear = clear;
+        self.network = network;
     }
 
     async fn send(&mut self, packet: &[u8]) {

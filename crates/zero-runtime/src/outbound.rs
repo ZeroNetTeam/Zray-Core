@@ -363,7 +363,7 @@ fn fingerprint_family_name(f: &zero_config::Fingerprint) -> &'static str {
 /// and then goes quiet cannot hold a session open indefinitely.
 const OUTBOUND_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-async fn within_setup_deadline<T>(
+pub(crate) async fn within_setup_deadline<T>(
     setup: impl std::future::Future<Output = Result<T, Failure>>,
 ) -> Result<T, Failure> {
     tokio::time::timeout(OUTBOUND_SETUP_TIMEOUT, setup)
@@ -811,6 +811,17 @@ async fn protect_socket(
         Some(policy) => boxed(FragmentStream::new(tcp, policy)),
         None => boxed(tcp),
     };
+    secure(outbound, base, fallback_host).await
+}
+
+/// TLS or REALITY over an already open byte stream: a TCP socket, or a
+/// connection carried by another outbound (`dialerProxy`).
+async fn secure(
+    outbound: &Outbound,
+    base: BoxStream,
+    fallback_host: &str,
+) -> Result<BoxStream, Failure> {
+    let stream = &outbound.stream;
     match &stream.security {
         Security::None => Ok(base),
         Security::Tls(_) => {
@@ -1187,8 +1198,6 @@ pub async fn build_stack(
     tcp: TcpStream,
     fallback_host: &str,
 ) -> Result<BoxStream, Failure> {
-    let stream = &outbound.stream;
-
     // 1. Fragmentation and security.
     let t_tls = std::time::Instant::now();
     let secured = protect_socket(outbound, tcp, fallback_host).await?;
@@ -1196,6 +1205,199 @@ pub async fn build_stack(
         security_ms = t_tls.elapsed().as_millis(),
         "security handshake"
     );
+    finish_stack(outbound, destination, secured, fallback_host).await
+}
+
+/// Open `outbound` to `destination` over `carried`, a connection to its
+/// server that another outbound already opened — one hop of Xray's
+/// `sockopt.dialerProxy` chain.
+///
+/// The point in Iran: with the carrier a WARP tunnel, the censor sees only
+/// WireGuard to Cloudflare, and the server's own address never appears on the
+/// local network, so it cannot be learned or blocked there. Fragmenting and
+/// SNI desync are skipped: inside the tunnel nobody is inspecting.
+pub async fn connect_over(
+    outbound: &Outbound,
+    carried: BoxStream,
+    destination: &Destination,
+) -> Result<BoxStream, Failure> {
+    if !chainable(outbound) {
+        return Err(
+            Failure::new(FailureKind::LocalPolicy, Stage::SocketConnected).with_detail(format!(
+                "outbound {} ({}) cannot run through dialerProxy yet",
+                outbound.tag,
+                outbound.protocol.name()
+            )),
+        );
+    }
+    let fallback_host = outbound
+        .endpoint()
+        .map(|(address, _)| address.host_string())
+        .unwrap_or_default();
+    let secured = secure(outbound, carried, &fallback_host).await?;
+    finish_stack(outbound, destination, secured, &fallback_host).await
+}
+
+/// Whether a connection for `outbound` can be opened before its
+/// destination is known — a "warm carrier": TCP, TLS and the transport
+/// upgrade done ahead of time, the protocol header (which names the
+/// destination) written only when a real connection needs it.
+///
+/// That takes a protocol whose header is plain bytes after the upgrade
+/// (VLESS without Vision or encryption, Trojan), over TLS with a WebSocket or
+/// HTTPUpgrade transport, without Mux. Measured from Tehran on 2026-09-28,
+/// the handshakes are most of a new connection's cost on a chained CDN path:
+/// 0.87 s to the first byte on a new connection against 0.21 s on an open one.
+pub fn warmable(outbound: &Outbound) -> bool {
+    let plain_header = match &outbound.protocol {
+        OutboundProtocol::Vless(v) => !v.encrypted() && !v.flow.is_vision(),
+        OutboundProtocol::Trojan(_) => true,
+        _ => false,
+    };
+    plain_header
+        && !outbound.mux.enabled
+        && outbound.stream.raw_http_header.is_none()
+        && matches!(outbound.stream.security, Security::Tls(_))
+        && matches!(
+            outbound.stream.transport,
+            Transport::WebSocket(_) | Transport::HttpUpgrade(_)
+        )
+}
+
+/// TCP and TLS to `outbound`'s own server, dialled directly (fragmenting and
+/// SNI desync apply). Returns the secured stream and the name TLS used.
+pub(crate) async fn open_secured(
+    outbound: &Outbound,
+    resolver: &zero_dns::Resolver,
+) -> Result<(BoxStream, String), Failure> {
+    let (address, port) = outbound.endpoint().ok_or_else(|| {
+        Failure::new(FailureKind::LocalPolicy, Stage::Resolving)
+            .with_detail(format!("outbound {} has no endpoint", outbound.tag))
+    })?;
+    let fallback_host = address.host_string();
+    let outbound = materialize_ech(outbound, resolver, &fallback_host).await?;
+    let addrs = resolver
+        .resolve_address(&address, resolver.settings().query_strategy)
+        .await
+        .map_err(|error| {
+            Failure::new(FailureKind::DnsNoData, Stage::Resolving).with_detail(error.to_string())
+        })?
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect::<Vec<_>>();
+    let tcp = dial_tcp(
+        &addrs,
+        &race_policy(&outbound.stream),
+        &socket_options(&outbound.stream),
+    )
+    .await?;
+    let secured = protect_socket(&outbound, tcp.stream, &fallback_host).await?;
+    Ok((secured, fallback_host))
+}
+
+/// TLS over `carried`, a connection to `outbound`'s server another outbound
+/// opened: one hop of a `dialerProxy` chain.
+pub(crate) async fn secure_over(
+    outbound: &Outbound,
+    carried: BoxStream,
+) -> Result<(BoxStream, String), Failure> {
+    let fallback_host = outbound
+        .endpoint()
+        .map(|(address, _)| address.host_string())
+        .unwrap_or_default();
+    let secured = secure(outbound, carried, &fallback_host).await?;
+    Ok((secured, fallback_host))
+}
+
+/// Upgrade a secured stream to `outbound`'s transport and stop: a warm
+/// carrier, ready for [`finish_carrier`]. Only for [`warmable`] outbounds.
+pub(crate) async fn open_carrier(
+    outbound: &Outbound,
+    secured: BoxStream,
+    fallback_host: &str,
+) -> Result<BoxStream, Failure> {
+    let config = |w: &zero_config::WebSocketConfig, early_data_len: usize| WsConfig {
+        path: w.path.to_string(),
+        host: w.host.as_deref().unwrap_or(fallback_host).to_string(),
+        headers: w
+            .headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        early_data_len,
+        xhttp: Default::default(),
+        secure: false,
+    };
+    match &outbound.stream.transport {
+        Transport::WebSocket(w) => {
+            let s = ws::connect(secured, &config(w, w.early_data_len), &[]).await?;
+            Ok(match keepalive_policy(&outbound.stream) {
+                Some(policy) => boxed(zero_evasion::KeepaliveStream::new(s, policy)),
+                None => boxed(s),
+            })
+        }
+        Transport::HttpUpgrade(w) => {
+            let s = httpupgrade::connect(secured, &config(w, 0))
+                .await
+                .map_err(|error| {
+                    Failure::new(FailureKind::WebsocketRejected, Stage::RequestSent)
+                        .with_detail(error)
+                })?;
+            Ok(boxed(s))
+        }
+        _ => Err(Failure::new(FailureKind::LocalPolicy, Stage::RequestSent)
+            .with_detail(format!("outbound {} cannot be warmed", outbound.tag))),
+    }
+}
+
+/// Use a warm carrier for `destination`: write the protocol header that
+/// names it. The response header is stripped by the caller, as for any
+/// stream ([`strip_response`]).
+pub(crate) async fn finish_carrier(
+    outbound: &Outbound,
+    mut carrier: BoxStream,
+    destination: &Destination,
+) -> Result<BoxStream, Failure> {
+    let header = protocol_header(outbound, destination)?;
+    carrier
+        .write_all(&header)
+        .await
+        .map_err(|e| Failure::from_io(&e, Stage::RequestSent))?;
+    carrier
+        .flush()
+        .await
+        .map_err(|e| Failure::from_io(&e, Stage::RequestSent))?;
+    Ok(carrier)
+}
+
+/// Whether `outbound` is a byte-stream protocol over a plain stream
+/// transport, which is what [`connect_over`] can layer over another outbound.
+pub fn chainable(outbound: &Outbound) -> bool {
+    matches!(
+        outbound.protocol,
+        OutboundProtocol::Vless(_)
+            | OutboundProtocol::Vmess(_)
+            | OutboundProtocol::Trojan(_)
+            | OutboundProtocol::Shadowsocks(_)
+            | OutboundProtocol::AnyTls(_)
+    ) && !outbound.mux.enabled
+        && matches!(
+            outbound.stream.transport,
+            Transport::Raw
+                | Transport::WebSocket(_)
+                | Transport::HttpUpgrade(_)
+                | Transport::Grpc(_)
+        )
+}
+
+/// Everything above security: header obfuscation, transport, protocol.
+async fn finish_stack(
+    outbound: &Outbound,
+    destination: &Destination,
+    secured: BoxStream,
+    fallback_host: &str,
+) -> Result<BoxStream, Failure> {
+    let stream = &outbound.stream;
 
     let secured = if let Some(raw) = &stream.raw_http_header {
         let config = raw_http_header_config(raw);

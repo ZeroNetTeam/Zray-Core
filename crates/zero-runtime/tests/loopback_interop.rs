@@ -483,3 +483,143 @@ async fn raw_tcp_keeps_concurrent_flows_separate() {
     let tunnel = tunnel("vless", raw()).await;
     concurrent_flows(&tunnel, 64, 8 * 1024).await;
 }
+
+/// A VLESS relay with a direct exit, as one hop of a chain.
+fn vless_relay(port: u16) -> Arc<zero_runtime::Server> {
+    spawn(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "relay-in",
+            "listen": "127.0.0.1",
+            "port": port,
+            "protocol": "vless",
+            "settings": {"clients": [{"id": UUID}]},
+            "streamSettings": raw(),
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }))
+}
+
+/// A VLESS client outbound to `port`, carried by `via` when given.
+fn vless_hop(tag: &str, port: u16, via: Option<&str>) -> Value {
+    let mut stream = raw();
+    if let Some(via) = via {
+        stream["sockopt"] = json!({"dialerProxy": via});
+    }
+    json!({
+        "tag": tag,
+        "protocol": "vless",
+        "settings": {"vnext": [{
+            "address": "127.0.0.1",
+            "port": port,
+            "users": [{"id": UUID, "encryption": "none"}]
+        }]},
+        "streamSettings": stream,
+    })
+}
+
+fn chain_client(socks_port: u16, outbounds: Value) -> Arc<zero_runtime::Server> {
+    spawn(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": socks_port,
+            "protocol": "socks",
+            "settings": {"udp": true},
+        }],
+        "outbounds": outbounds,
+    }))
+}
+
+/// `dialerProxy` chains follow every hop: the client reaches only the first
+/// relay itself, and each later relay only through the one before it. The
+/// relays' own counters show it — a hop dialled directly would leave the
+/// relays before it without a connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_three_hop_dialer_proxy_chain_uses_every_hop() {
+    init_logging();
+    let echo = echo_service().await;
+    let (entry_port, mid_port, exit_port, socks_port) =
+        (free_port(), free_port(), free_port(), free_port());
+    let entry = vless_relay(entry_port);
+    let mid = vless_relay(mid_port);
+    let exit = vless_relay(exit_port);
+    let client = chain_client(
+        socks_port,
+        json!([
+            vless_hop("proxy", exit_port, Some("mid")),
+            vless_hop("mid", mid_port, Some("entry")),
+            vless_hop("entry", entry_port, None),
+        ]),
+    );
+    for server in [&entry, &mid, &exit, &client] {
+        wait_until_listening(server).await;
+    }
+
+    let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    let mut stream = socks_connect(socks, echo).await.unwrap();
+    let body = payload(7, 64 * 1024);
+    round_trip(&mut stream, &body).await;
+    drop(stream);
+
+    // Byte counters are added when each relay's session ends, which follows
+    // the client closing by a moment. Every hop must have accepted the
+    // connection and carried at least the payload both ways: the exit relay
+    // was reached through the others, never alone.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen: Vec<(u64, u64)> = [&entry, &mid, &exit]
+            .iter()
+            .map(|relay| {
+                let stats = relay.stats.snapshot();
+                (stats.accepted, stats.uploaded + stats.downloaded)
+            })
+            .collect();
+        if seen
+            .iter()
+            .all(|(accepted, bytes)| *accepted >= 1 && *bytes >= 2 * body.len() as u64)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "every hop must carry the connection; (accepted, bytes) per hop (entry, mid, exit) = {seen:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A chain that leads back to itself is refused, never dialled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dialer_proxy_loop_is_refused() {
+    init_logging();
+    let echo = echo_service().await;
+    let (a_port, b_port, socks_port) = (free_port(), free_port(), free_port());
+    let a = vless_relay(a_port);
+    let b = vless_relay(b_port);
+    let client = chain_client(
+        socks_port,
+        json!([
+            vless_hop("proxy", a_port, Some("other")),
+            vless_hop("other", b_port, Some("proxy")),
+        ]),
+    );
+    for server in [&a, &b, &client] {
+        wait_until_listening(server).await;
+    }
+    let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    let refused = match socks_connect(socks, echo).await {
+        Err(_) => true,
+        Ok(mut stream) => {
+            let _ = stream.write_all(&[0, 0, 0, 1, 42]).await;
+            let mut byte = [0u8; 1];
+            !matches!(
+                tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut byte)).await,
+                Ok(Ok(_))
+            )
+        }
+    };
+    assert!(refused, "a looping chain must not carry traffic");
+    assert_eq!(a.stats.snapshot().accepted + b.stats.snapshot().accepted, 0);
+}
