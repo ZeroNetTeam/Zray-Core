@@ -51,7 +51,7 @@ const SMART_FRAGMENT_LENGTHS: [&str; 20] = [
     "90-100", "10-30", "20-40", "30-50", "40-60", "50-70", "60-80", "70-90", "80-100", "100-200",
 ];
 
-/// How much the builder layers ClientHello fragmentation onto TLS/REALITY links.
+/// How much the builder layers ClientHello fragmentation onto TLS links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Evasion {
     /// No fragmentation; the link dials as described.
@@ -80,6 +80,10 @@ struct BuildRequest {
     /// (the default, cheapest) or a write range such as `1-1` — the fallback
     /// BPB documents for when `tlshello` fragmentation stops getting through.
     fragment_packets: String,
+    /// Inject a decoy ClientHello carrying an allow-listed SNI (raw fake-SNI
+    /// desync) on every TLS/REALITY outbound. Needs CAP_NET_RAW at runtime; the
+    /// engine falls back to fragmentation when it is missing.
+    sni_spoof: bool,
     dns: DnsRequest,
     log_level: String,
     /// Scanner results (`ip:port`), ranked by the observatory for CDN-fronted
@@ -104,6 +108,7 @@ impl Default for BuildRequest {
             block_quic: true,
             evasion: "auto".into(),
             fragment_packets: "tlshello".into(),
+            sni_spoof: false,
             dns: DnsRequest::default(),
             log_level: "warning".into(),
             clean_ips: Vec::new(),
@@ -288,29 +293,45 @@ pub fn build_config_with_assets(
             .outbound
             .validate()
             .map_err(|error| format!("links[{index}]: {error}"))?;
-        // A link describes the server, not this network, so fragmentation is
-        // layered on rather than folded into it. ECH and plaintext carriers are
-        // skipped (see `fragmentable`), matching the preset's own switch.
+        // A link describes the server, not this network, so evasion is layered
+        // on rather than folded into it. Fragmentation skips ECH/plaintext and
+        // REALITY (see `fragmentable`); SNI spoofing rides any TLS/REALITY
+        // carrier (it adds a decoy packet without touching the real hello).
         let can_fragment = fragmentable(&parsed.outbound);
+        let spoof = (request.sni_spoof && sni_spoofable(&parsed.outbound))
+            .then(|| json!({"fakeSni": SPOOF_DECOY_SNI}));
+        // Compose one outbound's evasion object from an optional fragment length
+        // and the optional SNI decoy; `None` when neither applies.
+        let evasion_block = |length: Option<&str>| -> Option<Value> {
+            let mut block = serde_json::Map::new();
+            if let Some(length) = length {
+                block.insert(
+                    "fragment".into(),
+                    json!({"packets": fragment_packets, "length": length, "interval": "1-1"}),
+                );
+            }
+            if let Some(spoof) = &spoof {
+                block.insert("sniSpoof".into(), spoof.clone());
+            }
+            (!block.is_empty()).then_some(Value::Object(block))
+        };
+        let push = |outbounds: &mut Vec<Value>, length: Option<&str>| match evasion_block(length) {
+            Some(evasion) => outbounds.push(json!({"link": parsed.link, "evasion": evasion})),
+            None => outbounds.push(json!({"link": parsed.link})),
+        };
         match evasion {
             Evasion::Smart if can_fragment => {
                 // Expand this link across the fragment-length sweep; the
                 // balancer below keeps whichever length the ISP still passes
                 // today and routes around the rest.
                 for length in SMART_FRAGMENT_LENGTHS {
-                    outbounds.push(json!({
-                        "link": parsed.link,
-                        "evasion": fragment_evasion(&fragment_packets, length),
-                    }));
+                    push(&mut outbounds, Some(length));
                 }
             }
-            Evasion::Strong if can_fragment => {
-                outbounds.push(json!({
-                    "link": parsed.link,
-                    "evasion": fragment_evasion(&fragment_packets, "100-200"),
-                }));
-            }
-            _ => outbounds.push(json!({"link": parsed.link})),
+            Evasion::Strong if can_fragment => push(&mut outbounds, Some("100-200")),
+            // No fragmentation (Off, or a REALITY/QUIC link) — but the outbound
+            // still carries the SNI decoy when spoofing is on.
+            _ => push(&mut outbounds, None),
         }
     }
     // The balancer is keyed off how many proxy outbounds exist, not how many
@@ -517,20 +538,37 @@ fn fragmentable(outbound: &zero_config::Outbound) -> bool {
     match &outbound.stream.security {
         zero_config::Security::None => false,
         zero_config::Security::Tls(tls) => tls.ech.is_none(),
-        zero_config::Security::Reality(_) => true,
+        // REALITY already names a real, unblocked SNI, so a fragment hides
+        // nothing — and REALITY servers reject a ClientHello split across TLS
+        // records: they read the first record expecting a whole hello, miss
+        // the auth tag, and relay to the decoy (real Xray with `tlshello`
+        // fails the same way), so fragmenting a REALITY link breaks the tunnel
+        // outright. Left whole, matching the TUI's `outbound_shreds_well`.
+        zero_config::Security::Reality(_) => false,
     }
 }
 
-/// A `{"fragment": {…}}` evasion block for one outbound. `packets` is the
-/// ClientHello write mode (`tlshello` or a range like `1-1`), `length` the
-/// byte-length range each write is split into; `interval` is the inter-write
-/// delay BPB fixes at `1-1`.
-fn fragment_evasion(packets: &str, length: &str) -> Value {
-    json!({"fragment": {
-        "packets": packets,
-        "length": length,
-        "interval": "1-1",
-    }})
+/// The decoy SNI stamped into a spoofed ClientHello: a widely-allow-listed
+/// name, so a DPI parser sees an unblocked destination. The real hello (and
+/// its true SNI) still reaches the server untouched.
+const SPOOF_DECOY_SNI: &str = "www.microsoft.com";
+
+/// Whether raw fake-SNI injection applies to this outbound. Unlike
+/// fragmentation it adds a *separate* decoy packet and never touches the real
+/// ClientHello, so REALITY is fine — but there must be a TCP TLS/REALITY hello
+/// to hide behind, so plaintext, ECH and QUIC carriers are skipped.
+fn sni_spoofable(outbound: &zero_config::Outbound) -> bool {
+    if matches!(
+        outbound.protocol,
+        zero_config::OutboundProtocol::Hysteria2(_) | zero_config::OutboundProtocol::Tuic(_)
+    ) {
+        return false;
+    }
+    match &outbound.stream.security {
+        zero_config::Security::None => false,
+        zero_config::Security::Tls(tls) => tls.ech.is_none(),
+        zero_config::Security::Reality(_) => true,
+    }
 }
 
 #[cfg(test)]
@@ -795,8 +833,14 @@ mod tests {
             observatory.probe_interval,
             std::time::Duration::from_secs(60)
         );
-        // Strong evasion fragments every TLS-bearing link.
-        for outbound in &compiled.outbounds[..3] {
+        // Strong evasion fragments every TLS link, but never REALITY: its
+        // ClientHello must reach the server whole. proxy = REALITY here.
+        assert!(
+            compiled.outbounds[0].stream.evasion.tcp_fragment.is_none(),
+            "REALITY was fragmented: {}",
+            compiled.outbounds[0].tag
+        );
+        for outbound in &compiled.outbounds[1..3] {
             assert!(
                 outbound.stream.evasion.tcp_fragment.is_some(),
                 "{}",
@@ -811,7 +855,7 @@ mod tests {
         // variant fragmented, all balanced — so one server still gets the
         // balancer that picks whichever length the ISP passes.
         let config = build_config(&json!({
-            "links": [REALITY], "evasion": "smart"
+            "links": [WS_TLS], "evasion": "smart"
         }))
         .unwrap();
         let proxies = config["outbounds"]
@@ -855,7 +899,7 @@ mod tests {
         // switch the write mode to a `1-1` range. It must apply to each swept
         // variant, not just the first.
         let config = build_config(&json!({
-            "links": [REALITY], "evasion": "smart", "fragment_packets": "1-1"
+            "links": [WS_TLS], "evasion": "smart", "fragment_packets": "1-1"
         }))
         .unwrap();
         let modes: Vec<&str> = config["outbounds"]
@@ -870,10 +914,90 @@ mod tests {
 
         // A nonsense packets value is rejected by name.
         assert!(build_config(&json!({
-            "links": [REALITY], "evasion": "strong", "fragment_packets": "nonsense"
+            "links": [WS_TLS], "evasion": "strong", "fragment_packets": "nonsense"
         }))
         .unwrap_err()
         .contains("fragment_packets"));
+    }
+
+    #[test]
+    fn reality_links_are_never_fragmented() {
+        // Fragmenting a REALITY ClientHello breaks it: the server reads the
+        // first record expecting a whole hello, misses the auth tag and relays
+        // to the decoy. So under either evasion mode a REALITY link stays one
+        // plain outbound, unfragmented, with no length sweep and no balancer.
+        for mode in ["strong", "smart"] {
+            let config = build_config(&json!({
+                "links": [REALITY], "evasion": mode
+            }))
+            .unwrap();
+            let proxies = config["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|o| o["tag"].as_str().is_some_and(|t| t.starts_with("proxy")))
+                .count();
+            assert_eq!(proxies, 1, "mode {mode}: REALITY was expanded/fragmented");
+            let compiled = compile(&config);
+            assert!(
+                compiled.outbounds[0].stream.evasion.tcp_fragment.is_none(),
+                "mode {mode}: REALITY was fragmented"
+            );
+            assert!(
+                compiled.routing.balancers.is_empty(),
+                "mode {mode}: a single REALITY link should need no balancer"
+            );
+        }
+    }
+
+    #[test]
+    fn sni_spoof_rides_reality_without_fragmenting_it() {
+        // SNI spoofing adds a decoy packet, it does not split the hello, so it
+        // is safe on REALITY: the link stays one unfragmented outbound that
+        // now also carries the fake-SNI desync.
+        let config =
+            build_config(&json!({"links": [REALITY], "evasion": "smart", "sni_spoof": true}))
+                .unwrap();
+        let compiled = compile(&config);
+        let ev = &compiled.outbounds[0].stream.evasion;
+        assert!(ev.sni_desync.is_some(), "REALITY did not get the SNI decoy");
+        assert!(ev.tcp_fragment.is_none(), "REALITY must not be fragmented");
+    }
+
+    #[test]
+    fn sni_spoof_and_fragmentation_combine_on_a_tls_link() {
+        let config =
+            build_config(&json!({"links": [WS_TLS], "evasion": "strong", "sni_spoof": true}))
+                .unwrap();
+        let compiled = compile(&config);
+        let ev = &compiled.outbounds[0].stream.evasion;
+        assert!(ev.tcp_fragment.is_some(), "fragment lost");
+        assert!(ev.sni_desync.is_some(), "SNI decoy lost");
+    }
+
+    #[test]
+    fn sni_spoof_is_off_by_default_and_skips_quic() {
+        let off = compile(&build_config(&json!({"links": [REALITY]})).unwrap());
+        assert!(off.outbounds[0].stream.evasion.sni_desync.is_none());
+        // A QUIC carrier has no TCP hello to hide behind: never spoofed.
+        let quic =
+            compile(&build_config(&json!({"links": [HYSTERIA2], "sni_spoof": true})).unwrap());
+        assert!(quic.outbounds[0].stream.evasion.sni_desync.is_none());
+    }
+
+    #[test]
+    fn unmatched_traffic_defaults_through_the_tunnel_not_direct() {
+        // The default outbound — where the router sends anything no rule
+        // matched — must be the proxy, never `direct`/`block`. A fail-open to
+        // direct would carry unrouted destinations over the real IP and leak
+        // it. This locks that invariant against a future reordering.
+        let compiled = compile(&build_config(&json!({"links": [REALITY]})).unwrap());
+        let default = compiled.default_outbound().expect("a default outbound");
+        assert!(
+            default.tag.starts_with("proxy"),
+            "default outbound is {:?}, not the tunnel — traffic would leak direct",
+            default.tag
+        );
     }
 
     #[test]
