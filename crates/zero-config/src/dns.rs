@@ -19,7 +19,7 @@ pub struct DnsServer {
     pub tag: Option<Arc<str>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResolverEndpoint {
     /// Classic DNS over UDP, falling back to TCP on truncation.
     Udp {

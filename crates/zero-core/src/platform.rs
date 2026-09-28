@@ -260,6 +260,7 @@ pub async fn connect_protected(address: std::net::SocketAddr) -> io::Result<toki
         tokio::net::TcpSocket::new_v6()?
     };
     protect_socket(&socket)?;
+    crate::path_mss::apply(&socket);
     socket.connect(address).await
 }
 

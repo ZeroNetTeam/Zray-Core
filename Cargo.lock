@@ -4241,6 +4241,7 @@ dependencies = [
  "futures",
  "libc",
  "netstack-smoltcp",
+ "smoltcp",
  "thiserror 2.0.20",
  "tokio",
  "zero-core",

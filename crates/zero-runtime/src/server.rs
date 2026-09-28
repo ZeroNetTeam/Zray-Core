@@ -3863,6 +3863,7 @@ impl Server {
     /// ids from the fixed vocabulary; nothing about the user's own configs.
     pub fn method_observations(&self) -> Vec<(&'static str, bool)> {
         let mut observed = crate::cdn_check::observations(self.stats.cdn_condition()).to_vec();
+        observed.extend(self.tls_observations());
         let sanction = self
             .sanction
             .lock()
@@ -3870,6 +3871,46 @@ impl Server {
             .clone();
         if let Some(id) = sanction.as_ref().and_then(crate::sanction_dns::method_id) {
             observed.push((id, true));
+        }
+        observed
+    }
+
+    /// Whether TLS servers got through as is and whether they did with the
+    /// ClientHello split, from the health the sessions and probes already
+    /// recorded — nothing is sent to find out. A kind that was not tried is
+    /// not reported.
+    fn tls_observations(&self) -> Vec<(&'static str, bool)> {
+        let config = self.config();
+        let health = self
+            .health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut plain = None::<bool>;
+        let mut fragment = None::<bool>;
+        for outbound in config.outbounds.iter() {
+            let zero_config::Security::Tls(tls) = &outbound.stream.security else {
+                continue;
+            };
+            if tls.ech.is_some() {
+                continue;
+            }
+            let sample = health.sample(&outbound.tag);
+            if sample.successes + sample.failures == 0 {
+                continue;
+            }
+            let slot = if outbound.stream.evasion.tcp_fragment.is_some() {
+                &mut fragment
+            } else {
+                &mut plain
+            };
+            *slot = Some(slot.unwrap_or(false) || sample.successes > 0);
+        }
+        let mut observed = Vec::new();
+        if let Some(ok) = plain {
+            observed.push(("tls:plain", ok));
+        }
+        if let Some(ok) = fragment {
+            observed.push(("tls:fragment", ok));
         }
         observed
     }
@@ -4359,6 +4400,7 @@ impl Server {
     async fn record_observation(&self, outcome: &crate::relay::RelayOutcome) {
         let mut planner = self.planner.lock().await;
         if outcome.is_useful() {
+            zero_core::path_mss::note_progress();
             planner.record_success(outcome.stage, outcome.elapsed);
         } else {
             let kind = outcome
@@ -4366,6 +4408,17 @@ impl Server {
                 .as_deref()
                 .map(|error| crate::relay::classify_error(error, outcome.stage))
                 .unwrap_or(zero_core::FailureKind::Unknown);
+            // The black-hole signature: the server was reached, nothing came
+            // back before the handshake timed out.
+            if kind == zero_core::FailureKind::TlsTimeout
+                && outcome.transferred.downloaded == 0
+                && zero_core::path_mss::note_stall()
+            {
+                info!(
+                    mss = zero_core::path_mss::current(),
+                    "handshakes keep stalling; lowered the TCP segment size"
+                );
+            }
             let failure = zero_core::Failure::new(kind, outcome.stage)
                 .with_bytes(outcome.transferred.uploaded + outcome.transferred.downloaded)
                 .with_elapsed(outcome.elapsed)

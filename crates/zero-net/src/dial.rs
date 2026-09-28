@@ -221,6 +221,7 @@ fn new_socket(addr: SocketAddr, opts: &SocketOptions) -> io::Result<tokio::net::
     // A failure here fails the dial, which is correct — the alternative is a
     // connection that cannot work (zero_core::platform).
     zero_core::protect_socket(&socket)?;
+    zero_core::path_mss::apply(&socket);
 
     if let Some(sz) = opts.send_buffer {
         let _ = socket.set_send_buffer_size(u32::try_from(sz).unwrap_or(u32::MAX));

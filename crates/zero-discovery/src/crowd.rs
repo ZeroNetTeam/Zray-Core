@@ -138,7 +138,12 @@ pub struct RankedMethod {
 ///   split into TCP segments, or with ECH (see `zero_runtime::cdn_check`).
 /// * `sanction:*` — which anti-sanction resolver relayed sanctioned services
 ///   (see `zero_runtime::sanction_dns`).
+/// * `tls:*` — whether TLS servers got through as is or only with the
+///   ClientHello split. Apps start with fragmenting when this ranks it above
+///   the plain connection on their network.
 pub const METHODS: &[&str] = &[
+    "tls:plain",
+    "tls:fragment",
     "cdn:plain",
     "cdn:fragment",
     "cdn:ech",
@@ -251,6 +256,20 @@ fn wilson_lower(successes: f64, total: f64) -> f64 {
     let centre = p + z2 / (2.0 * total);
     let spread = z * ((p * (1.0 - p) + z2 / (4.0 * total)) / total).sqrt();
     ((centre - spread) / (1.0 + z2 / total)).max(0.0)
+}
+
+/// A delay rounded to two significant figures: 10 ms steps below 100 ms,
+/// 50 ms below a second, 250 ms above, at most a minute. Apps round before
+/// sending and the relay again before storing (`deploy/crowd-relay`), so an
+/// exact figure never ties one person's reports together; ranking needs no
+/// more precision than this.
+pub fn bucket_ms(ms: u32) -> u32 {
+    let step = match ms {
+        0..=99 => 10,
+        100..=999 => 50,
+        _ => 250,
+    };
+    ((ms + step / 2) / step * step).min(60_000)
 }
 
 fn median(values: &mut [u32]) -> Option<u32> {
@@ -712,5 +731,23 @@ mod tests {
         let rankings = aggregate(&reports, &known(), vec![], NOW);
         let json = serde_json::to_string(&rankings).unwrap();
         assert_eq!(serde_json::from_str::<Rankings>(&json).unwrap(), rankings);
+    }
+
+    #[test]
+    fn delays_are_rounded_to_two_significant_figures() {
+        for (ms, bucket) in [
+            (0, 0),
+            (4, 0),
+            (5, 10),
+            (34, 30),
+            (99, 100),
+            (187, 200),
+            (1_377, 1_500),
+            (1_374, 1_250),
+            (59_990, 60_000),
+            (u32::MAX / 2, 60_000),
+        ] {
+            assert_eq!(bucket_ms(ms), bucket, "{ms}");
+        }
     }
 }
