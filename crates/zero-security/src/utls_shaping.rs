@@ -1015,7 +1015,9 @@ mod tests {
     async fn real_servers_hand_us_brotli_certificates_we_can_read() {
         for host in ["www.google.com", "www.cloudflare.com"] {
             let before = BROTLI_DECODES.load(std::sync::atomic::Ordering::Relaxed);
-            let tcp = tokio::net::TcpStream::connect((host, 443)).await.expect("tcp");
+            let tcp = tokio::net::TcpStream::connect((host, 443))
+                .await
+                .expect("tcp");
             let mut params = crate::tls::TlsParams::new(host);
             params.fingerprint_name = Some("chrome".into());
             params.alpn = vec![b"http/1.1".to_vec()];
