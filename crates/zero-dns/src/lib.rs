@@ -253,6 +253,12 @@ struct Pools {
     h2: StdMutex<HashMap<PoolKey, H2Entry>>,
     dot: StdMutex<HashMap<PoolKey, Vec<IdleDot>>>,
     doq: StdMutex<HashMap<PoolKey, QuicEntry>>,
+    /// Measured response time per endpoint, shared by every view, so the
+    /// fastest resolver of a tier is asked first (see [`rank`]).
+    rtt: StdMutex<HashMap<ResolverEndpoint, Rtt>>,
+    /// Upstream group queries so far; every [`EXPLORE_EVERY`]th asks the top
+    /// two at once, so a resolver that got faster is noticed.
+    explored: AtomicU32,
 }
 
 impl Pools {
@@ -794,63 +800,203 @@ impl Resolver {
         // the name has no data.
         let mut negative_ttl: Option<Duration> = None;
         let mut all_negative = true;
-        for server in servers {
-            let result = match &server.endpoint {
-                ResolverEndpoint::System if self.settings.leak_policy == LeakPolicy::Strict => {
-                    Err(ResolveError::Unsupported(
-                        "system DNS is disabled by strict leak policy".into(),
-                    ))
-                }
-                ResolverEndpoint::System => self.system_lookup(name, kind).await,
-                ResolverEndpoint::FakeDns => self.fake_lookup(name, kind).await,
-                endpoint => self.query_endpoint(endpoint, name, kind).await,
+        let mut index = 0;
+        while index < servers.len() {
+            let end = peer_group_end(&servers, index);
+            let group = &servers[index..end];
+            index = end;
+            let (result, stop) = if group.len() > 1 {
+                self.race_group(group, name, kind).await
+            } else {
+                let server = group[0];
+                let started = Instant::now();
+                let result = self.ask(server, name, kind).await;
+                self.note_rtt(&server.endpoint, started, result.is_ok());
+                (
+                    result.map(|answer| screen(server, kind, answer)),
+                    server.skip_fallback,
+                )
             };
             match result {
-                Ok(mut answer) => {
-                    let authoritative_empty =
-                        answer.addresses.is_empty() && answer.records.is_empty();
-                    if kind == QueryType::Https {
-                        answer.records.retain(|record| !record.is_empty());
+                Ok(Screened::Usable(answer)) => return Ok(answer),
+                Ok(Screened::Empty { authoritative, ttl }) => {
+                    if authoritative {
+                        negative_ttl = Some(negative_ttl.map_or(ttl, |previous| previous.min(ttl)));
                     } else {
-                        answer
-                            .addresses
-                            .retain(|ip| kind.accepts(*ip) && expected_ip_allowed(server, *ip));
+                        all_negative = false;
                     }
-                    let usable = if kind == QueryType::Https {
-                        !answer.records.is_empty()
-                    } else {
-                        !answer.addresses.is_empty()
-                    };
-                    if !usable {
-                        if authoritative_empty {
-                            negative_ttl = Some(match negative_ttl {
-                                Some(previous) => previous.min(answer.ttl),
-                                None => answer.ttl,
-                            });
-                        } else {
-                            all_negative = false;
-                        }
-                        last_error = Some(ResolveError::NoData(name.to_string()));
-                        if server.skip_fallback {
-                            break;
-                        }
-                        continue;
-                    }
-                    return Ok(answer);
+                    last_error = Some(ResolveError::NoData(name.to_string()));
                 }
                 Err(e) => {
                     all_negative = false;
                     last_error = Some(e);
-                    if server.skip_fallback {
-                        break;
-                    }
                 }
+            }
+            if stop {
+                break;
             }
         }
         Err(QueryFailure {
             error: last_error.unwrap_or_else(|| ResolveError::NoData(name.to_string())),
             negative_ttl: negative_ttl.filter(|_| all_negative),
         })
+    }
+
+    /// Ask one server, without judging the answer.
+    async fn ask(
+        &self,
+        server: &DnsServer,
+        name: &str,
+        kind: QueryType,
+    ) -> Result<PacketAnswer, ResolveError> {
+        match &server.endpoint {
+            ResolverEndpoint::System if self.settings.leak_policy == LeakPolicy::Strict => Err(
+                ResolveError::Unsupported("system DNS is disabled by strict leak policy".into()),
+            ),
+            ResolverEndpoint::System => self.system_lookup(name, kind).await,
+            ResolverEndpoint::FakeDns => self.fake_lookup(name, kind).await,
+            endpoint => self.query_endpoint(endpoint, name, kind).await,
+        }
+    }
+
+    /// Ask interchangeable resolvers, fastest first, with hedging: the next
+    /// one is asked only if the current best has not answered within about
+    /// twice its usual time, or failed. A healthy tier costs one query per
+    /// lookup; a resolver that became slow or blocked costs one hedge delay
+    /// instead of the whole timeout, and drops down the ranking.
+    ///
+    /// The second value is always `false`: members of a group never set
+    /// `skip_fallback`.
+    async fn race_group(
+        &self,
+        group: &[&DnsServer],
+        name: &Arc<str>,
+        kind: QueryType,
+    ) -> (Result<Screened, ResolveError>, bool) {
+        let order = {
+            let rtt = lock(&self.pools.rtt);
+            rank(
+                group
+                    .iter()
+                    .map(|server| rtt.get(&server.endpoint).copied()),
+            )
+        };
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut next = 0;
+        let mut last_error = None;
+        let mut negative: Option<Duration> = None;
+        let launch = |tasks: &mut tokio::task::JoinSet<_>, position: usize| {
+            let server = group[order[position]].clone();
+            let resolver = self.clone();
+            let name = Arc::clone(name);
+            tasks.spawn(async move {
+                // Records the time even when this query loses the race and
+                // is aborted: that time is a lower bound on its latency, and
+                // without it a resolver that never answers would stay
+                // "unmeasured" and keep its place at the front.
+                let mut timing = Timing {
+                    resolver: &resolver,
+                    endpoint: &server.endpoint,
+                    started: Instant::now(),
+                    ok: None,
+                };
+                let result = timing.resolver.ask(&server, &name, kind).await;
+                timing.ok = Some(result.is_ok());
+                drop(timing);
+                result.map(|answer| screen(&server, kind, answer))
+            });
+        };
+        launch(&mut tasks, next);
+        next += 1;
+        if self
+            .pools
+            .explored
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(EXPLORE_EVERY)
+        {
+            launch(&mut tasks, next);
+            next += 1;
+        }
+        loop {
+            let hedge = {
+                let rtt = lock(&self.pools.rtt);
+                order
+                    .get(next)
+                    .map(|_| hedge_delay(rtt.get(&group[order[next - 1]].endpoint).copied()))
+            };
+            let joined = match hedge {
+                Some(delay) => match timeout(delay, tasks.join_next()).await {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        launch(&mut tasks, next);
+                        next += 1;
+                        continue;
+                    }
+                },
+                None => tasks.join_next().await,
+            };
+            let Some(joined) = joined else { break };
+            match joined {
+                Ok(Ok(Screened::Usable(answer))) => {
+                    // Dropping the set aborts the slower queries.
+                    return (Ok(Screened::Usable(answer)), false);
+                }
+                // The resolvers are equivalent, so one authoritative "no
+                // such name" is the group's answer; asking the rest would
+                // only spend the user's data.
+                Ok(Ok(Screened::Empty {
+                    authoritative: true,
+                    ttl,
+                })) => negative = Some(ttl),
+                Ok(Ok(Screened::Empty { .. })) => {
+                    last_error = Some(ResolveError::NoData(name.to_string()))
+                }
+                Ok(Err(e)) => last_error = Some(e),
+                Err(e) => last_error = Some(ResolveError::Transport(e.to_string())),
+            }
+            if let Some(ttl) = negative {
+                return (
+                    Ok(Screened::Empty {
+                        authoritative: true,
+                        ttl,
+                    }),
+                    false,
+                );
+            }
+            if next < order.len() {
+                launch(&mut tasks, next);
+                next += 1;
+            }
+        }
+        (
+            Err(last_error.unwrap_or_else(|| ResolveError::NoData(name.to_string()))),
+            false,
+        )
+    }
+
+    fn note_rtt(&self, endpoint: &ResolverEndpoint, started: Instant, ok: bool) {
+        self.note_rtt_sample(endpoint, started, Some(ok));
+    }
+
+    /// `None`: the query was abandoned; its elapsed time counts as a sample.
+    fn note_rtt_sample(&self, endpoint: &ResolverEndpoint, started: Instant, ok: Option<bool>) {
+        if matches!(
+            endpoint,
+            ResolverEndpoint::System | ResolverEndpoint::FakeDns
+        ) {
+            return;
+        }
+        let elapsed = started.elapsed();
+        let mut rtt = lock(&self.pools.rtt);
+        if rtt.len() >= 64 && !rtt.contains_key(endpoint) {
+            rtt.clear();
+        }
+        let entry = rtt.entry(endpoint.clone()).or_default();
+        match ok {
+            Some(true) => entry.observe(elapsed),
+            Some(false) => entry.fail(),
+            None => entry.observe_at_least(elapsed),
+        }
     }
 
     fn candidates<'a>(&'a self, name: &str) -> Vec<&'a DnsServer> {
@@ -1567,6 +1713,179 @@ fn domain_matches(pattern: &DomainPattern, name: &str) -> bool {
 
 fn normalize_pattern(value: &str) -> String {
     value.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Reports a raced query's time when it finishes or is aborted.
+struct Timing<'a> {
+    resolver: &'a Resolver,
+    endpoint: &'a ResolverEndpoint,
+    started: Instant,
+    ok: Option<bool>,
+}
+
+impl Drop for Timing<'_> {
+    fn drop(&mut self) {
+        self.resolver
+            .note_rtt_sample(self.endpoint, self.started, self.ok);
+    }
+}
+
+/// An answer after the server's own acceptance rules were applied.
+enum Screened {
+    Usable(PacketAnswer),
+    /// Nothing usable. `authoritative` when the server said the name has no
+    /// such data, rather than returning addresses `expectIPs` rejected.
+    Empty {
+        authoritative: bool,
+        ttl: Duration,
+    },
+}
+
+fn screen(server: &DnsServer, kind: QueryType, mut answer: PacketAnswer) -> Screened {
+    let authoritative = answer.addresses.is_empty() && answer.records.is_empty();
+    let usable = if kind == QueryType::Https {
+        answer.records.retain(|record| !record.is_empty());
+        !answer.records.is_empty()
+    } else {
+        answer
+            .addresses
+            .retain(|ip| kind.accepts(*ip) && expected_ip_allowed(server, *ip));
+        !answer.addresses.is_empty()
+    };
+    if usable {
+        Screened::Usable(answer)
+    } else {
+        Screened::Empty {
+            authoritative,
+            ttl: answer.ttl,
+        }
+    }
+}
+
+/// Whether a server can stand in for another: an encrypted or plain network
+/// resolver with no stop-here rule. The system resolver and FakeDNS are
+/// never raced; they are not the same kind of answer.
+fn interchangeable(server: &DnsServer) -> bool {
+    !server.skip_fallback
+        && !matches!(
+            server.endpoint,
+            ResolverEndpoint::System | ResolverEndpoint::FakeDns
+        )
+}
+
+/// End of the run of interchangeable servers starting at `start`: the same
+/// domains, answer filter and routing tag, so any of them may answer for all
+/// and none is reached by a different path.
+fn peer_group_end(servers: &[&DnsServer], start: usize) -> usize {
+    let first = servers[start];
+    if !interchangeable(first) {
+        return start + 1;
+    }
+    let mut end = start + 1;
+    while end < servers.len()
+        && interchangeable(servers[end])
+        && servers[end].domains == first.domains
+        && servers[end].expect_ips == first.expect_ips
+        // Same route out: racing a tunnelled resolver against a direct one
+        // would send every hedged query to the local network.
+        && servers[end].tag == first.tag
+    {
+        end += 1;
+    }
+    end
+}
+
+/// Smoothed response time of one resolver, in the style of TCP's SRTT:
+/// an exponential average with weight 1/4, and a penalty per consecutive
+/// failure so a blocked resolver sinks without being forgotten.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Rtt {
+    /// Milliseconds; zero means never measured.
+    smoothed_ms: u32,
+    failures: u8,
+}
+
+/// Assumed for a resolver that has not answered yet: ordinary for DoH
+/// through a tunnel from Iran, so an unmeasured resolver neither jumps the
+/// queue nor is starved.
+const UNMEASURED_MS: u32 = 400;
+/// One in this many upstream lookups measures the runner-up too: about 3%
+/// more DNS traffic, a few hundred bytes an hour for a typical phone.
+const EXPLORE_EVERY: u32 = 32;
+const HEDGE_MIN: Duration = Duration::from_millis(150);
+const HEDGE_MAX: Duration = Duration::from_millis(1_200);
+
+impl Rtt {
+    fn observe(&mut self, elapsed: Duration) {
+        let sample = u32::try_from(elapsed.as_millis())
+            .unwrap_or(u32::MAX)
+            .max(1);
+        self.smoothed_ms = if self.smoothed_ms == 0 {
+            sample
+        } else {
+            // 3/4 old + 1/4 new, in u64 so large values cannot overflow.
+            ((u64::from(self.smoothed_ms) * 3 + u64::from(sample)) / 4) as u32
+        };
+        self.failures = 0;
+    }
+
+    /// An abandoned query: it took at least `elapsed`. Moves the average up
+    /// but never down, and does not clear failures, since nothing answered.
+    fn observe_at_least(&mut self, elapsed: Duration) {
+        let failures = self.failures;
+        let previous = self.smoothed_ms;
+        if previous == 0 {
+            // Losing a race says nothing good: never rank above the
+            // assumption for an unmeasured resolver.
+            let sample = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
+            self.smoothed_ms = sample.max(UNMEASURED_MS);
+            return;
+        }
+        self.observe(elapsed);
+        self.smoothed_ms = self.smoothed_ms.max(previous);
+        self.failures = failures;
+    }
+
+    fn fail(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+    }
+
+    /// Lower is better: the expected wait, times four per consecutive
+    /// failure. One lost datagram is forgiven against a large latency gap;
+    /// two are not.
+    fn cost(self) -> u64 {
+        let base = if self.smoothed_ms == 0 {
+            UNMEASURED_MS
+        } else {
+            self.smoothed_ms
+        };
+        u64::from(base) << (2 * u32::from(self.failures.min(5)))
+    }
+}
+
+/// Order a group's positions by cost, keeping the configured order on ties
+/// so the user's or preset's first choice wins when nothing is known.
+fn rank(stats: impl Iterator<Item = Option<Rtt>>) -> Vec<usize> {
+    let costs: Vec<u64> = stats.map(|rtt| rtt.unwrap_or_default().cost()).collect();
+    let mut order: Vec<usize> = (0..costs.len()).collect();
+    order.sort_by_key(|&position| costs[position]);
+    order
+}
+
+/// How long to wait on a resolver before also asking the next: twice its
+/// smoothed time, bounded so a fast resolver's hiccup does not fire a
+/// needless second query and a slow one does not stall the lookup.
+fn hedge_delay(rtt: Option<Rtt>) -> Duration {
+    let rtt = rtt.unwrap_or_default();
+    if rtt.failures > 0 {
+        return HEDGE_MIN;
+    }
+    let base = if rtt.smoothed_ms == 0 {
+        UNMEASURED_MS
+    } else {
+        rtt.smoothed_ms
+    };
+    Duration::from_millis(u64::from(base) * 2).clamp(HEDGE_MIN, HEDGE_MAX)
 }
 
 fn expected_ip_allowed(server: &DnsServer, ip: IpAddr) -> bool {
@@ -3133,5 +3452,241 @@ mod tests {
         assert!(
             parse_http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A UDP resolver that answers every A query with `answer` after
+    /// `delay`, or never when `answer` is `None`... unless `nxdomain`.
+    async fn resolver_stub(
+        delay: Duration,
+        answer: Option<[u8; 4]>,
+        nxdomain: bool,
+    ) -> (u16, Arc<AtomicUsize>) {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let port = socket.local_addr().unwrap().port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 512];
+            loop {
+                let Ok((len, peer)) = socket.recv_from(&mut buffer).await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut reply = buffer[..len].to_vec();
+                let socket = Arc::clone(&socket);
+                tokio::spawn(async move {
+                    if answer.is_none() && !nxdomain {
+                        return; // a black hole
+                    }
+                    tokio::time::sleep(delay).await;
+                    reply[2] = 0x81;
+                    reply[3] = if nxdomain { 0x83 } else { 0x80 };
+                    if let Some(ip) = answer {
+                        reply[7] = 1;
+                        reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4]);
+                        reply.extend_from_slice(&ip);
+                    }
+                    let _ = socket.send_to(&reply, peer).await;
+                });
+            }
+        });
+        (port, count)
+    }
+
+    fn udp(port: u16) -> DnsServer {
+        DnsServer {
+            endpoint: ResolverEndpoint::Udp {
+                address: Address::parse_host("127.0.0.1"),
+                port,
+            },
+            domains: Vec::new(),
+            expect_ips: Vec::new(),
+            skip_fallback: false,
+            tag: None,
+        }
+    }
+
+    fn resolver(servers: Vec<DnsServer>) -> Resolver {
+        Resolver::new(DnsSettings {
+            servers: servers.into_boxed_slice(),
+            disable_cache: true,
+            ..DnsSettings::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_black_holed_first_resolver_costs_one_hedge_delay_then_sinks() {
+        let (dead, dead_hits) = resolver_stub(Duration::ZERO, None, false).await;
+        let (live, live_hits) = resolver_stub(Duration::ZERO, Some([10, 0, 0, 9]), false).await;
+        let resolver = resolver(vec![udp(dead), udp(live)]);
+
+        let started = Instant::now();
+        let ips = resolver
+            .lookup("example.com", QueryStrategy::UseIpv4)
+            .await
+            .unwrap();
+        assert_eq!(ips, vec![IpAddr::from([10, 0, 0, 9])]);
+        // One hedge delay for an unmeasured resolver, not the 5 s timeout.
+        assert!(started.elapsed() < Duration::from_millis(1_500));
+        assert_eq!(dead_hits.load(Ordering::SeqCst), 1);
+
+        // From now on the live resolver is asked first and alone.
+        for _ in 0..5 {
+            let started = Instant::now();
+            resolver
+                .lookup("example.com", QueryStrategy::UseIpv4)
+                .await
+                .unwrap();
+            assert!(started.elapsed() < Duration::from_millis(100));
+        }
+        assert_eq!(dead_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(live_hits.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn a_fast_resolver_answers_alone_without_a_second_query() {
+        let (fast, fast_hits) = resolver_stub(Duration::ZERO, Some([10, 0, 0, 1]), false).await;
+        let (other, other_hits) =
+            resolver_stub(Duration::from_millis(40), Some([10, 0, 0, 2]), false).await;
+        let resolver = resolver(vec![udp(fast), udp(other)]);
+        // The first upstream lookup explores both; the rest ask one.
+        for _ in 0..(EXPLORE_EVERY as usize) {
+            let ips = resolver
+                .lookup("example.com", QueryStrategy::UseIpv4)
+                .await
+                .unwrap();
+            assert_eq!(ips, vec![IpAddr::from([10, 0, 0, 1])]);
+        }
+        assert_eq!(fast_hits.load(Ordering::SeqCst), EXPLORE_EVERY as usize);
+        assert_eq!(other_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn one_authoritative_nxdomain_answers_for_the_whole_group() {
+        let (first, _) = resolver_stub(Duration::ZERO, None, true).await;
+        let (second, second_hits) =
+            resolver_stub(Duration::from_millis(200), Some([10, 0, 0, 2]), false).await;
+        let resolver = resolver(vec![udp(first), udp(second)]);
+        for _ in 0..3 {
+            let result = resolver
+                .lookup("missing.example", QueryStrategy::UseIpv4)
+                .await;
+            assert!(matches!(result, Err(ResolveError::NoData(_))), "{result:?}");
+        }
+        // Only the exploring first lookup reached the second resolver.
+        assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exploration_finds_a_faster_resolver_behind_a_fine_one() {
+        let (live, _) = resolver_stub(Duration::ZERO, Some([10, 0, 0, 3]), false).await;
+        let (slow, _) = resolver_stub(Duration::from_millis(50), Some([10, 0, 0, 4]), false).await;
+        let resolver = resolver(vec![udp(slow), udp(live)]);
+        // Warm the table: slow first (configured order), then measured.
+        for _ in 0..3 {
+            resolver
+                .lookup("example.com", QueryStrategy::UseIpv4)
+                .await
+                .unwrap();
+        }
+        let ips = resolver
+            .lookup("example.com", QueryStrategy::UseIpv4)
+            .await
+            .unwrap();
+        // Once measured, the faster one leads.
+        assert_eq!(ips, vec![IpAddr::from([10, 0, 0, 3])]);
+    }
+
+    #[test]
+    fn ranking_prefers_measured_speed_and_keeps_order_on_ties() {
+        let fast = Rtt {
+            smoothed_ms: 80,
+            failures: 0,
+        };
+        let slow = Rtt {
+            smoothed_ms: 700,
+            failures: 0,
+        };
+        assert_eq!(rank([None, None, None].into_iter()), vec![0, 1, 2]);
+        assert_eq!(rank([Some(slow), Some(fast)].into_iter()), vec![1, 0]);
+        // Unmeasured (400 ms assumed) sits between fast and slow.
+        assert_eq!(
+            rank([Some(slow), None, Some(fast)].into_iter()),
+            vec![2, 1, 0]
+        );
+        // Two failures outweigh a latency advantage.
+        let failing = Rtt {
+            smoothed_ms: 80,
+            failures: 2,
+        };
+        assert_eq!(rank([Some(failing), Some(slow)].into_iter()), vec![1, 0]);
+        // One failure does not.
+        let wobbly = Rtt {
+            smoothed_ms: 80,
+            failures: 1,
+        };
+        assert_eq!(rank([Some(wobbly), Some(slow)].into_iter()), vec![0, 1]);
+    }
+
+    #[test]
+    fn rtt_smooths_and_abandoned_queries_only_push_up() {
+        let mut rtt = Rtt::default();
+        rtt.observe(Duration::from_millis(100));
+        assert_eq!(rtt.smoothed_ms, 100);
+        rtt.observe(Duration::from_millis(500));
+        assert_eq!(rtt.smoothed_ms, 200);
+        rtt.observe_at_least(Duration::from_millis(10));
+        assert_eq!(rtt.smoothed_ms, 200);
+        rtt.fail();
+        rtt.observe_at_least(Duration::from_millis(1_000));
+        assert_eq!(rtt.failures, 1);
+        assert_eq!(rtt.smoothed_ms, 400);
+        rtt.observe(Duration::from_millis(400));
+        assert_eq!(rtt.failures, 0);
+    }
+
+    #[test]
+    fn hedge_delay_is_bounded() {
+        assert_eq!(hedge_delay(None), Duration::from_millis(800));
+        let fast = Rtt {
+            smoothed_ms: 5,
+            failures: 0,
+        };
+        assert_eq!(hedge_delay(Some(fast)), HEDGE_MIN);
+        let slow = Rtt {
+            smoothed_ms: 3_000,
+            failures: 0,
+        };
+        assert_eq!(hedge_delay(Some(slow)), HEDGE_MAX);
+        let failing = Rtt {
+            smoothed_ms: 3_000,
+            failures: 1,
+        };
+        assert_eq!(hedge_delay(Some(failing)), HEDGE_MIN);
+    }
+
+    #[tokio::test]
+    async fn resolvers_on_different_routes_are_never_raced() {
+        let (tunnelled, _) =
+            resolver_stub(Duration::from_millis(1_500), Some([10, 0, 0, 1]), false).await;
+        let (direct, direct_hits) = resolver_stub(Duration::ZERO, Some([10, 0, 0, 2]), false).await;
+        let mut first = udp(tunnelled);
+        first.tag = Some("remote".into());
+        let mut second = udp(direct);
+        second.tag = Some("local".into());
+        let resolver = resolver(vec![first, second]);
+        let ips = resolver
+            .lookup("example.com", QueryStrategy::UseIpv4)
+            .await
+            .unwrap();
+        // Slow, but answered by the configured first server alone.
+        assert_eq!(ips, vec![IpAddr::from([10, 0, 0, 1])]);
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
     }
 }

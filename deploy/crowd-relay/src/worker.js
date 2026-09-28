@@ -12,7 +12,8 @@
 // MCC+MNC that the phone names, the ISP's AS number when the report comes
 // straight from the user's network, or "any" when neither is known); two
 // daily pseudonyms; the server's link key or the Cloudflare address;
-// success; delay. The pseudonyms are HMACs that change every day:
+// success; delay, rounded to two significant figures. Times are rounded to
+// five minutes. The pseudonyms are HMACs that change every day:
 // `source` of the sending address (for the tunnel, the VPN server's), used
 // for the rate limit and so one address cannot pose as many people, and
 // `reporter` of the address plus a random value the app picks each day, so
@@ -25,6 +26,7 @@ const MAX_CLEAN = 10;
 // The only technique ids a report may carry (zero-discovery `crowd::METHODS`).
 // A fixed list keeps method reports free of anything personal.
 const METHODS = new Set([
+  "tls:plain", "tls:fragment",
   "cdn:plain", "cdn:fragment", "cdn:ech",
   "sanction:bertina", "sanction:shecan", "sanction:electro", "sanction:ipm",
   "sanction:begzar", "sanction:radar", "sanction:none",
@@ -46,7 +48,18 @@ const isIpv4 = (s) =>
   typeof s === "string" &&
   /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(s) &&
   s.split(".").every((p) => String(Number(p)) === p && Number(p) <= 255);
-const delay = (ms) => (Number.isInteger(ms) && ms >= 0 && ms <= 60000 ? ms : null);
+// Delays are stored coarsely: two significant figures rank servers just as
+// well, and an exact millisecond count is one more thing that could tie a
+// person's reports together. Same buckets as the app (Crowd.kt) and
+// zero-discovery `crowd::bucket_ms`.
+const bucket = (ms) => {
+  const step = ms < 100 ? 10 : ms < 1000 ? 50 : 250;
+  return Math.min(60000, Math.round(ms / step) * step);
+};
+const delay = (ms) => (Number.isInteger(ms) && ms >= 0 && ms <= 60000 ? bucket(ms) : null);
+// Stored times are rounded to five minutes: decay works in hours, and a
+// precise time would line a report up with anything else seen that second.
+const STORED_TIME_STEP = 300;
 
 // A pseudonym for today: an HMAC of the day and `value`, so it cannot be
 // reversed and changes at midnight UTC.
@@ -108,13 +121,14 @@ async function report(request, env) {
   if (rows.length === 0) return json({ net, accepted: 0 });
 
   const now = Math.floor(Date.now() / 1000);
+  const stored = now - (now % STORED_TIME_STEP);
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
   const nonce = typeof body.nonce === "string" ? body.nonce.slice(0, 64) : "";
   const source = await pseudonym(env.SALT_SECRET, ip, now);
   const reporter = await pseudonym(env.SALT_SECRET, `${ip}|${nonce}`, now);
 
   const recent = await env.DB.prepare("SELECT COUNT(*) AS n FROM reports WHERE source = ? AND ts > ?")
-    .bind(source, now - 3600)
+    .bind(source, stored - 3600)
     .first();
   if ((recent?.n ?? 0) + rows.length > PER_HOUR) return json({ error: "slow down", net }, 429);
 
@@ -122,7 +136,7 @@ async function report(request, env) {
     "INSERT INTO reports (ts, net, reporter, source, kind, item, ok, ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
   );
   await env.DB.batch(
-    rows.map(([kind, item, ok, ms]) => insert.bind(now, net, reporter, source, kind, item, ok ? 1 : 0, ms)),
+    rows.map(([kind, item, ok, ms]) => insert.bind(stored, net, reporter, source, kind, item, ok ? 1 : 0, ms)),
   );
   return json({ net, accepted: rows.length });
 }

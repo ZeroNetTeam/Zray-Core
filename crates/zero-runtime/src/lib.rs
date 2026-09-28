@@ -51,5 +51,6 @@ pub fn migrate_quic_connections() -> usize {
     // A new network may treat the Cloudflare CDN differently.
     cdn_check::NETWORK_CHANGED.notify_waiters();
     warm::network_changed();
+    zero_core::path_mss::network_changed();
     zero_transport::quic_pool::rebind_all() + zero_protocol::wg_stack::rebind_all()
 }

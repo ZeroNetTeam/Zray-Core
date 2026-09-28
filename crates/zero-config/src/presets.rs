@@ -32,6 +32,11 @@ pub const CDN_HTTP_PORTS: [u16; 7] = [80, 8080, 2052, 2082, 2086, 2095, 8880];
 /// Encrypted resolvers reached through the tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteDns {
+    /// Google, Cloudflare and Quad9 together: the resolver asks the one that
+    /// has been answering fastest through this tunnel and hedges to the
+    /// next when it stalls, so a resolver blocked or slow on the current
+    /// exit costs one short delay instead of every lookup's timeout.
+    Auto,
     /// DoH to Cloudflare by address, so the resolver's own name needs no
     /// lookup.
     Cloudflare,
@@ -43,6 +48,7 @@ pub enum RemoteDns {
 impl RemoteDns {
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
             "cloudflare" | "cf" => Self::Cloudflare,
             "google" => Self::Google,
             "quad9" => Self::Quad9,
@@ -53,6 +59,7 @@ impl RemoteDns {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Cloudflare => "cloudflare",
             Self::Google => "google",
             Self::Quad9 => "quad9",
@@ -64,11 +71,22 @@ impl RemoteDns {
     /// a DoH endpoint named by hostname needs a bootstrap lookup, and that
     /// lookup happens on the censored network before any tunnel exists.
     pub fn url(self) -> &'static str {
+        self.urls()[0]
+    }
+
+    /// Every resolver this choice stands for, in preference order when
+    /// nothing has been measured yet.
+    pub fn urls(self) -> &'static [&'static str] {
         match self {
-            Self::Cloudflare => "https://1.1.1.1/dns-query",
-            Self::Google => "https://8.8.8.8/dns-query",
-            Self::Quad9 => "https://9.9.9.9/dns-query",
-            Self::AdGuard => "https://94.140.14.14/dns-query",
+            Self::Auto => &[
+                "https://8.8.8.8/dns-query",
+                "https://1.1.1.1/dns-query",
+                "https://9.9.9.9/dns-query",
+            ],
+            Self::Cloudflare => &["https://1.1.1.1/dns-query"],
+            Self::Google => &["https://8.8.8.8/dns-query"],
+            Self::Quad9 => &["https://9.9.9.9/dns-query"],
+            Self::AdGuard => &["https://94.140.14.14/dns-query"],
         }
     }
 
@@ -76,6 +94,11 @@ impl RemoteDns {
     /// of the same resolver also resolves without a query.
     pub fn pinned_hosts(self) -> &'static [(&'static str, &'static [&'static str])] {
         match self {
+            Self::Auto => &[
+                ("dns.google", &["8.8.8.8", "8.8.4.4"]),
+                ("cloudflare-dns.com", &["1.1.1.1", "1.0.0.1"]),
+                ("dns.quad9.net", &["9.9.9.9", "149.112.112.112"]),
+            ],
             Self::Cloudflare => &[("cloudflare-dns.com", &["1.1.1.1", "1.0.0.1"])],
             Self::Google => &[("dns.google", &["8.8.8.8", "8.8.4.4"])],
             Self::Quad9 => &[("dns.quad9.net", &["9.9.9.9", "149.112.112.112"])],
@@ -340,7 +363,7 @@ impl Default for IranPreset {
             listen: "127.0.0.1".into(),
             socks_port: 10808,
             http_port: Some(10809),
-            remote_dns: RemoteDns::Google,
+            remote_dns: RemoteDns::Auto,
             custom_remote_dns: None,
             local_dns: LocalDns::Google,
             anti_sanction_dns: AntiSanctionDns::Auto,
@@ -542,11 +565,14 @@ impl IranPreset {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .filter(|value| crate::dns::ResolverEndpoint::parse(value).is_some());
-        let remote_address = custom_remote.unwrap_or_else(|| self.remote_dns.url());
-        servers.push(json!({
-            "address": remote_address,
-            "tag": REMOTE_TAG,
-        }));
+        match custom_remote {
+            Some(address) => servers.push(json!({"address": address, "tag": REMOTE_TAG})),
+            None => {
+                for address in self.remote_dns.urls() {
+                    servers.push(json!({"address": address, "tag": REMOTE_TAG}));
+                }
+            }
+        }
 
         let mut hosts = serde_json::Map::new();
         for (name, addresses) in self.remote_dns.pinned_hosts() {
@@ -810,6 +836,7 @@ mod tests {
     #[test]
     fn the_encrypted_resolver_is_named_by_address_and_its_hostname_is_pinned() {
         for remote in [
+            RemoteDns::Auto,
             RemoteDns::Cloudflare,
             RemoteDns::Google,
             RemoteDns::Quad9,
@@ -821,18 +848,21 @@ mod tests {
                 ..IranPreset::default()
             };
             let (config, _) = parse_config(&preset.build()).unwrap();
-            let server = config
+            let remote_servers: Vec<_> = config
                 .dns
                 .servers
                 .iter()
-                .find(|server| server.tag.as_deref() == Some(REMOTE_TAG))
-                .unwrap();
-            // A DoH endpoint that needs a bootstrap lookup is the leak this
-            // tier exists to avoid.
-            assert!(
-                !server.endpoint.needs_bootstrap(),
-                "{remote:?} would need bootstrap DNS"
-            );
+                .filter(|server| server.tag.as_deref() == Some(REMOTE_TAG))
+                .collect();
+            assert_eq!(remote_servers.len(), remote.urls().len());
+            for server in remote_servers {
+                // A DoH endpoint that needs a bootstrap lookup is the leak
+                // this tier exists to avoid.
+                assert!(
+                    !server.endpoint.needs_bootstrap(),
+                    "{remote:?} would need bootstrap DNS"
+                );
+            }
             for (name, _) in remote.pinned_hosts() {
                 assert!(config.dns.hosts.contains_key(*name), "{name} is not pinned");
             }

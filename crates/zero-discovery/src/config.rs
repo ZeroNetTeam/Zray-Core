@@ -42,25 +42,26 @@ pub const TUN_ADDRESS_V6: &str = "fdfe:dcba:9876::1/126";
 /// The observatory's probe for balancer ranking.
 pub const BALANCER_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 
-/// ClientHello byte-length ranges swept by `evasion = "smart"`. Each becomes
-/// one balanced outbound against the same server, so the `leastPing` balancer
-/// keeps whichever length the ISP still passes today and drops the rest.
-/// Ported from BPB's Smart Fragment `bestFragValues` (design, not source).
-const SMART_FRAGMENT_LENGTHS: [&str; 20] = [
-    "1-5", "1-10", "10-20", "20-30", "30-40", "40-50", "50-60", "60-70", "70-80", "80-90",
-    "90-100", "10-30", "20-40", "30-50", "40-60", "50-70", "60-80", "70-90", "80-100", "100-200",
-];
+/// ClientHello chunk sizes of the fragmented variants `evasion = "auto"`
+/// adds after each link's plain one. 40-80 got 10 of 10 through a throttled
+/// Cloudflare edge from Tehran on 2026-09-28; 100-200 3 of 3, with slower
+/// runs. BPB's sweep of twenty lengths is not needed once the split is plain
+/// TCP segments, and every variant is one more outbound to probe.
+const AUTO_FRAGMENT_LENGTHS: [&str; 2] = ["40-80", "100-200"];
 
 /// How much the builder layers ClientHello fragmentation onto TLS links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Evasion {
     /// No fragmentation; the link dials as described.
     Off,
-    /// One fragment block per fragmentable link at a fixed 100-200 length.
+    /// Each fragmentable link as is, then fragmented at each of
+    /// `AUTO_FRAGMENT_LENGTHS`, behind the balancer: the plain connection is
+    /// used while it works, and a fragmented one takes over when it does not.
+    /// When other users on this network reported fragmenting working better
+    /// (`fragment_first`), the fragmented variants come first instead.
+    Auto,
+    /// Every fragmentable link fragmented, always (40-80).
     Strong,
-    /// Expand each fragmentable link across `SMART_FRAGMENT_LENGTHS` behind the
-    /// balancer, so the client auto-selects the length that gets through.
-    Smart,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,11 +77,16 @@ struct BuildRequest {
     block_ads: bool,
     block_quic: bool,
     evasion: String,
-    /// ClientHello fragment packets for `strong`/`smart` evasion: a write
+    /// ClientHello fragment packets for `auto`/`strong` evasion: a write
     /// range, `1-1` by default (plain TCP segments of the ClientHello), or
     /// `tlshello` (TLS record re-framing), which stopped getting through in
     /// Iran — 0 of 3 against 3 of 3, measured 2026-09-28.
     fragment_packets: String,
+    /// Put the fragmented variants of `auto` first: the app sets this when
+    /// the crowd rankings say fragmenting works better than a plain
+    /// connection on this network, so a fresh connect starts with what
+    /// worked for others instead of rediscovering it.
+    fragment_first: bool,
     /// Inject a decoy ClientHello carrying an allow-listed SNI (raw fake-SNI
     /// desync) on every TLS/REALITY outbound. Needs CAP_NET_RAW at runtime; the
     /// engine falls back to fragmentation when it is missing.
@@ -109,6 +115,7 @@ impl Default for BuildRequest {
             block_quic: true,
             evasion: "auto".into(),
             fragment_packets: "1-1".into(),
+            fragment_first: false,
             sni_spoof: false,
             dns: DnsRequest::default(),
             log_level: "warning".into(),
@@ -213,16 +220,17 @@ pub fn build_config_with_assets(
         return Err("at least one link is required".into());
     }
     let evasion = match request.evasion.as_str() {
-        "off" | "auto" => Evasion::Off,
+        "off" => Evasion::Off,
+        // "smart" was a separate mode before it and "auto" became one.
+        "auto" | "smart" => Evasion::Auto,
         "strong" => Evasion::Strong,
-        "smart" => Evasion::Smart,
         other => {
             return Err(format!(
-                "evasion must be \"off\", \"auto\", \"strong\" or \"smart\", got {other:?}"
+                "evasion must be \"off\", \"auto\" or \"strong\", got {other:?}"
             ))
         }
     };
-    // Fragment packets for strong/smart evasion: a write-count range (`1-1`,
+    // Fragment packets for auto/strong evasion: a write-count range (`1-1`,
     // the default) or `tlshello`. Validated here so the error names the field
     // rather than surfacing from the compiler.
     let fragment_packets = {
@@ -322,12 +330,18 @@ pub fn build_config_with_assets(
             None => outbounds.push(json!({"link": parsed.link})),
         };
         match evasion {
-            Evasion::Smart if can_fragment => {
-                // Expand this link across the fragment-length sweep; the
-                // balancer below keeps whichever length the ISP still passes
-                // today and routes around the rest.
-                for length in SMART_FRAGMENT_LENGTHS {
+            Evasion::Auto if can_fragment => {
+                // Plain first, fragmented after — or the other way round when
+                // other users here found fragmenting works better. The
+                // balancer's probes then keep whichever gets through today.
+                if !request.fragment_first {
+                    push(&mut outbounds, None);
+                }
+                for length in AUTO_FRAGMENT_LENGTHS {
                     push(&mut outbounds, Some(length));
+                }
+                if request.fragment_first {
+                    push(&mut outbounds, None);
                 }
             }
             Evasion::Strong if can_fragment => push(&mut outbounds, Some("40-80")),
@@ -337,8 +351,8 @@ pub fn build_config_with_assets(
         }
     }
     // The balancer is keyed off how many proxy outbounds exist, not how many
-    // links: one link under Smart Fragment still expands into a sweep that
-    // needs the balancer to choose among.
+    // links: one link under `auto` still expands into variants that need the
+    // balancer to choose among.
     let proxy_count = outbounds.len();
 
     let assets_dir = request
@@ -859,16 +873,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn smart_fragment_sweeps_one_link_into_a_balanced_length_range() {
-        // A single fragmentable link expands into the full length sweep, each
-        // variant fragmented, all balanced — so one server still gets the
-        // balancer that picks whichever length the ISP passes.
-        let config = build_config(&json!({
-            "links": [WS_TLS], "evasion": "smart"
-        }))
-        .unwrap();
-        let proxies = config["outbounds"]
+    /// The fragment lengths of the proxy outbounds in `config`, in order;
+    /// `None` for a plain one.
+    fn variant_lengths(config: &Value) -> Vec<Option<String>> {
+        config["outbounds"]
             .as_array()
             .unwrap()
             .iter()
@@ -877,30 +885,60 @@ mod tests {
                     .as_str()
                     .is_some_and(|t| t == "proxy" || t.starts_with("proxy-"))
             })
-            .count();
-        assert_eq!(proxies, SMART_FRAGMENT_LENGTHS.len());
+            .map(|o| {
+                o["evasion"]["fragment"]["length"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect()
+    }
 
+    #[test]
+    fn auto_tries_the_link_plain_first_then_fragmented() {
+        let config = build_config(&json!({"links": [WS_TLS], "evasion": "auto"})).unwrap();
+        assert_eq!(
+            variant_lengths(&config),
+            [None, Some("40-80".into()), Some("100-200".into())]
+        );
         let compiled = compile(&config);
-        // vpn mode appends direct + block + dns-out to the swept proxies.
-        assert_eq!(compiled.outbounds.len(), SMART_FRAGMENT_LENGTHS.len() + 3);
-        // Every swept outbound carries the same packets mode and its own length.
-        let lengths: Vec<_> = compiled
-            .outbounds
-            .iter()
-            .filter_map(|o| o.stream.evasion.tcp_fragment.as_ref())
-            .map(|f| (f.length.min, f.length.max))
-            .collect();
-        assert_eq!(lengths.len(), SMART_FRAGMENT_LENGTHS.len());
-        assert!(lengths.contains(&(1, 5)));
-        assert!(lengths.contains(&(100, 200)));
-        // The balancer exists even though only one link was supplied.
+        // One link still gets the balancer that chooses among its variants.
         assert_eq!(compiled.routing.balancers.len(), 1);
         assert_eq!(
             compiled
                 .expand_balancer(&compiled.routing.balancers[0])
                 .len(),
-            SMART_FRAGMENT_LENGTHS.len()
+            3
         );
+        // Only the fragmented variants split the ClientHello, as TCP segments.
+        let fragments: Vec<_> = compiled
+            .outbounds
+            .iter()
+            .filter_map(|o| o.stream.evasion.tcp_fragment.as_ref())
+            .collect();
+        assert_eq!(fragments.len(), 2);
+        assert!(fragments
+            .iter()
+            .all(|f| f.packets == zero_config::FragmentPackets::Range { from: 1, to: 1 }));
+    }
+
+    #[test]
+    fn auto_starts_fragmented_when_others_here_found_that_works() {
+        let config = build_config(&json!({
+            "links": [WS_TLS], "evasion": "auto", "fragment_first": true
+        }))
+        .unwrap();
+        assert_eq!(
+            variant_lengths(&config),
+            [Some("40-80".into()), Some("100-200".into()), None]
+        );
+        compile(&config);
+    }
+
+    #[test]
+    fn smart_is_now_auto() {
+        let smart = build_config(&json!({"links": [WS_TLS], "evasion": "smart"})).unwrap();
+        let auto = build_config(&json!({"links": [WS_TLS], "evasion": "auto"})).unwrap();
+        assert_eq!(variant_lengths(&smart), variant_lengths(&auto));
     }
 
     #[test]
@@ -909,7 +947,7 @@ mod tests {
         // switch the write mode to a `1-1` range. It must apply to each swept
         // variant, not just the first.
         let config = build_config(&json!({
-            "links": [WS_TLS], "evasion": "smart", "fragment_packets": "1-1"
+            "links": [WS_TLS], "evasion": "auto", "fragment_packets": "1-1"
         }))
         .unwrap();
         let modes: Vec<&str> = config["outbounds"]
@@ -918,7 +956,7 @@ mod tests {
             .iter()
             .filter_map(|o| o["evasion"]["fragment"]["packets"].as_str())
             .collect();
-        assert_eq!(modes.len(), SMART_FRAGMENT_LENGTHS.len());
+        assert_eq!(modes.len(), AUTO_FRAGMENT_LENGTHS.len());
         assert!(modes.iter().all(|m| *m == "1-1"));
         compile(&config);
 
@@ -936,7 +974,7 @@ mod tests {
         // first record expecting a whole hello, misses the auth tag and relays
         // to the decoy. So under either evasion mode a REALITY link stays one
         // plain outbound, unfragmented, with no length sweep and no balancer.
-        for mode in ["strong", "smart"] {
+        for mode in ["strong", "auto"] {
             let config = build_config(&json!({
                 "links": [REALITY], "evasion": mode
             }))
@@ -966,7 +1004,7 @@ mod tests {
         // is safe on REALITY: the link stays one unfragmented outbound that
         // now also carries the fake-SNI desync.
         let config =
-            build_config(&json!({"links": [REALITY], "evasion": "smart", "sni_spoof": true}))
+            build_config(&json!({"links": [REALITY], "evasion": "auto", "sni_spoof": true}))
                 .unwrap();
         let compiled = compile(&config);
         let ev = &compiled.outbounds[0].stream.evasion;
@@ -1011,11 +1049,11 @@ mod tests {
     }
 
     #[test]
-    fn smart_fragment_leaves_non_tls_links_alone() {
+    fn auto_leaves_non_tls_links_alone() {
         // A Shadowsocks link has no ClientHello to split, so the sweep must not
         // touch it: one outbound, no fragment, no balancer.
         let config = build_config(&json!({
-            "links": [SS], "evasion": "smart"
+            "links": [SS], "evasion": "auto"
         }))
         .unwrap();
         let compiled = compile(&config);
@@ -1031,7 +1069,7 @@ mod tests {
         // model forbids TCP-shaped evasion on a QUIC carrier. So the fragment
         // sweep must skip them — one plain outbound, no fragment, no balancer,
         // whichever evasion mode is asked for.
-        for mode in ["strong", "smart"] {
+        for mode in ["strong", "auto"] {
             let config = build_config(&json!({
                 "links": [HYSTERIA2], "evasion": mode
             }))
