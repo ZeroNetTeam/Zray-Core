@@ -2599,6 +2599,11 @@ fn parse_assets(value: &Value, path: &str) -> R<AssetsConfig> {
         Some(Value::Bool(value)) => *value,
         Some(_) => return Err(format!("{path}.refreshOnStart must be a boolean")),
     };
+    let auto_update = match object.get("autoUpdate") {
+        None => defaults.auto_update,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err(format!("{path}.autoUpdate must be a boolean")),
+    };
 
     let files = match object.get("files") {
         None => Vec::new(),
@@ -2625,6 +2630,7 @@ fn parse_assets(value: &Value, path: &str) -> R<AssetsConfig> {
         max_bytes,
         timeout,
         refresh_on_start,
+        auto_update,
         files: files.into_boxed_slice(),
     })
 }

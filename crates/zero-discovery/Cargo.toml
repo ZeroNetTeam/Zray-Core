@@ -31,5 +31,6 @@ rustls-pki-types = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]
+zero-router = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time", "test-util"] }
 flate2 = { workspace = true }

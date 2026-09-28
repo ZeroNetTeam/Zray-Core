@@ -4163,7 +4163,9 @@ impl Server {
                 continue;
             };
             let specs = asset_specs(&assets);
-            if specs.is_empty() {
+            // The host supplies the files itself; they are loaded at start
+            // and never re-fetched.
+            if specs.is_empty() || !assets.auto_update {
                 tokio::time::sleep(assets.refresh_interval).await;
                 continue;
             }

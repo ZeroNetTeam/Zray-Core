@@ -3996,6 +3996,7 @@ dependencies = [
  "zero-config",
  "zero-core",
  "zero-net",
+ "zero-router",
  "zero-runtime",
  "zero-scanner",
 ]

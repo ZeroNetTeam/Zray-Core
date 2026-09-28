@@ -372,14 +372,15 @@ pub fn build_config_with_assets(
         block_ads: request.block_ads,
         // Applied per link above, where ECH can be skipped.
         fragment: false,
-        manage_assets: assets_present,
-        asset_directory: if assets_present {
-            assets_dir
-                .as_ref()
-                .map(|dir| dir.to_string_lossy().into_owned())
-        } else {
-            None
-        },
+        // Given a directory, the rule sets always come from it. This used to
+        // require the files to exist already, but nothing put them there, so
+        // the assets block never appeared, nothing was ever downloaded and
+        // every geosite:/geoip: rule (Iran-direct, ad blocking, private
+        // ranges) was silently skipped.
+        manage_assets: assets_dir.is_some(),
+        asset_directory: assets_dir
+            .as_ref()
+            .map(|dir| dir.to_string_lossy().into_owned()),
         clean_ip_candidates: request
             .clean_ips
             .iter()
@@ -390,6 +391,13 @@ pub fn build_config_with_assets(
     };
     let mut config = preset.build();
     config["log"] = json!({"loglevel": request.log_level});
+    // The app installs its own trimmed rule sets (a few tens of KB). With them
+    // in place the core must not replace them with the full upstream lists:
+    // geoip.dat alone is ~23 MB, fetched directly over a metered, filtered
+    // network. Only when they are missing does it fall back to downloading.
+    if config.get("assets").is_some() {
+        config["assets"]["autoUpdate"] = json!(!assets_present);
+    }
 
     // ---- inbounds
     let lan_auth = request.lan.enabled && !request.lan.user.is_empty();
@@ -1079,17 +1087,32 @@ mod tests {
     }
 
     #[test]
-    fn managed_assets_only_when_the_files_exist() {
+    fn a_given_asset_directory_is_always_used_and_only_fetched_into_when_empty() {
         let dir =
             std::env::temp_dir().join(format!("zero-discovery-assets-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // Empty: the rule sets are still configured (this was the bug: no
+        // assets block, so nothing ever downloaded them), and the core may
+        // fetch them as a fallback.
         let without = build_config_with_assets(&json!({"links": [SS]}), Some(&dir)).unwrap();
-        assert!(without.get("assets").is_none());
+        assert_eq!(without["assets"]["directory"], json!(dir.to_string_lossy()));
+        assert_eq!(without["assets"]["autoUpdate"], json!(true));
+        // The app's bundled files in place: loaded, never replaced.
         std::fs::write(dir.join("geosite.dat"), b"x").unwrap();
         std::fs::write(dir.join("geoip.dat"), b"x").unwrap();
         let with = build_config_with_assets(&json!({"links": [SS]}), Some(&dir)).unwrap();
         assert_eq!(with["assets"]["directory"], json!(dir.to_string_lossy()));
+        assert_eq!(with["assets"]["autoUpdate"], json!(false));
+        // Both shapes compile.
+        for config in [&without, &with] {
+            zero_config::compile_config(config, zero_core::GenerationId(1)).unwrap();
+        }
+        // No directory given: no assets block, as before.
+        assert!(build_config(&json!({"links": [SS]}))
+            .unwrap()
+            .get("assets")
+            .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
