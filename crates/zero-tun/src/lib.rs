@@ -6,7 +6,7 @@
 //! runtime.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::sync::Arc;
@@ -285,6 +285,107 @@ fn write_udp(packet: &mut [u8], source_port: u16, destination_port: u16, payload
     packet[4..6].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
     packet[6..8].fill(0);
     packet[8..].copy_from_slice(payload);
+}
+
+/// Build an ICMP "destination unreachable, port unreachable" for a UDP
+/// datagram this proxy will not carry, addressed back to the application
+/// that sent it.
+///
+/// A browser reaches most large sites over QUIC first and only falls back to
+/// TCP when the QUIC attempt fails. Dropping the datagram silently leaves it
+/// waiting out its own timer; this says at once that port 443 is not
+/// answering on this path, the same thing a host with nothing listening
+/// would say, and the browser moves to TCP immediately. This is also what a
+/// rejected UDP flow means: there is nothing to send, not a slow answer.
+///
+/// `from` is the application, `to` the address it sent to. The quoted
+/// original packet is rebuilt (20-byte IPv4 or 40-byte IPv6 header, UDP
+/// header, and the first eight payload bytes) because only what the kernel
+/// matches against its socket table matters; the application's own TCP/IP
+/// stack never sees the original bytes again.
+pub fn build_icmp_unreachable(
+    from: SocketAddr,
+    to: SocketAddr,
+    payload: &[u8],
+) -> Result<Vec<u8>, TunError> {
+    let quoted = payload.len().min(8);
+    match (from, to) {
+        (SocketAddr::V4(from), SocketAddr::V4(to)) => {
+            // Quote: a 20-byte header for the datagram the application sent,
+            // plus its UDP header and the start of its payload.
+            let quote_udp = 8 + quoted;
+            let quote_len = 20 + quote_udp;
+            let icmp_len = 8 + quote_len;
+            let total = 20 + icmp_len;
+            let mut out = vec![0u8; total];
+            // Outer IPv4 header: from the remote address back to the app.
+            out[0] = 0x45;
+            out[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+            out[8] = 64;
+            out[9] = 1; // ICMP
+            out[12..16].copy_from_slice(&to.ip().octets());
+            out[16..20].copy_from_slice(&from.ip().octets());
+            let header_checksum = internet_checksum(&out[..20]);
+            out[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+            // ICMP header: type 3, code 3.
+            out[20] = 3;
+            out[21] = 3;
+            // The quoted IPv4 header, as the application would have written
+            // it: DF set, its own addresses, UDP protocol.
+            let quote = &mut out[28..];
+            quote[0] = 0x45;
+            quote[2..4].copy_from_slice(&(quote_len as u16).to_be_bytes());
+            quote[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+            quote[8] = 64;
+            quote[9] = 17;
+            quote[12..16].copy_from_slice(&from.ip().octets());
+            quote[16..20].copy_from_slice(&to.ip().octets());
+            let quote_checksum = internet_checksum(&quote[..20]);
+            quote[10..12].copy_from_slice(&quote_checksum.to_be_bytes());
+            write_udp(&mut quote[20..], from.port(), to.port(), &payload[..quoted]);
+            let checksum = internet_checksum(&out[20..]);
+            out[22..24].copy_from_slice(&checksum.to_be_bytes());
+            Ok(out)
+        }
+        (SocketAddr::V6(from), SocketAddr::V6(to)) => {
+            let quote_udp = 8 + quoted;
+            let quote_len = 40 + quote_udp;
+            let icmp_len = 8 + quote_len;
+            let total = 40 + icmp_len;
+            let mut out = vec![0u8; total];
+            out[0] = 0x60;
+            out[4..6].copy_from_slice(&(icmp_len as u16).to_be_bytes());
+            out[6] = 58; // ICMPv6
+            out[7] = 64;
+            out[8..24].copy_from_slice(&to.ip().octets());
+            out[24..40].copy_from_slice(&from.ip().octets());
+            // ICMPv6 header: type 1 (destination unreachable), code 4
+            // (port unreachable).
+            out[40] = 1;
+            out[41] = 4;
+            let quote = &mut out[48..];
+            quote[0] = 0x60;
+            quote[4..6].copy_from_slice(&(quote_udp as u16).to_be_bytes());
+            quote[6] = 17;
+            quote[7] = 64;
+            quote[8..24].copy_from_slice(&from.ip().octets());
+            quote[24..40].copy_from_slice(&to.ip().octets());
+            write_udp(&mut quote[40..], from.port(), to.port(), &payload[..quoted]);
+            let checksum = icmpv6_checksum(*to.ip(), *from.ip(), &out[40..]);
+            out[42..44].copy_from_slice(&checksum.to_be_bytes());
+            Ok(out)
+        }
+        _ => Err(TunError::MalformedPacket("address families do not match")),
+    }
+}
+
+fn icmpv6_checksum(source: Ipv6Addr, destination: Ipv6Addr, icmp: &[u8]) -> u16 {
+    let mut sum = checksum_add(0, &source.octets());
+    sum = checksum_add(sum, &destination.octets());
+    sum = checksum_add(sum, &(icmp.len() as u32).to_be_bytes());
+    sum = checksum_add(sum, &[0, 0, 0, 58]);
+    sum = checksum_add(sum, icmp);
+    nonzero_checksum(checksum_finish(sum))
 }
 
 // The pseudo-header is summed in place rather than assembled into a buffer
@@ -1854,6 +1955,66 @@ mod tests {
         assert_eq!(parsed.payload, b"answer");
         assert_ne!(&reply[10..12], &[0, 0]);
         assert_ne!(&reply[26..28], &[0, 0]);
+    }
+
+    /// The ICMP error a rejected flow gets: the kernel matches it against the
+    /// application's connected UDP socket by the quoted header, so the
+    /// addresses, ports and protocol in the quote are what make it work.
+    #[test]
+    fn builds_a_checksummed_ipv4_port_unreachable() {
+        let from: std::net::SocketAddr = "10.0.0.2:51000".parse().unwrap();
+        let to: std::net::SocketAddr = "203.0.113.7:443".parse().unwrap();
+        let packet = build_icmp_unreachable(from, to, b"quic initial bytes").unwrap();
+        // Outer IPv4 header.
+        assert_eq!(packet[0], 0x45);
+        assert_eq!(packet[9], 1, "ICMP");
+        assert_eq!(&packet[12..16], &[203, 0, 113, 7]);
+        assert_eq!(&packet[16..20], &[10, 0, 0, 2]);
+        // Checksums are verified the way a receiver does: with the field
+        // zeroed before summing.
+        let mut header = packet[..20].to_vec();
+        header[10..12].fill(0);
+        assert_eq!(&packet[10..12], &internet_checksum(&header).to_be_bytes());
+        // ICMP type 3 (unreachable), code 3 (port).
+        assert_eq!(packet[20], 3);
+        assert_eq!(packet[21], 3);
+        let mut icmp = packet[20..].to_vec();
+        icmp[2..4].fill(0);
+        assert_eq!(&packet[22..24], &internet_checksum(&icmp).to_be_bytes());
+        // Quote: the original IPv4 header, UDP header and eight payload bytes.
+        let quote = &packet[28..];
+        assert_eq!(quote[0], 0x45);
+        assert_eq!(quote[9], 17, "UDP");
+        assert_eq!(&quote[12..16], &[10, 0, 0, 2]);
+        assert_eq!(&quote[16..20], &[203, 0, 113, 7]);
+        assert_eq!(&quote[20..22], &51000u16.to_be_bytes());
+        assert_eq!(&quote[22..24], &443u16.to_be_bytes());
+        assert_eq!(&quote[28..], &b"quic ini"[..]);
+    }
+
+    #[test]
+    fn builds_a_checksummed_ipv6_port_unreachable() {
+        let from: std::net::SocketAddr = "[fd00::2]:51000".parse().unwrap();
+        let to: std::net::SocketAddr = "[2001:db8::7]:443".parse().unwrap();
+        let packet = build_icmp_unreachable(from, to, b"quic initial bytes").unwrap();
+        assert_eq!(packet[0], 0x60);
+        assert_eq!(packet[6], 58, "ICMPv6");
+        assert_eq!(&packet[40..42], &[1, 4], "unreachable, port");
+        let mut icmp = packet[40..].to_vec();
+        icmp[2..4].fill(0);
+        assert_eq!(
+            &packet[42..44],
+            &icmpv6_checksum(
+                "2001:db8::7".parse().unwrap(),
+                "fd00::2".parse().unwrap(),
+                &icmp
+            )
+            .to_be_bytes()
+        );
+        let quote = &packet[48..];
+        assert_eq!(quote[6], 17, "UDP");
+        assert_eq!(&quote[40..42], &51000u16.to_be_bytes());
+        assert_eq!(&quote[42..44], &443u16.to_be_bytes());
     }
 
     #[test]

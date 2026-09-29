@@ -70,6 +70,8 @@
 2. روی دکمه‌ی اتصال کلیک کنید. همه‌چیز با موس کار می‌کند، مثل یک برنامه‌ی معمولی.
 3. در تنظیمات، **System Proxy** را روی **SET SYSTEM** بگذارید (یا آن‌قدر **Ctrl+P** بزنید تا SET SYSTEM شود) تا بقیه‌ی برنامه‌ها هم از آن استفاده کنند.
 
+**اکانت رایگان WARP:** توی زیرونت کلید **W** را بزنید تا یک اکانت WARP از کلودفلر بگیرید. کلیدها روی دستگاه خودتان ساخته می‌شوند و فقط نیمه‌ی عمومی‌شان فرستاده می‌شود. هر سه راه (WireGuard و MASQUE روی HTTP/2 و روی HTTP/3) را با هم امتحان می‌کند و اولی را نگه می‌دارد که واقعاً ترافیک رد کند، و یادش می‌ماند کدام روی شبکه‌ی شما کار کرد. اگر API کلودفلر جایی که هستید فیلتر است، اول به یک سرور وصل شوید و دوباره **W** را بزنید.
+
 **سه حالت اتصال** (روی صفحه‌ی اصلی اپ اندروید):
 - **معمولی:** فقط سرورهای رمزگذاری‌شده (TLS یا REALITY) که مثل HTTPS معمولی دیده می‌شوند، همراه چند سرور پشتیبان. بهترین انتخاب برای استفاده‌ی روزمره.
 - **سریع:** به اولین سروری که کار کند وصل می‌شود، بدون جست‌وجوی اضافه. سریع‌ترین راه برای وصل شدن.
@@ -149,6 +151,8 @@ On macOS it runs in Terminal.app, so double-clicking always works.
 2. Click connect.
 3. In Settings, set **System Proxy** to **SET SYSTEM** (or press **Ctrl+P**
    until it shows SET SYSTEM) so other apps use it too.
+
+**Free WARP account:** press **W** in ZeroNet to get a Cloudflare WARP account. The keys are made on your device and only the public halves are sent. It tries all three ways (WireGuard, MASQUE over HTTP/2 and over HTTP/3) at once and keeps the first one that really carries traffic, and remembers which one worked on your network. If Cloudflare's API is filtered where you are, connect to a server first and press **W** again.
 
 **Three connection modes** (on the Android home screen):
 - **Normal:** encrypted servers only (TLS or REALITY, which look like ordinary HTTPS), with backups ready. The everyday choice.

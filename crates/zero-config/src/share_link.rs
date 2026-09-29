@@ -133,6 +133,7 @@ fn parse_link_inner(link: &str) -> Result<ShareLink, String> {
         "hysteria2" | "hy2" => parse_hysteria2(rest),
         "tuic" => parse_tuic(rest),
         "wireguard" | "wg" => parse_wireguard(rest),
+        "warp" => parse_warp_link(rest),
         // Reserved for ZeroNet's own share format, which is not released
         // yet. Refused by name so such a link is not mistaken for a typo.
         "zerov1" => Err(
@@ -586,6 +587,50 @@ fn parse_tuic(rest: &str) -> Result<ShareLink, String> {
     Ok(ShareLink {
         link: String::new(),
         remark: p.remark,
+        outbound,
+    })
+}
+
+/// The prefix of a WARP account link.
+pub const WARP_LINK_SCHEME: &str = "warp://";
+
+/// A `warp://` link for the settings of a `warp` outbound (see
+/// `xray_json::parse_warp`): the settings as JSON, base64url without padding,
+/// with the remark after `#`. Everything an account needs travels in it, so
+/// importing one is a paste.
+pub fn warp_link(settings: &serde_json::Value, remark: &str) -> String {
+    use base64::Engine as _;
+    let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(settings.to_string());
+    if remark.is_empty() {
+        format!("{WARP_LINK_SCHEME}{body}")
+    } else {
+        let remark =
+            percent_encoding::utf8_percent_encode(remark, percent_encoding::NON_ALPHANUMERIC);
+        format!("{WARP_LINK_SCHEME}{body}#{remark}")
+    }
+}
+
+/// `warp://<base64url settings JSON>#remark`, built by [`warp_link`].
+fn parse_warp_link(rest: &str) -> Result<ShareLink, String> {
+    use base64::Engine as _;
+    let (body, remark) = rest.split_once('#').unwrap_or((rest, ""));
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body.trim_end_matches('='))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(body))
+        .map_err(|error| format!("warp link is not base64: {error}"))?;
+    let settings: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("warp link is not JSON: {error}"))?;
+    let protocol = crate::xray_json::parse_warp(Some(&settings), "warp link")?;
+    let outbound = Outbound {
+        tag: Arc::from("proxy"),
+        protocol,
+        stream: StreamSettings::default(),
+        mux: MuxConfig::default(),
+    };
+    outbound.validate()?;
+    Ok(ShareLink {
+        link: String::new(),
+        remark: decode(remark),
         outbound,
     })
 }
@@ -1531,5 +1576,27 @@ mod tests {
         };
         assert_eq!(ss.port, 8388);
         assert_eq!(link.remark, "legacy");
+    }
+
+    #[test]
+    fn a_warp_link_carries_a_whole_account_and_round_trips() {
+        use base64::Engine as _;
+        let der = base64::engine::general_purpose::STANDARD.encode([3u8; 40]);
+        let settings = serde_json::json!({
+            "route": "masque-h2",
+            "masque": {"privateKey": der, "serverPublicKey": der, "address": ["172.16.0.2"]}
+        });
+        let link = warp_link(&settings, "WARP خانه");
+        assert!(link.starts_with("warp://"));
+        let parsed = parse_link(&link).unwrap();
+        assert_eq!(parsed.remark, "WARP خانه");
+        let OutboundProtocol::AmneziaWireguard(warp) = &parsed.outbound.protocol else {
+            panic!("expected a WARP outbound")
+        };
+        assert_eq!(warp.route, WarpRoute::MasqueHttp2);
+        assert!(warp.masque.is_some() && !warp.wireguard_usable());
+        // Damage is reported, not guessed at.
+        assert!(parse_link("warp://!!!").is_err());
+        assert!(parse_link(&format!("warp://{}", "e30")).is_err());
     }
 }

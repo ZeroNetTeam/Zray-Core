@@ -9,6 +9,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Nothing here writes to the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -22,7 +26,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: formatting
         run: cargo fmt --all -- --check
@@ -52,7 +56,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Declaring an MSRV that the workspace does not actually build under is
       # worse than declaring none, because downstream trusts the number.
       - run: cargo check --workspace --all-targets
@@ -63,7 +67,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
 
@@ -88,7 +92,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # The TUN and raw-socket paths drift per platform, so every desktop
       # target is compiled even where the tests cannot run.
       - run: cargo check --workspace --target ${{ matrix.target }}
@@ -101,7 +105,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # `ring`, `aws-lc-sys` and `zstd-sys` all build C, so the shipped
       # library cannot be produced without the NDK toolchain. The runner has
@@ -151,7 +155,7 @@ jobs:
           # llvm-nm matching rustc's LLVM: Xcode's nm can lag behind it and
           # then reads nothing from the archive.
           components: llvm-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # iOS links the static archive into a NEPacketTunnelProvider extension.
       - name: build the iOS static library
@@ -183,7 +187,7 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
         with:
           # Its default list includes the legacy "tools" package, which the
           # SDK repository no longer carries, failing the step.
@@ -193,7 +197,7 @@ jobs:
       # are hard-coded here; this only records what the repository offers.
       - name: available SDK platforms
         run: sdkmanager --list 2>/dev/null | grep -E "platforms;android-3[6-9]|build-tools;3[6-9]" | sort -u || true
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
       # The Rust library has its own jobs above; this one checks the Kotlin
       # and renders every screen (Robolectric + Roborazzi) on the JVM.
       - name: compile and unit tests

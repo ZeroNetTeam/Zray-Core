@@ -242,6 +242,18 @@ async fn reap(key: String, pooled: Weak<Pooled>) {
 /// on next use. Callable from any thread, inside a runtime or not.
 pub fn rebind_all() -> usize {
     let slots: Vec<Slot> = lock(&POOL).values().cloned().collect();
+    rebind_slots(&slots)
+}
+
+/// [`rebind_all`], but only the connections to `server` (for tests and
+/// diagnostics). A real network change is process-wide; a caller that wants
+/// to move one tunnel — a test, or a per-server recovery — uses this so it
+/// cannot disturb connections it did not mean to touch.
+pub fn rebind_to(server: SocketAddr) -> usize {
+    rebind_slots(&slots_to(server))
+}
+
+fn rebind_slots(slots: &[Slot]) -> usize {
     let mut moved = 0;
     for slot in slots {
         // A dial in progress is on the new network already.
@@ -274,6 +286,20 @@ pub fn rebind_all() -> usize {
     moved
 }
 
+/// The pool slots that name `server` as one of their addresses.
+fn slots_to(server: SocketAddr) -> Vec<Slot> {
+    let needle = server.to_string();
+    lock(&POOL)
+        .iter()
+        .filter(|(key, _)| {
+            key.split('|')
+                .nth(1)
+                .is_some_and(|addrs| addrs.split(',').any(|a| a == needle))
+        })
+        .map(|(_, slot)| slot.clone())
+        .collect()
+}
+
 /// Connections in the pool that are still open (for tests and diagnostics).
 pub fn live_connections() -> usize {
     let slots: Vec<Slot> = lock(&POOL).values().cloned().collect();
@@ -289,16 +315,7 @@ pub fn live_connections() -> usize {
 
 /// Open pooled connections to `server` (for tests and diagnostics).
 pub fn live_connections_to(server: SocketAddr) -> usize {
-    let needle = server.to_string();
-    let slots: Vec<Slot> = lock(&POOL)
-        .iter()
-        .filter(|(key, _)| {
-            key.split('|')
-                .nth(1)
-                .is_some_and(|addrs| addrs.split(',').any(|a| a == needle))
-        })
-        .map(|(_, slot)| slot.clone())
-        .collect();
+    let slots = slots_to(server);
     slots
         .iter()
         .filter(|slot| {

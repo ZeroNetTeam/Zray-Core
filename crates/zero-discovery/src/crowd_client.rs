@@ -15,7 +15,7 @@
 //! See `deploy/crowd-relay/README.md` for what is shared and what is not.
 
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -36,6 +36,10 @@ pub const MAX_RESULTS: usize = 40;
 /// At most this many clean addresses per report.
 pub const MAX_CLEAN: usize = 10;
 const RANKINGS_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// A ranking stamped further ahead than this is refused rather than trusted.
+/// `generated_at` is monotonic (see [`accept_download`]), so one bad publish
+/// with a clock set a year forward would pin every client to it for a year.
+pub const MAX_CLOCK_SKEW_SECS: i64 = 24 * 3600;
 
 /// One tested server, by its link key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,20 +62,43 @@ pub fn parse_rankings(body: &[u8]) -> Option<Rankings> {
     (rankings.v == RANKINGS_VERSION).then_some(rankings)
 }
 
+/// Whether a downloaded ranking may replace the cached one.
+///
+/// The signature proves who published a file, not when: a CDN or a network
+/// in the middle can replay an old, correctly signed `rankings.json` and roll
+/// every client back to a list the censor has since learned. So a download
+/// replaces the cache only when its `generated_at` is strictly newer, and a
+/// stamp too far ahead of the clock is refused outright — otherwise one
+/// skewed publish would outrank every honest update after it.
+fn accept_download(downloaded: &Rankings, cached: Option<&Rankings>, now: i64) -> bool {
+    if downloaded.generated_at > now + MAX_CLOCK_SKEW_SECS {
+        return false;
+    }
+    match cached {
+        Some(cached) => downloaded.generated_at > cached.generated_at,
+        None => true,
+    }
+}
+
 /// The rankings: from `cache_file` when younger than [`RANKINGS_TTL`], else
 /// downloaded (and the cache refreshed). A download that fails falls back
 /// to the cached copy however old. `None` when there is neither.
 pub async fn fetch_rankings(cache_file: Option<&Path>, timeout: Duration) -> Option<Rankings> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or(0);
     let cached = cache_file.and_then(|path| std::fs::read(path).ok().map(|body| (path, body)));
-    if let Some((path, body)) = &cached {
+    let cached_rankings = cached.as_ref().and_then(|(_, body)| parse_rankings(body));
+    if let Some((path, _)) = &cached {
         let fresh = std::fs::metadata(path)
             .and_then(|meta| meta.modified())
             .ok()
             .and_then(|modified| SystemTime::now().duration_since(modified).ok())
             .is_some_and(|age| age < RANKINGS_TTL);
         if fresh {
-            if let Some(rankings) = parse_rankings(body) {
-                return Some(rankings);
+            if let Some(rankings) = &cached_rankings {
+                return Some(rankings.clone());
             }
         }
     }
@@ -82,6 +109,15 @@ pub async fn fetch_rankings(cache_file: Option<&Path>, timeout: Duration) -> Opt
         let Some(rankings) = parse_rankings(&body) else {
             continue;
         };
+        // A replayed or clock-skewed file must not outrank what we hold.
+        if !accept_download(&rankings, cached_rankings.as_ref(), now) {
+            tracing::warn!(
+                %url,
+                generated_at = rankings.generated_at,
+                "rankings are not newer than the cached copy; keeping it"
+            );
+            continue;
+        }
         // A build with a signing key refuses a ranking that is not signed
         // by it: a substitute could push anyone's server to the top.
         if crate::sign::key_configured() {
@@ -104,7 +140,7 @@ pub async fn fetch_rankings(cache_file: Option<&Path>, timeout: Duration) -> Opt
         }
         return Some(rankings);
     }
-    cached.and_then(|(_, body)| parse_rankings(&body))
+    cached_rankings
 }
 
 /// The ranking buckets to read for `net`, most specific first: the exact
@@ -330,6 +366,32 @@ mod tests {
         assert!(parse_rankings(br#"{"v":1,"generated_at":0}"#).is_some());
         assert!(parse_rankings(br#"{"v":2,"generated_at":0}"#).is_none());
         assert!(parse_rankings(b"<html>").is_none());
+    }
+
+    /// A signature says who published a file, not when: an old, correctly
+    /// signed ranking replayed by a CDN must not roll a client back.
+    #[test]
+    fn a_replayed_ranking_never_replaces_a_newer_cache() {
+        let now = 1_800_000_000;
+        let at = |generated_at| Rankings {
+            v: 1,
+            generated_at,
+            ..Rankings::default()
+        };
+        // Nothing cached: anything sane is accepted.
+        assert!(accept_download(&at(now - 60), None, now));
+        let cached = at(now - 600);
+        assert!(accept_download(&at(now - 60), Some(&cached), now));
+        // Older, and the same file again, are refused.
+        assert!(!accept_download(&at(now - 900), Some(&cached), now));
+        assert!(!accept_download(&at(now - 600), Some(&cached), now));
+        // A stamp far ahead would pin every client to it, so it is refused
+        // even with nothing cached to compare against.
+        assert!(!accept_download(
+            &at(now + MAX_CLOCK_SKEW_SECS + 1),
+            None,
+            now
+        ));
     }
 
     #[tokio::test]

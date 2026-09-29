@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Lets tests of other crates stage a route race for a screen to draw.
+test-util = []
+
 [dependencies]
 zero-core = { workspace = true }
 zero-config = { workspace = true }
@@ -31,6 +35,11 @@ httparse = { workspace = true }
 h3 = { workspace = true }
 h3-quinn = { workspace = true }
 sha2 = { workspace = true }
+# QUIC Initial sniffing decrypts the ClientHello the way RFC 9001 defines it:
+# HKDF for the initial secrets, AES for header protection and AEAD.
+hkdf = { workspace = true }
+aes = { workspace = true }
+aes-gcm = { workspace = true }
 hex = { workspace = true }
 url = { workspace = true }
 
@@ -51,6 +60,9 @@ base64 = { workspace = true }
 libc = { workspace = true }
 # The DNS oracle stands up its own DoQ server to compare both clients against.
 quinn = { workspace = true }
+
+# The WARP route tests run a tunnel against the loopback edge stand-ins.
+zero-transport = { workspace = true, features = ["test-util"] }
 
 # `tune_allocator` sets glibc's mmap threshold.
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -14,6 +14,14 @@ use zero_core::{Failure, FailureKind, Stage};
 
 const HISTORY_LIMIT: usize = 64;
 
+/// How much better another member must score before it takes over from a
+/// balancer's last choice: a relative part plus a small floor. Probe jitter of
+/// a few milliseconds must not move a user's next connection to a different
+/// server, while a real failure adds whole seconds to a ping score and does
+/// switch at once.
+const PING_HYSTERESIS_RATIO: f64 = 0.2;
+const PING_HYSTERESIS_FLOOR: f64 = 0.02;
+
 /// Bounded per-outbound health evidence used by balancer selection. This is
 /// deliberately separate from `NetworkProfile`: endpoint tags are local
 /// configuration labels and the table never stores destinations or payloads.
@@ -29,6 +37,9 @@ pub struct OutboundHealth {
 #[derive(Debug, Default)]
 pub struct HealthTable {
     samples: HashMap<Arc<str>, OutboundHealth>,
+    /// The member each balancer chose last, so a marginally better score does
+    /// not move the next session. One entry per balancer tag.
+    last_pick: HashMap<Arc<str>, Arc<str>>,
 }
 
 impl HealthTable {
@@ -98,35 +109,63 @@ impl HealthTable {
     /// through different, untested servers. `LeastLoad` still rotates ties:
     /// spreading sessions is its purpose.
     pub fn choose(
-        &self,
+        &mut self,
+        balancer: &str,
         strategy: BalancerHealthStrategy,
         tags: &[Arc<str>],
         ticket: u64,
     ) -> usize {
         debug_assert!(!tags.is_empty());
+        let score_of = |sample: OutboundHealth| match strategy {
+            BalancerHealthStrategy::LeastPing => {
+                sample
+                    .latency
+                    .map(|duration| duration.as_secs_f64())
+                    .unwrap_or(5.0)
+                    + sample.consecutive_failures as f64 * 2.0
+            }
+            BalancerHealthStrategy::LeastLoad => {
+                sample.consecutive_failures as f64 * 10.0
+                    + sample.failures.saturating_sub(sample.successes) as f64
+            }
+        };
         let mut best = 0usize;
         let mut best_score = f64::INFINITY;
         for (index, tag) in tags.iter().enumerate() {
-            let sample = self.sample(tag);
-            let score = match strategy {
-                BalancerHealthStrategy::LeastPing => {
-                    sample
-                        .latency
-                        .map(|duration| duration.as_secs_f64())
-                        .unwrap_or(5.0)
-                        + sample.consecutive_failures as f64 * 2.0
-                }
-                BalancerHealthStrategy::LeastLoad => {
-                    sample.consecutive_failures as f64 * 10.0
-                        + sample.failures.saturating_sub(sample.successes) as f64
-                }
-            };
+            let score = score_of(self.sample(tag));
             let rotate_tie = matches!(strategy, BalancerHealthStrategy::LeastLoad)
                 && score == best_score
                 && (ticket as usize) % tags.len() == index;
             if score < best_score || rotate_tie {
                 best = index;
                 best_score = score;
+            }
+        }
+        // Hysteresis for least-ping: keep the member chosen last time unless a
+        // challenger beats it by a clear margin. Least-load is left rotating,
+        // because spreading sessions across tied members is its purpose.
+        if strategy == BalancerHealthStrategy::LeastPing {
+            if let Some(previous) = self.last_pick.get(balancer) {
+                if let Some(index) = tags.iter().position(|tag| tag == previous) {
+                    let incumbent = score_of(self.sample(&tags[index]));
+                    let margin = incumbent * PING_HYSTERESIS_RATIO + PING_HYSTERESIS_FLOOR;
+                    if best_score + margin >= incumbent {
+                        best = index;
+                    }
+                }
+            }
+            // Updated in place: this runs once per connection, and the key
+            // is only allocated the first time a balancer is seen.
+            match self.last_pick.get_mut(balancer) {
+                Some(slot) => {
+                    if *slot != tags[best] {
+                        *slot = Arc::clone(&tags[best]);
+                    }
+                }
+                None => {
+                    self.last_pick
+                        .insert(Arc::from(balancer), Arc::clone(&tags[best]));
+                }
             }
         }
         best
@@ -923,7 +962,7 @@ mod tests {
 
     #[test]
     fn least_ping_sends_every_session_to_the_first_member_until_probed() {
-        let table = HealthTable::default();
+        let mut table = HealthTable::default();
         let tags = [
             Arc::from("proxy"),
             Arc::from("proxy-1"),
@@ -931,7 +970,7 @@ mod tests {
         ];
         for ticket in 0..9 {
             assert_eq!(
-                table.choose(BalancerHealthStrategy::LeastPing, &tags, ticket),
+                table.choose("auto", BalancerHealthStrategy::LeastPing, &tags, ticket),
                 0,
                 "ticket {ticket}"
             );
@@ -940,12 +979,50 @@ mod tests {
 
     #[test]
     fn least_load_still_spreads_tied_members() {
-        let table = HealthTable::default();
+        let mut table = HealthTable::default();
         let tags = [Arc::from("a"), Arc::from("b"), Arc::from("c")];
         let chosen: std::collections::HashSet<usize> = (0..3)
-            .map(|ticket| table.choose(BalancerHealthStrategy::LeastLoad, &tags, ticket))
+            .map(|ticket| table.choose("auto", BalancerHealthStrategy::LeastLoad, &tags, ticket))
             .collect();
         assert_eq!(chosen.len(), 3);
+    }
+
+    /// Hysteresis: probe jitter must not move the next connection, while a
+    /// server that starts failing must give way at once.
+    #[test]
+    fn least_ping_keeps_its_choice_unless_a_challenger_is_clearly_better() {
+        let mut table = HealthTable::default();
+        let tags = [
+            Arc::from("a"),
+            Arc::from("b"),
+            Arc::from("c"),
+            Arc::from("d"),
+        ];
+        table.record_success("a", Duration::from_millis(100));
+        // a is the only probed member, so it is chosen and remembered.
+        assert_eq!(
+            table.choose("auto", BalancerHealthStrategy::LeastPing, &tags, 0),
+            0
+        );
+        // c is a little faster (10%); that alone does not move the session.
+        table.record_success("c", Duration::from_millis(90));
+        assert_eq!(
+            table.choose("auto", BalancerHealthStrategy::LeastPing, &tags, 1),
+            0
+        );
+        // d is far faster: the session moves.
+        table.record_success("d", Duration::from_millis(10));
+        assert_eq!(
+            table.choose("auto", BalancerHealthStrategy::LeastPing, &tags, 2),
+            3
+        );
+        // d starts failing: failover is immediate, to the best healthy one.
+        table.record_failure("d");
+        table.record_failure("d");
+        assert_eq!(
+            table.choose("auto", BalancerHealthStrategy::LeastPing, &tags, 3),
+            2
+        );
     }
 
     #[test]
@@ -963,6 +1040,7 @@ mod tests {
         assert_eq!(table.sample("proxy").consecutive_failures, 0);
         assert_eq!(
             table.choose(
+                "auto",
                 BalancerHealthStrategy::LeastPing,
                 &[Arc::from("proxy"), Arc::from("proxy-1")],
                 1
@@ -986,6 +1064,7 @@ mod tests {
         table.record_success("fast", Duration::from_millis(20));
         assert_eq!(
             table.choose(
+                "auto",
                 BalancerHealthStrategy::LeastPing,
                 &[Arc::from("slow"), Arc::from("fast")],
                 0
@@ -996,6 +1075,7 @@ mod tests {
         table.record_failure("fast");
         assert_eq!(
             table.choose(
+                "auto",
                 BalancerHealthStrategy::LeastPing,
                 &[Arc::from("slow"), Arc::from("fast")],
                 0

@@ -12,7 +12,8 @@ use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 use zero_config::{
-    InboundProtocol, NoiseConfig, NoiseKind, OutboundProtocol, RuntimeConfig, VlessInboundConfig,
+    InboundProtocol, NoiseConfig, NoiseKind, OutboundProtocol, RuntimeConfig, Sniffing,
+    VlessInboundConfig,
 };
 use zero_core::{boxed, Address, Destination, GenerationId, InboundId, Network, SessionContext};
 use zero_protocol::socks::{self, Accepted, InboundKind};
@@ -1468,6 +1469,17 @@ impl Server {
         restored
     }
 
+    /// What the inbound with this id asks the sniffer for, in the shape the
+    /// UDP relay wants. An inbound that has gone from its generation sniffs
+    /// nothing.
+    fn sniff_policy(&self, id: InboundId) -> SniffPolicy {
+        self.config()
+            .inbounds
+            .get(id.0 as usize)
+            .map(|inbound| SniffPolicy::from(&inbound.sniffing))
+            .unwrap_or_default()
+    }
+
     fn router(&self) -> Arc<Router> {
         Arc::clone(&self.state.load_full().router)
     }
@@ -1784,7 +1796,8 @@ impl Server {
         // the first address that uses it from there; replies go to wherever
         // that client last sent from.
         let mut client: Option<SocketAddr> = None;
-        let (mut udp, mut replies) = UdpRelay::<()>::new(Arc::clone(&self), id, tag, 64);
+        let (mut udp, mut replies) =
+            UdpRelay::<()>::new(Arc::clone(&self), id, tag, 64, self.sniff_policy(id));
         let mut control_byte = [0u8; 1];
         let mut packet = vec![0u8; 65_535];
         loop {
@@ -2093,8 +2106,9 @@ impl Server {
         if let Some(udp) = parts.udp {
             let me = Arc::clone(&self);
             let udp_tag = tag.clone();
+            let udp_device = Arc::clone(&device);
             tokio::spawn(async move {
-                me.serve_tun_udp(udp, id, udp_tag).await;
+                me.serve_tun_udp(udp, id, udp_tag, udp_device).await;
             });
         }
         let Some(mut tcp) = parts.tcp else {
@@ -2133,13 +2147,15 @@ impl Server {
         udp: zero_tun::UdpSocket,
         id: InboundId,
         tag: Arc<str>,
+        device: Arc<zero_tun::TunDevice>,
     ) {
+        let sniff = self.sniff_policy(id);
         let (mut reader, mut writer) = udp.split();
         // One flow per application socket and destination: the TUN writes
         // every answer as if it came from the address the application sent
         // to, which is what a connected UDP socket insists on.
         let (mut relay, mut replies) =
-            UdpRelay::<(SocketAddr, SocketAddr)>::new(Arc::clone(&self), id, tag, 4096);
+            UdpRelay::<(SocketAddr, SocketAddr)>::new(Arc::clone(&self), id, tag, 4096, sniff);
         loop {
             tokio::select! {
                 datagram = reader.next() => {
@@ -2147,7 +2163,11 @@ impl Server {
                         return;
                     };
                     let destination = Destination::udp(Address::Ip(target.ip()), target.port());
-                    relay.dispatch((source, target), source, destination, payload).await;
+                    if let Dispatch::Rejected(payload) =
+                        relay.dispatch((source, target), source, destination, payload).await
+                    {
+                        reject_udp(&device, source, target, &payload).await;
+                    }
                 }
                 Some(reply) = replies.recv() => {
                     let (source, target) = reply.key;
@@ -2181,7 +2201,7 @@ impl Server {
     ) {
         let destination = Destination::udp(target.0, target.1);
         let (mut relay, mut replies) =
-            UdpRelay::<SocketAddr>::new(Arc::clone(&self), id, tag, 4096);
+            UdpRelay::<SocketAddr>::new(Arc::clone(&self), id, tag, 4096, self.sniff_policy(id));
         let mut buffer = vec![0u8; 65_535];
         loop {
             tokio::select! {
@@ -3456,7 +3476,8 @@ impl Server {
         buffered: Vec<u8>,
     ) -> Result<(), String> {
         let (mut reader, writer) = tokio::io::split(ChainedStream::new(buffered, stream));
-        let (mut udp, replies) = UdpRelay::<()>::new(Arc::clone(&self), id, tag, 64);
+        let (mut udp, replies) =
+            UdpRelay::<()>::new(Arc::clone(&self), id, tag, 64, self.sniff_policy(id));
         let writer = AbortOnDrop(vec![tokio::spawn(write_udp_replies(
             writer,
             replies,
@@ -3513,7 +3534,8 @@ impl Server {
             .await
             .map_err(|error| format!("flushing VLESS UDP response: {error}"))?;
         let (mut reader, writer) = tokio::io::split(ChainedStream::new(buffered, stream));
-        let (mut udp, replies) = UdpRelay::<()>::new(Arc::clone(&self), id, tag, 4);
+        let (mut udp, replies) =
+            UdpRelay::<()>::new(Arc::clone(&self), id, tag, 4, self.sniff_policy(id));
         let writer = AbortOnDrop(vec![tokio::spawn(write_udp_replies(
             writer,
             replies,
@@ -3589,17 +3611,21 @@ impl Server {
             .send_to(&datagram.payload, target)
             .await
             .map_err(|error| format!("sending UDP payload: {error}"))?;
-        let mut response = vec![0u8; 65_535];
-        let (len, remote) = timeout(
+        // One exchange per datagram, up to thousands at once: the buffer is
+        // reserved but never zero-filled, so only what the answer touches is
+        // ever written, and it becomes the reply itself instead of a copy.
+        let mut response = Vec::with_capacity(65_535);
+        let remote = timeout(
             Duration::from_secs(5),
-            remote_socket.recv_from(&mut response),
+            remote_socket.recv_buf_from(&mut response),
         )
         .await
         .map_err(|_| "UDP response timed out".to_string())?
-        .map_err(|e| format!("receiving UDP response: {e}"))?;
+        .map_err(|e| format!("receiving UDP response: {e}"))?
+        .1;
         Ok((
             Destination::udp(Address::Ip(remote.ip()), remote.port()),
-            response[..len].to_vec(),
+            response,
         ))
     }
 
@@ -3682,8 +3708,7 @@ impl Server {
             let peer = *peer_endpoints
                 .first()
                 .ok_or_else(|| "AmneziaWG peer has no address".to_string())?;
-            let stack =
-                zero_protocol::wg_stack::shared(peer, outbound::wireguard_stack_params(wireguard))?;
+            let stack = crate::warp::tunnel(wireguard, Some(peer)).await?;
             let destination = match &datagram.destination.address {
                 Address::Ip(ip) => SocketAddr::new(*ip, datagram.destination.port),
                 // Resolved inside the tunnel, like the TCP path.
@@ -3696,6 +3721,7 @@ impl Server {
                     .ok_or_else(|| "AmneziaWG destination has no usable address".to_string())?,
             };
             let result = stack.exchange_udp(destination, &datagram.payload).await;
+            stack.report(&result);
             let (source, response) = result?;
             return Ok((
                 Destination::udp(Address::Ip(source.ip()), source.port()),
@@ -3794,23 +3820,26 @@ impl Server {
                     .flush()
                     .await
                     .map_err(|error| format!("flushing Trojan UDP frame: {error}"))?;
-                let mut response = vec![0u8; 65_535];
-                let mut filled = 0;
+                // Starts small and grows with the frame, up to the frame limit:
+                // a DNS answer never needs the 64 KiB a full frame would.
+                const FRAME_LIMIT: usize = 65_535;
+                let mut response: Vec<u8> = Vec::with_capacity(2048);
                 loop {
+                    let remaining = FRAME_LIMIT - response.len();
+                    let mut room = bytes::BufMut::limit(&mut response, remaining);
                     let n = stream
-                        .read(&mut response[filled..])
+                        .read_buf(&mut room)
                         .await
                         .map_err(|error| format!("reading Trojan UDP response: {error}"))?;
                     if n == 0 {
                         return Err("Trojan closed before returning a UDP response".into());
                     }
-                    filled += n;
                     if let Ok((destination, payload, _)) =
-                        zero_protocol::trojan::decode_udp_packet(&response[..filled])
+                        zero_protocol::trojan::decode_udp_packet(&response)
                     {
                         return Ok((destination, payload));
                     }
-                    if filled == response.len() {
+                    if response.len() >= FRAME_LIMIT {
                         return Err("Trojan UDP response exceeded the frame limit".into());
                     }
                 }
@@ -3824,15 +3853,15 @@ impl Server {
                     .flush()
                     .await
                     .map_err(|error| format!("flushing VMess UDP payload: {error}"))?;
-                let mut payload = vec![0u8; 65_535];
+                let mut payload = Vec::with_capacity(65_535);
                 let n = stream
-                    .read(&mut payload)
+                    .read_buf(&mut payload)
                     .await
                     .map_err(|error| format!("reading VMess UDP response: {error}"))?;
                 if n == 0 {
                     return Err("VMess closed before returning a UDP response".into());
                 }
-                Ok((datagram.destination.clone(), payload[..n].to_vec()))
+                Ok((datagram.destination.clone(), payload))
             }
             other => Err(format!("{} cannot carry UDP", other.name())),
         }
@@ -4150,6 +4179,7 @@ impl Server {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .choose(
+                        &b.tag,
                         zero_observatory::BalancerHealthStrategy::LeastPing,
                         &tags,
                         ticket,
@@ -4164,6 +4194,7 @@ impl Server {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .choose(
+                        &b.tag,
                         zero_observatory::BalancerHealthStrategy::LeastLoad,
                         &tags,
                         ticket,
@@ -4949,6 +4980,60 @@ struct UdpReply<K> {
     restored: bool,
 }
 
+/// What an inbound's `sniffing` block asks for, reduced to the three flags
+/// the UDP relay needs. Held by value so a relay never keeps a configuration
+/// generation alive.
+#[derive(Debug, Clone, Copy, Default)]
+struct SniffPolicy {
+    enabled: bool,
+    quic: bool,
+    route_only: bool,
+}
+
+impl From<&Sniffing> for SniffPolicy {
+    fn from(sniffing: &Sniffing) -> Self {
+        Self {
+            enabled: sniffing.enabled,
+            quic: sniffing.sniff_quic,
+            route_only: sniffing.route_only,
+        }
+    }
+}
+
+/// What became of one datagram.
+#[derive(Debug)]
+enum Dispatch {
+    /// Handed to a flow, a proxy, or the resolver.
+    Sent,
+    /// Refused before anything left the process. The datagram comes back so a
+    /// TUN ingress can quote it in an ICMP port-unreachable: a QUIC client
+    /// waiting on a handshake that will never be answered stays on it until
+    /// its own timer expires, while the ICMP error moves it to TCP at once.
+    Rejected(Vec<u8>),
+}
+
+/// Send an ICMP port-unreachable for a datagram this proxy refused.
+///
+/// The packet goes straight to the device rather than back through the
+/// userspace stack: it is addressed to the application's own address, so its
+/// kernel is the one that has to see it, exactly as it would see one from a
+/// host with nothing listening on the port.
+async fn reject_udp(
+    device: &zero_tun::TunDevice,
+    source: SocketAddr,
+    target: SocketAddr,
+    payload: &[u8],
+) {
+    match zero_tun::build_icmp_unreachable(source, target, payload) {
+        Ok(packet) => {
+            if let Err(error) = device.send(&packet).await {
+                debug!(%error, "could not send a port-unreachable notice");
+            }
+        }
+        Err(error) => debug!(%error, "could not build a port-unreachable notice"),
+    }
+}
+
 /// One direct (Freedom) UDP flow: an outbound socket owned by one client flow
 /// and address family, plus the task that carries its answers back.
 struct NatFlow {
@@ -5001,6 +5086,8 @@ struct UdpRelay<K> {
     epoch: tokio::time::Instant,
     /// Bumped whenever anything moves, so a session can tell idle from busy.
     activity: Arc<AtomicU64>,
+    /// What this ingress' inbound asks the sniffer for.
+    sniff: SniffPolicy,
 }
 
 impl<K> UdpRelay<K>
@@ -5012,6 +5099,7 @@ where
         id: InboundId,
         tag: Arc<str>,
         flow_limit: usize,
+        sniff: SniffPolicy,
     ) -> (Self, tokio::sync::mpsc::Receiver<UdpReply<K>>) {
         let (replies, receiver) = tokio::sync::mpsc::channel(UDP_REPLY_QUEUE);
         (
@@ -5026,6 +5114,7 @@ where
                 exchanges: tokio::task::JoinSet::new(),
                 epoch: tokio::time::Instant::now(),
                 activity: Arc::new(AtomicU64::new(0)),
+                sniff,
             },
             receiver,
         )
@@ -5043,25 +5132,39 @@ where
         source: SocketAddr,
         destination: Destination,
         payload: Vec<u8>,
-    ) {
+    ) -> Dispatch {
         self.activity.fetch_add(1, Ordering::Relaxed);
         // Reap finished exchanges so the set does not grow with history.
         while self.exchanges.try_join_next().is_some() {}
         let server = Arc::clone(&self.server);
         let restored_destination = server.restore_fake_destination(&destination).await;
-        let restored = restored_destination != destination;
-        let destination = restored_destination;
-        let ctx = SessionContext::new(
+        let mut restored = restored_destination != destination;
+        let before_sniff = restored_destination;
+        let mut ctx = SessionContext::new(
             server.generation(),
             self.id,
             self.tag.clone(),
-            destination.clone(),
+            before_sniff.clone(),
         )
         .with_source(source);
+        // A QUIC flow names itself in its first datagram, and until it does
+        // routing sees only the address the client dialled. `inspect` refuses
+        // everything that is not an Initial packet, so this costs one byte
+        // test on every other datagram of the flow.
+        if self.sniff.enabled && self.sniff.quic && before_sniff.address.is_ip() {
+            if let Some(sniffed) = crate::quic_sniff::inspect(&payload) {
+                ctx.apply_sniff(sniffed, !self.sniff.route_only);
+            }
+        }
+        let destination = ctx.destination.clone();
+        // The name now decides where this flow goes while the client still
+        // only knows the address it sent to, so answers have to keep coming
+        // from that address.
+        restored |= destination != before_sniff;
         let (resolver, outbound) = match server.route(&ctx).await {
             Decision::Block => {
                 server.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                return;
+                return Dispatch::Rejected(payload);
             }
             Decision::DirectVia { resolver } => {
                 (Arc::new(server.resolver().for_tag(&resolver)), None)
@@ -5070,15 +5173,23 @@ where
                 let Some(outbound) = server.pick_outbound(&tag) else {
                     server.stats.failed.fetch_add(1, Ordering::Relaxed);
                     debug!(outbound = %tag, "no outbound for UDP route");
-                    return;
+                    return Dispatch::Rejected(payload);
                 };
                 if matches!(outbound.protocol, OutboundProtocol::Dns) {
                     self.spawn_dns_answer(key, destination, payload, restored);
-                    return;
+                    return Dispatch::Sent;
+                }
+                // A blackhole outbound is how a config says "drop this", not a
+                // server to connect to; the TCP path already treats it as a
+                // refusal, and a UDP flow has to as well or the datagram is
+                // handed to a proxy that is not a proxy.
+                if matches!(outbound.protocol, OutboundProtocol::Blackhole) {
+                    server.stats.blocked.fetch_add(1, Ordering::Relaxed);
+                    return Dispatch::Rejected(payload);
                 }
                 if !matches!(outbound.protocol, OutboundProtocol::Freedom { .. }) {
                     self.spawn_exchange(key, outbound, destination, payload, restored);
-                    return;
+                    return Dispatch::Sent;
                 }
                 (server.resolver(), Some(outbound))
             }
@@ -5094,10 +5205,12 @@ where
         {
             Ok(()) => {
                 server.stats.uploaded.fetch_add(length, Ordering::Relaxed);
+                Dispatch::Sent
             }
             Err(error) => {
                 server.stats.failed.fetch_add(1, Ordering::Relaxed);
                 debug!(%destination, %error, "direct UDP datagram failed");
+                Dispatch::Rejected(payload)
             }
         }
     }
@@ -6087,11 +6200,14 @@ mod tests {
         assert!(!server.resolver().has_fake());
     }
 
+    use std::net::SocketAddr;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::time::timeout;
     use zero_core::boxed;
     use zero_core::{Address, Destination, GenerationId, InboundId, SessionContext};
+
+    use super::{Dispatch, UdpRelay};
     use zero_router::Decision;
 
     /// A ClientHello carrying only an SNI, enough for the sniffer.
@@ -6250,6 +6366,117 @@ mod tests {
             [false, true],
             "blocked name leaked / allowed name blocked"
         );
+    }
+
+    /// A UDP flow that only ever knew the address it dialled must still follow
+    /// the rule written for the name in its QUIC Initial, the way its TCP twin
+    /// already follows the name in its ClientHello.
+    #[tokio::test]
+    async fn quic_initials_route_by_the_name_they_carry() {
+        let outcomes = quic_route_outcomes(&["http", "tls", "quic"]).await;
+        assert_eq!(
+            outcomes,
+            [true, false],
+            "the name in the Initial did not decide where its flow went"
+        );
+    }
+
+    /// The control for the test above: with QUIC sniffing off, the same
+    /// datagram routes on its address alone and the domain rule never sees it.
+    #[tokio::test]
+    async fn quic_initials_are_ignored_without_quic_sniffing() {
+        let outcomes = quic_route_outcomes(&["http", "tls"]).await;
+        assert_eq!(
+            outcomes,
+            [false, false],
+            "a flow was sniffed that should not be"
+        );
+    }
+
+    /// Send one QUIC Initial for a blocked name and one for an allowed name to
+    /// a loopback sink, and say which of them routing refused.
+    async fn quic_route_outcomes(dest_override: &[&str]) -> [bool; 2] {
+        // The sink stands in for the site: the destination is what the client
+        // dialled, and only the name inside the datagram can identify it.
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = sink.local_addr().unwrap();
+        let server = Arc::new(tun_style_server(serde_json::json!({
+            "inbounds": [{
+                "tag": "tun", "listen": "127.0.0.1", "port": 1080, "protocol": "socks",
+                "sniffing": {"enabled": true, "destOverride": dest_override},
+            }],
+            "outbounds": [
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "block", "protocol": "blackhole"},
+            ],
+            "routing": {"rules": [
+                {"type": "field", "domain": ["full:blocked.example"], "outboundTag": "block"},
+            ]},
+            "dns": {"hosts": {"allowed.example": "127.0.0.1"}},
+        })));
+        let source: SocketAddr = "10.0.0.2:40000".parse().unwrap();
+        let mut outcomes = [false; 2];
+        for (index, name) in ["blocked.example", "allowed.example"]
+            .into_iter()
+            .enumerate()
+        {
+            // A fresh relay per name: one relay would keep the flow open and
+            // the second Initial would join it rather than route again.
+            let (mut relay, _replies) = UdpRelay::<(SocketAddr, SocketAddr)>::new(
+                Arc::clone(&server),
+                InboundId(0),
+                Arc::from("tun"),
+                4096,
+                server.sniff_policy(InboundId(0)),
+            );
+            let outcome = relay
+                .dispatch(
+                    (source, target),
+                    source,
+                    Destination::udp(Address::Ip(target.ip()), target.port()),
+                    crate::quic_sniff::test_initial(name),
+                )
+                .await;
+            outcomes[index] = matches!(outcome, Dispatch::Rejected(_));
+        }
+        outcomes
+    }
+
+    /// A datagram routing refuses comes back to the ingress, so the TUN path
+    /// can quote it in a port-unreachable instead of leaving a QUIC client to
+    /// wait out its own timer.
+    #[tokio::test]
+    async fn a_refused_datagram_comes_back_to_be_quoted() {
+        let server = Arc::new(tun_style_server(serde_json::json!({
+            "inbounds": [{"tag": "tun", "listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "block", "protocol": "blackhole"},
+            ],
+            "routing": {"rules": [
+                {"type": "field", "domain": ["full:blocked.example"], "outboundTag": "block"},
+            ]},
+        })));
+        let (mut relay, _replies) = UdpRelay::<()>::new(
+            Arc::clone(&server),
+            InboundId(0),
+            Arc::from("tun"),
+            64,
+            server.sniff_policy(InboundId(0)),
+        );
+        let query = b"\x12\x34\x01\x00\x00\x01".to_vec();
+        let outcome = relay
+            .dispatch(
+                (),
+                "10.0.0.2:40000".parse().unwrap(),
+                Destination::udp(Address::domain("blocked.example"), 443),
+                query.clone(),
+            )
+            .await;
+        match outcome {
+            Dispatch::Rejected(payload) => assert_eq!(payload, query, "the quote lost its bytes"),
+            Dispatch::Sent => panic!("a blocked datagram was sent anyway"),
+        }
     }
 
     fn sanction_server() -> Server {

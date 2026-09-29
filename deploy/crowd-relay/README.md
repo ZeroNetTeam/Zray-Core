@@ -42,6 +42,16 @@ moved or added without an app update.
   tunnel says `any` and counts only towards the all-networks list; one that
   reaches the relay straight from the user's network is filed under the
   ISP's AS number (e.g. `asn:58224`).
+- **How each mode did** (Normal, Fast, Gaming, Legacy): per mode, whether a
+  connection came up and how long it took, the delay of the server in use,
+  and whether a session of five minutes or more ran without the server being
+  replaced. The ids are a fixed list; nothing else can be in one. The Action
+  turns a day's worth into totals (how many people, how many succeeded, the
+  median and the slowest tenth of the delays; a network is listed only when
+  at least five people reported from it), **seals** that file with a public
+  key so that only the maintainer can read it, and publishes the sealed file
+  as `modes/YYYY-MM-DD.sealed` on the `crowd-data` branch. Nobody else, the
+  relay included, gets to see the totals. See "Reading the mode totals".
 - **Users can turn it off**: Settings → Privacy → Help others connect.
 
 A false report cannot put a new server in front of anyone: only servers
@@ -98,3 +108,31 @@ and 10 addresses per request.
 
 `GET /v1/export?since=<unix seconds>` with `Authorization: Bearer <EXPORT_TOKEN>`
 returns the stored reports; only the crowd workflow calls it.
+
+## Reading the mode totals
+
+The totals answer one question: which mode is better in real use, and by how
+much. They are sealed (X25519 + HKDF-SHA256 + AES-256-GCM, a fresh key per
+file) to a public key only the maintainer holds the private half of, so the
+file can sit on a public branch without telling anyone anything.
+
+Set up once, on your own computer:
+
+```
+cargo run -p zero-discovery --bin zeronet-stats -- keygen
+```
+
+It prints a **public** key and a **secret** key. Put the public one in the
+repository variable `MODE_STATS_KEY` (Settings → Secrets and variables →
+Actions → Variables). Keep the secret one in a password manager, and never in
+GitHub. Without the variable the Action writes nothing.
+
+To read a day:
+
+```
+curl -fsSL https://raw.githubusercontent.com/zeghostwriter/ZeroNet/crowd-data/modes/2026-09-30.sealed -o day.sealed
+MODE_STATS_SECRET=<the secret key> cargo run -p zero-discovery --bin zeronet-stats -- open day.sealed
+```
+
+If the secret key is ever lost, make a new pair and change the variable; the
+days sealed to the old key stay unreadable, which is the point.

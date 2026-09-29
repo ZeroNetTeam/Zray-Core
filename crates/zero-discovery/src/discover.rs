@@ -37,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::events::EventSink;
 use crate::feed::{fetch_feed, FeedSource, FeedStatus};
-use crate::link::{parse_candidate, parse_candidates, Candidate};
+use crate::link::{parse_candidate, parse_candidates, parse_feed_candidates, Candidate};
 use crate::order::order_by_class;
 use crate::probe::{real_test, tcp_ping, ProbeTarget, DEFAULT_PROBE_URL};
 
@@ -70,6 +70,11 @@ pub struct DiscoverRequest {
     pub fetch: bool,
     /// Per-feed download deadline.
     pub fetch_timeout_ms: u64,
+    /// Accept a feed link whose endpoint is a private, loopback or link-local
+    /// address. Off by default, so a hostile feed cannot turn discovery into a
+    /// probe of the user's own machine or network; like `confirm_tls`, tests
+    /// against local servers turn it on.
+    pub allow_private_hosts: bool,
 }
 
 impl Default for DiscoverRequest {
@@ -93,6 +98,7 @@ impl Default for DiscoverRequest {
             next_tier_if_alive_below: 3,
             fetch: true,
             fetch_timeout_ms: 20_000,
+            allow_private_hosts: false,
         }
     }
 }
@@ -354,7 +360,14 @@ async fn run(shared: Arc<Shared>) {
         for (source, result) in results {
             let mut count = 0usize;
             if let Some(body) = result.body.as_deref() {
-                let (candidates, _report) = parse_candidates(body, &seen);
+                // A feed is written by strangers: unless this is a test run
+                // against local servers, it may not name the user's own
+                // machine or network.
+                let (candidates, _report) = if request.allow_private_hosts {
+                    parse_candidates(body, &seen)
+                } else {
+                    parse_feed_candidates(body, &seen)
+                };
                 for candidate in candidates {
                     if seen.insert(candidate.info.key.clone()) {
                         count += 1;
@@ -759,12 +772,14 @@ mod tests {
                         url: format!("http://{origin}/tier1"),
                         tier: 1,
                         sig_url: None,
+                        mirrors: Vec::new(),
                     },
                     FeedSource {
                         id: "two".into(),
                         url: format!("http://{origin}/tier2"),
                         tier: 2,
                         sig_url: None,
+                        mirrors: Vec::new(),
                     },
                 ],
                 want_alive: 3,
@@ -773,6 +788,7 @@ mod tests {
                 tcp_timeout_ms: 500,
                 probe_url: format!("http://{probe}/generate_204"),
                 confirm_tls: false,
+                allow_private_hosts: true,
                 ..DiscoverRequest::default()
             },
             sink,
@@ -838,12 +854,14 @@ mod tests {
                         url: format!("http://{origin}/tier1"),
                         tier: 1,
                         sig_url: None,
+                        mirrors: Vec::new(),
                     },
                     FeedSource {
                         id: "two".into(),
                         url: format!("http://{origin}/tier2"),
                         tier: 2,
                         sig_url: None,
+                        mirrors: Vec::new(),
                     },
                 ],
                 want_alive: 1,
@@ -854,6 +872,7 @@ mod tests {
                 real_timeout_ms: 800,
                 probe_url: format!("http://{probe}/generate_204"),
                 confirm_tls: false,
+                allow_private_hosts: true,
                 ..DiscoverRequest::default()
             },
             sink,

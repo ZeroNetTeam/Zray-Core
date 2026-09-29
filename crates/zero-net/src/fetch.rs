@@ -260,8 +260,21 @@ pub async fn post_with_headers(
     body: &[u8],
     limits: &FetchLimits,
 ) -> Result<Vec<u8>, FetchError> {
+    send_with_headers("POST", url, content_type, headers, body, limits).await
+}
+
+/// [`post_with_headers`] for another method with a body (`PATCH`, `PUT`).
+/// The method must be upper-case letters only.
+pub async fn send_with_headers(
+    method: &str,
+    url: &str,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    limits: &FetchLimits,
+) -> Result<Vec<u8>, FetchError> {
     let target = parse_target(url)?;
-    let request = post_request(&target, content_type, headers, body)?;
+    let request = body_request(method, &target, content_type, headers, body)?;
     match timeout(limits.timeout, send_once(&target, &request, limits)).await {
         Err(_) => Err(FetchError::Timeout(limits.timeout)),
         Ok(Err(error)) => Err(error),
@@ -285,8 +298,24 @@ pub async fn post_over<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    send_over(stream, "POST", url, content_type, headers, body, limits).await
+}
+
+/// [`post_over`] for another method with a body (`PATCH`, `PUT`).
+pub async fn send_over<S>(
+    stream: S,
+    method: &str,
+    url: &str,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    limits: &FetchLimits,
+) -> Result<Vec<u8>, FetchError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let target = parse_target(url)?;
-    let request = post_request(&target, content_type, headers, body)?;
+    let request = body_request(method, &target, content_type, headers, body)?;
     match timeout(limits.timeout, exchange(stream, &request, limits)).await {
         Err(_) => Err(FetchError::Timeout(limits.timeout)),
         Ok(Err(error)) => Err(error),
@@ -296,13 +325,17 @@ where
     }
 }
 
-/// The bytes of a POST request to `target`.
-fn post_request(
+/// The bytes of a request with a body to `target`.
+fn body_request(
+    method: &str,
     target: &Target,
     content_type: &str,
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Vec<u8>, FetchError> {
+    if method.is_empty() || !method.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        return Err(FetchError::Protocol("invalid request method".into()));
+    }
     if headers
         .iter()
         .any(|(k, v)| k.contains(['\r', '\n']) || v.contains(['\r', '\n']))
@@ -317,7 +350,7 @@ fn post_request(
             |(_, v)| (*v).to_string(),
         );
     let mut head = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {agent}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {agent}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         target.request_target,
         host_header(target),
         body.len(),

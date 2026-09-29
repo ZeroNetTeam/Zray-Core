@@ -31,6 +31,13 @@ const METHODS = new Set([
   "sanction:bertina", "sanction:shecan", "sanction:electro", "sanction:ipm",
   "sanction:begzar", "sanction:radar", "sanction:none",
 ]);
+// The only ids a mode report may carry (zero-discovery `modestats`): four
+// connection modes, three measures each. How long a connect took, whether it
+// came up, the delay of the server in use, whether a long session stayed
+// steady. Nothing else can be in one.
+const MODES = ["normal", "fast", "gaming", "legacy"];
+const MODE_METRICS = ["connect", "ping", "stable"];
+const MODE_IDS = new Set(MODES.flatMap((m) => MODE_METRICS.map((x) => `${m}:${x}`)));
 // Results one address may add per hour. Many people can share a VPN
 // server's address, so this is generous; it is a ceiling for a flood.
 const PER_HOUR = 2000;
@@ -117,6 +124,11 @@ async function report(request, env) {
   }
   for (const m of (Array.isArray(body.methods) ? body.methods : []).slice(0, METHODS.size)) {
     if (METHODS.has(m?.id) && typeof m.ok === "boolean") rows.push(["method", m.id, m.ok, m.ok ? delay(m.ms) : null]);
+  }
+  // How each mode did. Unlike a server, a mode that failed still has a
+  // time: how long the attempt took before it gave up.
+  for (const m of (Array.isArray(body.modes) ? body.modes : []).slice(0, MODE_IDS.size * 2)) {
+    if (MODE_IDS.has(m?.id) && typeof m.ok === "boolean") rows.push(["mode", m.id, m.ok, delay(m.ms)]);
   }
   if (rows.length === 0) return json({ net, accepted: 0 });
 

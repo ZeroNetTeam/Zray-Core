@@ -93,6 +93,13 @@ pub fn sign_with(secret: &[u8; 32], body: &[u8]) -> String {
     format!("{PREFIX}{}", hex::encode(signature.to_bytes()))
 }
 
+/// Whether `secret` is the private half of the key compiled into this build.
+/// A signing secret that is not is the mistake that makes every list CI
+/// publishes fail verification in the app.
+pub fn matches_compiled_key(secret: &[u8; 32]) -> bool {
+    public_hex(secret).eq_ignore_ascii_case(PUBLIC_KEY_HEX.trim())
+}
+
 /// The public key (hex) matching a 32-byte signing seed, to paste into
 /// [`PUBLIC_KEY_HEX`].
 pub fn public_hex(secret: &[u8; 32]) -> String {
@@ -163,5 +170,12 @@ mod tests {
         // or every signed feed would be refused on devices in the field.
         let key = hex32(PUBLIC_KEY_HEX).expect("PUBLIC_KEY_HEX is 32 hex bytes");
         assert!(VerifyingKey::from_bytes(&key).is_ok());
+    }
+
+    #[test]
+    fn a_seed_is_recognised_as_the_compiled_keys_or_not() {
+        let other = [9u8; 32];
+        assert!(!matches_compiled_key(&other));
+        assert_eq!(public_hex(&other).len(), 64);
     }
 }

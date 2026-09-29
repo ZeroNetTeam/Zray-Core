@@ -10,7 +10,10 @@
 //! zeronet-sign sign verified.txt rankings.json
 //!
 //! # Anywhere: check a file against a public key (hex).
-//! zeronet-sign verify --key <hex> verified.txt
+//! zeronet-sign verify [--key <hex>] verified.txt   # default: the key compiled into this build
+//!
+//! # Does the seed in $CROWD_SIGNING_KEY belong to the key the app trusts?
+//! zeronet-sign check
 //! ```
 //!
 //! `keygen` prints the public key (paste it into `sign::PUBLIC_KEY_HEX`) and
@@ -34,10 +37,11 @@ fn run() -> Result<(), String> {
         Some("keygen") => keygen(),
         Some("sign") => sign_files(args.collect()),
         Some("verify") => verify_file(args.collect()),
+        Some("check") => check_seed(),
         Some(other) => Err(format!(
-            "unknown command {other:?}; use keygen, sign or verify"
+            "unknown command {other:?}; use keygen, sign, verify or check"
         )),
-        None => Err("a command is required: keygen, sign or verify".into()),
+        None => Err("a command is required: keygen, sign, verify or check".into()),
     }
 }
 
@@ -82,6 +86,23 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Say whether the seed in `$CROWD_SIGNING_KEY` is the private half of the
+/// public key compiled into this build, without signing or printing anything
+/// secret. Run it with the seed you believe is in the CI secret.
+fn check_seed() -> Result<(), String> {
+    let seed = seed_from_env()?;
+    if sign::matches_compiled_key(&seed) {
+        eprintln!("This seed matches the public key compiled into the app.");
+        Ok(())
+    } else {
+        Err(format!(
+            "This seed does NOT match the compiled public key ({}); its own public key is {}.",
+            sign::PUBLIC_KEY_HEX,
+            sign::public_hex(&seed)
+        ))
+    }
+}
+
 /// Sign each file, writing `<file>.sig` beside it.
 fn sign_files(paths: Vec<String>) -> Result<(), String> {
     if paths.is_empty() {
@@ -110,7 +131,8 @@ fn verify_file(args: Vec<String>) -> Result<(), String> {
             other => file = Some(other.to_string()),
         }
     }
-    let key = key.ok_or("--key <hex> is required")?;
+    // Without --key, the key compiled into this build: the one the app trusts.
+    let key = key.unwrap_or_else(|| sign::PUBLIC_KEY_HEX.to_string());
     let file = file.ok_or("a file to verify is required")?;
     let body = std::fs::read(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
     let sig_path = format!("{file}.sig");

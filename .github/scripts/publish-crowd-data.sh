@@ -17,7 +17,13 @@ if git -C "$work" fetch -q --depth 1 "$repo_url" crowd-data 2>/dev/null; then
   git -C "$work" checkout -q FETCH_HEAD -- .
 fi
 for file in "$@"; do
-  cp "$file" "$work/$(basename "$file")"
+  if [ -d "$file" ]; then
+    # A directory (the sealed mode totals): its files join the ones there.
+    mkdir -p "$work/$(basename "$file")"
+    cp -R "$file"/. "$work/$(basename "$file")/"
+  else
+    cp "$file" "$work/$(basename "$file")"
+  fi
 done
 cd "$work"
 git config user.name "github-actions[bot]"
@@ -28,5 +34,6 @@ git push -q --force "$repo_url" HEAD:crowd-data
 # Ask the jsDelivr mirror to drop its copies, which it otherwise keeps for
 # up to a day.
 for file in "$@"; do
+  [ -d "$file" ] && continue
   curl -fsS --max-time 20 "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@crowd-data/$(basename "$file")" > /dev/null || true
 done
