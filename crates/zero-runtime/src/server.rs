@@ -764,7 +764,10 @@ impl Server {
                 }));
                 continue;
             }
-            if matches!(inbound.protocol, InboundProtocol::Dokodemo { .. }) {
+            if matches!(
+                inbound.protocol,
+                InboundProtocol::Dokodemo { target: None, .. }
+            ) {
                 debug!(tag = %inbound.tag, "dokodemo-door TCP inbound needs a fixed target; skipping");
                 continue;
             }
@@ -1574,6 +1577,22 @@ impl Server {
             return self.handle_udp_association(stream, peer, id, tag).await;
         }
 
+        // A client that only knows an IP address sends nothing until the
+        // proxy has answered, so the sniff below would always time out. Answer
+        // first, as Xray does; a refused or failed dial then closes the
+        // connection instead of reporting the error in the reply.
+        let replied = sniffing.enabled
+            && accepted.destination.network == Network::Tcp
+            && accepted.destination.address.is_ip()
+            && matches!(
+                accepted.kind,
+                InboundKind::Socks5 | InboundKind::HttpConnect
+            );
+        if replied {
+            self.finish_handshake(&mut stream, &accepted, true, false)
+                .await;
+        }
+
         let mut prefetched = Vec::new();
         let mut probe = accepted.prefix.clone();
         if sniffing.enabled && accepted.destination.network == Network::Tcp {
@@ -1606,7 +1625,8 @@ impl Server {
         match decision {
             Decision::Block => {
                 self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                self.finish_handshake(&mut stream, &accepted, false).await;
+                self.finish_handshake(&mut stream, &accepted, false, replied)
+                    .await;
                 Ok(())
             }
             Decision::Outbound(tag) | Decision::Balancer(tag) => {
@@ -1625,7 +1645,8 @@ impl Server {
                     .map_err(|e| e.to_string())?,
                     OutboundProtocol::Blackhole => {
                         self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                        self.finish_handshake(&mut stream, &accepted, false).await;
+                        self.finish_handshake(&mut stream, &accepted, false, replied)
+                            .await;
                         return Ok(());
                     }
                     OutboundProtocol::Vless(_)
@@ -1650,7 +1671,8 @@ impl Server {
                     }
                 };
 
-                self.finish_handshake(&mut stream, &accepted, true).await;
+                self.finish_handshake(&mut stream, &accepted, true, replied)
+                    .await;
 
                 let mut remote = remote;
                 if !accepted.prefix.is_empty() {
@@ -1703,7 +1725,8 @@ impl Server {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-                self.finish_handshake(&mut stream, &accepted, true).await;
+                self.finish_handshake(&mut stream, &accepted, true, replied)
+                    .await;
                 let mut remote = remote;
                 if !accepted.prefix.is_empty() {
                     remote
@@ -1829,9 +1852,36 @@ impl Server {
         tag: Arc<str>,
         target: (Address, u16),
     ) -> Result<(), String> {
-        let destination = Destination::tcp(target.0, target.1);
-        let ctx =
+        // The netstack hands over the address the application dialled. For a
+        // FakeDNS answer that is a local handle, so restore the name first;
+        // sniffing then names connections that only knew a real IP.
+        let destination = self
+            .restore_fake_destination(&Destination::tcp(target.0, target.1))
+            .await;
+        let sniffing = self
+            .config()
+            .inbounds
+            .get(id.0 as usize)
+            .map(|inbound| inbound.sniffing.clone())
+            .unwrap_or_default();
+        let mut stream = stream;
+        let mut prefetched = Vec::new();
+        let mut ctx =
             SessionContext::new(self.generation(), id, tag, destination.clone()).with_source(peer);
+        if sniffing.enabled && destination.address.is_ip() {
+            prefetched = sniff_probe(&mut stream).await;
+            let sniffed =
+                zero_core::sniff::inspect(&prefetched, sniffing.sniff_http, sniffing.sniff_tls);
+            if sniffed.domain.is_some() || sniffed.protocol.is_some() {
+                ctx.apply_sniff(sniffed, !sniffing.route_only);
+            }
+        }
+        let destination = ctx.destination.clone();
+        let stream: zero_core::BoxStream = if prefetched.is_empty() {
+            stream
+        } else {
+            boxed(ChainedStream::new(prefetched, stream))
+        };
         let decision = self.route(&ctx).await;
         let mut health_tag = None;
         let remote = match decision {
@@ -1885,7 +1935,7 @@ impl Server {
                 }
             }
         };
-        let outcome = relay(boxed(stream), remote).await;
+        let outcome = relay(stream, remote).await;
         if let Some(tag) = health_tag {
             self.record_outbound_observation(&tag, &outcome);
         }
@@ -4833,7 +4883,11 @@ impl Server {
         stream: &mut zero_core::BoxStream,
         accepted: &Accepted,
         ok: bool,
+        replied: bool,
     ) {
+        if replied {
+            return;
+        }
         match accepted.kind {
             InboundKind::Socks5 => {
                 let code = if ok {
@@ -4861,6 +4915,19 @@ impl Server {
                 }
             }
         }
+    }
+}
+
+/// Reads whatever the client sends first, for at most 50 ms: enough for a
+/// TLS ClientHello or an HTTP request head to name its destination.
+async fn sniff_probe(stream: &mut zero_core::BoxStream) -> Vec<u8> {
+    let mut buffer = vec![0u8; 8192];
+    match timeout(Duration::from_millis(50), stream.read(&mut buffer)).await {
+        Ok(Ok(read)) => {
+            buffer.truncate(read);
+            buffer
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -6013,6 +6080,170 @@ mod tests {
             "the mapping was lost on reload"
         );
         assert!(!server.resolver().has_fake());
+    }
+
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::time::timeout;
+    use zero_core::boxed;
+    use zero_core::{Address, InboundId};
+
+    /// A ClientHello carrying only an SNI, enough for the sniffer.
+    fn hello_for(name: &str) -> Vec<u8> {
+        let mut sni = Vec::new();
+        sni.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
+        sni.push(0);
+        sni.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sni.extend_from_slice(name.as_bytes());
+        let mut extensions = vec![0, 0];
+        extensions.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&sni);
+        let mut hello = vec![3, 3];
+        hello.extend_from_slice(&[0; 32]);
+        hello.push(0);
+        hello.extend_from_slice(&[0, 2, 0x13, 0x01]);
+        hello.extend_from_slice(&[1, 0]);
+        hello.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        hello.extend_from_slice(&extensions);
+        let mut record = vec![0x16, 3, 1];
+        record.extend_from_slice(&(hello.len() as u16 + 4).to_be_bytes());
+        record.extend_from_slice(&[
+            1,
+            (hello.len() >> 16) as u8,
+            (hello.len() >> 8) as u8,
+            hello.len() as u8,
+        ]);
+        record.extend_from_slice(&hello);
+        record
+    }
+
+    /// A sink that answers the first four bytes it receives with themselves.
+    async fn echo_sink() -> u16 {
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = sink.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = sink.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    if let Ok(read) = socket.read(&mut buffer).await {
+                        let _ = socket.write_all(&buffer[..read.min(4)]).await;
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    fn tun_style_server(config: serde_json::Value) -> Server {
+        let (generation, _) =
+            zero_config::compile_config(&config, zero_core::GenerationId(1)).expect("config");
+        Server::new(ServerConfig {
+            config: Arc::clone(&generation.config),
+            generation: generation.id,
+        })
+    }
+
+    /// A DNS server that answers every A query with 127.0.0.1.
+    async fn loopback_dns() -> u16 {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut query = [0u8; 512];
+            while let Ok((read, peer)) = socket.recv_from(&mut query).await {
+                let mut reply = query[..read].to_vec();
+                reply[2] = 0x81;
+                reply[3] = 0x80;
+                reply[6] = 0;
+                reply[7] = 1;
+                reply.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);
+                let _ = socket.send_to(&reply, peer).await;
+            }
+        });
+        port
+    }
+
+    /// The TUN hands over the address the application dialled. With FakeDNS
+    /// that is a local handle, and dialling it literally sent every TCP flow
+    /// of a phone to a benchmark address.
+    #[tokio::test]
+    async fn tun_tcp_flows_to_fake_addresses_reach_the_real_name() {
+        let sink_port = echo_sink().await;
+        let dns_port = loopback_dns().await;
+        let server = tun_style_server(serde_json::json!({
+            "inbounds": [{"tag": "tun", "listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "dns": {
+                "servers": ["fakedns", {"address": "127.0.0.1", "port": dns_port, "tag": "real"}],
+                "queryStrategy": "UseIPv4",
+            },
+        }));
+        let fake = server
+            .client_resolver()
+            .lookup("app.test", zero_config::dns::QueryStrategy::UseIpv4)
+            .await
+            .expect("fake answer");
+        assert!(matches!(fake[0], std::net::IpAddr::V4(v4) if v4.octets()[..2] == [198, 18]));
+        let server = Arc::new(server);
+        let (mut app, netstack) = tokio::io::duplex(4096);
+        let session = tokio::spawn(Arc::clone(&server).handle_dokodemo_tcp(
+            boxed(netstack),
+            "10.0.0.2:40000".parse().unwrap(),
+            InboundId(0),
+            Arc::from("tun"),
+            (Address::Ip(fake[0]), sink_port),
+        ));
+        app.write_all(b"ping").await.unwrap();
+        let mut answer = [0u8; 4];
+        timeout(Duration::from_secs(3), app.read_exact(&mut answer))
+            .await
+            .expect("the flow reached the sink")
+            .unwrap();
+        assert_eq!(&answer, b"ping");
+        drop(app);
+        let _ = session.await;
+    }
+
+    /// A TUN flow to a bare IP is named by its ClientHello, so a domain rule
+    /// still applies to it.
+    #[tokio::test]
+    async fn tun_tcp_flows_are_sniffed_for_routing() {
+        let sink_port = echo_sink().await;
+        let server = Arc::new(tun_style_server(serde_json::json!({
+            "inbounds": [{
+                "tag": "tun", "listen": "127.0.0.1", "port": 1080, "protocol": "socks",
+                "sniffing": {"enabled": true, "destOverride": ["http", "tls"]},
+            }],
+            "outbounds": [
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "block", "protocol": "blackhole"},
+            ],
+            "routing": {"rules": [
+                {"type": "field", "domain": ["full:blocked.example"], "outboundTag": "block"},
+            ]},
+            "dns": {"hosts": {"allowed.example": "127.0.0.1"}},
+        })));
+        let mut reached = Vec::new();
+        for name in ["blocked.example", "allowed.example"] {
+            let (mut app, netstack) = tokio::io::duplex(8192);
+            let session = tokio::spawn(Arc::clone(&server).handle_dokodemo_tcp(
+                boxed(netstack),
+                "10.0.0.2:40000".parse().unwrap(),
+                InboundId(0),
+                Arc::from("tun"),
+                (Address::Ip("127.0.0.1".parse().unwrap()), sink_port),
+            ));
+            app.write_all(&hello_for(name)).await.unwrap();
+            let mut answer = [0u8; 4];
+            let got = timeout(Duration::from_secs(2), app.read_exact(&mut answer)).await;
+            reached.push(matches!(got, Ok(Ok(_))));
+            drop(app);
+            let _ = session.await;
+        }
+        assert_eq!(
+            reached,
+            [false, true],
+            "blocked name leaked / allowed name blocked"
+        );
     }
 
     fn sample_outbound(server: &Server) -> zero_config::Outbound {
