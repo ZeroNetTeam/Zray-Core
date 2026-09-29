@@ -305,6 +305,8 @@ jobs:
             **Not sure which Linux file?** Run `uname -m` in a terminal: `x86_64` → **x64**, `aarch64` → **ARM64**. "exec format error" means the other one.
             The other files are for the in-app updater and for experts: the bare programs, `.tar.gz` archives, and smaller Android APKs for one processor type (`arm64-v8a` fits almost every modern phone).
 
-            **مطمئن نیستید کدام فایل لینوکس؟** در ترمینال `uname -m` را بزنید: `x86_64` یعنی **x64** و `aarch64` یعنی **ARM64**. خطای «exec format error» یعنی باید آن یکی را بگیرید. برای اندروید اگر مطمئن نیستید، `universal` را نصب کنید.
+            **نمیدونی کدوم فایل لینوکس رو بگیری؟** توی ترمینال `uname -m` رو بزن : `x86_64` یعنی **x64** و `aarch64` یعنی **ARM64** . اگه ارور «exec format error» گرفتی یعنی باید اون یکی رو بگیری . برای اندروید هم اگه مطمئن نیستی `universal` رو نصب کن .
 
-            راهنمای کامل فارسی در [README](https://github.com/${{ github.repository }}#readme).
+            **زری کور** همون موتور بدون اپه ، یه برنامه ی خط فرمان برای سرور و روتر و اسکریپت (`zray run config.json`) . فایل هاش بالا توی جدول Zray Core هستن .
+
+            راهنمای کامل فارسی توی [README](https://github.com/${{ github.repository }}#readme) هست.
