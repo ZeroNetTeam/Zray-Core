@@ -111,6 +111,13 @@ pub fn looks_like_long_header(datagram: &[u8]) -> bool {
 /// Sniff a QUIC datagram: `Some` when it is an Initial packet, with the
 /// ClientHello's SNI when the first CRYPTO frame was readable.
 pub fn inspect(datagram: &[u8]) -> Option<Sniffed> {
+    // Whatever the network delivers on UDP/443 arrives here, and a panic in
+    // the task that serves the tunnel takes the whole tunnel with it. A
+    // datagram that cannot be read must cost an unnamed flow, nothing more.
+    std::panic::catch_unwind(|| inspect_initial(datagram)).unwrap_or(None)
+}
+
+fn inspect_initial(datagram: &[u8]) -> Option<Sniffed> {
     // Clients pad every Initial datagram to 1200 bytes (RFC 9000 §14.1), so
     // anything shorter is refused before a single key is derived.
     if !looks_like_long_header(datagram) {
@@ -137,9 +144,9 @@ struct Parts {
     payload_end: usize,
     /// The datagram's first byte with header protection removed.
     first_byte: u8,
-    /// The header protection mask: its first byte carries the low bits of the
-    /// first byte, the rest hide the packet number.
-    mask: [u8; 4],
+    /// The header protection mask: its first byte covers the low bits of the
+    /// first byte, the next four hide a packet number of up to four bytes.
+    mask: [u8; 5],
 }
 
 fn header(datagram: &[u8]) -> Option<Parts> {
@@ -190,7 +197,7 @@ fn header(datagram: &[u8]) -> Option<Parts> {
     block.copy_from_slice(sample);
     let cipher = aes::Aes128::new_from_slice(&keys.hp).ok()?;
     cipher.encrypt_block((&mut block).into());
-    let mask = [block[0], block[1], block[2], block[3]];
+    let mask = [block[0], block[1], block[2], block[3], block[4]];
     let first_byte = first ^ (mask[0] & 0x0f);
     let pn_len = (first_byte & 0x03) as usize + 1;
     if pn_offset + pn_len > payload_end {
@@ -318,10 +325,9 @@ mod tests {
     /// Protect a payload the way a client does: it is the inverse of `open`,
     /// so a change to one side breaks this test unless both change. The key
     /// derivation above is what keeps the pair honest.
-    fn protect(dcid: &[u8], payload: &[u8]) -> Vec<u8> {
+    fn protect(dcid: &[u8], payload: &[u8], pn_len: usize) -> Vec<u8> {
         let keys = initial_keys(&SALT_V1, dcid, VERSION_1);
         let pn = 2u32;
-        let pn_len = 2usize;
         let mut nonce = keys.iv;
         for (index, byte) in pn.to_be_bytes().iter().enumerate() {
             nonce[index + 8] ^= *byte;
@@ -360,6 +366,12 @@ mod tests {
     }
 
     pub(super) fn initial_with(host: &str) -> Vec<u8> {
+        initial_with_pn(host, 2)
+    }
+
+    /// The same Initial, with a packet number of `pn_len` bytes (1 to 4): the
+    /// client picks the length, and real clients use all four.
+    fn initial_with_pn(host: &str, pn_len: usize) -> Vec<u8> {
         let hello = client_hello(host);
         let mut frame = vec![6];
         frame.extend_from_slice(&[0]); // offset
@@ -375,7 +387,7 @@ mod tests {
         frame.extend_from_slice(&length);
         frame.extend_from_slice(&hello);
         frame.extend_from_slice(&vec![0; 1200 - frame.len()]);
-        protect(&hex::decode("8394c8f03e515708").unwrap(), &frame)
+        protect(&hex::decode("8394c8f03e515708").unwrap(), &frame, pn_len)
     }
 
     #[test]
@@ -384,6 +396,53 @@ mod tests {
         let sniffed = inspect(&datagram).expect("an Initial with a ClientHello");
         assert_eq!(sniffed.protocol, Some("quic"));
         assert_eq!(sniffed.domain.as_deref(), Some("example.com"));
+    }
+
+    /// Every packet number length a client may choose is read, not just the
+    /// short ones. A four-byte number needs the fifth byte of the
+    /// header-protection mask (one for the first byte, four for the number).
+    #[test]
+    fn an_initial_is_sniffed_whatever_its_packet_number_length() {
+        for pn_len in 1..=4 {
+            let datagram = initial_with_pn("example.com", pn_len);
+            let sniffed = inspect(&datagram)
+                .unwrap_or_else(|| panic!("a {pn_len}-byte packet number was not read"));
+            assert_eq!(sniffed.domain.as_deref(), Some("example.com"), "{pn_len}");
+        }
+    }
+
+    /// Anything a network can deliver on UDP/443 goes through `inspect`, so no
+    /// input may panic it: it would end the task that serves the tunnel.
+    /// Valid Initials with a byte damaged, and noise dressed as an Initial.
+    #[test]
+    fn no_datagram_makes_the_sniffer_panic() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let valid: Vec<Vec<u8>> = (1..=4).map(|n| initial_with_pn("example.com", n)).collect();
+        for round in 0..20_000usize {
+            let mut datagram = valid[round % valid.len()].clone();
+            // Damage the header region hardest: that is where the lengths are.
+            for _ in 0..(1 + next() % 4) {
+                let at = if next() % 3 == 0 {
+                    (next() as usize) % datagram.len()
+                } else {
+                    (next() as usize) % 40
+                };
+                datagram[at] = next() as u8;
+            }
+            let _ = inspect(&datagram);
+            let mut noise = vec![0u8; 1200 + (next() % 200) as usize];
+            for byte in noise.iter_mut() {
+                *byte = next() as u8;
+            }
+            noise[0] |= 0xc0;
+            let _ = inspect(&noise);
+        }
     }
 
     #[test]

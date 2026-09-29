@@ -202,6 +202,58 @@ mod tests {
         assert!(inspect(b"not a request", true, false).domain.is_none());
     }
 
+    /// The sniffer reads whatever a client sends first, from any application
+    /// on the phone, so nothing it is handed may panic it. Damaged copies of a
+    /// real ClientHello and of a request, and plain noise.
+    #[test]
+    fn no_first_bytes_make_the_sniffer_panic() {
+        let extensions = [
+            0, 0, 0, 16, 0, 14, 0, 0, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c',
+            b'o', b'm',
+        ];
+        let mut hello = vec![3, 3];
+        hello.extend_from_slice(&[0; 32]);
+        hello.push(0);
+        hello.extend_from_slice(&[0, 2, 0x13, 0x01]);
+        hello.extend_from_slice(&[1, 0]);
+        hello.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        hello.extend_from_slice(&extensions);
+        let mut record = vec![0x16, 3, 1];
+        record.extend_from_slice(&(hello.len() as u16 + 4).to_be_bytes());
+        record.extend_from_slice(&[1, 0, (hello.len() >> 8) as u8, hello.len() as u8]);
+        record.extend_from_slice(&hello);
+        let request = b"GET / HTTP/1.1\r\nHost: Example.COM:443\r\n\r\n".to_vec();
+
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..30_000usize {
+            let mut bytes = if round % 2 == 0 {
+                record.clone()
+            } else {
+                request.clone()
+            };
+            for _ in 0..(1 + next() % 4) {
+                let at = (next() as usize) % bytes.len();
+                bytes[at] = next() as u8;
+            }
+            if next() % 4 == 0 {
+                bytes.truncate((next() as usize) % bytes.len());
+            }
+            let _ = inspect(&bytes, true, true);
+            let _ = client_hello_sni(&bytes);
+            let mut noise = vec![0u8; (next() % 300) as usize];
+            for byte in noise.iter_mut() {
+                *byte = next() as u8;
+            }
+            let _ = inspect(&noise, true, true);
+        }
+    }
+
     #[test]
     fn inspects_tls_clienthello_sni() {
         let extensions = [
