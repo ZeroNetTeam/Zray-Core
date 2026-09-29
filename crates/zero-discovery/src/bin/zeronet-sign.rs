@@ -9,8 +9,9 @@
 //! #   the 32-byte seed comes from $CROWD_SIGNING_KEY (base64 or hex).
 //! zeronet-sign sign verified.txt rankings.json
 //!
-//! # Anywhere: check a file against a public key (hex).
-//! zeronet-sign verify [--key <hex>] verified.txt   # default: the key compiled into this build
+//! # Anywhere: check a file against a public key (hex), by default the one
+//! # compiled into this build.
+//! zeronet-sign verify [--key <hex>] verified.txt
 //!
 //! # Does the seed in $CROWD_SIGNING_KEY belong to the key the app trusts?
 //! zeronet-sign check
