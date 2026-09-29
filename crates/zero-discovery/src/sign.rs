@@ -26,7 +26,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 /// "no key compiled in" ([`key_configured`] is false) as "do not verify"
 /// rather than "reject" (see `Crowd`/discovery), which keeps a keyless build
 /// connecting.
-pub const PUBLIC_KEY_HEX: &str = "1d2375dcc22a761d95ab5005f576d4673738e128a37f60b68660417ea086e9e8";
+pub const PUBLIC_KEY_HEX: &str = "7d3085a128a20010febc485a344b586a132a454f2ab5e86c3c6cb5536db2cd62";
 
 /// Line prefix of a detached signature file.
 const PREFIX: &str = "ed25519:";
@@ -91,6 +91,13 @@ pub fn sign_with(secret: &[u8; 32], body: &[u8]) -> String {
     let key = SigningKey::from_bytes(secret);
     let signature = key.sign(body);
     format!("{PREFIX}{}", hex::encode(signature.to_bytes()))
+}
+
+/// Whether `secret` is the private half of the key compiled into this build.
+/// A signing secret that is not is the mistake that makes every list CI
+/// publishes fail verification in the app.
+pub fn matches_compiled_key(secret: &[u8; 32]) -> bool {
+    public_hex(secret).eq_ignore_ascii_case(PUBLIC_KEY_HEX.trim())
 }
 
 /// The public key (hex) matching a 32-byte signing seed, to paste into
@@ -163,5 +170,12 @@ mod tests {
         // or every signed feed would be refused on devices in the field.
         let key = hex32(PUBLIC_KEY_HEX).expect("PUBLIC_KEY_HEX is 32 hex bytes");
         assert!(VerifyingKey::from_bytes(&key).is_ok());
+    }
+
+    #[test]
+    fn a_seed_is_recognised_as_the_compiled_keys_or_not() {
+        let other = [9u8; 32];
+        assert!(!matches_compiled_key(&other));
+        assert_eq!(public_hex(&other).len(), 64);
     }
 }

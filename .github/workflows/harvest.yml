@@ -58,6 +58,10 @@ jobs:
         run: |
           if [ -n "$CROWD_SIGNING_KEY" ]; then
             target/release/zeronet-sign sign verified.txt
+            # The app rejects a list whose signature does not verify against
+            # the key compiled into it. A secret that belongs to another key
+            # would publish lists nobody accepts, so stop here instead.
+            target/release/zeronet-sign verify verified.txt
           else
             echo "::warning::No CROWD_SIGNING_KEY; publishing verified.txt unsigned. Run the 'create crowd signing key' workflow."
           fi
