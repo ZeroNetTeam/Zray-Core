@@ -105,11 +105,23 @@ zstd = "0.13"
 brotli-decompressor = { version = "5", default-features = false, features = ["std"] }
 zeroize = "1"
 
+# Optimised for size: on the SOCKS/TLS path the time goes into the crypto
+# (hand-written assembly in ring/aws-lc) and the kernel, and the benchmark in
+# docs/benchmarks measures the same speed as -O3 within noise, at about a third
+# less file size. The user-space packet stack keeps -O3 below, since TUN mode
+# spends its time there.
 [profile.release]
 codegen-units = 1
 lto = "fat"
 panic = "abort"
 strip = "symbols"
+opt-level = "s"
+
+[profile.release.package.smoltcp]
+opt-level = 3
+[profile.release.package.netstack-smoltcp]
+opt-level = 3
+[profile.release.package.zero-tun]
 opt-level = 3
 
 # Mobile libraries (crates/zray-mobile/build-android.sh). Identical to release
@@ -123,6 +135,15 @@ panic = "unwind"
 # Measured on arm64: 16.5 MB -> 13.3 MB (gzipped 7.6 -> 5.7 MB). Crypto hot
 # paths are hand-written assembly in ring/aws-lc and unaffected; the proxy is
 # I/O bound, and download size matters more on Iranian mobile links.
+opt-level = "s"
+
+# The packet stack is -O3 on desktop (see [profile.release]); phones stay at
+# "s" like the rest of the library.
+[profile.release-mobile.package.smoltcp]
+opt-level = "s"
+[profile.release-mobile.package.netstack-smoltcp]
+opt-level = "s"
+[profile.release-mobile.package.zero-tun]
 opt-level = "s"
 
 [patch.crates-io]
