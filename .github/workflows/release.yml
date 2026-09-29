@@ -1,8 +1,8 @@
 name: release
 
 # Push a tag like `v0.2.0` and every download people need lands on the
-# GitHub Releases page: the desktop app for Windows, Linux and macOS, and the
-# Android APKs. Running it by hand builds the same files as workflow
+# GitHub Releases page: the desktop app for Windows, Linux and macOS, the
+# Android APKs, and Zray Core, the command line engine on its own. Running it by hand builds the same files as workflow
 # artifacts without publishing a release.
 on:
   push:
@@ -34,6 +34,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo build --release -p zeronet-tui
+      - run: cargo build --release -p zray-cli
       - name: package
         shell: pwsh
         run: |
@@ -47,6 +48,12 @@ jobs:
           Copy-Item wintun/wintun/LICENSE.txt pkg/wintun-LICENSE.txt
           Compress-Archive -Path pkg/* -DestinationPath dist/ZeroNet-Windows-x64.zip
           Copy-Item target/release/zeronet-tui.exe dist/ZeroNet-Windows-x64.exe
+          # Zray Core: the engine without the app.
+          New-Item -ItemType Directory -Force core | Out-Null
+          Copy-Item target/release/zray.exe core/
+          Copy-Item LICENSE core/
+          Compress-Archive -Path core/* -DestinationPath dist/ZrayCore-Windows-x64.zip
+          Copy-Item target/release/zray.exe dist/ZrayCore-Windows-x64.exe
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -76,6 +83,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo build --release -p zeronet-tui
+      - run: cargo build --release -p zray-cli
       - name: AppImage and tarball
         env:
           ARCH: ${{ matrix.arch }}
@@ -105,6 +113,13 @@ jobs:
           mkdir -p "$pkg"
           cp target/release/zeronet-tui packaging/linux/zeronet.desktop packaging/icons/zeronet.png "$pkg/"
           tar -czf "dist/$pkg.tar.gz" "$pkg"
+
+          # Zray Core: the engine without the app, as a tarball and bare.
+          core="ZrayCore-Linux-${LABEL}"
+          mkdir -p "$core"
+          cp target/release/zray LICENSE "$core/"
+          tar -czf "dist/$core.tar.gz" "$core"
+          install -m755 target/release/zray "dist/$core"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.label }}
@@ -122,6 +137,8 @@ jobs:
       - run: |
           cargo build --release -p zeronet-tui --target aarch64-apple-darwin
           cargo build --release -p zeronet-tui --target x86_64-apple-darwin
+          cargo build --release -p zray-cli --target aarch64-apple-darwin
+          cargo build --release -p zray-cli --target x86_64-apple-darwin
       - name: app bundle
         run: |
           version="${RELEASE_TAG#v}"
@@ -140,6 +157,16 @@ jobs:
           cp "$app/Contents/MacOS/zeronet-tui" dist/ZeroNet-macOS-universal
           (cd dist && ditto -c -k --keepParent ZeroNet.app ZeroNet-macOS-universal.zip)
           rm -rf "$app"
+          # Zray Core: the engine without the app. A tarball keeps the
+          # executable bit; the ad-hoc signature is what Apple Silicon needs.
+          core=ZrayCore-macOS-universal
+          mkdir -p "$core"
+          lipo -create -output "$core/zray" \
+            target/aarch64-apple-darwin/release/zray \
+            target/x86_64-apple-darwin/release/zray
+          codesign --force --sign - "$core/zray"
+          cp LICENSE "$core/"
+          tar -czf "dist/$core.tar.gz" "$core"
       - uses: actions/upload-artifact@v4
         with:
           name: macos
@@ -265,6 +292,15 @@ jobs:
             | 🐧 Linux on ARM (Raspberry Pi, ARM laptops) | `ZeroNet-Linux-ARM64.AppImage` | Make it executable, double-click |
             | 🍎 macOS (Intel and Apple Silicon) | `ZeroNet-macOS-universal.zip` | Unzip, right-click `ZeroNet.app` → Open |
             | 🤖 Android, any phone | `ZeroNet-Android-universal.apk` | Install it |
+
+            **Zray Core** is the same engine without the app, a command-line program for servers, routers and scripts (`zray run config.json`):
+
+            | | Download this |
+            |---|---|
+            | 🪟 Windows | `ZrayCore-Windows-x64.zip` |
+            | 🐧 Linux, Intel / AMD | `ZrayCore-Linux-x64.tar.gz` |
+            | 🐧 Linux on ARM | `ZrayCore-Linux-ARM64.tar.gz` |
+            | 🍎 macOS (Intel and Apple Silicon) | `ZrayCore-macOS-universal.tar.gz` |
 
             **Not sure which Linux file?** Run `uname -m` in a terminal: `x86_64` → **x64**, `aarch64` → **ARM64**. "exec format error" means the other one.
             The other files are for the in-app updater and for experts: the bare programs, `.tar.gz` archives, and smaller Android APKs for one processor type (`arm64-v8a` fits almost every modern phone).

@@ -64,6 +64,8 @@
 >
 > برای گوشی‌های جدید فایل `arm64-v8a` کم‌حجم‌تر است. اگر مطمئن نیستید، `universal` را بگیرید.
 
+**Zray Core** همان موتور بدون برنامه است: یک برنامه‌ی خط فرمان برای سرور، روتر و اسکریپت. در همان صفحه است با نام‌های `ZrayCore-Windows-x64.zip`،&rlm; `ZrayCore-Linux-x64.tar.gz`،&rlm; `ZrayCore-Linux-ARM64.tar.gz` و `ZrayCore-macOS-universal.tar.gz`. فایل را باز کنید و `zray run config.json` را بزنید (`zray help` بقیه‌ی دستورها را نشان می‌دهد).
+
 ### 🧭 استفاده
 
 1. لینک کانفیگ (`vless://`،&rlm; `vmess://`،&rlm; `trojan://`،&rlm; `ss://` یا لینک ساب‌اسکریپشن) را کپی کنید و در زیرونت **Ctrl+V** بزنید.
@@ -139,6 +141,12 @@ Everything is on the **[Releases page](https://github.com/zeghostwriter/ZeroNet/
 Not sure which Linux file? Run `uname -m` in a terminal: `x86_64` means
 **x64**, `aarch64` means **ARM64**. "exec format error" means you have the
 other one.
+
+**Zray Core** is the same engine without the app: one command-line program
+for servers, routers and scripts. It is on the same page, as
+`ZrayCore-Windows-x64.zip`, `ZrayCore-Linux-x64.tar.gz`,
+`ZrayCore-Linux-ARM64.tar.gz` and `ZrayCore-macOS-universal.tar.gz`. Unpack
+it and run `zray run config.json` (`zray help` lists the rest).
 
 ZeroNet is a terminal app that works like a desktop app: mouse, hover,
 menus, clicks. When you double-click it, it opens its own terminal window.
