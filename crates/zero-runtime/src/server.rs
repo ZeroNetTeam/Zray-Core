@@ -1,6 +1,6 @@
 //! Inbound listeners and dispatch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -41,9 +41,28 @@ pub struct Stats {
     /// as zero. A session end is not a hot path, so a mutex-guarded map is
     /// cheaper than an atomic per possible tag.
     pub traffic: StdMutex<HashMap<String, u64>>,
+    /// Whether the TUN device is still being served: [`TUN_NONE`] when this
+    /// runtime has none, [`TUN_UP`] while its packet bridge runs and
+    /// [`TUN_LOST`] once the bridge has ended. The device can vanish under us
+    /// (the platform closed the interface, another VPN took over) and nothing
+    /// else on this side would notice, so the host reads this to know that
+    /// "connected" has stopped being true.
+    pub tun: AtomicU8,
 }
 
+/// [`Stats::tun`]: this runtime has no TUN device.
+pub const TUN_NONE: u8 = 0;
+/// [`Stats::tun`]: the packet bridge is running.
+pub const TUN_UP: u8 = 1;
+/// [`Stats::tun`]: the packet bridge ended; nothing more will flow.
+pub const TUN_LOST: u8 = 2;
+
 impl Stats {
+    /// True once a TUN device that was being served is gone.
+    pub fn tun_lost(&self) -> bool {
+        self.tun.load(Ordering::Relaxed) == TUN_LOST
+    }
+
     pub fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
             accepted: self.accepted.load(Ordering::Relaxed),
@@ -359,6 +378,9 @@ pub struct Server {
     /// The anti-sanction resolver measured best on this network, once the
     /// first measurement is in ([`crate::sanction_dns`]).
     sanction: StdMutex<Option<crate::sanction_dns::SanctionState>>,
+    /// Names whose anti-sanction verdict has been logged, so each is said once
+    /// (bounded; see [`Server::announce_sanction`]).
+    announced: StdMutex<HashSet<String>>,
     /// Connections prepared ahead of need ([`crate::warm`]).
     warm: Arc<crate::warm::WarmPool>,
     /// Lock-free mirror of the shortest time-triggered reset the planner has
@@ -427,6 +449,7 @@ impl Server {
             listening: tokio::sync::watch::channel(false).0,
             planner_strategy: AtomicU8::new(zero_observatory::PathStrategy::DirectReality.as_u8()),
             sanction: StdMutex::new(None),
+            announced: StdMutex::new(HashSet::new()),
             warm: Arc::default(),
             planner_flow_lifetime_ms: AtomicU64::new(0),
             stats: Arc::new(Stats::default()),
@@ -1886,16 +1909,34 @@ impl Server {
             let sniffed =
                 zero_core::sniff::inspect(&prefetched, sniffing.sniff_http, sniffing.sniff_tls);
             if sniffed.domain.is_some() || sniffed.protocol.is_some() {
-                ctx.apply_sniff(sniffed, !sniffing.route_only);
+                // The name is for routing only. A flow to a bare IP belongs to
+                // an application that chose that address itself (its own DNS,
+                // a pinned edge, a server that only answers there), and
+                // sending it to whatever the name resolves to on our side
+                // breaks exactly those apps.
+                ctx.apply_sniff(sniffed, false);
             }
         }
-        let destination = ctx.destination.clone();
+        let mut destination = ctx.destination.clone();
         let stream: zero_core::BoxStream = if prefetched.is_empty() {
             stream
         } else {
             boxed(ChainedStream::new(prefetched, stream))
         };
         let decision = self.route(&ctx).await;
+        // The one place the name does replace the address: a sanctioned
+        // service. The address the application holds is then a relay's (the
+        // anti-sanction resolver answered its DNS query), which only means
+        // something when reached from here, so whichever way the flow goes -
+        // through that resolver's relay or through the tunnel - it has to be
+        // dialled by name.
+        if let Some(domain) = ctx.sniffed.domain.as_deref() {
+            if destination.address.is_ip()
+                && matches!(self.router().route(&ctx, None), Decision::DirectVia { .. })
+            {
+                destination = Destination::tcp(Address::domain(domain), destination.port);
+            }
+        }
         let mut health_tag = None;
         let remote = match decision {
             Decision::Block => {
@@ -2094,7 +2135,24 @@ impl Server {
             .as_ref()
             .and_then(|network| network.uplink_interface())
             .map(|uplink| zero_core::platform::BoundInterface::set(&uplink));
-        let _bridge = zero_tun::spawn_netstack_bridge(Arc::clone(&device), parts.stack);
+        let bridge = zero_tun::spawn_netstack_bridge(Arc::clone(&device), parts.stack);
+        self.stats.tun.store(TUN_UP, Ordering::Relaxed);
+        {
+            let me = Arc::clone(&self);
+            let bridge_tag = tag.clone();
+            tokio::spawn(async move {
+                // The bridge only returns when the device is gone or the
+                // stack closed. Say so, instead of letting the runtime carry
+                // on as if traffic still had somewhere to enter.
+                let ended = match bridge.await {
+                    Ok(Ok(())) => "the device reached end of file".to_string(),
+                    Ok(Err(error)) => error.to_string(),
+                    Err(error) => format!("the bridge task failed: {error}"),
+                };
+                me.stats.tun.store(TUN_LOST, Ordering::Relaxed);
+                tracing::warn!(tag = %bridge_tag, reason = %ended, "TUN packet bridge ended");
+            });
+        }
         if let Some(runner) = parts.runner {
             tokio::spawn(async move {
                 if let Err(error) = runner.await {
@@ -3906,6 +3964,8 @@ impl Server {
         if resolver.as_ref() != crate::sanction_dns::TAG {
             return decision;
         }
+        let sniffed = ctx.sniffed.domain.as_deref();
+        let name = ctx.destination.address.as_domain().or(sniffed);
         let Some(state) = self
             .sanction
             .lock()
@@ -3914,16 +3974,17 @@ impl Server {
         else {
             // Not measured yet: a direct connection to a relay that may
             // present the wrong certificate would break HSTS sites for good.
+            self.announce_sanction(name, "the anti-sanction resolver is not measured yet");
             return self.default_tunnel_decision();
         };
         let tunnel = || self.default_tunnel_decision();
         let Some(pinned) = state.pinned_tag() else {
+            self.announce_sanction(name, "no anti-sanction resolver relays on this network");
             return tunnel();
         };
         // Only a name can be checked against the relay; an address with no
         // name (an IP literal, QUIC without SNI) goes the safe way.
-        let sniffed = ctx.sniffed.domain.as_deref();
-        let Some(domain) = ctx.destination.address.as_domain().or(sniffed) else {
+        let Some(domain) = name else {
             return tunnel();
         };
         let answers = self
@@ -3933,12 +3994,29 @@ impl Server {
             .await
             .unwrap_or_default();
         if state.relays(&answers) {
+            self.announce_sanction(name, "sent through the anti-sanction relay");
             Decision::DirectVia {
                 resolver: pinned.into(),
             }
         } else {
-            debug!(%domain, "anti-sanction resolver does not relay this name; using the tunnel");
+            self.announce_sanction(name, "the anti-sanction resolver does not relay it");
             tunnel()
+        }
+    }
+
+    /// Say once per name, at info level, which way a sanctioned name went and
+    /// why. A name that "does not work" is otherwise a silent routing choice;
+    /// with the app's detailed log on this shows what was decided. Bounded, so
+    /// a long session cannot grow it without limit.
+    fn announce_sanction(&self, name: Option<&str>, verdict: &str) {
+        const LIMIT: usize = 256;
+        let Some(name) = name else { return };
+        let mut seen = self
+            .announced
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if seen.len() < LIMIT && seen.insert(format!("{name}|{verdict}")) {
+            info!(%name, "anti-sanction: {verdict}");
         }
     }
 
@@ -6368,6 +6446,39 @@ mod tests {
         );
     }
 
+    /// A TUN flow to a bare IP still goes to that IP when its hello names
+    /// something else: the name decides the route, not the address.
+    #[tokio::test]
+    async fn tun_tcp_flows_keep_the_address_the_app_chose() {
+        let sink_port = echo_sink().await;
+        let server = Arc::new(tun_style_server(serde_json::json!({
+            "inbounds": [{
+                "tag": "tun", "listen": "127.0.0.1", "port": 1080, "protocol": "socks",
+                "sniffing": {"enabled": true, "destOverride": ["http", "tls"]},
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            // The name points somewhere nothing listens; the app dialled the sink.
+            "dns": {"hosts": {"moved.example": "127.0.0.2"}},
+        })));
+        let (mut app, netstack) = tokio::io::duplex(8192);
+        let session = tokio::spawn(Arc::clone(&server).handle_dokodemo_tcp(
+            boxed(netstack),
+            "10.0.0.2:40000".parse().unwrap(),
+            InboundId(0),
+            Arc::from("tun"),
+            (Address::Ip("127.0.0.1".parse().unwrap()), sink_port),
+        ));
+        app.write_all(&hello_for("moved.example")).await.unwrap();
+        let mut answer = [0u8; 4];
+        let got = timeout(Duration::from_secs(2), app.read_exact(&mut answer)).await;
+        assert!(
+            matches!(got, Ok(Ok(_))),
+            "the flow went to the name's address instead of the one the app dialled"
+        );
+        drop(app);
+        let _ = session.await;
+    }
+
     /// A UDP flow that only ever knew the address it dialled must still follow
     /// the rule written for the name in its QUIC Initial, the way its TCP twin
     /// already follows the name in its ClientHello.
@@ -6706,5 +6817,20 @@ mod tests {
                 reality.fingerprint
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tun_state_tests {
+    use super::*;
+
+    #[test]
+    fn the_tun_counts_as_lost_only_after_it_was_served_and_ended() {
+        let stats = Stats::default();
+        assert!(!stats.tun_lost(), "a runtime with no TUN has lost nothing");
+        stats.tun.store(TUN_UP, Ordering::Relaxed);
+        assert!(!stats.tun_lost());
+        stats.tun.store(TUN_LOST, Ordering::Relaxed);
+        assert!(stats.tun_lost());
     }
 }
