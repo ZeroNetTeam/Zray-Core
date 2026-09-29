@@ -55,11 +55,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.relays.outputs.list != ''
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: steps.relays.outputs.list != ''
         with:
           key: crowd
-      - run: cargo build --release -p zero-discovery --bin zeronet-crowd --bin zeronet-sign
+      - run: cargo build --release -p zero-discovery --bin zeronet-crowd --bin zeronet-sign --bin zeronet-stats
         if: steps.relays.outputs.list != ''
 
       - name: export reports
@@ -68,7 +68,10 @@ jobs:
           RELAYS: ${{ steps.relays.outputs.list }}
           EXPORT_TOKEN: ${{ secrets.CROWD_EXPORT_TOKEN }}
         run: |
-          since=$(( $(date +%s) - 12 * 3600 ))
+          # From the start of yesterday (UTC), so the sealed mode totals of
+          # both days are always made from whole days; ranking ignores what
+          # is older than it needs.
+          since=$(date -u -d 'yesterday 00:00' +%s)
           parts=()
           IFS=',' read -ra relays <<< "$RELAYS"
           for relay in "${relays[@]}"; do
@@ -99,13 +102,36 @@ jobs:
         env:
           RELAYS: ${{ steps.relays.outputs.list }}
         run: |
-          target/release/zeronet-crowd \
-            --reports reports.json \
-            --sources deploy/crowd/sources.json \
-            --sources deploy/crowd/harvest-sources.json \
-            --sources deploy/crowd/verified-source.json \
-            --out rankings.json \
-            --relays "$RELAYS"
+          # What is published now, so a thin or empty run cannot replace it.
+          # Optional: on the first run there is nothing to compare against.
+          # Only a 404 means "nothing published yet"; any other failure stops
+          # the run, or the guard would be skipped exactly when GitHub hiccups.
+          code=$(curl -sS --max-time 30 -o previous.json -w '%{http_code}' \
+            "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/crowd-data/rankings.json")
+          case "$code" in
+            200) ;;
+            404) rm -f previous.json; echo "no published rankings yet" ;;
+            *) echo "could not read the published rankings (HTTP $code)"; exit 1 ;;
+          esac
+          args=(--reports reports.json --out rankings.json --relays "$RELAYS"
+                --sources deploy/crowd/sources.json
+                --sources deploy/crowd/harvest-sources.json
+                --sources deploy/crowd/verified-source.json)
+          if [ -f previous.json ]; then args+=(--previous previous.json); fi
+          target/release/zeronet-crowd "${args[@]}"
+
+      # How each connection mode does in real use: totals per UTC day, sealed
+      # to the maintainer's public key (repository variable MODE_STATS_KEY),
+      # so the files can sit on the public branch and be read by nobody else.
+      # Nothing is written without the key. The log says only how many reports
+      # went in, never a figure.
+      - name: seal mode totals
+        if: steps.relays.outputs.list != '' && vars.MODE_STATS_KEY != ''
+        env:
+          MODE_STATS_KEY: ${{ vars.MODE_STATS_KEY }}
+        run: |
+          rm -rf modes
+          target/release/zeronet-stats seal --reports reports.json --public "$MODE_STATS_KEY" --out-dir modes --days 2
 
       - name: publish
         if: steps.relays.outputs.list != ''
@@ -124,4 +150,6 @@ jobs:
           fi
           files="rankings.json"
           [ -f rankings.json.sig ] && files="$files rankings.json.sig"
+          # The sealed mode totals, when there are any.
+          [ -d modes ] && [ -n "$(ls -A modes)" ] && files="$files modes"
           .github/scripts/publish-crowd-data.sh $files

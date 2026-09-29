@@ -55,6 +55,44 @@ pub const TUNNEL_MTU: usize = 1280;
 pub const TCP_RX_BUFFER: usize = 128 * 1024;
 /// Send buffer of one TCP connection.
 pub const TCP_TX_BUFFER: usize = 64 * 1024;
+/// The most the receive window grows to on a long round trip. A connection can
+/// go no faster than its window divided by the round trip, so a fixed 128 KiB
+/// window caps one download at about 7 Mbit/s at 150 ms, whatever the link.
+pub const TCP_RX_MAX: usize = 512 * 1024;
+/// The rate a single connection's window is sized for, in bytes per second
+/// (about 28 Mbit/s): enough that the window is not what limits a download on
+/// the paths these tunnels run over, without provisioning for a fibre link.
+const TARGET_RATE: f64 = 3.5e6;
+/// Above this many open connections, new ones get the fixed small buffers.
+/// The bigger windows are for the few busy flows of a download, not the
+/// dozens a browser keeps open, and memory stays where it was.
+const ADAPT_BELOW_CONNECTIONS: usize = 16;
+
+/// A quarter of each new round-trip sample joins the estimate, so one slow
+/// handshake does not swing the buffer sizing.
+fn smooth(previous: Option<Duration>, sample: Duration) -> Duration {
+    match previous {
+        None => sample,
+        Some(previous) => previous * 3 / 4 + sample / 4,
+    }
+}
+
+/// The receive buffer for a new connection, given the tunnel's smoothed round
+/// trip: the bandwidth-delay product of [`TARGET_RATE`], never below
+/// [`TCP_RX_BUFFER`] or above [`TCP_RX_MAX`]. The buffers are allocated zeroed
+/// and pages are only committed as data passes through them.
+fn rx_buffer_for(rtt: Option<Duration>, open_connections: usize) -> usize {
+    let Some(rtt) = rtt else {
+        return TCP_RX_BUFFER;
+    };
+    if open_connections >= ADAPT_BELOW_CONNECTIONS {
+        return TCP_RX_BUFFER;
+    }
+    let wanted = (TARGET_RATE * rtt.as_secs_f64()) as usize;
+    wanted
+        .clamp(TCP_RX_BUFFER, TCP_RX_MAX)
+        .next_multiple_of(4096)
+}
 /// A tunnel with nothing open for this long shuts down.
 pub const IDLE_SHUTDOWN: Duration = Duration::from_secs(5 * 60);
 /// How long a TCP connect through the tunnel may take.
@@ -335,6 +373,13 @@ pub fn shared(peer: SocketAddr, params: WgStackParams) -> Result<WgStack, String
     Ok(stack)
 }
 
+/// Stop sharing the tunnel to `peer` with `params`. Its driver ends once the
+/// last handle to it is dropped, instead of waiting out the idle timeout: for
+/// a tunnel that was started to be tried and lost.
+pub fn release(peer: SocketAddr, params: &WgStackParams) {
+    lock(&SHARED).retain(|(p, q, _)| !(*p == peer && q == params));
+}
+
 /// After a network change: move every running tunnel to a fresh socket.
 /// Returns how many were asked to move.
 pub fn rebind_all() -> usize {
@@ -585,6 +630,8 @@ struct Driver {
     next_port: u16,
     started: Instant,
     last_activity: Instant,
+    /// Smoothed time from SYN to established, over the connections so far.
+    rtt: Option<Duration>,
 }
 
 impl WgLink {
@@ -666,6 +713,7 @@ impl Driver {
             next_port: 40000 + rand::random::<u16>() % 20000,
             started,
             last_activity: started,
+            rtt: None,
         }
     }
 
@@ -754,9 +802,11 @@ impl Driver {
                     let _ = reply.send(Err(format!("the tunnel has no address for {destination}")));
                     return;
                 }
+                let receive = rx_buffer_for(self.rtt, self.tcp.len());
+                let send = (receive / 2).max(TCP_TX_BUFFER);
                 let mut socket = tcp::Socket::new(
-                    tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER]),
-                    tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER]),
+                    tcp::SocketBuffer::new(vec![0u8; receive]),
+                    tcp::SocketBuffer::new(vec![0u8; send]),
                 );
                 socket.set_nagle_enabled(false);
                 socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(30)));
@@ -858,6 +908,9 @@ impl Driver {
             if let Some((reply, deadline, io)) = slot.reply.take() {
                 match socket.state() {
                     tcp::State::Established | tcp::State::CloseWait => {
+                        // The deadline was set when the SYN went out.
+                        let sample = now.saturating_duration_since(deadline - CONNECT_TIMEOUT);
+                        self.rtt = Some(smooth(self.rtt, sample));
                         let _ = reply.send(Ok(io));
                         moved = true;
                     }
@@ -981,6 +1034,12 @@ impl Driver {
                 if let Some(reply) = slot.reply.take() {
                     let from =
                         SocketAddr::new(IpAddr::from(meta.endpoint.addr), meta.endpoint.port);
+                    // Every connection starts with a lookup through the same
+                    // tunnel, so its round trip is known before the first
+                    // connection is opened. It is the tunnel's own share of the
+                    // path, a floor for what a flow will see.
+                    let sample = now.saturating_duration_since(slot.deadline - UDP_TIMEOUT);
+                    self.rtt = Some(smooth(self.rtt, sample));
                     let _ = reply.send(Ok((from, data.to_vec())));
                 }
                 done = true;
@@ -1472,5 +1531,26 @@ mod tests {
         assert_eq!(ttl, Duration::from_secs(60));
         assert!(dns_answer(&answer, 0x9999, 1).is_err());
         assert!(dns_query(1, "bad..name", 1).is_err());
+    }
+
+    #[test]
+    fn the_receive_window_follows_the_round_trip_and_stays_small_when_busy() {
+        let ms = |n| Some(Duration::from_millis(n));
+        // Unknown, or short: the fixed floor.
+        assert_eq!(rx_buffer_for(None, 0), TCP_RX_BUFFER);
+        assert_eq!(rx_buffer_for(ms(20), 0), TCP_RX_BUFFER);
+        // Longer: the bandwidth-delay product, in whole pages.
+        let mid = rx_buffer_for(ms(100), 0);
+        assert!(
+            mid > TCP_RX_BUFFER && mid < TCP_RX_MAX && mid.is_multiple_of(4096),
+            "{mid}"
+        );
+        // Very long: capped.
+        assert_eq!(rx_buffer_for(ms(900), 0), TCP_RX_MAX);
+        // Many connections open: back to the floor whatever the round trip.
+        assert_eq!(
+            rx_buffer_for(ms(900), ADAPT_BELOW_CONNECTIONS),
+            TCP_RX_BUFFER
+        );
     }
 }

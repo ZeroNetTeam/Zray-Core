@@ -38,5 +38,25 @@
     "id": "f0rc3run",
     "url": "https://raw.githubusercontent.com/F0rc3Run/F0rc3Run/main/Best-Results/sub.txt",
     "tier": 3
+  },
+  {
+    "id": "solvpn",
+    "url": "https://raw.githubusercontent.com/SoliSpirit/SolVPN/main/all_configs.txt",
+    "tier": 2
+  },
+  {
+    "id": "miladtahanian",
+    "url": "https://raw.githubusercontent.com/miladtahanian/Config-Collector/main/mixed_iran.txt",
+    "tier": 2
+  },
+  {
+    "id": "freedom",
+    "url": "https://raw.githubusercontent.com/MahanKenway/Freedom-V2Ray/main/configs/mix.txt",
+    "tier": 3
+  },
+  {
+    "id": "ebrasha",
+    "url": "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/main/vless_configs.txt",
+    "tier": 3
   }
 ]

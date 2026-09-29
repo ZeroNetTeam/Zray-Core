@@ -509,16 +509,18 @@ async fn connect_resolved(
             Failure::new(FailureKind::DnsNoData, Stage::Resolving)
                 .with_detail("WireGuard peer has no address")
         })?;
-        let stack = zero_protocol::wg_stack::shared(peer, wireguard_stack_params(wireguard))
+        let stack = crate::warp::tunnel(wireguard, Some(peer))
+            .await
             .map_err(|error| {
                 Failure::new(FailureKind::LocalPolicy, Stage::SocketConnected).with_detail(error)
             })?;
-        return stack
-            .connect_host(&destination.address, destination.port)
-            .await
-            .map_err(|error| {
-                Failure::new(FailureKind::TcpTimeout, Stage::RequestSent).with_detail(error)
-            });
+        // The tunnel alone, or through the exits the account lists, each the
+        // other's failsafe; the tunnel reports how connections went so route
+        // selection can learn from it.
+        let connected = crate::warp::connect(wireguard, &stack, destination).await;
+        return connected.map_err(|error| {
+            Failure::new(FailureKind::TcpTimeout, Stage::RequestSent).with_detail(error)
+        });
     }
     if let OutboundProtocol::Hysteria2(hysteria) = &outbound.protocol {
         let fallback_host = address.host_string();
@@ -1373,21 +1375,7 @@ pub(crate) async fn finish_carrier(
 /// Whether `outbound` is a byte-stream protocol over a plain stream
 /// transport, which is what [`connect_over`] can layer over another outbound.
 pub fn chainable(outbound: &Outbound) -> bool {
-    matches!(
-        outbound.protocol,
-        OutboundProtocol::Vless(_)
-            | OutboundProtocol::Vmess(_)
-            | OutboundProtocol::Trojan(_)
-            | OutboundProtocol::Shadowsocks(_)
-            | OutboundProtocol::AnyTls(_)
-    ) && !outbound.mux.enabled
-        && matches!(
-            outbound.stream.transport,
-            Transport::Raw
-                | Transport::WebSocket(_)
-                | Transport::HttpUpgrade(_)
-                | Transport::Grpc(_)
-        )
+    outbound.chainable()
 }
 
 /// Everything above security: header obfuscation, transport, protocol.

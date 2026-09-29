@@ -1014,6 +1014,33 @@ mod tests {
         );
     }
 
+    /// The apps store a `warp://` link as `{"link": ...}` and rebuild the
+    /// whole configuration from it, so the account must survive that trip.
+    #[test]
+    fn a_warp_account_link_becomes_the_proxy_outbound() {
+        use base64::Engine as _;
+        let der = base64::engine::general_purpose::STANDARD.encode([3u8; 40]);
+        let link = crate::share_link::warp_link(
+            &serde_json::json!({
+                "route": "auto",
+                "masque": {"privateKey": der, "serverPublicKey": der, "address": ["172.16.0.2"]}
+            }),
+            "WARP",
+        );
+        let preset = IranPreset {
+            outbounds: outbounds_from_links([link.as_str()]),
+            ..IranPreset::default()
+        };
+        let (config, _) = parse_config(&preset.build()).unwrap();
+        let proxy = &config.outbounds[0];
+        assert_eq!(proxy.tag.as_ref(), PROXY_TAG);
+        let crate::OutboundProtocol::AmneziaWireguard(warp) = &proxy.protocol else {
+            panic!("the account did not become a WARP outbound")
+        };
+        assert_eq!(warp.route, crate::WarpRoute::Auto);
+        assert!(warp.masque.is_some());
+    }
+
     #[test]
     fn fragmentation_layers_onto_a_link_outbound() {
         let link = "vless://00000000-0000-0000-0000-000000000001@203.0.113.10:443\

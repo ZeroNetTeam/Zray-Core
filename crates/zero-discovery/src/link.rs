@@ -15,6 +15,7 @@
 //! remark still reaches the user as the display name.
 
 use std::collections::{BTreeMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::Serialize;
 use zero_config::{OutboundProtocol, Security, ShareLink, Transport};
@@ -33,6 +34,10 @@ pub struct LinkInfo {
     pub country: String,
     /// [`LinkClass::as_str`]: the family discovery interleaves by.
     pub class: String,
+    /// For a WARP account, the fingerprint of its keys (`warp::fingerprint`),
+    /// which a screen draws as a small picture so accounts are told apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fp: Option<String>,
 }
 
 /// Coarse server families, in the order candidates are interleaved.
@@ -125,6 +130,77 @@ pub fn parse_candidate(link: &str) -> Result<Candidate, String> {
     candidate_from(parsed)
 }
 
+/// Whether an endpoint may be dialled as a discovered server.
+///
+/// Public feeds are written by strangers. A link pointing at `127.0.0.1`, the
+/// LAN, link-local or the carrier-grade NAT range would turn discovery into a
+/// probe of the user's own machine or network, so feed links are held to
+/// public addresses. A host name is left to the resolver: it is the answer,
+/// not the spelling, that decides where a connection lands. The test and
+/// documentation ranges are not refused — they reach nothing either way.
+fn public_host(host: &str) -> bool {
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        // Names that can only ever mean this machine or its network.
+        let name = host.trim_end_matches('.').to_ascii_lowercase();
+        return !(name == "localhost"
+            || name.ends_with(".localhost")
+            || name.ends_with(".local")
+            || name.ends_with(".internal")
+            || name.ends_with(".lan"));
+    };
+    match ip {
+        IpAddr::V4(v4) => public_v4(v4),
+        IpAddr::V6(v6) => public_v6(v6),
+    }
+}
+
+fn public_v4(v4: Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    // 100.64.0.0/10: carrier-grade NAT, where a user's own router or ISP
+    // equipment usually lives.
+    let cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+    !(v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        // 0.0.0.0/8 ("this network") and 240.0.0.0/4 (reserved).
+        || octets[0] == 0
+        || octets[0] >= 240
+        || cgnat)
+}
+
+fn public_v6(v6: Ipv6Addr) -> bool {
+    // An IPv4-mapped address is an IPv4 address in disguise.
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return public_v4(v4);
+    }
+    !(v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_multicast()
+        || v6.is_unique_local()
+        || v6.is_unicast_link_local())
+}
+
+fn require_public(candidate: &Candidate) -> Result<(), String> {
+    let Some((address, _)) = candidate.outbound.endpoint() else {
+        return Ok(());
+    };
+    let host = address.host_string();
+    // An IPv6 literal keeps its brackets in the display form; strip them so
+    // it is parsed as an address rather than mistaken for a host name.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(&host);
+    if public_host(bare) {
+        Ok(())
+    } else {
+        Err(format!("host {host} must be a public address"))
+    }
+}
+
 fn summarize(parsed: &ShareLink, class: LinkClass) -> LinkInfo {
     let outbound = &parsed.outbound;
     let (host, port) = outbound
@@ -160,6 +236,11 @@ fn summarize(parsed: &ShareLink, class: LinkClass) -> LinkInfo {
     } else {
         remark.chars().take(120).collect()
     };
+    let fp = parsed
+        .link
+        .starts_with(zero_config::share_link::WARP_LINK_SCHEME)
+        .then(|| crate::warp::fingerprint(&parsed.link))
+        .flatten();
     LinkInfo {
         key: link_key(&parsed.link),
         link: parsed.link.clone(),
@@ -171,6 +252,7 @@ fn summarize(parsed: &ShareLink, class: LinkClass) -> LinkInfo {
         host,
         port,
         class: class.as_str().to_string(),
+        fp,
     }
 }
 
@@ -300,7 +382,7 @@ pub fn guess_country(remark: &str) -> String {
 
 // ------------------------------------------------------------ text to links
 
-const SCHEMES: [&str; 8] = [
+const SCHEMES: [&str; 9] = [
     "vless://",
     "vmess://",
     "trojan://",
@@ -309,6 +391,7 @@ const SCHEMES: [&str; 8] = [
     "hy2://",
     "tuic://",
     "anytls://",
+    "warp://",
 ];
 
 /// Pull every proxy share link out of arbitrary text: one link per line, a
@@ -456,6 +539,23 @@ pub fn parse_links(text: &str) -> ParseReport {
 /// Parse text into candidates, skipping any key in `exclude`. The report's
 /// `items` is left empty; the candidates carry the same information.
 pub fn parse_candidates(text: &str, exclude: &HashSet<String>) -> (Vec<Candidate>, ParseReport) {
+    parse_candidates_inner(text, exclude, false)
+}
+
+/// [`parse_candidates`] for a downloaded feed: the same, but a link that
+/// points at the local machine or network is rejected (see [`public_host`]).
+pub fn parse_feed_candidates(
+    text: &str,
+    exclude: &HashSet<String>,
+) -> (Vec<Candidate>, ParseReport) {
+    parse_candidates_inner(text, exclude, true)
+}
+
+fn parse_candidates_inner(
+    text: &str,
+    exclude: &HashSet<String>,
+    public_only: bool,
+) -> (Vec<Candidate>, ParseReport) {
     let mut report = ParseReport::default();
     let mut seen: HashSet<String> = HashSet::new();
     let mut candidates = Vec::new();
@@ -465,7 +565,13 @@ pub fn parse_candidates(text: &str, exclude: &HashSet<String>) -> (Vec<Candidate
             report.duplicates += 1;
             continue;
         }
-        match parse_candidate(&link) {
+        let parsed = parse_candidate(&link).and_then(|candidate| {
+            if public_only {
+                require_public(&candidate)?;
+            }
+            Ok(candidate)
+        });
+        match parsed {
             Ok(candidate) => candidates.push(candidate),
             Err(error) => {
                 report.rejected += 1;
@@ -587,5 +693,35 @@ pub(crate) mod tests {
         let (candidates, report) = parse_candidates(&format!("{REALITY}\n{SS}"), &exclude);
         assert_eq!(candidates.len(), 1);
         assert_eq!(report.duplicates, 1);
+    }
+
+    /// A hostile feed must not be able to point discovery at the user's own
+    /// machine or network.
+    #[test]
+    fn feed_links_may_not_point_at_the_local_machine_or_network() {
+        let private = [
+            "trojan://secret@127.0.0.1:8443?security=tls&sni=t.example.com#loopback",
+            "trojan://secret@10.0.0.5:8443?security=tls&sni=t.example.com#lan",
+            "trojan://secret@169.254.1.1:8443?security=tls&sni=t.example.com#link-local",
+            "trojan://secret@100.64.0.9:8443?security=tls&sni=t.example.com#cgnat",
+            "trojan://secret@[::1]:8443?security=tls&sni=t.example.com#v6-loopback",
+            "trojan://secret@[fc00::1]:8443?security=tls&sni=t.example.com#ula",
+            "trojan://secret@[::ffff:192.168.1.9]:8443?security=tls&sni=t.example.com#mapped",
+            "trojan://secret@localhost:8443?security=tls&sni=t.example.com#name",
+            "trojan://secret@router.local:8443?security=tls&sni=t.example.com#mdns",
+            "trojan://secret@0.1.2.3:8443?security=tls&sni=t.example.com#this-net",
+            "trojan://secret@224.0.0.1:8443?security=tls&sni=t.example.com#multicast",
+        ];
+        let text = private.join("\n");
+        let (candidates, report) = parse_feed_candidates(&text, &HashSet::new());
+        assert!(candidates.is_empty(), "{candidates:?}");
+        assert_eq!(report.rejected, private.len());
+        // The same links pasted by the user are left alone: a local server is
+        // their own choice, not a stranger's feed.
+        assert_eq!(parse_links(&text).items.len(), private.len());
+        // A public address in a feed is unaffected.
+        let (candidates, report) = parse_feed_candidates(TROJAN, &HashSet::new());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(report.rejected, 0);
     }
 }

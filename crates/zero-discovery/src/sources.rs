@@ -22,6 +22,7 @@ fn source(
     tier: u32,
     sig_url: Option<String>,
 ) -> NamedSource {
+    let mirrors = cdn_mirror(&url).into_iter().collect();
     NamedSource {
         name,
         source: FeedSource {
@@ -29,8 +30,38 @@ fn source(
             url,
             tier,
             sig_url,
+            mirrors,
         },
     }
+}
+
+/// The same file on the other CDN.
+///
+/// GitHub raw and jsDelivr are filtered at different times in Iran, so every
+/// feed whose URL maps cleanly gets a second path to the same bytes:
+/// `raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>` becomes
+/// `cdn.jsdelivr.net/gh/<owner>/<repo>@<branch>/<path>`, and back. Nothing is
+/// guessed: a URL that does not match either shape gets no mirror.
+fn cdn_mirror(url: &str) -> Option<String> {
+    const RAW: &str = "https://raw.githubusercontent.com/";
+    const JSD: &str = "https://cdn.jsdelivr.net/gh/";
+    if let Some(rest) = url.strip_prefix(RAW) {
+        let mut parts = rest.splitn(4, '/');
+        let owner = parts.next()?;
+        let repo = parts.next()?;
+        let branch = parts.next()?;
+        let path = parts.next()?;
+        return Some(format!("{JSD}{owner}/{repo}@{branch}/{path}"));
+    }
+    if let Some(rest) = url.strip_prefix(JSD) {
+        let mut parts = rest.splitn(3, '/');
+        let owner = parts.next()?;
+        let repo_ref = parts.next()?;
+        let path = parts.next()?;
+        let (repo, branch) = repo_ref.rsplit_once('@')?;
+        return Some(format!("{RAW}{owner}/{repo}/{branch}/{path}"));
+    }
+    None
 }
 
 /// Every built-in feed.
@@ -68,6 +99,20 @@ pub fn builtin() -> Vec<NamedSource> {
             None,
         ),
         source(
+            "solvpn",
+            "SolVPN (tested)",
+            format!("{RAW}/SoliSpirit/SolVPN/main/all_configs.txt"),
+            2,
+            None,
+        ),
+        source(
+            "miladtahanian",
+            "Config-Collector (Iran)",
+            format!("{RAW}/miladtahanian/Config-Collector/main/mixed_iran.txt"),
+            2,
+            None,
+        ),
+        source(
             "radikal",
             "0xRadikal",
             format!("{RAW}/0xRadikal/Free-v2ray-Configs/main/all/configs.txt"),
@@ -79,6 +124,20 @@ pub fn builtin() -> Vec<NamedSource> {
             "Epodonios",
             format!("{RAW}/Epodonios/v2ray-configs/main/All_Configs_Sub.txt"),
             2,
+            None,
+        ),
+        source(
+            "freedom",
+            "Freedom-V2Ray",
+            format!("{RAW}/MahanKenway/Freedom-V2Ray/main/configs/mix.txt"),
+            3,
+            None,
+        ),
+        source(
+            "ebrasha",
+            "EbraSha (VLESS)",
+            format!("{RAW}/ebrasha/free-v2ray-public-list/main/vless_configs.txt"),
+            3,
             None,
         ),
         source(
@@ -137,5 +196,29 @@ mod tests {
         let some = enabled(&["limilco".into()], 1);
         assert!(some.iter().all(|s| s.tier <= 1 && s.id != "limilco"));
         assert!(some.iter().any(|s| s.id == "zeronet"));
+    }
+
+    #[test]
+    fn every_feed_carries_the_other_cdn_as_a_mirror() {
+        for named in builtin() {
+            let source = &named.source;
+            let mirror = source
+                .mirrors
+                .first()
+                .unwrap_or_else(|| panic!("{} has no mirror", source.id));
+            assert_ne!(mirror, &source.url);
+            assert!(mirror.starts_with("https://"));
+            // The verified feed's primary is jsDelivr and mirrors to GitHub
+            // raw; the rest are the reverse.
+        }
+        assert_eq!(
+            cdn_mirror("https://raw.githubusercontent.com/a/b/main/c.txt").as_deref(),
+            Some("https://cdn.jsdelivr.net/gh/a/b@main/c.txt")
+        );
+        assert_eq!(
+            cdn_mirror("https://cdn.jsdelivr.net/gh/a/b@main/c.txt").as_deref(),
+            Some("https://raw.githubusercontent.com/a/b/main/c.txt")
+        );
+        assert_eq!(cdn_mirror("https://example.com/x"), None);
     }
 }

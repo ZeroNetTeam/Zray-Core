@@ -10,6 +10,7 @@ zero-core = { workspace = true }
 zero-config = { workspace = true }
 zero-net = { workspace = true }
 zero-runtime = { workspace = true }
+zero-transport = { workspace = true }
 # Only the scan engine: the terminal front end (and its ratatui/crossterm/clap
 # graph) stays out of the mobile build.
 zero-scanner = { path = "../zero-scanner", version = "0.1.0", default-features = false }
@@ -23,6 +24,11 @@ base64 = { workspace = true }
 hex = { workspace = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = { workspace = true }
+x25519-dalek = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+aes-gcm = { workspace = true }
+percent-encoding = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 tokio-rustls = { workspace = true }

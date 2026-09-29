@@ -446,6 +446,7 @@ async fn read_channel(name: &str, pages: usize) -> Option<(String, Vec<String>, 
             url: telegram::page_url(name, before),
             tier: 1,
             sig_url: None,
+            mirrors: Vec::new(),
         };
         let page = fetch_feed(&source, None, Duration::from_secs(20))
             .await

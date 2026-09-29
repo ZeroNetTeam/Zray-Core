@@ -132,7 +132,45 @@ pub fn classify_error(error: &str, stage: Stage) -> FailureKind {
     if error.contains("http/2") || error.contains("h2") {
         return FailureKind::H2ProtocolError;
     }
+    // A TLS handshake failure is classified precisely in `zero-security`, but
+    // its detail reaches here as text once a transport wrapper has flattened
+    // it; without this it was recorded as `Unknown` again. Only consulted at a
+    // TLS stage, so an unrelated string that happens to say "alert" cannot
+    // borrow the taxonomy.
+    if matches!(stage, Stage::TlsStarted | Stage::TlsCompleted) {
+        if let Some(kind) = classify_tls_detail(&error) {
+            return kind;
+        }
+    }
     FailureKind::Unknown
+}
+
+/// The detail strings the TLS layer produces, mapped back onto the taxonomy.
+/// `error` is already lower-cased by [`classify_error`].
+fn classify_tls_detail(error: &str) -> Option<FailureKind> {
+    // REALITY authenticates the server with its own certificate; a failure
+    // there is not an ordinary TLS problem.
+    if error.contains("reality") {
+        return Some(FailureKind::RealityAuthFailure);
+    }
+    if error.contains("certificate")
+        || error.contains("unknownissuer")
+        || error.contains("notvalidforname")
+        || error.contains("expired")
+        || error.contains("bad signature")
+    {
+        return Some(FailureKind::TlsCertificateFailure);
+    }
+    if error.contains("alert") {
+        return Some(FailureKind::TlsAlert);
+    }
+    if error.contains("handshake")
+        || error.contains("invalid message")
+        || error.contains("unexpected eof")
+    {
+        return Some(FailureKind::TlsHandshakeMalformed);
+    }
+    None
 }
 
 impl RelayOutcome {
@@ -716,6 +754,38 @@ mod tests {
         assert_eq!(
             classify_error("h2 protocol error", Stage::RequestSent),
             FailureKind::H2ProtocolError
+        );
+    }
+
+    /// The TLS layer already knows which kind of handshake failure this was;
+    /// flattening it to text and back must not lose that.
+    #[test]
+    fn a_flattened_tls_failure_keeps_its_taxonomy() {
+        assert_eq!(
+            classify_error("alert HandshakeFailure", Stage::TlsStarted),
+            FailureKind::TlsAlert
+        );
+        assert_eq!(
+            classify_error("invalid peer certificate: UnknownIssuer", Stage::TlsStarted),
+            FailureKind::TlsCertificateFailure
+        );
+        assert_eq!(
+            classify_error("invalid message: unexpected eof", Stage::TlsCompleted),
+            FailureKind::TlsHandshakeMalformed
+        );
+        assert_eq!(
+            classify_error("reality handshake failed", Stage::TlsStarted),
+            FailureKind::RealityAuthFailure
+        );
+        // Only at a TLS stage: the same words elsewhere mean nothing.
+        assert_eq!(
+            classify_error("alert HandshakeFailure", Stage::PayloadTransferred),
+            FailureKind::Unknown
+        );
+        // The earlier, exact matches still win over the TLS detail scan.
+        assert_eq!(
+            classify_error("connection reset by peer", Stage::TlsStarted),
+            FailureKind::TcpReset
         );
     }
 

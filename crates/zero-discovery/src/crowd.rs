@@ -448,12 +448,55 @@ pub fn aggregate(
     }
 }
 
+/// How many servers and clean addresses a ranking puts in front of users.
+pub fn item_count(rankings: &Rankings) -> usize {
+    rankings
+        .nets
+        .values()
+        .map(|net| net.servers.len() + net.clean_ips.len())
+        .sum()
+}
+
+/// Why `next` must not replace `previous`, or `None` when it may.
+///
+/// The publish job replaces the whole `crowd-data` commit every twenty
+/// minutes, so a single bad run — the relay down, the export empty, a feed
+/// fetch that returned nothing — would wipe a good list for every user. A run
+/// that carries too few reports, or that would shrink the published list
+/// sharply, is refused and the previous commit left in place. `--force` is
+/// there for the times the shrink is real.
+pub fn refuse_publish(
+    previous: Option<&Rankings>,
+    next: &Rankings,
+    reports: usize,
+    min_reports: usize,
+) -> Option<String> {
+    // Nothing published yet: a first list, however thin, is better than none.
+    let previous = previous?;
+    let old = item_count(previous);
+    if old == 0 {
+        return None;
+    }
+    if reports < min_reports {
+        return Some(format!(
+            "only {reports} reports (< {min_reports}); keeping the published list"
+        ));
+    }
+    let new = item_count(next);
+    if new * 2 < old {
+        return Some(format!(
+            "would shrink the list from {old} to {new} entries; keeping the published list"
+        ));
+    }
+    None
+}
+
 /// The link key → link map of every server in `feeds` (feed bodies as
 /// fetched).
 pub fn known_servers<'a>(feeds: impl IntoIterator<Item = &'a str>) -> HashMap<String, String> {
     let mut known = HashMap::new();
     for body in feeds {
-        let (candidates, _) = crate::link::parse_candidates(body, &HashSet::new());
+        let (candidates, _) = crate::link::parse_feed_candidates(body, &HashSet::new());
         for candidate in candidates {
             known
                 .entry(candidate.info.key)
@@ -749,5 +792,45 @@ mod tests {
         ] {
             assert_eq!(bucket_ms(ms), bucket, "{ms}");
         }
+    }
+
+    /// The publish job replaces the whole crowd-data commit, so one bad run
+    /// must not wipe a good list. Rule 16.
+    #[test]
+    fn a_thin_or_shrinking_run_never_replaces_the_published_list() {
+        let with_servers = |count: usize| {
+            let mut rankings = Rankings {
+                v: RANKINGS_VERSION,
+                generated_at: 1,
+                ..Rankings::default()
+            };
+            rankings.nets.insert(
+                ALL_NETS.into(),
+                NetRanking {
+                    servers: (0..count)
+                        .map(|_| RankedServer {
+                            id: "aaaaaaaaaaaaaaaa".into(),
+                            link: "vless://a".into(),
+                            score: 1.0,
+                            reporters: 2,
+                            ms: None,
+                        })
+                        .collect(),
+                    ..NetRanking::default()
+                },
+            );
+            rankings
+        };
+        // Nothing published yet: a first list goes out even from a thin run.
+        assert!(refuse_publish(None, &with_servers(1), 0, 10).is_none());
+        let published = with_servers(10);
+        // Too few reports: refused, so a relay outage cannot empty the list.
+        assert!(refuse_publish(Some(&published), &with_servers(10), 3, 5).is_some());
+        // Half the entries gone: refused.
+        assert!(refuse_publish(Some(&published), &with_servers(4), 100, 5).is_some());
+        // A modest shrink, with enough reports, is published.
+        assert!(refuse_publish(Some(&published), &with_servers(6), 100, 5).is_none());
+        // An empty previous file does not block a real run.
+        assert!(refuse_publish(Some(&with_servers(0)), &with_servers(6), 1, 5).is_none());
     }
 }

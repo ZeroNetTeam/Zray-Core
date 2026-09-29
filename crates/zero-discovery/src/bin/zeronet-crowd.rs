@@ -10,12 +10,16 @@
 //! It fetches every public feed in `sources.json` itself, so it knows which
 //! servers are public and what their links are (see `zero_discovery::crowd`),
 //! then ranks the reports. It refuses to write a file when no feed could be
-//! fetched: an empty ranking would tell every app that nothing works.
+//! fetched, and — given the currently published file with `--previous` — when
+//! the new ranking is too thin or has shrunk sharply: an empty or gutted
+//! ranking would tell every app that almost nothing works, and it replaces
+//! the published one.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use zero_discovery::crowd::{self, Report};
+use zero_discovery::crowd_client;
 use zero_discovery::feed::{fetch_feed, FeedSource};
 
 struct Args {
@@ -23,6 +27,15 @@ struct Args {
     sources: Vec<PathBuf>,
     out: PathBuf,
     relays: Vec<String>,
+    /// The ranking currently published, to compare against before replacing
+    /// it. Absent on a first run.
+    previous: Option<PathBuf>,
+    /// Below this many reports a run is refused when a list is already
+    /// published. One by default, so a completely empty export never wipes
+    /// the list; raise it on a relay that carries steady traffic.
+    min_reports: usize,
+    /// Publish even when the guards object.
+    force: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -30,6 +43,9 @@ fn parse_args() -> Result<Args, String> {
     let mut sources = Vec::new();
     let mut out = None;
     let mut relays = Vec::new();
+    let mut previous = None;
+    let mut min_reports = 1usize;
+    let mut force = false;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -37,6 +53,13 @@ fn parse_args() -> Result<Args, String> {
             "--reports" => reports = Some(PathBuf::from(value()?)),
             "--sources" => sources.push(PathBuf::from(value()?)),
             "--out" => out = Some(PathBuf::from(value()?)),
+            "--previous" => previous = Some(PathBuf::from(value()?)),
+            "--force" => force = true,
+            "--min-reports" => {
+                min_reports = value()?
+                    .parse()
+                    .map_err(|_| "--min-reports needs a number".to_string())?;
+            }
             "--relays" => {
                 for relay in value()?.split(',').map(str::trim) {
                     // The same relay can come from the Cloudflare lookup and
@@ -58,6 +81,9 @@ fn parse_args() -> Result<Args, String> {
         },
         out: out.ok_or("--out is required")?,
         relays,
+        previous,
+        min_reports,
+        force,
     })
 }
 
@@ -121,6 +147,23 @@ fn run() -> Result<(), String> {
             ranking.servers.len(),
             ranking.clean_ips.len()
         );
+    }
+    // Never replace a good published list with a thin or gutted one. The file
+    // is optional: on a first run there is nothing to compare against.
+    let previous = args.previous.as_ref().and_then(|path| {
+        std::fs::read(path)
+            .ok()
+            .and_then(|body| crowd_client::parse_rankings(&body))
+    });
+    if !args.force {
+        if let Some(reason) = crowd::refuse_publish(
+            previous.as_ref(),
+            &rankings,
+            reports.len(),
+            args.min_reports,
+        ) {
+            return Err(format!("refusing to publish: {reason}"));
+        }
     }
     let json = serde_json::to_string(&rankings).map_err(|e| e.to_string())?;
     std::fs::write(&args.out, json).map_err(|e| format!("cannot write {}: {e}", args.out.display()))

@@ -55,3 +55,22 @@ ZeroNet-Mobile/app/src/main/jniLibs/
 
 # Personal Cloudflare Worker deployment (kept local, not in the repo)
 /deploy/cloudflare-worker/
+
+# ---- Local changelogs, plans, findings and idea notes (working memory, not shipped) ----
+# Commits, release notes and PR descriptions are where changelog writing lives.
+CHANGELOG*
+/notes/
+/plans/
+/research/
+/findings/
+/ideas/
+/docs/notes/
+/docs/plans/
+/docs/findings/
+/docs/research/
+**/*-plan.md
+**/*-notes.md
+**/*-findings.md
+**/*-ideas.md
+# The ignore file itself (root only, so nested ones keep working)
+/.gitignore

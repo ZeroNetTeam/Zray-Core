@@ -542,8 +542,11 @@ async fn a_quic_connection_survives_moving_to_a_new_socket() {
         let mut before = socks_connect(tunnel.socks, tunnel.echo).await.unwrap();
         round_trip(&mut before, &payload(1, 2048)).await;
 
+        // Rebind only this tunnel's connection. `rebind_all` is process-wide
+        // and would move the pooled connections of every other test running
+        // in this binary, closing any it cannot migrate.
         assert!(
-            zero_transport::quic_pool::rebind_all() >= 1,
+            zero_transport::quic_pool::rebind_to(tunnel.relay) >= 1,
             "{protocol}: nothing was migrated"
         );
 
@@ -564,11 +567,20 @@ async fn a_quic_connection_survives_moving_to_a_new_socket() {
 async fn transfers_in_flight_survive_a_migration() {
     for protocol in ["hysteria2", "tuic"] {
         let tunnel = tunnel(protocol, true, raw()).await;
+        // Every transfer announces itself once its first bytes have come
+        // back, so the migrations below happen while the streams are genuinely
+        // in flight. Migrating during stream *setup* raced the handshake and
+        // could fail under load for a reason this test does not mean to
+        // measure.
+        let (ready, mut started) = tokio::sync::mpsc::channel::<()>(6);
         let transfers: Vec<_> = (0..6u8)
             .map(|seed| {
                 let (socks, echo) = (tunnel.socks, tunnel.echo);
+                let ready = ready.clone();
                 tokio::spawn(async move {
                     let mut stream = socks_connect(socks, echo).await.unwrap();
+                    round_trip(&mut stream, &payload(seed, 4096)).await;
+                    let _ = ready.send(()).await;
                     for round in 0..4u8 {
                         round_trip(
                             &mut stream,
@@ -579,9 +591,15 @@ async fn transfers_in_flight_survive_a_migration() {
                 })
             })
             .collect();
+        drop(ready);
+        for _ in 0..6 {
+            started.recv().await.expect("a transfer never started");
+        }
         for _ in 0..3 {
             tokio::time::sleep(Duration::from_millis(15)).await;
-            zero_transport::quic_pool::rebind_all();
+            // This tunnel only: a process-wide rebind would also move the
+            // connections of the other tests sharing this binary.
+            zero_transport::quic_pool::rebind_to(tunnel.relay);
         }
         for task in futures::future::join_all(transfers).await {
             task.unwrap_or_else(|error| panic!("{protocol}: {error}"));

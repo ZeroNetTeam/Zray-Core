@@ -26,16 +26,20 @@ pub mod crowd_client;
 pub mod discover;
 pub mod events;
 pub mod feed;
+pub mod glyph;
 pub mod json_subscription;
 pub mod link;
+pub mod modestats;
 pub mod order;
 pub mod panel;
 pub mod probe;
 pub mod scan;
+pub mod selftest;
 pub mod sign;
 pub mod sources;
 pub mod telegram;
 pub mod test_links;
+pub mod warp;
 
 #[cfg(test)]
 pub(crate) mod testing;
@@ -49,3 +53,4 @@ pub use panel::subscription_fetch_url;
 pub use scan::{scan, ScanRequest};
 pub use test_links::{test_links, TestRequest};
 pub use tokio_util::sync::CancellationToken;
+pub use warp::{warp_job, WarpRequest};

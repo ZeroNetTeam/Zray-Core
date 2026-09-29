@@ -41,6 +41,11 @@ pub struct FeedSource {
     /// unaffected, and so is a build with no key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig_url: Option<String>,
+    /// Other URLs that serve the same body, tried in order when the primary
+    /// fails. GitHub raw, jsDelivr and Fastly are blocked at different times
+    /// in Iran, so a feed carries more than one where it can.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<String>,
 }
 
 fn default_tier() -> u32 {
@@ -148,6 +153,11 @@ async fn verify_body(sig_url: &str, body: &[u8], timeout: Duration) -> Result<bo
 }
 
 /// Fetch one feed, consulting and updating the cache in `cache_dir` (if any).
+///
+/// The primary URL is tried first, then each mirror: a host that is filtered
+/// today but not tomorrow (or the reverse) does not decide whether discovery
+/// has anything to read. Validators are replayed only for the URL that issued
+/// them, so a mirror is never told "not modified" about another host's file.
 pub async fn fetch_feed(
     source: &FeedSource,
     cache_dir: Option<&Path>,
@@ -158,140 +168,123 @@ pub async fn fetch_feed(
         .as_ref()
         .and_then(|(body, _)| std::fs::read(body).ok())
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    // Validators are only replayed for the URL they were issued by: a source
-    // that moved must not be told "not modified" about a different file.
-    let validators = match (&files, &cached_body) {
-        (Some((_, meta)), Some(_)) => std::fs::read(meta)
+    let stored = files.as_ref().and_then(|(_, meta)| {
+        std::fs::read(meta)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Meta>(&bytes).ok())
-            .filter(|meta| meta.url == source.url)
-            .map(|meta| Validators {
-                etag: meta.etag,
-                last_modified: meta.last_modified,
-            })
-            .unwrap_or_default(),
-        _ => Validators::default(),
-    };
+    });
 
-    let limits = FetchLimits {
-        max_bytes: MAX_FEED_BYTES,
-        timeout,
-        max_redirects: 5,
-    };
-    let fetched = zero_net::fetch_with(
-        &source.url,
-        &limits,
-        &validators,
-        &FetchOptions { accept_gzip: true },
-    )
-    .await;
+    let mut last_error: Option<String> = None;
+    for url in std::iter::once(source.url.as_str()).chain(source.mirrors.iter().map(String::as_str))
+    {
+        // Validators are only replayed for the URL they were issued by: a
+        // source that moved must not be told "not modified" about a
+        // different file.
+        let validators = match (cached_body.as_ref(), stored.as_ref()) {
+            (Some(_), Some(meta)) if meta.url == url => Validators {
+                etag: meta.etag.clone(),
+                last_modified: meta.last_modified.clone(),
+            },
+            _ => Validators::default(),
+        };
+        let limits = FetchLimits {
+            max_bytes: MAX_FEED_BYTES,
+            timeout,
+            max_redirects: 5,
+        };
+        let fetched = zero_net::fetch_with(
+            url,
+            &limits,
+            &validators,
+            &FetchOptions { accept_gzip: true },
+        )
+        .await;
 
-    match fetched {
-        Ok(Fetched::NotModified) => match cached_body {
-            Some(body) => FeedResult {
-                status: FeedStatus::NotModified,
-                bytes: body.len(),
-                body: Some(body),
-                error: None,
+        match fetched {
+            Ok(Fetched::NotModified) => match &cached_body {
+                Some(body) => {
+                    return FeedResult {
+                        status: FeedStatus::NotModified,
+                        bytes: body.len(),
+                        body: Some(body.clone()),
+                        error: None,
+                    }
+                }
+                // Validators are only sent alongside a cached body, so a 304
+                // without one is an origin misbehaving.
+                None => {
+                    last_error = Some("304 without a cached body".into());
+                    continue;
+                }
             },
-            // Validators are only sent alongside a cached body, so a 304
-            // without one is an origin misbehaving.
-            None => FeedResult {
-                status: FeedStatus::Error,
-                body: None,
-                bytes: 0,
-                error: Some("304 without a cached body".into()),
-            },
-        },
-        Ok(Fetched::Body { body, validators }) => {
-            let text = String::from_utf8_lossy(&body).into_owned();
-            // A signed source: a freshly downloaded body must match the
-            // detached signature, or it is refused and the cached copy (if
-            // any) kept. Skipped when no key is compiled in, so a keyless
-            // build still works. NotModified/Cached bodies were verified when
-            // first stored, so they are not re-checked.
-            if let Some(sig_url) = source.sig_url.as_deref() {
-                if crate::sign::key_configured() {
-                    match verify_body(sig_url, text.as_bytes(), timeout).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            tracing::warn!(id = %source.id, "feed signature did not verify; refusing it");
-                            return match cached_body {
-                                Some(body) => FeedResult {
-                                    status: FeedStatus::Cached,
-                                    bytes: body.len(),
-                                    body: Some(body),
-                                    error: Some("signature did not verify".into()),
-                                },
-                                None => FeedResult {
-                                    status: FeedStatus::Error,
-                                    body: None,
-                                    bytes: 0,
-                                    error: Some("signature did not verify".into()),
-                                },
-                            };
-                        }
-                        Err(error) => {
-                            // Could not fetch the signature: treat the body as
-                            // unverified and fall back rather than trust it.
-                            tracing::warn!(id = %source.id, %error, "could not fetch feed signature; refusing the body");
-                            return match cached_body {
-                                Some(body) => FeedResult {
-                                    status: FeedStatus::Cached,
-                                    bytes: body.len(),
-                                    body: Some(body),
-                                    error: Some(format!("signature unavailable: {error}")),
-                                },
-                                None => FeedResult {
-                                    status: FeedStatus::Error,
-                                    body: None,
-                                    bytes: 0,
-                                    error: Some(format!("signature unavailable: {error}")),
-                                },
-                            };
+            Ok(Fetched::Body { body, validators }) => {
+                let text = String::from_utf8_lossy(&body).into_owned();
+                // A signed source: a freshly downloaded body must match the
+                // detached signature, or it is refused and the next mirror (or
+                // the cached copy) used instead. Skipped when no key is
+                // compiled in, so a keyless build still works. NotModified and
+                // Cached bodies were verified when first stored.
+                if let Some(sig_url) = source.sig_url.as_deref() {
+                    if crate::sign::key_configured() {
+                        match verify_body(sig_url, text.as_bytes(), timeout).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                tracing::warn!(id = %source.id, %url, "feed signature did not verify; trying the next source");
+                                last_error = Some("signature did not verify".into());
+                                continue;
+                            }
+                            Err(error) => {
+                                // Could not fetch the signature: treat the
+                                // body as unverified and try elsewhere rather
+                                // than trust it.
+                                tracing::warn!(id = %source.id, %url, %error, "could not fetch feed signature; refusing the body");
+                                last_error = Some(format!("signature unavailable: {error}"));
+                                continue;
+                            }
                         }
                     }
                 }
-            }
-            if let (Some(dir), Some((body_path, meta_path))) = (cache_dir, &files) {
-                let stored = std::fs::create_dir_all(dir)
-                    .and_then(|()| write_atomic(body_path, text.as_bytes()))
-                    .and_then(|()| {
-                        let meta = Meta {
-                            url: source.url.clone(),
-                            etag: validators.etag,
-                            last_modified: validators.last_modified,
-                        };
-                        write_atomic(meta_path, &serde_json::to_vec(&meta).unwrap_or_default())
-                    });
-                if let Err(error) = stored {
-                    tracing::warn!(id = %source.id, %error, "could not cache a feed");
+                if let (Some(dir), Some((body_path, meta_path))) = (cache_dir, &files) {
+                    let written = std::fs::create_dir_all(dir)
+                        .and_then(|()| write_atomic(body_path, text.as_bytes()))
+                        .and_then(|()| {
+                            let meta = Meta {
+                                url: url.to_string(),
+                                etag: validators.etag,
+                                last_modified: validators.last_modified,
+                            };
+                            write_atomic(meta_path, &serde_json::to_vec(&meta).unwrap_or_default())
+                        });
+                    if let Err(error) = written {
+                        tracing::warn!(id = %source.id, %error, "could not cache a feed");
+                    }
                 }
+                return FeedResult {
+                    status: FeedStatus::Ok,
+                    bytes: text.len(),
+                    body: Some(text),
+                    error: None,
+                };
             }
-            FeedResult {
-                status: FeedStatus::Ok,
-                bytes: text.len(),
-                body: Some(text),
-                error: None,
-            }
-        }
-        Err(error) => {
-            let message = error.to_string();
-            match cached_body {
-                Some(body) => FeedResult {
-                    status: FeedStatus::Cached,
-                    bytes: body.len(),
-                    body: Some(body),
-                    error: Some(message),
-                },
-                None => FeedResult {
-                    status: FeedStatus::Error,
-                    body: None,
-                    bytes: 0,
-                    error: Some(message),
-                },
+            Err(error) => {
+                last_error = Some(error.to_string());
             }
         }
+    }
+
+    match cached_body {
+        Some(body) => FeedResult {
+            status: FeedStatus::Cached,
+            bytes: body.len(),
+            body: Some(body),
+            error: last_error,
+        },
+        None => FeedResult {
+            status: FeedStatus::Error,
+            body: None,
+            bytes: 0,
+            error: last_error,
+        },
     }
 }
 
@@ -365,6 +358,7 @@ mod tests {
             url,
             tier: 1,
             sig_url: None,
+            mirrors: Vec::new(),
         };
 
         let first = fetch_feed(&source, Some(&dir), Duration::from_secs(5)).await;
@@ -406,6 +400,7 @@ mod tests {
             url: format!("http://127.0.0.1:{port}/feed"),
             tier: 1,
             sig_url: None,
+            mirrors: Vec::new(),
         };
         let result = fetch_feed(&source, Some(&dir), Duration::from_secs(3)).await;
         assert_eq!(result.status, FeedStatus::Cached);
@@ -416,6 +411,36 @@ mod tests {
         let result = fetch_feed(&source, Some(&dir), Duration::from_secs(3)).await;
         assert_eq!(result.status, FeedStatus::Error);
         assert!(result.body.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A filtered host must not leave discovery with nothing to read: the
+    /// mirror carries the same feed.
+    #[tokio::test]
+    async fn a_mirror_is_used_when_the_primary_is_filtered() {
+        let (mirror, full, _not_modified) = origin("vless://mirrored\n").await;
+        // A port nothing listens on stands in for a blocked host.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let dir = scratch("mirror");
+        let source = FeedSource {
+            id: "mirrored".into(),
+            url: format!("http://127.0.0.1:{dead}/feed.txt"),
+            tier: 1,
+            sig_url: None,
+            mirrors: vec![mirror],
+        };
+        let first = fetch_feed(&source, Some(&dir), Duration::from_secs(3)).await;
+        assert_eq!(first.status, FeedStatus::Ok);
+        assert_eq!(first.body.as_deref(), Some("vless://mirrored\n"));
+        // The mirror is what answered, so its validators are replayed next
+        // time and the body is fetched once.
+        let second = fetch_feed(&source, Some(&dir), Duration::from_secs(3)).await;
+        assert_eq!(second.status, FeedStatus::NotModified);
+        assert_eq!(full.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

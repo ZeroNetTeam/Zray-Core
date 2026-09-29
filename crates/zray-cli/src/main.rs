@@ -4,6 +4,12 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
+/// The release this binary was built for, else the crate version.
+const VERSION: &str = match option_env!("ZRAY_APP_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 fn main() -> Result<()> {
     zero_runtime::tune_allocator();
     init_tracing();
@@ -55,7 +61,7 @@ fn main() -> Result<()> {
         "version" | "-version" | "--version" | "-V" => {
             // v2rayA expects the output to have at least two fields, with fields[0] matching "V2RAY" or "XRAY"
             // e.g. "Xray 26.3.27" or "V2Ray 5.52.0"
-            println!("Xray {} (Zray-Core)", env!("CARGO_PKG_VERSION"));
+            println!("Xray {VERSION} (Zray-Core)");
             Ok(())
         }
         "help" | "--help" | "-h" => {
@@ -100,7 +106,7 @@ fn print_usage() {
          --clean-ip-ports LIST comma-separated ports (default 443,2053,8443)\n  \
          --clean-ip-seed N     candidate sampling seed (default 1)\n  \
          -o, --output FILE     write the config instead of printing it\n",
-        env!("CARGO_PKG_VERSION")
+        VERSION
     );
 }
 

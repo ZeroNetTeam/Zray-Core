@@ -54,8 +54,13 @@ fn tls_server_name(bytes: &[u8]) -> Option<String> {
     if record_len + 5 > bytes.len() || record_len < 4 {
         return None;
     }
-    let message = &bytes[5..5 + record_len];
-    if message[0] != 1 {
+    client_hello_sni(&bytes[5..5 + record_len])
+}
+
+/// The SNI of a bare TLS ClientHello handshake message, with no record
+/// header in front of it: the shape QUIC carries inside a CRYPTO frame.
+pub fn client_hello_sni(message: &[u8]) -> Option<String> {
+    if message.len() < 4 || message[0] != 1 {
         return None;
     }
     let hello_len =
@@ -222,5 +227,34 @@ mod tests {
         let sniffed = inspect(&record, false, true);
         assert_eq!(sniffed.protocol, Some("tls"));
         assert_eq!(sniffed.domain.as_deref(), Some("example.com"));
+    }
+
+    /// A QUIC CRYPTO frame carries the handshake message alone: no record
+    /// header, so the record-shaped parser above must not be the one that
+    /// reads it.
+    #[test]
+    fn reads_a_bare_client_hello_without_a_record_header() {
+        let extensions = [
+            0, 0, 0, 16, 0, 14, 0, 0, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c',
+            b'o', b'm',
+        ];
+        let mut hello = vec![3, 3];
+        hello.extend_from_slice(&[0; 32]);
+        hello.push(0);
+        hello.extend_from_slice(&[0, 2, 0x13, 0x01]);
+        hello.extend_from_slice(&[1, 0]);
+        hello.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        hello.extend_from_slice(&extensions);
+        let mut message = vec![
+            1,
+            (hello.len() >> 16) as u8,
+            (hello.len() >> 8) as u8,
+            hello.len() as u8,
+        ];
+        message.extend_from_slice(&hello);
+        assert_eq!(client_hello_sni(&message).as_deref(), Some("example.com"));
+        // The record-shaped parser still refuses it, and vice versa.
+        assert!(inspect(&message, false, true).domain.is_none());
+        assert_eq!(client_hello_sni(&hello), None);
     }
 }

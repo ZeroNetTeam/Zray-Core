@@ -922,6 +922,125 @@ pub struct AmneziaWireguardConfig {
     /// The three reserved bytes of every WireGuard message; Cloudflare WARP
     /// uses them as a client id (its `client_id`). Zero otherwise.
     pub reserved: [u8; 3],
+    /// Whether the key pair above is real. A MASQUE-only WARP account has no
+    /// WireGuard half and keeps zeroed keys here.
+    pub has_wireguard: bool,
+    /// Which way this outbound reaches Cloudflare. Only WARP has more than
+    /// one; an ordinary WireGuard server is always [`WarpRoute::WireGuard`].
+    pub route: WarpRoute,
+    /// The account's MASQUE side, when it has one.
+    pub masque: Option<Box<MasqueConfig>>,
+    /// Share links of servers to dial *through* the tunnel: the connection
+    /// goes to the tunnel first and to one of these from there, so the exit
+    /// is the server's address, and the server's own address is only ever
+    /// seen inside the tunnel (see `zero_runtime::warp`).
+    pub exits: Vec<Arc<str>>,
+    /// Which path is tried first: the exits (with the tunnel alone as the
+    /// failsafe) or the tunnel alone (with the exits as the failsafe).
+    pub prefer_exit: bool,
+}
+
+impl AmneziaWireguardConfig {
+    /// Whether this outbound has a WireGuard half at all.
+    pub fn wireguard_usable(&self) -> bool {
+        self.has_wireguard
+    }
+}
+
+/// How a WARP outbound reaches Cloudflare.
+///
+/// On some networks QUIC to foreign hosts is dropped, plain
+/// WireGuard is filtered unless junk packets precede the handshake, and
+/// HTTP/2 to a Cloudflare edge address under a harmless SNI gets through; on
+/// other networks any of them can be the fast one. `Auto` races them and keeps
+/// the first that carries traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum WarpRoute {
+    #[default]
+    Auto,
+    WireGuard,
+    MasqueHttp2,
+    MasqueHttp3,
+}
+
+impl WarpRoute {
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" | "hybrid" => Self::Auto,
+            "wireguard" | "wg" => Self::WireGuard,
+            "masque-h2" | "masque-http2" | "h2" | "http2" => Self::MasqueHttp2,
+            "masque-h3" | "masque-http3" | "h3" | "http3" => Self::MasqueHttp3,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::WireGuard => "wireguard",
+            Self::MasqueHttp2 => "masque-h2",
+            Self::MasqueHttp3 => "masque-h3",
+        }
+    }
+
+    pub fn uses_masque(self) -> bool {
+        !matches!(self, Self::WireGuard)
+    }
+}
+
+/// The MASQUE half of a WARP account (see `zero_transport::masque`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct MasqueConfig {
+    /// The enrolled ECDSA P-256 private key, DER, PKCS#8 or SEC1.
+    pub private_key: Vec<u8>,
+    /// The Cloudflare endpoint key to pin: a DER `SubjectPublicKeyInfo`.
+    pub server_public_key: Vec<u8>,
+    /// The tunnel's own addresses, one per family (WARP hands out both).
+    pub addresses: Vec<IpAddr>,
+    /// Edge addresses for the HTTP/2 (TCP) and HTTP/3 (UDP) tunnels.
+    pub http2_endpoints: Vec<std::net::SocketAddr>,
+    pub http3_endpoints: Vec<std::net::SocketAddr>,
+    /// The TLS server name each transport sends.
+    pub http2_sni: Arc<str>,
+    pub http3_sni: Arc<str>,
+    /// The `:authority` of the CONNECT request.
+    pub authority: Arc<str>,
+}
+
+impl std::fmt::Debug for MasqueConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The key never reaches a log.
+        f.debug_struct("MasqueConfig")
+            .field("addresses", &self.addresses)
+            .field("http2_endpoints", &self.http2_endpoints)
+            .field("http3_endpoints", &self.http3_endpoints)
+            .field("http2_sni", &self.http2_sni)
+            .field("http3_sni", &self.http3_sni)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MasqueConfig {
+    /// Edge addresses to try for the HTTP/2 tunnel, in order. The address the
+    /// official client uses (`.2`) is last: it is the one most often filtered.
+    pub const DEFAULT_HTTP2_ENDPOINTS: [&'static str; 4] = [
+        "162.159.198.4:443",
+        "162.159.198.7:443",
+        "162.159.198.100:443",
+        "162.159.198.2:443",
+    ];
+    /// The address the official client's QUIC tunnel uses.
+    pub const DEFAULT_HTTP3_ENDPOINTS: [&'static str; 1] = ["162.159.198.1:443"];
+    /// A name the filters there let through; Cloudflare's edge answers
+    /// whatever name it is given, and the server is verified by its key.
+    pub const DEFAULT_HTTP2_SNI: &'static str = "www.speedtest.net";
+    /// The name the official client sends.
+    pub const DEFAULT_HTTP3_SNI: &'static str = "consumer-masque.cloudflareclient.com";
+    pub const DEFAULT_AUTHORITY: &'static str = "cloudflareaccess.com";
+
+    pub fn default_endpoints(list: &[&str]) -> Vec<std::net::SocketAddr> {
+        list.iter().filter_map(|text| text.parse().ok()).collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -940,6 +1059,28 @@ pub struct MuxConfig {
 }
 
 impl Outbound {
+    /// Whether this outbound can run over a connection another outbound
+    /// already opened (`dialerProxy`, a WARP exit): a stream protocol over
+    /// plain TCP, WebSocket, HTTPUpgrade or gRPC, without Mux. QUIC carriers
+    /// and XHTTP need a socket of their own.
+    pub fn chainable(&self) -> bool {
+        matches!(
+            self.protocol,
+            OutboundProtocol::Vless(_)
+                | OutboundProtocol::Vmess(_)
+                | OutboundProtocol::Trojan(_)
+                | OutboundProtocol::Shadowsocks(_)
+                | OutboundProtocol::AnyTls(_)
+        ) && !self.mux.enabled
+            && matches!(
+                self.stream.transport,
+                Transport::Raw
+                    | Transport::WebSocket(_)
+                    | Transport::HttpUpgrade(_)
+                    | Transport::Grpc(_)
+            )
+    }
+
     /// Reject combinations that cannot work, before any socket is opened.
     pub fn validate(&self) -> Result<(), String> {
         let caps = self.stream.transport.capabilities();
@@ -1138,6 +1279,53 @@ impl Outbound {
         }
 
         if let OutboundProtocol::AmneziaWireguard(wireguard) = &self.protocol {
+            match (wireguard.route, &wireguard.masque) {
+                (WarpRoute::WireGuard, _) if !wireguard.wireguard_usable() => {
+                    return Err(format!(
+                        "outbound {}: the WireGuard route needs a WireGuard key pair",
+                        self.tag
+                    ));
+                }
+                (WarpRoute::Auto, None) if !wireguard.wireguard_usable() => {
+                    return Err(format!(
+                        "outbound {}: a WARP outbound needs WireGuard keys or a MASQUE key",
+                        self.tag
+                    ));
+                }
+                (route, None) if route.uses_masque() && route != WarpRoute::Auto => {
+                    return Err(format!(
+                        "outbound {}: the {} route needs a MASQUE key",
+                        self.tag,
+                        route.name()
+                    ));
+                }
+                _ => {}
+            }
+            if let Some(masque) = &wireguard.masque {
+                let wants = |route: WarpRoute| {
+                    matches!(wireguard.route, WarpRoute::Auto) || wireguard.route == route
+                };
+                if masque.private_key.is_empty() || masque.server_public_key.is_empty() {
+                    return Err(format!(
+                        "outbound {}: MASQUE needs its private key and the server key to pin",
+                        self.tag
+                    ));
+                }
+                if masque.addresses.is_empty() {
+                    return Err(format!(
+                        "outbound {}: MASQUE needs the tunnel address of the account",
+                        self.tag
+                    ));
+                }
+                if (wants(WarpRoute::MasqueHttp2) && masque.http2_endpoints.is_empty())
+                    || (wants(WarpRoute::MasqueHttp3) && masque.http3_endpoints.is_empty())
+                {
+                    return Err(format!(
+                        "outbound {}: MASQUE has no endpoint for the chosen transport",
+                        self.tag
+                    ));
+                }
+            }
             if wireguard.port == 0 {
                 return Err(format!(
                     "outbound {}: AmneziaWG endpoint port must be non-zero",
@@ -1421,6 +1609,9 @@ pub struct Sniffing {
     pub enabled: bool,
     pub sniff_http: bool,
     pub sniff_tls: bool,
+    /// Read the server name from a QUIC Initial (RFC 9001) so a UDP flow to
+    /// port 443 routes by domain like its TCP twin.
+    pub sniff_quic: bool,
     /// When set, a sniffed domain informs routing but does not rewrite the
     /// destination.
     pub route_only: bool,

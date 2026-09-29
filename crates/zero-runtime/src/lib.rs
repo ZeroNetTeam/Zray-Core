@@ -7,10 +7,12 @@ pub mod api;
 pub mod cdn_check;
 mod dns_out;
 pub mod outbound;
+pub mod quic_sniff;
 pub mod relay;
 pub mod sanction_dns;
 pub mod server;
 pub mod warm;
+pub mod warp;
 
 pub use relay::{relay, RelayOutcome, Transferred};
 
@@ -43,8 +45,8 @@ pub fn tune_allocator() {
 pub use server::{asset_specs_for, asset_store_for, Server, ServerConfig};
 
 /// After the device's network changed: move the pooled Hysteria2/TUIC
-/// connections (QUIC connection migration) and the WireGuard tunnels
-/// (WireGuard roaming) onto sockets on the new network, so they and the
+/// connections (QUIC connection migration), the WireGuard tunnels
+/// (WireGuard roaming) and the MASQUE ones (which reconnect) onto sockets on the new network, so they and the
 /// streams they carry survive the switch. Returns how many moved. Safe to
 /// call from any thread.
 pub fn migrate_quic_connections() -> usize {
@@ -52,5 +54,7 @@ pub fn migrate_quic_connections() -> usize {
     cdn_check::NETWORK_CHANGED.notify_waiters();
     warm::network_changed();
     zero_core::path_mss::network_changed();
-    zero_transport::quic_pool::rebind_all() + zero_protocol::wg_stack::rebind_all()
+    zero_transport::quic_pool::rebind_all()
+        + zero_protocol::wg_stack::rebind_all()
+        + warp::network_changed()
 }

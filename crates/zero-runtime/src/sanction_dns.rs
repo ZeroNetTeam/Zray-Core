@@ -36,6 +36,7 @@ pub const TAG: &str = "anti-sanction";
 /// Re-measure this often on a network that has not changed.
 pub const RECHECK: Duration = Duration::from_secs(30 * 60);
 const QUERY_TIMEOUT: Duration = Duration::from_millis(1500);
+const CERT_TIMEOUT: Duration = Duration::from_millis(3000);
 /// A domestic name every honest Iranian resolver answers the same way.
 const DOMESTIC_NAME: &str = "digikala.com";
 /// Sanctioned names grouped by who runs them. A relay address is one
@@ -115,6 +116,9 @@ struct Measured {
     domestic: Vec<IpAddr>,
     /// Probe answers, one entry per probe name that was answered.
     answers: Vec<(&'static str, Vec<IpAddr>)>,
+    /// The same answers by name, to check a relay's certificate for a name
+    /// it actually relayed.
+    named: Vec<(&'static str, Vec<IpAddr>)>,
 }
 
 /// The anti-sanction candidates in `dns`: plain resolvers on port 53 with an
@@ -141,8 +145,61 @@ pub fn candidates(dns: &zero_config::dns::DnsSettings) -> Vec<IpAddr> {
 /// Measure every candidate at once and choose. Costs one domestic and six
 /// sanctioned lookups per candidate, a few kilobytes in all.
 pub async fn probe(candidates: &[IpAddr]) -> SanctionState {
-    let measured = futures::future::join_all(candidates.iter().map(|ip| measure(*ip))).await;
-    choose(measured.into_iter().flatten().collect())
+    let mut measured: Vec<Measured> =
+        futures::future::join_all(candidates.iter().map(|ip| measure(*ip)))
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+    loop {
+        let state = choose(measured.clone());
+        let Some(server) = state.chosen else {
+            return state;
+        };
+        let names = relayed_names(&measured, server, &state.relay);
+        if relay_certificate_holds(&state.relay, &names).await {
+            return state;
+        }
+        // A relay whose certificate does not verify is a middlebox, not a
+        // pass-through: HSTS sites would refuse it with no way past. Try the
+        // next best resolver instead.
+        tracing::debug!(%server, "anti-sanction relay failed the certificate check");
+        measured.retain(|candidate| candidate.server != server);
+    }
+}
+
+/// Up to two probe names the chosen resolver answered with its relay.
+fn relayed_names(measured: &[Measured], server: IpAddr, relay: &[IpAddr]) -> Vec<&'static str> {
+    measured
+        .iter()
+        .find(|candidate| candidate.server == server)
+        .map(|candidate| {
+            candidate
+                .named
+                .iter()
+                .filter(|(_, ips)| ips.iter().any(|ip| relay.contains(ip)))
+                .map(|(name, _)| *name)
+                .take(2)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a TLS handshake to the relay for one of the names it relayed
+/// verifies against the public roots.
+async fn relay_certificate_holds(relay: &[IpAddr], names: &[&'static str]) -> bool {
+    let Some(address) = relay.first().copied() else {
+        return false;
+    };
+    for name in names {
+        if zero_net::verify_tls(SocketAddr::new(address, 443), name, CERT_TIMEOUT)
+            .await
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 async fn measure(server: IpAddr) -> Option<Measured> {
@@ -153,22 +210,32 @@ async fn measure(server: IpAddr) -> Option<Measured> {
     if domestic.is_empty() {
         return None;
     }
-    let answers = futures::future::join_all(PROBE_NAMES.iter().map(|(group, name)| async move {
-        zero_dns::probe_udp(address, name, QUERY_TIMEOUT)
-            .await
-            .ok()
-            .filter(|(ips, _)| !ips.is_empty())
-            .map(|(ips, _)| (*group, ips))
-    }))
-    .await
-    .into_iter()
-    .flatten()
-    .collect();
+    let probed: Vec<(&'static str, &'static str, Vec<IpAddr>)> =
+        futures::future::join_all(PROBE_NAMES.iter().map(|(group, name)| async move {
+            zero_dns::probe_udp(address, name, QUERY_TIMEOUT)
+                .await
+                .ok()
+                .filter(|(ips, _)| !ips.is_empty())
+                .map(|(ips, _)| (*group, *name, ips))
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+    let answers = probed
+        .iter()
+        .map(|(group, _, ips)| (*group, ips.clone()))
+        .collect();
+    let named = probed
+        .into_iter()
+        .map(|(_, name, ips)| (name, ips))
+        .collect();
     Some(Measured {
         server,
         latency,
         domestic,
         answers,
+        named,
     })
 }
 
@@ -286,6 +353,7 @@ mod tests {
                 .iter()
                 .map(|(group, answer)| (*group, vec![ip(answer)]))
                 .collect(),
+            named: Vec::new(),
         }
     }
 
