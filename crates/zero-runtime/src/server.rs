@@ -3862,6 +3862,14 @@ impl Server {
     /// Otherwise a direct connection would reach the service from an Iranian
     /// address and be refused, so the name goes the default way (the tunnel).
     /// Until the first measurement, the configured behaviour stands.
+    fn default_tunnel_decision(&self) -> Decision {
+        let config = self.config();
+        match config.default_outbound() {
+            Some(outbound) => Decision::Outbound(outbound.tag.clone()),
+            None => Decision::Block,
+        }
+    }
+
     async fn adapt_sanctioned(&self, ctx: &SessionContext, decision: Decision) -> Decision {
         let Decision::DirectVia { resolver } = &decision else {
             return decision;
@@ -3875,22 +3883,19 @@ impl Server {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
         else {
-            return decision;
+            // Not measured yet: a direct connection to a relay that may
+            // present the wrong certificate would break HSTS sites for good.
+            return self.default_tunnel_decision();
         };
-        let tunnel = || {
-            let config = self.config();
-            match config.default_outbound() {
-                Some(outbound) => Decision::Outbound(outbound.tag.clone()),
-                None => Decision::Block,
-            }
-        };
+        let tunnel = || self.default_tunnel_decision();
         let Some(pinned) = state.pinned_tag() else {
             return tunnel();
         };
-        let Some(domain) = ctx.destination.address.as_domain() else {
-            return Decision::DirectVia {
-                resolver: pinned.into(),
-            };
+        // Only a name can be checked against the relay; an address with no
+        // name (an IP literal, QUIC without SNI) goes the safe way.
+        let sniffed = ctx.sniffed.domain.as_deref();
+        let Some(domain) = ctx.destination.address.as_domain().or(sniffed) else {
+            return tunnel();
         };
         let answers = self
             .resolver()
@@ -6086,7 +6091,8 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::time::timeout;
     use zero_core::boxed;
-    use zero_core::{Address, InboundId};
+    use zero_core::{Address, Destination, GenerationId, InboundId, SessionContext};
+    use zero_router::Decision;
 
     /// A ClientHello carrying only an SNI, enough for the sniffer.
     fn hello_for(name: &str) -> Vec<u8> {
@@ -6243,6 +6249,57 @@ mod tests {
             reached,
             [false, true],
             "blocked name leaked / allowed name blocked"
+        );
+    }
+
+    fn sanction_server() -> Server {
+        tun_style_server(serde_json::json!({
+            "inbounds": [{"tag": "socks", "listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [
+                {"tag": "proxy", "protocol": "freedom"},
+                {"tag": "direct", "protocol": "freedom"},
+            ],
+            "dns": {"servers": [{"address": "193.186.32.32", "tag": "anti-sanction"}]},
+        }))
+    }
+
+    fn sanctioned_ctx(destination: zero_core::Destination) -> SessionContext {
+        SessionContext::new(
+            GenerationId(1),
+            InboundId(0),
+            Arc::from("socks"),
+            destination,
+        )
+    }
+
+    /// Until the first measurement, and for a destination that has no name,
+    /// the relay's certificate cannot have been checked: go through the
+    /// tunnel rather than to a relay that may break HSTS sites.
+    #[tokio::test]
+    async fn sanctioned_names_wait_for_a_measurement_and_a_name() {
+        let server = sanction_server();
+        let direct_via = || Decision::DirectVia {
+            resolver: crate::sanction_dns::TAG.into(),
+        };
+        let named = sanctioned_ctx(Destination::tcp(Address::domain("azure.com"), 443));
+        assert_eq!(
+            server.adapt_sanctioned(&named, direct_via()).await,
+            Decision::Outbound("proxy".into()),
+            "unmeasured: must not go direct"
+        );
+
+        *server.sanction.lock().unwrap() = Some(crate::sanction_dns::SanctionState {
+            chosen: Some("193.186.32.32".parse().unwrap()),
+            relay: vec!["203.0.113.9".parse().unwrap()],
+        });
+        let bare = sanctioned_ctx(Destination::tcp(
+            Address::Ip("203.0.113.9".parse().unwrap()),
+            443,
+        ));
+        assert_eq!(
+            server.adapt_sanctioned(&bare, direct_via()).await,
+            Decision::Outbound("proxy".into()),
+            "no name to check the relay against: must not go direct"
         );
     }
 

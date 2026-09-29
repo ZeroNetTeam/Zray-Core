@@ -4,6 +4,7 @@ pub mod clean_ip;
 pub mod dial;
 pub mod fetch;
 pub mod socket;
+pub mod tls_check;
 
 pub use dial::{candidates, dial_tcp, order_candidates, Dialed, RacePolicy, SocketOptions};
 pub use fetch::{
@@ -11,3 +12,4 @@ pub use fetch::{
     Fetched, Validators,
 };
 pub use socket::prepare_listener;
+pub use tls_check::{verify_tls, verify_tls_with};
