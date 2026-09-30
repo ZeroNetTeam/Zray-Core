@@ -339,8 +339,13 @@ async fn crawl_telegram(
             queue.push_back(name);
         }
     };
-    // Directories first: channels such as mahsa_net that list other
-    // channels (their monthly donors) rather than only posting configs.
+    // The seed list first, so the crawl's cap never crowds out a channel
+    // someone picked by hand.
+    for name in seeds.directories.iter().chain(&seeds.channels) {
+        enqueue(name.clone(), &mut queue);
+    }
+    // Then what the directories list: channels such as mahsa_net that list
+    // other channels (their monthly donors) rather than only posting configs.
     // Every name they list is worth one look, whatever it is called.
     for directory in &seeds.directories {
         let Some((text, _, mentioned)) = read_channel(directory, DIRECTORY_PAGES).await else {
@@ -356,9 +361,6 @@ async fn crawl_telegram(
         for name in listed.into_iter().chain(mentioned) {
             enqueue(name, &mut queue);
         }
-    }
-    for name in seeds.directories.iter().chain(&seeds.channels) {
-        enqueue(name.clone(), &mut queue);
     }
     for (name, state) in &previous.channels {
         if now - state.seen < FORGET_AFTER_SECS {
