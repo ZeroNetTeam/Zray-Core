@@ -157,16 +157,26 @@ fn is_hex_id(name: &str) -> bool {
 
 /// The oldest post number on the page, for fetching the page before it.
 pub fn oldest_post(html: &str, channel: &str) -> Option<u64> {
-    let marker = format!("data-post=\"{channel}/");
+    post_numbers(html, channel).min()
+}
+
+/// The newest post number on the page: where the next check can stop.
+pub fn newest_post(html: &str, channel: &str) -> Option<u64> {
+    post_numbers(html, channel).max()
+}
+
+fn post_numbers(html: &str, channel: &str) -> std::vec::IntoIter<u64> {
+    let marker = format!("data-post=\"{channel}/").to_ascii_lowercase();
     let lower = html.to_ascii_lowercase();
-    lower
-        .match_indices(&marker.to_ascii_lowercase())
+    let numbers: Vec<u64> = lower
+        .match_indices(&marker)
         .filter_map(|(at, m)| {
             let rest = &lower[at + m.len()..];
             let end = rest.find('"')?;
             rest[..end].parse::<u64>().ok()
         })
-        .min()
+        .collect();
+    numbers.into_iter()
 }
 
 #[cfg(test)]
@@ -258,6 +268,7 @@ mod tests {
     #[test]
     fn older_pages_are_found() {
         assert_eq!(oldest_post(PAGE, "parsvpn"), Some(1188));
+        assert_eq!(newest_post(PAGE, "parsvpn"), Some(1201));
         assert_eq!(
             page_url("parsvpn", Some(1188)),
             "https://t.me/s/parsvpn?before=1188"
