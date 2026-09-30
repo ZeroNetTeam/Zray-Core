@@ -2,6 +2,10 @@
   "directories": [
     "mahsa_net"
   ],
+  "priority": [
+    "radvpne",
+    "ciaconfig"
+  ],
   "channels": [
     "parsvpn",
     "farsvpn",
@@ -33,10 +37,8 @@
     "v2ray_outlinevpn",
     "iranvpnfree",
     "vpnfree_iran",
-    "ciaconfig",
     "k2guard",
     "v2ray_configs_pools",
-    "v2ray_confiig",
-    "radvpne"
+    "v2ray_confiig"
   ]
 }

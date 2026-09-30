@@ -49,6 +49,15 @@ jobs:
             --telegram deploy/crowd/telegram-channels.json \
             --telegram-state telegram-state.json \
             --out verified.txt --want 300 --min 20 --minutes 20
+      # Keep what the fresh workflow found in the priority channels at the
+      # top; it tested them in the last ten minutes.
+      - name: keep the fresh configs at the top
+        run: |
+          git fetch -q --depth 1 origin crowd-data
+          if git show FETCH_HEAD:fresh.txt > fresh.txt 2>/dev/null; then
+            target/release/zeronet-harvest merge --top fresh.txt \
+              --rest verified.txt --out verified.txt
+          fi
       # Sign the list so apps can tell a genuine one from a CDN's or a
       # network's substitute. Skipped, with a warning, when no signing key is
       # set: the app then falls back to trusting the list as before.
