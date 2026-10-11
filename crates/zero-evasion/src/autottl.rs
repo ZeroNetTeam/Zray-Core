@@ -81,6 +81,10 @@ const MAX_SERVERS: usize = 256;
 /// hop_count_guess(50)  == Some(14)  // 64 - 50
 /// hop_count_guess(10)  == None      // too far to tell
 /// ```
+///
+/// Only the platforms that can read an echo reply's TTL call it; the tests
+/// check the arithmetic everywhere.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn hop_count_guess(received: u8) -> Option<u8> {
     let initial: u8 = if received > 223 {
         255

@@ -260,7 +260,7 @@ impl Pool {
         // Only a positive allowance counts down; negative is unlimited.
         let _ = entry
             .uses_left
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                 (left > 0).then(|| left - 1)
             });
         Next::Use(entry.lease(true))
