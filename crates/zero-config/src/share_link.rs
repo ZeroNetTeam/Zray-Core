@@ -129,10 +129,32 @@ fn parse_link_inner(link: &str) -> Result<ShareLink, String> {
         "ss" => parse_shadowsocks(rest),
         "vmess" => parse_vmess(rest),
         "anytls" => parse_anytls(rest),
+        // `socks5h` is curl's spelling for "let the proxy resolve names",
+        // which is the only way this outbound works.
+        "socks" | "socks5" | "socks5h" => parse_socks(rest),
+        "masterdns" => parse_masterdns(rest),
+        // `tor://#name`: Tor with its defaults. Bridges do not fit a link
+        // sensibly (they carry spaces and certificates), so they live in JSON.
+        "tor" => {
+            let remark = rest.split_once('#').map_or("", |(_, name)| name);
+            let outbound = Outbound {
+                tag: Arc::from("proxy"),
+                protocol: OutboundProtocol::Tor(TorConfig::default()),
+                stream: StreamSettings::default(),
+                mux: MuxConfig::default(),
+            };
+            outbound.validate()?;
+            Ok(ShareLink {
+                link: String::new(),
+                remark: decode(remark),
+                outbound,
+            })
+        }
         "zerov1" | "tide" => parse_tide(rest),
         // `hy2://` is the short form the Hysteria project itself documents.
         "hysteria2" | "hy2" => parse_hysteria2(rest),
         "tuic" => parse_tuic(rest),
+        "juicity" => parse_juicity(rest),
         "wireguard" | "wg" => parse_wireguard(rest),
         "warp" => parse_warp_link(rest),
         _ => Err(format!("unsupported share link scheme {scheme:?}")),
@@ -504,6 +526,143 @@ fn parse_anytls(rest: &str) -> Result<ShareLink, String> {
     })
 }
 
+/// `socks5://[user:password@]host:port#name`, for a local Tor, Orbot or
+/// Psiphon client or any SOCKS5 server. v2rayN's `socks://<base64 user:pass>@…`
+/// form is read too. No credential is the normal case for a local client.
+fn parse_socks(rest: &str) -> Result<ShareLink, String> {
+    use base64::Engine as _;
+    let (body, fragment) = rest.split_once('#').unwrap_or((rest, ""));
+    let authority = body.split(['?', '/']).next().unwrap_or("");
+    let (userinfo, host_port) = match authority.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, authority),
+    };
+    let (host, port) = zero_core::address::split_host_port(host_port)
+        .ok_or_else(|| format!("cannot parse host:port from {host_port:?}"))?;
+    let auth = match userinfo.filter(|u| !u.is_empty()) {
+        None => None,
+        Some(u) => {
+            // Split before decoding so a `%3A` in the password stays inside it.
+            let (user, pass) = match u.split_once(':') {
+                Some((user, pass)) => (decode(user), decode(pass)),
+                None => {
+                    let raw = decode(u);
+                    let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+                        .decode(raw.trim_end_matches('='))
+                        .or_else(|_| {
+                            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                .decode(raw.trim_end_matches('='))
+                        })
+                        .map_err(|_| "SOCKS5 link credential must be user:password".to_string())?;
+                    let text = String::from_utf8(bytes)
+                        .map_err(|_| "SOCKS5 link credential is not text".to_string())?;
+                    let (user, pass) = text.split_once(':').ok_or_else(|| {
+                        "SOCKS5 link credential must be user:password".to_string()
+                    })?;
+                    (user.to_string(), pass.to_string())
+                }
+            };
+            Some(SocksCredential {
+                username: user.into(),
+                password: pass.into(),
+            })
+        }
+    };
+    let outbound = Outbound {
+        tag: Arc::from("proxy"),
+        protocol: OutboundProtocol::Socks(SocksConfig {
+            address: Address::parse_host(host),
+            port,
+            auth,
+        }),
+        stream: StreamSettings::default(),
+        mux: MuxConfig::default(),
+    };
+    outbound.validate()?;
+    Ok(ShareLink {
+        link: String::new(),
+        remark: decode(fragment),
+        outbound,
+    })
+}
+
+/// Resolvers given as `ip` or `ip:port` (`[v6]:port`), 53 when no port is named.
+fn parse_resolver(text: &str) -> Option<std::net::SocketAddr> {
+    let text = text.trim();
+    text.parse::<std::net::SocketAddr>().ok().or_else(|| {
+        text.trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| std::net::SocketAddr::new(ip, 53))
+    })
+}
+
+/// `masterdns://<key>@t.example.com?resolvers=8.8.8.8,1.1.1.1:53&server=203.0.113.7#name`
+///
+/// MasterDnsVPN has no link format of its own; this one is Zray's. The key and
+/// domain are required. `resolvers` are the DNS servers the queries go through
+/// (IP addresses, port 53 unless named), `server` adds the server's own address
+/// as a direct resolver (it answers on UDP 53), `method` is the encryption id
+/// (5, AES-256-GCM, when absent) and `mode` is `socks5` (default) or `tcp`.
+fn parse_masterdns(rest: &str) -> Result<ShareLink, String> {
+    let (body, fragment) = rest.split_once('#').unwrap_or((rest, ""));
+    let (authority, query_str) = body.split_once('?').unwrap_or((body, ""));
+    let (key, domain) = authority
+        .rsplit_once('@')
+        .ok_or_else(|| "MasterDNS link is missing the key before the '@'".to_string())?;
+    let domain = domain.trim_end_matches('/').to_ascii_lowercase();
+    let query = parse_query(query_str);
+    let mut resolvers = Vec::new();
+    if let Some(server) = query.get("server").filter(|s| !s.is_empty()) {
+        resolvers.push(
+            parse_resolver(server)
+                .ok_or_else(|| format!("MasterDNS server {server:?} is not an IP address"))?,
+        );
+    }
+    for item in query
+        .get("resolvers")
+        .map(String::as_str)
+        .unwrap_or("")
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+    {
+        let resolver = parse_resolver(item)
+            .ok_or_else(|| format!("MasterDNS resolver {item:?} is not an IP address"))?;
+        if !resolvers.contains(&resolver) {
+            resolvers.push(resolver);
+        }
+    }
+    let method = match query.get("method") {
+        None => 5,
+        Some(m) => m
+            .parse()
+            .map_err(|_| format!("MasterDNS method {m:?} is not a number"))?,
+    };
+    let mode = match query.get("mode").map(|m| m.to_ascii_lowercase()).as_deref() {
+        None | Some("socks5") | Some("socks") => MasterDnsMode::Socks5,
+        Some("tcp") => MasterDnsMode::Tcp,
+        Some(other) => return Err(format!("MasterDNS mode {other:?} is not socks5 or tcp")),
+    };
+    let outbound = Outbound {
+        tag: Arc::from("proxy"),
+        protocol: OutboundProtocol::MasterDns(MasterDnsConfig {
+            domain: domain.into(),
+            key: decode(key).into(),
+            method,
+            resolvers,
+            mode,
+        }),
+        stream: StreamSettings::default(),
+        mux: MuxConfig::default(),
+    };
+    outbound.validate()?;
+    Ok(ShareLink {
+        link: String::new(),
+        remark: decode(fragment),
+        outbound,
+    })
+}
+
 /// `zerov1://<user>@host:port?key=<server key>&path=/prefix&...#name`
 /// (`tide://` is read too; it is the name the protocol was built under).
 ///
@@ -631,6 +790,60 @@ fn parse_tuic(rest: &str) -> Result<ShareLink, String> {
     let outbound = Outbound {
         tag: Arc::from("proxy"),
         protocol: OutboundProtocol::Tuic(TuicConfig {
+            address: Address::parse_host(p.host),
+            port: p.port,
+            uuid,
+            password: password.into(),
+        }),
+        stream,
+        mux: MuxConfig::default(),
+    };
+    outbound.validate()?;
+    Ok(ShareLink {
+        link: String::new(),
+        remark: p.remark,
+        outbound,
+    })
+}
+
+/// `juicity://<uuid>:<password>@host:port?sni=&congestion_control=#name`
+///
+/// Juicity's own share link. The credential is `uuid:password`, exactly like
+/// TUIC; the carrier is certificate TLS over QUIC with ALPN `h3`. The
+/// `congestion_control` hint is accepted and ignored (the QUIC stack picks the
+/// controller), and `pinned_certchain_sha256` is accepted and ignored because
+/// this client verifies the ordinary certificate chain rather than a pinned
+/// hash. `allow_insecure` is not honoured: the model refuses to disable
+/// certificate verification for any outbound, so a Juicity server must present
+/// a chain this client can verify.
+fn parse_juicity(rest: &str) -> Result<ShareLink, String> {
+    let p = split_link(rest)?;
+    let (uuid_text, password) = p
+        .credential
+        .split_once(':')
+        .ok_or_else(|| "Juicity link credential must be uuid:password".to_string())?;
+    let uuid = parse_uuid(uuid_text)?;
+    if password.is_empty() {
+        return Err("Juicity link has an empty password".into());
+    }
+    let mut stream = build_stream(&p.query, p.host)?;
+    if matches!(stream.security, Security::None) {
+        let fingerprint = Fingerprint::parse(p.query.get("fp").map(String::as_str).unwrap_or(""))
+            .ok_or_else(|| "unknown Juicity fingerprint".to_string())?;
+        stream.security = Security::Tls(TlsConfig {
+            server_name: Some(Arc::from(
+                p.query.get("sni").map(String::as_str).unwrap_or(p.host),
+            )),
+            alpn: vec![Box::from("h3")],
+            fingerprint,
+            allow_insecure: false,
+            ech: None,
+            trusted_roots: Vec::new(),
+        });
+    }
+    let outbound = Outbound {
+        tag: Arc::from("proxy"),
+        protocol: OutboundProtocol::Juicity(JuicityConfig {
             address: Address::parse_host(p.host),
             port: p.port,
             uuid,
@@ -994,7 +1207,9 @@ fn parse_short_id(s: &str) -> Result<Vec<u8>, String> {
     (0..s.len())
         .step_by(2)
         .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| format!("bad hex in shortId {s:?}"))
+            s.get(i..i + 2)
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(|| format!("bad hex in shortId {s:?}"))
         })
         .collect()
 }
@@ -1009,7 +1224,11 @@ mod hex {
         }
         (0..s.len())
             .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| Error))
+            .map(|i| {
+                s.get(i..i + 2)
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                    .ok_or(Error)
+            })
             .collect()
     }
 }
@@ -1017,6 +1236,89 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A feed can carry anything where a key should be, including text cut
+    /// off with "…": the hex decoders must refuse it, never slice through it.
+    #[test]
+    fn non_ascii_keys_are_refused_not_panicked_on() {
+        for bad in ["a…", "…", "ab\u{e9}d", "\u{e9}\u{e9}", "0123456789abcde…"] {
+            assert!(parse_short_id(bad).is_err(), "short id {bad:?}");
+            assert!(parse_reality_key(bad).is_err(), "key {bad:?}");
+        }
+        assert_eq!(parse_short_id("ab12").unwrap(), vec![0xab, 0x12]);
+    }
+
+    fn masterdns(link: &str) -> Result<MasterDnsConfig, String> {
+        match parse_link(link)?.outbound.protocol {
+            OutboundProtocol::MasterDns(m) => Ok(m),
+            other => Err(format!("not a MasterDNS outbound: {other:?}")),
+        }
+    }
+
+    #[test]
+    fn a_masterdns_link_names_the_domain_key_and_resolvers() {
+        let m = masterdns(
+            "masterdns://k3y%2Bsecret@T.Example.com?server=203.0.113.7&resolvers=8.8.8.8,1.1.1.1:5353,[2001:4860:4860::8888]&method=4&mode=tcp#My%20DNS",
+        )
+        .unwrap();
+        assert_eq!(&*m.domain, "t.example.com");
+        assert_eq!(&*m.key, "k3y+secret");
+        assert_eq!(m.method, 4);
+        assert_eq!(m.mode, MasterDnsMode::Tcp);
+        let resolvers: Vec<String> = m.resolvers.iter().map(|r| r.to_string()).collect();
+        // The server itself comes first, then the resolvers; port 53 by default.
+        assert_eq!(
+            resolvers,
+            [
+                "203.0.113.7:53",
+                "8.8.8.8:53",
+                "1.1.1.1:5353",
+                "[2001:4860:4860::8888]:53"
+            ]
+        );
+        assert_eq!(
+            parse_link("masterdns://k@t.example.com?server=203.0.113.7#My%20DNS")
+                .unwrap()
+                .remark,
+            "My DNS"
+        );
+    }
+
+    #[test]
+    fn a_masterdns_link_defaults_to_aes_gcm_and_socks5() {
+        let m = masterdns("masterdns://k@t.example.com?resolvers=9.9.9.9").unwrap();
+        assert_eq!((m.method, m.mode), (5, MasterDnsMode::Socks5));
+    }
+
+    #[test]
+    fn a_bad_masterdns_link_says_what_is_wrong() {
+        for (link, needle) in [
+            ("masterdns://t.example.com?resolvers=9.9.9.9", "key"),
+            ("masterdns://k@t.example.com", "resolver"),
+            (
+                "masterdns://k@t.example.com?resolvers=dns.google",
+                "not an IP",
+            ),
+            ("masterdns://k@localhost?resolvers=9.9.9.9", "domain"),
+            (
+                "masterdns://k@t.example.com?resolvers=9.9.9.9&method=2",
+                "method",
+            ),
+            (
+                "masterdns://k@t.example.com?resolvers=9.9.9.9&mode=udp",
+                "mode",
+            ),
+        ] {
+            let error = masterdns(link).unwrap_err();
+            assert!(error.contains(needle), "{link}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_masterdns_key_never_prints() {
+        let m = masterdns("masterdns://very-secret-key@t.example.com?resolvers=9.9.9.9").unwrap();
+        assert!(!format!("{m:?}").contains("very-secret-key"));
+    }
 
     fn outbound(link: &str) -> Outbound {
         parse_link(link)
@@ -1361,6 +1663,56 @@ mod tests {
     }
 
     #[test]
+    fn parses_socks_links_with_and_without_a_credential() {
+        let local = parse_link("socks5://127.0.0.1:9050#Tor").unwrap();
+        assert_eq!(local.remark, "Tor");
+        match &local.outbound.protocol {
+            OutboundProtocol::Socks(s) => {
+                assert_eq!(s.port, 9050);
+                assert_eq!(s.address, Address::parse_host("127.0.0.1"));
+                assert!(s.auth.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(local.outbound.stream.security, Security::None));
+
+        // A %3A in the password must not be mistaken for the separator.
+        let plain = parse_link("socks5h://alice:p%3Ass@proxy.example:1080").unwrap();
+        match &plain.outbound.protocol {
+            OutboundProtocol::Socks(s) => {
+                let auth = s.auth.as_ref().unwrap();
+                assert_eq!(&*auth.username, "alice");
+                assert_eq!(&*auth.password, "p:ss");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // v2rayN: base64("alice:secret") in the user position.
+        let b64 = parse_link("socks://YWxpY2U6c2VjcmV0@[::1]:1080").unwrap();
+        match &b64.outbound.protocol {
+            OutboundProtocol::Socks(s) => {
+                let auth = s.auth.as_ref().unwrap();
+                assert_eq!((&*auth.username, &*auth.password), ("alice", "secret"));
+                assert_eq!(s.address, Address::parse_host("::1"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        assert!(parse_link("socks5://127.0.0.1").is_err());
+        assert!(parse_link("socks5://nocolon@127.0.0.1:9050").is_err());
+    }
+
+    #[test]
+    fn parses_the_bare_tor_link() {
+        let link = parse_link("tor://#Tor%20network").unwrap();
+        assert_eq!(link.remark, "Tor network");
+        assert_eq!(
+            link.outbound.protocol,
+            OutboundProtocol::Tor(TorConfig::default())
+        );
+    }
+
+    #[test]
     fn parses_hysteria2_link_with_tls_default() {
         let link = parse_link("hysteria2://secret@example.com:443?sni=cdn.example#H2").unwrap();
         assert_eq!(link.remark, "H2");
@@ -1387,6 +1739,46 @@ mod tests {
         };
         assert_eq!(tls.server_name.as_deref(), Some("cdn.example"));
         assert_eq!(tls.alpn, vec![Box::<str>::from("h3")]);
+    }
+
+    #[test]
+    fn parses_juicity_link_with_uuid_password_and_h3() {
+        let link = parse_link(
+            "juicity://00000000-0000-0000-0000-000000000001:secret@example.com:443?sni=cdn.example&congestion_control=bbr#Juicity",
+        )
+        .unwrap();
+        assert_eq!(link.remark, "Juicity");
+        let OutboundProtocol::Juicity(juicity) = &link.outbound.protocol else {
+            panic!("expected juicity, got {:?}", link.outbound.protocol);
+        };
+        assert_eq!(juicity.port, 443);
+        assert_eq!(&*juicity.password, "secret");
+        assert_eq!(juicity.uuid[15], 1);
+        let Security::Tls(tls) = &link.outbound.stream.security else {
+            panic!("expected certificate TLS");
+        };
+        assert_eq!(tls.server_name.as_deref(), Some("cdn.example"));
+        assert_eq!(tls.alpn, vec![Box::<str>::from("h3")]);
+        assert!(!tls.allow_insecure);
+    }
+
+    #[test]
+    fn juicity_link_imports_securely_and_rejects_empty_password() {
+        // A plain Juicity link verifies the certificate chain: the model
+        // refuses to disable verification, so `allow_insecure` in the query is
+        // not honoured and the connection stays secure.
+        let link = parse_link(
+            "juicity://00000000-0000-0000-0000-000000000001:pw@example.com:443?allow_insecure=1#J",
+        )
+        .unwrap();
+        let Security::Tls(tls) = &link.outbound.stream.security else {
+            panic!("expected certificate TLS");
+        };
+        assert!(!tls.allow_insecure);
+        assert!(parse_link(
+            "juicity://00000000-0000-0000-0000-000000000001:@example.com:443#empty"
+        )
+        .is_err());
     }
 
     #[test]

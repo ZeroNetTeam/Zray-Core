@@ -185,6 +185,7 @@ fn score(path: &str) -> u32 {
         ("vmess", 1),
         ("hysteria", 1),
         ("tuic", 1),
+        ("juicity", 1),
         ("proxy", 1),
     ] {
         if lower.contains(word) {

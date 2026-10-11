@@ -227,6 +227,26 @@ jobs:
           merge-multiple: true
       - name: checksums
         run: cd dist && sha256sum * > SHA256SUMS.txt
+      # The apps install the server program on people's own servers only after
+      # this list's signature checks out against the key built into them, so a
+      # release without a signature simply cannot be installed from the app.
+      - uses: actions/checkout@v7
+        with:
+          path: src
+      - uses: dtolnay/rust-toolchain@stable
+      - name: sign the checksums
+        env:
+          CROWD_SIGNING_KEY: ${{ secrets.CROWD_SIGNING_KEY }}
+        run: |
+          if [ -z "$CROWD_SIGNING_KEY" ]; then
+            echo "::warning::No CROWD_SIGNING_KEY; SHA256SUMS.txt is unsigned, so the apps cannot install the server from this release."
+            exit 0
+          fi
+          cargo build --release --manifest-path src/Cargo.toml -p zero-discovery --bin zeronet-sign
+          sign=src/target/release/zeronet-sign
+          $sign sign dist/SHA256SUMS.txt
+          # A seed that belongs to another key would publish a signature no app accepts.
+          $sign verify dist/SHA256SUMS.txt
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ env.RELEASE_TAG }}

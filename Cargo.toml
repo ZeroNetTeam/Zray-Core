@@ -18,6 +18,9 @@ members = [
     "crates/zero-scanner",
     "crates/zero-discovery",
     "crates/zeronet-tui",
+    "crates/zero-tor",
+    "crates/zero-masterdns",
+    "crates/zero-provision",
     # Allocation counts for the framed read paths. A workspace member so it
     # resolves the same dependency versions as the code it measures, and so its
     # release profile is the shipped one.
@@ -52,6 +55,9 @@ zero-discovery = { path = "crates/zero-discovery", version = "0.1.0" }
 zray-cli = { path = "crates/zray-cli", version = "0.1.0" }
 zray-mobile = { path = "crates/zray-mobile", version = "0.1.0" }
 zeronet-tui = { path = "crates/zeronet-tui", version = "0.1.0" }
+zero-tor = { path = "crates/zero-tor", version = "0.1.0" }
+zero-masterdns = { path = "crates/zero-masterdns", version = "0.1.0" }
+zero-provision = { path = "crates/zero-provision", version = "0.1.0" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "aws-lc-rs", "tls12", "logging"] }
@@ -106,6 +112,13 @@ subtle = "2"
 anyhow = "1"
 libc = "0.2"
 zstd = "0.13"
+# LZ4 block codec for the MasterDNS tunnel's optional payload compression.
+# Pure Rust (no C), and the two `safe-*` features keep the decoder out of
+# `unsafe`, which matters for a codec that runs on bytes a remote end chose.
+# `default-features = false` drops the LZ4 *frame* module and its xxhash
+# dependency; only the raw block API (size-prefixed) is used, to match the
+# Go server's `lz4.CompressBlock` + 4-byte little-endian length header.
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
 # Decode-only brotli, for certificate compression. rustls' own `brotli`
 # feature links the full compressor as well (~800 KB of the mobile core) for
 # a job only a server does.

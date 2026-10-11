@@ -267,9 +267,22 @@ fn shaped(tcp: TcpStream, stream: &StreamSettings, injected: bool) -> BoxStream 
             },
             ttl: spoof.ttl,
         };
-        let decoy = policy.sendable();
         let urgent = zero_evasion::urgent::supported();
         let peer = tcp.peer_addr().ok();
+        // On a kernel with no MD5 option the decoy is stopped by a hop limit,
+        // which has to match the path. `zero_evasion::autottl` learns that
+        // distance from the server itself, so the decoy counts as a possible
+        // way here even when no hop count was configured; the value is settled
+        // below once the way is Decoy. Where the kernel has MD5 (`ttl_available`
+        // is then false) this stays off and no probe is ever sent.
+        let learn_ttl = peer.is_some()
+            && zero_evasion::autottl::supported()
+            && zero_evasion::decoy::ttl_available()
+            && matches!(
+                policy.fooling,
+                zero_evasion::Fooling::Auto | zero_evasion::Fooling::Ttl
+            );
+        let decoy = policy.sendable() || learn_ttl;
         let way = match spoof.method {
             SniMethod::Decoy => decoy.then_some(Way::Decoy),
             SniMethod::Urgent => urgent.then_some(Way::Urgent),
@@ -282,7 +295,25 @@ fn shaped(tcp: TcpStream, stream: &StreamSettings, injected: bool) -> BoxStream 
             },
         };
         match (way, spoof.method, peer) {
-            (Some(Way::Decoy), ..) => return boxed(zero_evasion::DecoyStream::new(tcp, policy)),
+            (Some(Way::Decoy), ..) => {
+                // Settle the hop limit the TTL decoy needs. A distance learned
+                // from the path beats the configured guess; on a cache miss
+                // `fake_ttl` starts one background probe and this connection
+                // falls back to the urgent byte, so the next one to this server
+                // finds the answer ready.
+                let mut policy = policy;
+                if learn_ttl {
+                    if let Some(ttl) = peer.and_then(|p| zero_evasion::autottl::fake_ttl(p.ip())) {
+                        policy.ttl = ttl;
+                    }
+                }
+                if policy.sendable() {
+                    return boxed(zero_evasion::DecoyStream::new(tcp, policy));
+                }
+                if urgent {
+                    return boxed(zero_evasion::UrgentStream::new(tcp));
+                }
+            }
             // Only an urgent byte the device chose is watched: one the
             // configuration asked for is kept whatever happens.
             (Some(Way::Urgent), SniMethod::Auto, Some(peer)) => {
@@ -317,6 +348,7 @@ fn fragment_policy(f: &zero_config::FragmentConfig) -> FragmentPolicy {
     FragmentPolicy {
         packets: match f.packets {
             FragmentPackets::TlsHello => Packets::TlsHello,
+            FragmentPackets::TlsSni => Packets::TlsSni,
             FragmentPackets::Range { from, to } => Packets::Range {
                 from: from as u64,
                 to: to as u64,
@@ -404,6 +436,9 @@ pub(crate) fn tls_params(stream: &StreamSettings, fallback_host: &str) -> Option
         // REALITY is not a rustls connection; it is handled separately and is
         // rejected earlier for carriers that cannot host it.
         Security::Reality(_) => None,
+        // ShadowTLS builds its own browser-shaped ClientHello and never runs a
+        // rustls session, so there is nothing to hand to the TLS layer.
+        Security::ShadowTls(_) => None,
     }
 }
 
@@ -460,6 +495,12 @@ pub(crate) async fn within_setup_deadline<T>(
 
 /// Open a proxied connection to `destination` through `outbound`.
 pub async fn connect(outbound: &Outbound, destination: &Destination) -> Result<BoxStream, Failure> {
+    if let OutboundProtocol::Tor(tor) = &outbound.protocol {
+        return connect_tor(tor, destination).await;
+    }
+    if let OutboundProtocol::MasterDns(masterdns) = &outbound.protocol {
+        return crate::masterdns::connect(masterdns, destination).await;
+    }
     let (address, port) = outbound.endpoint().ok_or_else(|| {
         Failure::new(FailureKind::LocalPolicy, Stage::Resolving)
             .with_detail(format!("outbound {} has no endpoint", outbound.tag))
@@ -487,6 +528,12 @@ pub async fn connect_with_resolver(
     destination: &Destination,
     resolver: &zero_dns::Resolver,
 ) -> Result<BoxStream, Failure> {
+    if let OutboundProtocol::Tor(tor) = &outbound.protocol {
+        return connect_tor(tor, destination).await;
+    }
+    if let OutboundProtocol::MasterDns(masterdns) = &outbound.protocol {
+        return crate::masterdns::connect(masterdns, destination).await;
+    }
     let (address, port) = outbound.endpoint().ok_or_else(|| {
         Failure::new(FailureKind::LocalPolicy, Stage::Resolving)
             .with_detail(format!("outbound {} has no endpoint", outbound.tag))
@@ -516,6 +563,38 @@ pub async fn connect_with_resolver(
         Some(resolver),
     ))
     .await
+}
+
+/// Open a stream through the embedded Tor client.
+///
+/// Deliberately outside `within_setup_deadline`: a cold Tor start downloads the
+/// network directory and legitimately takes longer than any other outbound's
+/// handshake, so `zero_tor` applies its own, longer bounds. The name is handed
+/// to Tor unresolved so the lookup happens at the exit, not on this network.
+#[cfg(feature = "tor")]
+async fn connect_tor(
+    tor: &zero_config::TorConfig,
+    destination: &Destination,
+) -> Result<BoxStream, Failure> {
+    if destination.network != zero_core::Network::Tcp {
+        return Err(Failure::new(FailureKind::LocalPolicy, Stage::RequestSent)
+            .with_detail("Tor carries TCP only"));
+    }
+    zero_tor::connect(tor, &destination.address, destination.port)
+        .await
+        .map(boxed)
+        .map_err(|error| {
+            Failure::new(FailureKind::TcpUnreachable, Stage::SocketConnected).with_detail(error)
+        })
+}
+
+#[cfg(not(feature = "tor"))]
+async fn connect_tor(
+    _tor: &zero_config::TorConfig,
+    _destination: &Destination,
+) -> Result<BoxStream, Failure> {
+    Err(Failure::new(FailureKind::LocalPolicy, Stage::Resolving)
+        .with_detail("this build was made without Tor support; use a build with the `tor` feature"))
 }
 
 /// The tunnel parameters of a WireGuard/AmneziaWG outbound.
@@ -634,6 +713,30 @@ async fn connect_resolved(
             &tuic.password,
             destination,
         )
+        .await
+        .map_err(|error| {
+            Failure::new(FailureKind::ProtocolRejected, Stage::RequestSent).with_detail(error)
+        });
+    }
+    if let OutboundProtocol::Juicity(juicity) = &outbound.protocol {
+        let fallback_host = address.host_string();
+        let tls = tls_params(&outbound.stream, &fallback_host).ok_or_else(|| {
+            Failure::new(FailureKind::LocalPolicy, Stage::TlsStarted)
+                .with_detail("Juicity requires ordinary certificate TLS")
+        })?;
+        if destination.network == zero_core::Network::Udp {
+            return Err(Failure::new(FailureKind::LocalPolicy, Stage::RequestSent)
+                .with_detail("Juicity UDP is dispatched through the datagram exchange"));
+        }
+        // Boxed: this future's state would otherwise sit in this function's
+        // frame, and chained dialers nest frames (see the dialer-proxy tests).
+        return Box::pin(zero_transport::juicity::connect(
+            &addrs,
+            &tls,
+            &juicity.uuid,
+            &juicity.password,
+            destination,
+        ))
         .await
         .map_err(|error| {
             Failure::new(FailureKind::ProtocolRejected, Stage::RequestSent).with_detail(error)
@@ -1060,6 +1163,21 @@ async fn secure(
             Ok(match policy {
                 Some(policy) => boxed(zero_evasion::KeepaliveStream::new(secured, policy)),
                 None => boxed(secured),
+            })
+        }
+        Security::ShadowTls(cfg) => {
+            let alpn: Vec<Vec<u8>> = cfg.alpn.iter().map(|a| a.as_bytes().to_vec()).collect();
+            Box::pin(zero_transport::shadowtls::connect(
+                base,
+                &cfg.password,
+                &cfg.server_name,
+                &alpn,
+                FingerprintProfile::Chrome,
+            ))
+            .await
+            .map_err(|error| {
+                Failure::new(FailureKind::TlsHandshakeMalformed, Stage::TlsStarted)
+                    .with_detail(error.to_string())
             })
         }
     }
@@ -1688,6 +1806,26 @@ async fn finish_stack(
         return Ok(boxed(stream));
     }
 
+    if let OutboundProtocol::Socks(socks) = &outbound.protocol {
+        let credential = socks
+            .auth
+            .as_ref()
+            .map(|a| zero_protocol::socks::Credential {
+                username: a.username.clone(),
+                password: a.password.clone(),
+            });
+        let stream = Box::pin(zero_protocol::socks::connect_socks5(
+            secured,
+            credential.as_ref(),
+            destination,
+        ))
+        .await
+        .map_err(|error| {
+            Failure::new(FailureKind::ProtocolRejected, Stage::RequestSent).with_detail(error)
+        })?;
+        return Ok(boxed(stream));
+    }
+
     // 3. Carrier, and the protocol header that rides in its first bytes.
     let header = protocol_header(outbound, destination)?;
 
@@ -2017,9 +2155,13 @@ fn protocol_header(outbound: &Outbound, destination: &Destination) -> Result<Vec
         OutboundProtocol::Shadowsocks(_) => Ok(Vec::new()),
         OutboundProtocol::Vmess(_) => Ok(Vec::new()),
         OutboundProtocol::AnyTls(_) => Ok(Vec::new()),
+        OutboundProtocol::Socks(_) => Ok(Vec::new()),
+        OutboundProtocol::Tor(_) => Ok(Vec::new()),
+        OutboundProtocol::MasterDns(_) => Ok(Vec::new()),
         OutboundProtocol::Tide(_) => Ok(Vec::new()),
         OutboundProtocol::Hysteria2(_) => Ok(Vec::new()),
         OutboundProtocol::Tuic(_) => Ok(Vec::new()),
+        OutboundProtocol::Juicity(_) => Ok(Vec::new()),
         OutboundProtocol::AmneziaWireguard(_) => Ok(Vec::new()),
         other => Err(
             Failure::new(FailureKind::LocalPolicy, Stage::RequestSent).with_detail(format!(

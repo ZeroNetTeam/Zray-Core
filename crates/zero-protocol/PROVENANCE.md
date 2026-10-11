@@ -30,3 +30,30 @@
   frames preserve the zero session ID, eight-byte global ID, UDP source target,
   and packet payload contract, with one-shot exchange support for the runtime
   datagram boundary.
+- MasterDnsVPN is a Rust port of the deterministic wire core of
+  `masterking32/MasterDnsVPN` (MIT), pinned to the server release
+  `v2026.06.13.234407-7de2476`. This crate carries only the parts that must be
+  byte-identical to the server to interoperate: the raw packet layout and its
+  one-byte header check, the lower-base36 DNS-label codec (with the base32 and
+  raw-base64 alternates the server can be configured for), the AES-GCM/XOR/none
+  encryption methods and their key derivation, the SESSION_ACCEPT payload, and
+  the packed-control-block list. It also carries the pure framing that rides on
+  top of those: the DNS `TXT` carrier (building the tunnel question name and
+  recovering the raw frame from `TXT` answers, including chunk reassembly), the
+  compression type vocabulary and its packed upload/download pair, the
+  SESSION_INIT request payload, and the SOCKS target address codec. Every
+  encoded value is checked against vectors generated from the upstream Go
+  packages (`internal/vpnproto`, `internal/basecodec`, `internal/security`,
+  `internal/dnsparser`, `internal/compression`, `internal/socksproto`) at the
+  pinned commit, so a passing test run means the two agree on the wire. Method 2
+  (ChaCha20, which upstream runs unauthenticated) is understood but not built:
+  it returns an error rather than carry a cipher that is never a safe choice.
+  What stays out of this crate: the sockets that send the DNS queries, the
+  compression codecs themselves (deflate/zstd/lz4), the reliable (ARQ) layer,
+  the session handshake orchestration and SOCKS stream management. They need
+  sockets, timing, and heavier dependencies and belong in
+  `zero-transport`/`zero-runtime`, the same split the `tide` protocol uses.
+  `zero-masterdns/tests/live_go_server.rs` runs these parts against the real Go
+  server built from the pinned commit (MTU probes, handshake, ping, a stream
+  open and a data round trip, for every supported encryption method); it is
+  opt-in because it needs the server binary.

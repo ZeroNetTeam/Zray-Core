@@ -12,6 +12,11 @@ ignore = [
   # APIs ratatui never calls: its only use is `LruCache::get_or_insert`.
   { id = "RUSTSEC-2026-0002", reason = "IterMut is not used by ratatui 0.29" },
   { id = "RUSTSEC-2026-0253", reason = "LruCache::pop is not used by ratatui 0.29" },
+  # rsa is pulled in by Arti (zero-tor). The Marvin attack times RSA private-key
+  # operations; Arti's client uses the crate to verify relays' RSA identity
+  # certificates (public-key operations), and Zray holds no RSA private key and
+  # decrypts nothing with RSA. No patched release exists upstream.
+  { id = "RUSTSEC-2023-0071", reason = "Arti verifies relay RSA certificates only; no RSA private-key use" },
 ]
 
 [bans]
@@ -42,6 +47,9 @@ allow = [
   "OpenSSL",
   "Unicode-DFS-2016",
   "Unicode-3.0",
+  # Public-domain dedication, compatible with MIT. async_executors, via
+  # Arti's runtime layer (zero-tor).
+  "Unlicense",
   "Zlib",
 ]
 [sources]

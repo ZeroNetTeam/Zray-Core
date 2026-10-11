@@ -23,6 +23,15 @@ pub enum Packets {
     /// Only the first write, and only if it is a TLS handshake record. The
     /// record is re-framed into several smaller *valid* TLS records.
     TlsHello,
+    /// Only the first write, and only if it is a TLS ClientHello carrying a
+    /// server name. The record is re-framed into TLS records with one cut
+    /// landing *inside* the host name (its second-level label), so the name
+    /// never appears whole in any one record. For a censor that reassembles
+    /// TCP but reads the name out of a single TLS record — what Iran was seen
+    /// doing in 2026, where plain segment splitting had stopped working — the
+    /// name is split where it looks for it. `length_*` is ignored; the cut is
+    /// placed from the name, not a size.
+    TlsSni,
     /// Writes numbered `from..=to` (1-based) are split at raw byte
     /// boundaries, with no record re-framing.
     Range { from: u64, to: u64 },
@@ -214,6 +223,110 @@ pub fn plan_tls_hello(buf: &[u8], policy: &FragmentPolicy) -> Option<Vec<Chunk>>
     Some(chunks)
 }
 
+/// Plan a split of a TLS ClientHello with one record boundary inside the
+/// server name, used by [`Packets::TlsSni`].
+///
+/// Returns `None` when the input is not a ClientHello carrying a name, so the
+/// caller sends the buffer untouched. Otherwise the record is re-framed into
+/// two valid TLS records whose boundary falls in the middle of the name's
+/// second-level label — `www.speedtest.net` is cut inside `speedtest` — so a
+/// censor that reads the name out of one TLS record never sees it whole. A
+/// handshake message may legally span records, so the server reassembles it
+/// exactly as it would any hello.
+///
+/// `length_*` is not used: the cut is placed from the name, not a size. When
+/// the policy would merge records into one write ([`FragmentPolicy::combines_hello`])
+/// both records go in that one write, which still breaks the record-boundary
+/// match at no extra latency or syscall; otherwise the configured delay is
+/// left between them.
+pub fn plan_tls_sni(buf: &[u8], policy: &FragmentPolicy) -> Option<Vec<Chunk>> {
+    if buf.len() <= 5 || buf[0] != 22 {
+        return None;
+    }
+    let record_len = 5 + ((buf[3] as usize) << 8 | buf[4] as usize);
+    if buf.len() < record_len {
+        // Already fragmented by someone else; do not re-frame.
+        return None;
+    }
+    let name = crate::decoy::server_name_range(&buf[..record_len])?;
+    // The cut in record coordinates, then as an offset into the payload (which
+    // starts after the five-byte record header). A one-byte name cannot be
+    // split in two, and then there is nothing to do.
+    let cut = name.start + sld_midpoint(&buf[name.clone()])?;
+    let data = &buf[5..record_len];
+    let at = cut - 5;
+
+    // One TLS record carrying `slice`: the original content type and version,
+    // a rewritten 16-bit length, then the bytes.
+    let record = |slice: &[u8]| -> Vec<u8> {
+        let mut rec = Vec::with_capacity(5 + slice.len());
+        rec.extend_from_slice(&buf[..3]);
+        rec.push((slice.len() >> 8) as u8);
+        rec.push(slice.len() as u8);
+        rec.extend_from_slice(slice);
+        rec
+    };
+    let first = record(&data[..at]);
+    let second = record(&data[at..]);
+
+    let mut chunks = Vec::new();
+    if policy.combines_hello() {
+        let mut one = first;
+        one.extend_from_slice(&second);
+        chunks.push(Chunk {
+            bytes: one,
+            delay_ms: 0,
+        });
+    } else {
+        chunks.push(Chunk {
+            bytes: first,
+            delay_ms: policy.delay_after(0),
+        });
+        chunks.push(Chunk {
+            bytes: second,
+            delay_ms: 0,
+        });
+    }
+
+    // Anything after the record travels unfragmented.
+    if buf.len() > record_len {
+        chunks.push(Chunk {
+            bytes: buf[record_len..].to_vec(),
+            delay_ms: 0,
+        });
+    }
+
+    Some(chunks)
+}
+
+/// The byte offset inside `name` to cut at: the middle of its second-level
+/// label (`speedtest` in `www.speedtest.net`), the part a suffix match keys
+/// on. Falls back to the middle of the whole name when there is no clear
+/// second-level label, and returns `None` for a name too short to split in
+/// two, where the caller leaves the record whole.
+///
+/// The result is always in `1..name.len()`, so both records hold at least one
+/// byte of the name.
+fn sld_midpoint(name: &[u8]) -> Option<usize> {
+    if name.len() < 2 {
+        return None;
+    }
+    // The dots are the label boundaries. The last label is the TLD; the one
+    // in front of it is the second-level label the cut aims into.
+    let dots: Vec<usize> = name
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| (*b == b'.').then_some(i))
+        .collect();
+    let (start, end) = match dots.len() {
+        0 => (0, name.len()),
+        1 => (0, dots[0]),
+        n => (dots[n - 2] + 1, dots[n - 1]),
+    };
+    let mid = start + (end - start) / 2;
+    Some(mid.clamp(1, name.len() - 1))
+}
+
 /// Plan a raw byte-boundary split, used by `Packets::Range`.
 ///
 /// A listed length of zero cuts nothing, so that piece is skipped; it still
@@ -278,7 +391,7 @@ impl<S> FragmentStream<S> {
 
     fn should_fragment(&self, count: u64) -> bool {
         match self.policy.packets {
-            Packets::TlsHello => count == 1,
+            Packets::TlsHello | Packets::TlsSni => count == 1,
             Packets::Range { from, to } => count >= from && count <= to,
         }
     }
@@ -358,6 +471,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FragmentStream<S> {
 
         let plan = match this.policy.packets {
             Packets::TlsHello => plan_tls_hello(buf, &this.policy),
+            Packets::TlsSni => plan_tls_sni(buf, &this.policy),
             Packets::Range { .. } => Some(plan_raw(buf, &this.policy)),
         };
 
@@ -716,5 +830,118 @@ mod tests {
             .await
             .unwrap();
         assert!(got.ends_with(&later[5..]));
+    }
+
+    /// A real ClientHello record carrying `name`, enough for the SNI parser to
+    /// find the name: one cipher suite, null compression, SNI and two filler
+    /// extensions.
+    fn hello(name: &str) -> Vec<u8> {
+        let mut extensions = vec![0xff, 0x01, 0, 1, 0]; // renegotiation_info
+        extensions.extend_from_slice(&[0, 0]); // server_name
+        extensions.extend_from_slice(&(name.len() as u16 + 5).to_be_bytes());
+        extensions.extend_from_slice(&(name.len() as u16 + 3).to_be_bytes());
+        extensions.push(0); // host_name
+        extensions.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(name.as_bytes());
+        extensions.extend_from_slice(&[0, 0x17, 0, 0]); // extended_master_secret
+        let mut body = vec![3, 3];
+        body.extend_from_slice(&[7; 32]);
+        body.extend_from_slice(&[4, 1, 2, 3, 4]); // session id
+        body.extend_from_slice(&[0, 2, 0x13, 0x01]); // one cipher suite
+        body.extend_from_slice(&[1, 0]); // null compression
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+        let mut record = vec![0x16, 3, 1];
+        record.extend_from_slice(&(body.len() as u16 + 4).to_be_bytes());
+        record.extend_from_slice(&[1, 0]);
+        record.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        record.extend_from_slice(&body);
+        record
+    }
+
+    /// The cut lands in the middle of the second-level label, so neither
+    /// record holds the whole name and the pieces still rebuild it.
+    #[test]
+    fn sni_split_cuts_inside_the_name() {
+        let record = hello("www.speedtest.net");
+        let sni = FragmentPolicy {
+            packets: Packets::TlsSni,
+            interval_min_ms: 1,
+            interval_max_ms: 1,
+            ..Default::default()
+        };
+        let chunks = plan_tls_sni(&record, &sni).expect("a ClientHello with a name");
+        assert_eq!(chunks.len(), 2, "a delay keeps the records in two writes");
+
+        let mut payload = Vec::new();
+        for c in &chunks {
+            assert_eq!(&c.bytes[..3], &record[..3], "content type and version kept");
+            let l = (c.bytes[3] as usize) << 8 | c.bytes[4] as usize;
+            assert_eq!(l, c.bytes.len() - 5, "record length header rewritten");
+            // The whole name must not sit in any one record.
+            assert!(
+                !c.bytes
+                    .windows("www.speedtest.net".len())
+                    .any(|w| w == b"www.speedtest.net"),
+                "the name is still whole in one record"
+            );
+            payload.extend_from_slice(&c.bytes[5..]);
+        }
+        assert_eq!(payload, record[5..], "the records rebuild the hello");
+    }
+
+    /// With no delay the two records share one write, which still breaks the
+    /// record-boundary match.
+    #[test]
+    fn sni_split_coalesces_without_a_delay() {
+        let record = hello("api.cloudflareclient.com");
+        let sni = FragmentPolicy {
+            packets: Packets::TlsSni,
+            interval_min_ms: 0,
+            interval_max_ms: 0,
+            ..Default::default()
+        };
+        let chunks = plan_tls_sni(&record, &sni).unwrap();
+        assert_eq!(chunks.len(), 1, "one write holds both records");
+        assert_eq!(record_lengths(&chunks[0].bytes).len(), 2);
+    }
+
+    /// A write that is not a ClientHello with a name is left for the caller to
+    /// send whole.
+    #[test]
+    fn sni_split_passes_through_without_a_name() {
+        let sni = FragmentPolicy {
+            packets: Packets::TlsSni,
+            ..Default::default()
+        };
+        assert!(plan_tls_sni(&tls_record(300), &sni).is_none());
+        assert!(plan_tls_sni(b"GET / HTTP/1.1\r\n\r\n", &sni).is_none());
+    }
+
+    /// Bytes glued on after the record travel on their own, unframed.
+    #[test]
+    fn sni_split_keeps_trailing_bytes() {
+        let mut record = hello("www.speedtest.net");
+        record.extend_from_slice(b"TRAILER");
+        let sni = FragmentPolicy {
+            packets: Packets::TlsSni,
+            ..Default::default()
+        };
+        let chunks = plan_tls_sni(&record, &sni).unwrap();
+        assert_eq!(chunks.last().unwrap().bytes, b"TRAILER");
+    }
+
+    #[test]
+    fn sld_midpoint_aims_at_the_second_level_label() {
+        assert_eq!(sld_midpoint(b"www.speedtest.net"), Some(8));
+        assert_eq!(sld_midpoint(b"example.com"), Some(3));
+        assert_eq!(sld_midpoint(b"localhost"), Some(4));
+        // Too short to split in two.
+        assert_eq!(sld_midpoint(b"a"), None);
+        // Always inside, never at an edge.
+        for name in ["a.b", "a.b.c", "x.co.uk", "aa", "www.a.com"] {
+            let mid = sld_midpoint(name.as_bytes()).unwrap();
+            assert!((1..name.len()).contains(&mid), "{name}: {mid}");
+        }
     }
 }

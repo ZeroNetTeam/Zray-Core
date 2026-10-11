@@ -48,6 +48,8 @@ pub struct Stats {
     /// else on this side would notice, so the host reads this to know that
     /// "connected" has stopped being true.
     pub tun: AtomicU8,
+    /// Who is connected, as counts only ([`crate::usage`]).
+    pub usage: Arc<crate::usage::UsageTracker>,
 }
 
 /// [`Stats::tun`]: this runtime has no TUN device.
@@ -409,6 +411,18 @@ pub struct Server {
     /// about, and can take it away. A host application embedding the runtime
     /// needs this for the same reason a test does.
     listening: tokio::sync::watch::Sender<bool>,
+    /// Bumped on every configuration reload with the generation that was just
+    /// installed. Its only job is to let the idle background tasks wait for a
+    /// change instead of polling: while no observatory or asset block is
+    /// configured, `run_observatory` and `run_asset_refresh` sleep on this
+    /// signal rather than waking several times a minute to re-read a config
+    /// that cannot have changed without a reload.
+    ///
+    /// Invariant: [`Server::reload`] stores the new state *before* it sends
+    /// here, so a receiver woken by the signal always re-reads `config()` and
+    /// sees the generation that triggered it. The value carried is only for
+    /// clarity; a receiver reacts to the change, not to the number.
+    config_changed: tokio::sync::watch::Sender<GenerationId>,
     /// Lock-free mirror of the planner rung used when materialising an
     /// outbound for a new session.
     planner_strategy: AtomicU8,
@@ -487,6 +501,7 @@ impl Server {
             xhttp_packet_hub: Arc::new(zero_transport::xhttp::PacketHub::new()),
             selection_counter: AtomicU64::new(0),
             listening: tokio::sync::watch::channel(false).0,
+            config_changed: tokio::sync::watch::channel(cfg.generation).0,
             planner_strategy: AtomicU8::new(zero_observatory::PathStrategy::DirectReality.as_u8()),
             sanction: StdMutex::new(None),
             announced: StdMutex::new(HashSet::new()),
@@ -661,6 +676,12 @@ impl Server {
             next.client_resolver = Arc::new(adopted);
         }
         self.state.store(Arc::new(next));
+        // Wake the idle background tasks now that the new state is visible.
+        // The store above happens first on purpose: a task woken here re-reads
+        // `config()` and must see the generation that triggered the wake, not
+        // the one it replaced. A send only fails when no task is listening,
+        // which is fine — there is nothing to wake.
+        let _ = self.config_changed.send(generation);
         Ok(())
     }
 
@@ -757,7 +778,7 @@ impl Server {
                     &tls.private_key,
                 )
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-                info!(tag = %inbound.tag, %addr, protocol = ?inbound.protocol, "listening");
+                info!(tag = %inbound.tag, %addr, protocol = inbound.protocol.kind(), "listening");
                 let me = Arc::clone(&self);
                 let id = InboundId(idx as u32);
                 handles_vec.push(tokio::spawn(async move {
@@ -779,7 +800,7 @@ impl Server {
                     &tls.private_key,
                 )
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-                info!(tag = %inbound.tag, %addr, protocol = ?inbound.protocol, "listening");
+                info!(tag = %inbound.tag, %addr, protocol = inbound.protocol.kind(), "listening");
                 let me = Arc::clone(&self);
                 let id = InboundId(idx as u32);
                 handles_vec.push(tokio::spawn(async move {
@@ -804,7 +825,7 @@ impl Server {
                     .map_err(|error| {
                         std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
                     })?;
-                    info!(tag = %inbound.tag, %addr, protocol = ?inbound.protocol, "listening");
+                    info!(tag = %inbound.tag, %addr, protocol = inbound.protocol.kind(), "listening");
                     let me = Arc::clone(&self);
                     let id = InboundId(idx as u32);
                     handles_vec.push(tokio::spawn(async move {
@@ -820,7 +841,7 @@ impl Server {
             } = &inbound.protocol
             {
                 let socket = UdpSocket::bind(addr).await?;
-                info!(tag = %inbound.tag, %addr, protocol = ?inbound.protocol, "listening");
+                info!(tag = %inbound.tag, %addr, protocol = inbound.protocol.kind(), "listening");
                 let me = Arc::clone(&self);
                 let tag = inbound.tag.clone();
                 let target = target.clone();
@@ -839,7 +860,7 @@ impl Server {
             }
 
             let listener = zero_net::prepare_listener(addr)?;
-            info!(tag = %inbound.tag, %addr, protocol = ?inbound.protocol, "listening");
+            info!(tag = %inbound.tag, %addr, protocol = inbound.protocol.kind(), "listening");
 
             let me = Arc::clone(&self);
             let id = InboundId(idx as u32);
@@ -1413,6 +1434,9 @@ impl Server {
                         peer,
                     } => {
                         me.stats.accepted.fetch_add(1, Ordering::Relaxed);
+                        // Accepted here means the QUIC layer already
+                        // authenticated the client, so it counts as a user.
+                        let _usage = me.stats.usage.open(&tag, peer.ip());
                         if let Err(error) = Arc::clone(&me)
                             .handle_hysteria2(stream, peer, id, tag, destination)
                             .await
@@ -1430,6 +1454,9 @@ impl Server {
                         peer,
                     } => {
                         me.stats.accepted.fetch_add(1, Ordering::Relaxed);
+                        // Accepted here means the QUIC layer already
+                        // authenticated the client, so it counts as a user.
+                        let _usage = me.stats.usage.open(&tag, peer.ip());
                         if let Err(error) = Arc::clone(&me)
                             .handle_hysteria2_udp(
                                 Hysteria2UdpSession {
@@ -1483,6 +1510,9 @@ impl Server {
                         peer,
                     } => {
                         me.stats.accepted.fetch_add(1, Ordering::Relaxed);
+                        // Accepted here means the QUIC layer already
+                        // authenticated the client, so it counts as a user.
+                        let _usage = me.stats.usage.open(&tag, peer.ip());
                         if let Err(error) = Arc::clone(&me)
                             .handle_hysteria2(stream, peer, id, tag, destination)
                             .await
@@ -1500,6 +1530,9 @@ impl Server {
                         peer,
                     } => {
                         me.stats.accepted.fetch_add(1, Ordering::Relaxed);
+                        // Accepted here means the QUIC layer already
+                        // authenticated the client, so it counts as a user.
+                        let _usage = me.stats.usage.open(&tag, peer.ip());
                         if let Err(error) = Arc::clone(&me)
                             .handle_tuic_udp(
                                 connection,
@@ -1571,7 +1604,36 @@ impl Server {
         self.generation()
     }
 
+    /// One session of an inbound. It is counted in the usage figures from the
+    /// moment it is first routed, which is after the protocol authenticated it
+    /// (see [`crate::usage::PendingSession`]).
     async fn handle(
+        self: Arc<Self>,
+        stream: zero_core::BoxStream,
+        peer: SocketAddr,
+        id: InboundId,
+        session: InboundSession,
+    ) -> Result<(), String> {
+        let Some(tag) = session
+            .state
+            .config
+            .inbounds
+            .get(id.0 as usize)
+            .map(|inbound| inbound.tag.clone())
+        else {
+            return Err("inbound disappeared from its own generation".into());
+        };
+        let pending = crate::usage::PendingSession::new(&self.stats.usage, &tag, peer.ip());
+        // Boxed: the session future is large, and holding it in this frame
+        // as well would double the stack a chain of dialers needs in debug builds.
+        crate::usage::scope(
+            pending,
+            Box::pin(self.handle_session(stream, peer, id, session)),
+        )
+        .await
+    }
+
+    async fn handle_session(
         self: Arc<Self>,
         mut stream: zero_core::BoxStream,
         peer: SocketAddr,
@@ -1764,9 +1826,13 @@ impl Server {
                     | OutboundProtocol::Shadowsocks(_)
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
+                    | OutboundProtocol::Socks(_)
+                    | OutboundProtocol::Tor(_)
+                    | OutboundProtocol::MasterDns(_)
                     | OutboundProtocol::Tide(_)
                     | OutboundProtocol::Hysteria2(_)
                     | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::Juicity(_)
                     | OutboundProtocol::AmneziaWireguard(_) => {
                         let s = self
                             .open_outbound(&ob, &accepted.destination)
@@ -1956,6 +2022,25 @@ impl Server {
         }
     }
 
+    /// Whether TUN inbound `id` was given IPv4 addresses only, which is how a
+    /// client says IPv6 is off. The phone (or the OS) may still send IPv6
+    /// packets into the tunnel so none can leave around it; those flows have
+    /// nowhere to go and must fail fast. An inbound with no addresses listed
+    /// (a host-provided interface) is not judged.
+    fn tun_is_ipv4_only(&self, id: InboundId) -> bool {
+        match self
+            .config()
+            .inbounds
+            .get(id.0 as usize)
+            .map(|i| &i.protocol)
+        {
+            Some(InboundProtocol::Tun(tun)) => {
+                !tun.addresses.is_empty() && !tun.addresses.iter().any(|a| a.contains(':'))
+            }
+            _ => false,
+        }
+    }
+
     async fn handle_dokodemo_tcp(
         self: Arc<Self>,
         stream: zero_core::BoxStream,
@@ -1964,6 +2049,12 @@ impl Server {
         tag: Arc<str>,
         target: (Address, u16),
     ) -> Result<(), String> {
+        // IPv6 is off: close at once instead of sending the flow to a server
+        // that may not reach IPv6 either. An app that tries IPv6 first (Telegram
+        // does) then falls back to IPv4 immediately, not after its own timeout.
+        if matches!(target.0, Address::Ip(std::net::IpAddr::V6(_))) && self.tun_is_ipv4_only(id) {
+            return Ok(());
+        }
         // The netstack hands over the address the application dialled. For a
         // FakeDNS answer that is a local handle, so restore the name first;
         // sniffing then names connections that only knew a real IP.
@@ -2047,9 +2138,13 @@ impl Server {
                     | OutboundProtocol::Shadowsocks(_)
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
+                    | OutboundProtocol::Socks(_)
+                    | OutboundProtocol::Tor(_)
+                    | OutboundProtocol::MasterDns(_)
                     | OutboundProtocol::Tide(_)
                     | OutboundProtocol::Hysteria2(_)
                     | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::Juicity(_)
                     | OutboundProtocol::AmneziaWireguard(_) => {
                         let stream = self
                             .open_outbound(&outbound, &destination)
@@ -2433,9 +2528,13 @@ impl Server {
                     | OutboundProtocol::Shadowsocks(_)
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
+                    | OutboundProtocol::Socks(_)
+                    | OutboundProtocol::Tor(_)
+                    | OutboundProtocol::MasterDns(_)
                     | OutboundProtocol::Tide(_)
                     | OutboundProtocol::Hysteria2(_)
                     | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::Juicity(_)
                     | OutboundProtocol::AmneziaWireguard(_) => {
                         let stream = self
                             .open_outbound(&outbound, &destination)
@@ -2616,9 +2715,13 @@ impl Server {
                     | OutboundProtocol::Shadowsocks(_)
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
+                    | OutboundProtocol::Socks(_)
+                    | OutboundProtocol::Tor(_)
+                    | OutboundProtocol::MasterDns(_)
                     | OutboundProtocol::Tide(_)
                     | OutboundProtocol::Hysteria2(_)
                     | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::Juicity(_)
                     | OutboundProtocol::AmneziaWireguard(_) => {
                         let stream = self
                             .open_outbound(&outbound, &destination)
@@ -2706,9 +2809,13 @@ impl Server {
                     | OutboundProtocol::Shadowsocks(_)
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
+                    | OutboundProtocol::Socks(_)
+                    | OutboundProtocol::Tor(_)
+                    | OutboundProtocol::MasterDns(_)
                     | OutboundProtocol::Tide(_)
                     | OutboundProtocol::Hysteria2(_)
                     | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::Juicity(_)
                     | OutboundProtocol::AmneziaWireguard(_) => {
                         let stream = self
                             .open_outbound(&outbound, &destination)
@@ -3120,9 +3227,13 @@ impl Server {
                     | OutboundProtocol::Shadowsocks(_)
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
+                    | OutboundProtocol::Socks(_)
+                    | OutboundProtocol::Tor(_)
+                    | OutboundProtocol::MasterDns(_)
                     | OutboundProtocol::Tide(_)
                     | OutboundProtocol::Hysteria2(_)
                     | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::Juicity(_)
                     | OutboundProtocol::AmneziaWireguard(_) => {
                         let stream = self
                             .open_outbound(&outbound, &request.destination)
@@ -3416,9 +3527,13 @@ impl Server {
                     | OutboundProtocol::Shadowsocks(_)
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
+                    | OutboundProtocol::Socks(_)
+                    | OutboundProtocol::Tor(_)
+                    | OutboundProtocol::MasterDns(_)
                     | OutboundProtocol::Tide(_)
                     | OutboundProtocol::Hysteria2(_)
                     | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::Juicity(_)
                     | OutboundProtocol::AmneziaWireguard(_) => {
                         let stream = self
                             .open_outbound(&outbound, &destination)
@@ -3505,9 +3620,13 @@ impl Server {
                     | OutboundProtocol::Shadowsocks(_)
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
+                    | OutboundProtocol::Socks(_)
+                    | OutboundProtocol::Tor(_)
+                    | OutboundProtocol::MasterDns(_)
                     | OutboundProtocol::Tide(_)
                     | OutboundProtocol::Hysteria2(_)
                     | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::Juicity(_)
                     | OutboundProtocol::AmneziaWireguard(_) => {
                         let stream = self
                             .open_outbound(&outbound, &request.destination)
@@ -3634,9 +3753,13 @@ impl Server {
                     | OutboundProtocol::Shadowsocks(_)
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
+                    | OutboundProtocol::Socks(_)
+                    | OutboundProtocol::Tor(_)
+                    | OutboundProtocol::MasterDns(_)
                     | OutboundProtocol::Tide(_)
                     | OutboundProtocol::Hysteria2(_)
                     | OutboundProtocol::Tuic(_)
+                    | OutboundProtocol::Juicity(_)
                     | OutboundProtocol::AmneziaWireguard(_) => {
                         let stream = self
                             .open_outbound(&outbound, &destination)
@@ -3960,6 +4083,30 @@ impl Server {
             )
             .await;
         }
+        if let OutboundProtocol::Juicity(juicity) = &outbound.protocol {
+            let (address, port) = outbound
+                .endpoint()
+                .ok_or_else(|| "Juicity outbound has no endpoint".to_string())?;
+            let addrs = self
+                .resolver()
+                .resolve_address(&address, self.resolver().settings().query_strategy)
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect::<Vec<_>>();
+            let tls = outbound::tls_params(&outbound.stream, &address.host_string())
+                .ok_or_else(|| "Juicity requires ordinary certificate TLS".to_string())?;
+            return zero_transport::juicity::exchange_udp(
+                &addrs,
+                &tls,
+                &juicity.uuid,
+                &juicity.password,
+                &datagram.destination,
+                &datagram.payload,
+            )
+            .await;
+        }
         if let OutboundProtocol::Hysteria2(hysteria) = &outbound.protocol {
             let (address, port) = outbound
                 .endpoint()
@@ -4077,6 +4224,8 @@ impl Server {
 
     /// Pick a concrete outbound, expanding a balancer tag if needed.
     async fn route(&self, ctx: &SessionContext) -> Decision {
+        // The first route of a session happens after its client authenticated.
+        crate::usage::confirm_current();
         let resolved = match (
             ctx.destination.address.as_domain(),
             self.config().routing.domain_strategy,
@@ -4657,6 +4806,10 @@ impl Server {
                 }
             }
             zero_config::Security::None => {}
+            // ShadowTLS carries no configurable fingerprint: the client always
+            // sends a fixed browser-shaped ClientHello, so there is nothing to
+            // rotate.
+            zero_config::Security::ShadowTls(_) => {}
         }
     }
 
@@ -4864,11 +5017,23 @@ impl Server {
     /// permanently blocked mirror from being re-dialled in a tight loop — the
     /// situation a censored network produces by design.
     async fn run_asset_refresh(self: Arc<Self>) {
+        // See `run_observatory`: a reload is the only way an asset block can
+        // appear, and it wakes this task at once, so the periodic re-check
+        // while none is configured only guards against a signal that never
+        // arrives and is kept long to stay off the CPU on an idle session.
+        const IDLE_RECHECK: Duration = Duration::from_secs(300);
+        let mut config_changed = self.config_changed.subscribe();
         let mut first_pass = true;
         loop {
+            // Snapshot the reload version before reading the config so a
+            // reload racing the read below still wakes us (see run_observatory).
+            config_changed.mark_unchanged();
             let config = self.config();
             let Some(assets) = config.assets.clone() else {
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                tokio::select! {
+                    _ = config_changed.changed() => {}
+                    _ = tokio::time::sleep(IDLE_RECHECK) => {}
+                }
                 continue;
             };
             let specs = asset_specs(&assets);
@@ -5013,9 +5178,23 @@ impl Server {
     }
 
     async fn run_observatory(self: Arc<Self>) {
+        // How long to re-check the configuration even when no reload has
+        // signalled one. A reload is the only way an observatory block can
+        // appear and it wakes this task at once, so this is just a safety net
+        // against a signal that never arrives; it is kept long so an idle
+        // session with no observatory barely touches the CPU.
+        const IDLE_RECHECK: Duration = Duration::from_secs(300);
+        let mut config_changed = self.config_changed.subscribe();
         loop {
+            // Snapshot the reload version *before* reading the config, so a
+            // reload that lands between the read and the wait below is seen as
+            // a change and wakes us rather than being missed.
+            config_changed.mark_unchanged();
             let Some(config) = self.config().observatory.clone() else {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::select! {
+                    _ = config_changed.changed() => {}
+                    _ = tokio::time::sleep(IDLE_RECHECK) => {}
+                }
                 continue;
             };
             let target = match parse_probe_target(&config.probe_url) {
@@ -5782,10 +5961,18 @@ fn replace_outbound_endpoint(outbound: &mut zero_config::Outbound, address: Addr
             config.address = address;
             config.port = port;
         }
+        OutboundProtocol::Juicity(config) => {
+            config.address = address;
+            config.port = port;
+        }
         // AmneziaWG is a UDP peer configuration. Clean-IP substitution is a
         // CDN/TCP optimization and must not rewrite its authenticated peer
-        // endpoint behind the caller's back.
+        // endpoint behind the caller's back. A SOCKS5 upstream is the user's
+        // own client (often loopback), not a CDN edge, so it is left alone too.
         OutboundProtocol::AmneziaWireguard(_)
+        | OutboundProtocol::Socks(_)
+        | OutboundProtocol::Tor(_)
+        | OutboundProtocol::MasterDns(_)
         | OutboundProtocol::Freedom { .. }
         | OutboundProtocol::Blackhole
         | OutboundProtocol::Dns => {}
@@ -6544,6 +6731,58 @@ mod tests {
         assert!(!server.resolver().has_fake());
     }
 
+    /// The idle background tasks wait on `config_changed` instead of polling
+    /// while no observatory or asset block is configured. A reload must wake
+    /// that wait, and the task must see the new config when it does — so the
+    /// signal has to fire *after* the new state is stored. This checks the
+    /// contract `run_observatory` and `run_asset_refresh` depend on: a
+    /// receiver that marked the current version unchanged, then saw a reload,
+    /// observes the change and reads the generation that caused it.
+    #[tokio::test]
+    async fn a_reload_wakes_the_idle_background_tasks() {
+        let plain = serde_json::json!({
+            "inbounds": [{"tag": "socks", "listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+        });
+        let (generation, _) =
+            zero_config::compile_config(&plain, zero_core::GenerationId(1)).expect("config");
+        let server = Server::new(ServerConfig {
+            config: Arc::clone(&generation.config),
+            generation: generation.id,
+        });
+        assert!(server.config().observatory.is_none());
+
+        // Mimic the loop: snapshot the version, confirm nothing has changed.
+        let mut rx = server.config_changed.subscribe();
+        rx.mark_unchanged();
+        assert!(!rx.has_changed().expect("sender alive"));
+
+        // A reload that turns the observatory on must both wake the wait and
+        // leave the new block visible to the woken reader.
+        let with_observatory = serde_json::json!({
+            "inbounds": [{"tag": "socks", "listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "observatory": {
+                "probeUrl": "https://example.com/health",
+                "probeInterval": "300s",
+            },
+        });
+        let (next, _) = zero_config::compile_config(&with_observatory, zero_core::GenerationId(2))
+            .expect("config");
+        server
+            .reload(next.config, zero_core::GenerationId(2))
+            .expect("reload");
+
+        tokio::time::timeout(Duration::from_secs(1), rx.changed())
+            .await
+            .expect("the reload did not wake the idle wait")
+            .expect("sender alive");
+        assert!(
+            server.config().observatory.is_some(),
+            "a woken task must see the config the reload installed"
+        );
+    }
+
     use std::net::SocketAddr;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -6710,6 +6949,47 @@ mod tests {
             [false, true],
             "blocked name leaked / allowed name blocked"
         );
+    }
+
+    /// With IPv6 off the TUN is given IPv4 addresses only: an IPv6 flow that
+    /// still reaches it is closed at once, so an app that tries IPv6 first
+    /// falls back to IPv4 without waiting for its own timeout.
+    #[tokio::test]
+    async fn tun_ipv6_flows_are_closed_at_once_when_ipv6_is_off() {
+        let config = |addresses: serde_json::Value| {
+            tun_style_server(serde_json::json!({
+                "inbounds": [{
+                    "tag": "tun", "protocol": "tun",
+                    "settings": {"addresses": addresses},
+                }],
+                "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            }))
+        };
+        let v4_only = Arc::new(config(serde_json::json!(["198.18.0.1/15"])));
+        assert!(v4_only.tun_is_ipv4_only(InboundId(0)));
+        assert!(!config(serde_json::json!([
+            "198.18.0.1/15",
+            "fdfe:dcba:9876::1/126"
+        ]))
+        .tun_is_ipv4_only(InboundId(0)));
+
+        let (mut app, netstack) = tokio::io::duplex(1024);
+        let session = tokio::spawn(Arc::clone(&v4_only).handle_dokodemo_tcp(
+            boxed(netstack),
+            "[fdfe:dcba:9876::2]:40000".parse().unwrap(),
+            InboundId(0),
+            Arc::from("tun"),
+            (Address::Ip("2001:db8::1".parse().unwrap()), 443),
+        ));
+        let mut byte = [0u8; 1];
+        let closed = timeout(Duration::from_millis(500), app.read(&mut byte)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0))),
+            "the IPv6 flow was not closed at once: {closed:?}"
+        );
+        // Ended by the early return, not by a failed dial.
+        let ended = timeout(Duration::from_millis(500), session).await;
+        assert!(matches!(ended, Ok(Ok(Ok(())))), "{ended:?}");
     }
 
     /// A TUN flow to a bare IP still goes to that IP when its hello names

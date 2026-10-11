@@ -519,7 +519,12 @@ impl Padder {
     /// random extra. `session_id` is the early session this write carries.
     fn pad(&self, out: &mut Vec<u8>, session_id: u16) {
         use rand::RngCore;
-        let jitter = rand::rngs::OsRng.next_u32() as usize % PAD_JITTER;
+        // Thread-local ChaCha CSPRNG rather than `OsRng`, the way Vision and
+        // VMess draw their padding noise: the jitter only has to be
+        // unpredictable to an on-path observer, which an OS-seeded CSPRNG
+        // already is, and this drops the `getrandom` syscall `OsRng` made on
+        // each early write.
+        let jitter = rand::thread_rng().next_u32() as usize % PAD_JITTER;
         let target = (out.len() / PAD_STEP + 1) * PAD_STEP + jitter;
         // A data frame may not be empty, so there is always one filler byte.
         let filler = target.saturating_sub(out.len() + PAD_HEADER).max(1);

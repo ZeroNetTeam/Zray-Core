@@ -239,8 +239,18 @@ async fn measure(server: IpAddr) -> Option<Measured> {
     })
 }
 
+/// The provider tried first (Shecan, both of its addresses). It is chosen
+/// whenever it really relays here and keeps up with the best candidate (see
+/// [`choose`]); otherwise the automatic choice below stands.
+const PREFERRED: &[&str] = &["178.22.122.100", "185.51.200.2"];
+
 /// Pick the candidate that relays the most, among those whose domestic
-/// answer agrees with the majority.
+/// answer agrees with the majority; ties go to the faster.
+///
+/// The [`PREFERRED`] provider wins over that when it relays at least half as
+/// many of the probe names as the best candidate does. A preferred resolver
+/// that answers honestly (no relay), is insane, or relays far less is passed
+/// over, so the choice stays automatic whenever it fails.
 fn choose(measured: Vec<Measured>) -> SanctionState {
     // The /16 most candidates put the domestic name in. A resolver that
     // disagrees is broken or lying, and its "relay" means nothing.
@@ -261,7 +271,8 @@ fn choose(measured: Vec<Measured>) -> SanctionState {
         .max_by_key(|(prefix, count)| (*count, *prefix))
         .map(|(prefix, _)| prefix);
 
-    let mut best: Option<(usize, Duration, IpAddr, Vec<IpAddr>)> = None;
+    // (names relayed, latency, server, relay) of every sane candidate that relays.
+    let mut relaying: Vec<(usize, Duration, IpAddr, Vec<IpAddr>)> = Vec::new();
     for candidate in measured {
         let sane = candidate
             .domestic
@@ -279,21 +290,29 @@ fn choose(measured: Vec<Measured>) -> SanctionState {
             .iter()
             .filter(|(_, ips)| ips.iter().any(|ip| relay.contains(ip)))
             .count();
-        let better = match &best {
-            None => true,
-            Some((count, latency, _, _)) => {
-                relayed > *count || (relayed == *count && candidate.latency < *latency)
-            }
-        };
-        if better {
-            best = Some((relayed, candidate.latency, candidate.server, relay));
-        }
+        relaying.push((relayed, candidate.latency, candidate.server, relay));
     }
-    match best {
-        Some((_, _, server, relay)) => SanctionState {
-            chosen: Some(server),
-            relay,
-        },
+    // Most names relayed first, the faster first among equals.
+    let ranking = |a: &(usize, Duration, IpAddr, Vec<IpAddr>),
+                   b: &(usize, Duration, IpAddr, Vec<IpAddr>)| {
+        b.0.cmp(&a.0).then(a.1.cmp(&b.1))
+    };
+    relaying.sort_by(ranking);
+    let most = relaying.first().map_or(0, |best| best.0);
+    let preferred = relaying.iter().position(|(relayed, _, server, _)| {
+        relayed * 2 >= most
+            && PREFERRED
+                .iter()
+                .any(|p| p.parse::<IpAddr>().ok() == Some(*server))
+    });
+    match preferred.or(if relaying.is_empty() { None } else { Some(0) }) {
+        Some(at) => {
+            let (_, _, server, relay) = relaying.swap_remove(at);
+            SanctionState {
+                chosen: Some(server),
+                relay,
+            }
+        }
         None => SanctionState {
             chosen: None,
             relay: Vec::new(),
@@ -485,5 +504,76 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(candidates(&dns), vec![ip("193.186.32.32")]);
+    }
+
+    /// A measured resolver whose probe names all answer with one relay address.
+    fn relaying(server: &str, ms: u64, relay: &str, groups: &[&'static str]) -> Measured {
+        let answers: Vec<(&'static str, &str)> = groups.iter().map(|g| (*g, relay)).collect();
+        measured(server, ms, "185.188.104.10", &answers)
+    }
+
+    #[test]
+    fn shecan_is_preferred_when_it_relays_even_if_slower() {
+        let state = choose(vec![
+            relaying(
+                "193.186.32.32",
+                40,
+                "132.243.209.113",
+                &["google", "docker", "jetbrains", "anthropic"],
+            ),
+            relaying(
+                "178.22.122.100",
+                200,
+                "10.1.1.1",
+                &["google", "docker", "jetbrains", "anthropic"],
+            ),
+        ]);
+        assert_eq!(state.chosen, Some(ip("178.22.122.100")));
+        assert_eq!(state.relay, vec![ip("10.1.1.1")]);
+    }
+
+    #[test]
+    fn shecan_keeps_the_choice_while_it_relays_at_least_half_as_much() {
+        let state = choose(vec![
+            relaying(
+                "193.186.32.32",
+                40,
+                "132.243.209.113",
+                &["google", "docker", "jetbrains", "anthropic"],
+            ),
+            relaying("178.22.122.100", 90, "10.1.1.1", &["google", "docker"]),
+        ]);
+        assert_eq!(state.chosen, Some(ip("178.22.122.100")));
+    }
+
+    #[test]
+    fn auto_takes_over_when_shecan_relays_too_little_or_nothing() {
+        // Two of five names against five: under half, so the best resolver stays.
+        let few = choose(vec![
+            relaying(
+                "193.186.32.32",
+                40,
+                "132.243.209.113",
+                &["google", "google", "docker", "jetbrains", "anthropic"],
+            ),
+            relaying("178.22.122.100", 90, "10.1.1.1", &["google", "docker"]),
+        ]);
+        assert_eq!(few.chosen, Some(ip("193.186.32.32")));
+        // The Tehran measurements: Shecan answered honestly, so it is passed over.
+        assert_eq!(choose(tehran()).chosen, Some(ip("193.186.32.32")));
+    }
+
+    #[test]
+    fn the_second_shecan_address_counts_as_shecan() {
+        let state = choose(vec![
+            relaying(
+                "193.186.32.32",
+                40,
+                "132.243.209.113",
+                &["google", "docker"],
+            ),
+            relaying("185.51.200.2", 120, "10.2.2.2", &["google", "docker"]),
+        ]);
+        assert_eq!(state.chosen, Some(ip("185.51.200.2")));
     }
 }

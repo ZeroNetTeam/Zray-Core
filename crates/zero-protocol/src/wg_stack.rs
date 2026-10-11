@@ -811,12 +811,10 @@ struct WgLink {
     /// go out without re-encoding, and the reserved bytes apply.
     plain: bool,
     rng: rand::rngs::StdRng,
-    /// Reused buffers: WireGuard output, decrypted input, network input, and a
-    /// scratch copy for stamping the reserved bytes.
+    /// Reused buffers: WireGuard output, decrypted input, and network input.
     out: Vec<u8>,
     clear: Vec<u8>,
     network: Vec<u8>,
-    stamp: Vec<u8>,
 }
 
 struct Driver {
@@ -867,7 +865,6 @@ impl WgLink {
             out: vec![0u8; NETWORK_BUFFER],
             clear: vec![0u8; NETWORK_BUFFER],
             network: vec![0u8; NETWORK_BUFFER],
-            stamp: Vec::new(),
         }
     }
 }
@@ -1338,7 +1335,6 @@ impl WgLink {
         }
         let mut network = std::mem::take(&mut self.network);
         let datagram = &mut network[..length];
-        let decoded;
         let packet: &[u8] = if self.plain {
             // WARP echoes its reserved bytes; boringtun expects zeros.
             if datagram.len() >= 4 {
@@ -1347,10 +1343,7 @@ impl WgLink {
             datagram
         } else {
             match amnezia::decode_packet(self.params.obfuscation, datagram) {
-                Ok(Some(normal)) => {
-                    decoded = normal;
-                    &decoded
-                }
+                Ok(Some(offset)) => &datagram[offset..],
                 _ => {
                     self.network = network;
                     return;
@@ -1381,7 +1374,7 @@ impl WgLink {
         self.network = network;
     }
 
-    async fn send(&mut self, packet: &[u8]) {
+    async fn send(&mut self, packet: &mut [u8]) {
         let result = if self.plain {
             if amnezia::packet_kind(packet) == Some(amnezia::PacketKind::HandshakeInit) {
                 if let Ok(junk) = amnezia::junk_packets(self.params.obfuscation, &mut self.rng) {
@@ -1391,18 +1384,15 @@ impl WgLink {
                 }
             }
             if self.params.reserved != [0; 3] && packet.len() >= 4 {
-                // Into the reused buffer: this ran once per datagram, and the
-                // only thing done to the copy is overwriting three bytes.
-                let mut stamp = std::mem::take(&mut self.stamp);
-                stamp.clear();
-                stamp.extend_from_slice(packet);
-                stamp[1..4].copy_from_slice(&self.params.reserved);
-                let sent = self.wire.send_to(&stamp, self.peer).await;
-                self.stamp = stamp;
-                sent
-            } else {
-                self.wire.send_to(packet, self.peer).await
+                // Stamp the reserved bytes straight into boringtun's own output
+                // buffer. That buffer is handed back as a mutable slice, is
+                // owned by this link, and is fully overwritten before the next
+                // send, so three bytes written here cost nothing after; the
+                // older shape copied the whole datagram into a scratch buffer
+                // only to overwrite the same three bytes.
+                packet[1..4].copy_from_slice(&self.params.reserved);
             }
+            self.wire.send_to(packet, self.peer).await
         } else {
             match amnezia::encode_packet(self.params.obfuscation, packet, &mut self.rng) {
                 Ok(encoded) => {

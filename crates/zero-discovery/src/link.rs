@@ -92,7 +92,9 @@ impl Candidate {
     pub fn is_udp_based(&self) -> bool {
         matches!(
             self.outbound.protocol,
-            OutboundProtocol::Hysteria2(_) | OutboundProtocol::Tuic(_)
+            OutboundProtocol::Hysteria2(_)
+                | OutboundProtocol::Tuic(_)
+                | OutboundProtocol::Juicity(_)
         )
     }
 }
@@ -184,6 +186,20 @@ fn public_v6(v6: Ipv6Addr) -> bool {
 }
 
 fn require_public(candidate: &Candidate) -> Result<(), String> {
+    // A MasterDNS link has no endpoint; its resolvers are what gets dialled.
+    if let OutboundProtocol::MasterDns(masterdns) = &candidate.outbound.protocol {
+        return match masterdns
+            .resolvers
+            .iter()
+            .find(|r| !public_host(&r.ip().to_string()))
+        {
+            Some(resolver) => Err(format!(
+                "resolver {} must be a public address",
+                resolver.ip()
+            )),
+            None => Ok(()),
+        };
+    }
     let Some((address, _)) = candidate.outbound.endpoint() else {
         return Ok(());
     };
@@ -203,13 +219,17 @@ fn require_public(candidate: &Candidate) -> Result<(), String> {
 
 fn summarize(parsed: &ShareLink, class: LinkClass) -> LinkInfo {
     let outbound = &parsed.outbound;
-    let (host, port) = outbound
-        .endpoint()
-        .map(|(address, port)| (address.host_string(), port))
-        .unwrap_or_default();
+    // A MasterDNS server is named by its domain; queries go out on port 53.
+    let (host, port) = match &outbound.protocol {
+        OutboundProtocol::MasterDns(masterdns) => (masterdns.domain.to_string(), 53),
+        _ => outbound
+            .endpoint()
+            .map(|(address, port)| (address.host_string(), port))
+            .unwrap_or_default(),
+    };
     let quic = matches!(
         outbound.protocol,
-        OutboundProtocol::Hysteria2(_) | OutboundProtocol::Tuic(_)
+        OutboundProtocol::Hysteria2(_) | OutboundProtocol::Tuic(_) | OutboundProtocol::Juicity(_)
     );
     let protocol = match outbound.protocol.name() {
         "shadowsocks" => "ss",
@@ -382,7 +402,7 @@ pub fn guess_country(remark: &str) -> String {
 
 // ------------------------------------------------------------ text to links
 
-const SCHEMES: [&str; 11] = [
+const SCHEMES: [&str; 13] = [
     "vless://",
     "vmess://",
     "trojan://",
@@ -394,6 +414,8 @@ const SCHEMES: [&str; 11] = [
     "zerov1://",
     "tide://",
     "warp://",
+    "masterdns://",
+    "juicity://",
 ];
 
 /// Pull every proxy share link out of arbitrary text: one link per line, a
@@ -606,6 +628,40 @@ pub(crate) mod tests {
     pub const SS: &str = "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@192.0.2.9:8388#plain";
     pub const HYSTERIA2: &str =
         "hysteria2://secret@203.0.113.20:443?security=tls&sni=h2.example.com#hy2";
+
+    pub const MASTERDNS: &str =
+        "masterdns://k3y@t.example.com?server=203.0.113.7&resolvers=8.8.8.8#My%20DNS";
+
+    #[test]
+    fn a_masterdns_link_is_found_in_text_and_described_by_its_domain() {
+        let links = extract_links(&format!("here: {MASTERDNS} thanks"));
+        assert_eq!(links, vec![MASTERDNS.to_string()]);
+        let candidate = parse_candidate(MASTERDNS).expect("parses");
+        assert_eq!(candidate.info.protocol, "masterdns");
+        assert_eq!(candidate.info.host, "t.example.com");
+        assert_eq!(candidate.info.port, 53);
+        assert_eq!(candidate.info.name, "My DNS");
+    }
+
+    #[test]
+    fn a_juicity_link_is_found_in_text_and_counts_as_quic() {
+        let juicity = "juicity://00000000-0000-0000-0000-000000000001:secret@203.0.113.9:443?sni=cdn.example.com&congestion_control=bbr#Juicity";
+        let links = extract_links(&format!("<pre>{juicity}</pre>\n{HYSTERIA2}"));
+        assert_eq!(links, vec![juicity.to_string(), HYSTERIA2.to_string()]);
+        let candidate = parse_candidate(juicity).expect("parses");
+        assert_eq!(candidate.info.protocol, "juicity");
+        assert_eq!(candidate.info.transport, "quic");
+        assert!(candidate.is_udp_based());
+    }
+
+    #[test]
+    fn a_feed_masterdns_link_may_not_aim_queries_at_a_private_address() {
+        let private = "masterdns://k@t.example.com?resolvers=192.168.1.1";
+        let candidate = parse_candidate(private).expect("a user's own link parses");
+        assert!(require_public(&candidate).is_err());
+        let public = parse_candidate(MASTERDNS).unwrap();
+        assert!(require_public(&public).is_ok());
+    }
 
     #[test]
     fn the_key_ignores_the_remark_and_surrounding_noise() {

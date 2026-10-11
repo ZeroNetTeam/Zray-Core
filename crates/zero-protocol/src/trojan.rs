@@ -95,12 +95,15 @@ pub fn encode_udp_packet(dst: &Destination, payload: &[u8]) -> Result<Vec<u8>, S
     if payload.is_empty() || payload.len() > u16::MAX as usize {
         return Err("Trojan UDP payload must contain 1..=65535 bytes".into());
     }
-    let mut out = BytesMut::with_capacity(32 + payload.len());
+    // Build straight into the returned `Vec` (which implements `BufMut`): the
+    // older shape filled a `BytesMut` and then copied it out with `to_vec`,
+    // one whole-datagram copy per UDP packet for nothing.
+    let mut out = Vec::with_capacity(32 + payload.len());
     encode_address(dst, &mut out);
     out.put_u16(payload.len() as u16);
     out.put_slice(&CRLF);
     out.put_slice(payload);
-    Ok(out.to_vec())
+    Ok(out)
 }
 
 /// Decode one complete Trojan UDP packet, returning the consumed byte count.
@@ -214,8 +217,12 @@ fn decode_address(buf: &[u8], mut offset: usize) -> Result<(Address, usize), Str
     Ok((address, offset))
 }
 
-/// Write a SOCKS5-style address, which is address-first.
-pub fn encode_address(dst: &Destination, out: &mut BytesMut) {
+/// Write a SOCKS5-style address, which is address-first. Takes `&mut dyn
+/// BufMut` so both the `BytesMut` request builder and the `Vec` UDP builder
+/// share one encoder; it is called once per request or datagram, not on the
+/// bulk path, so dynamic dispatch here costs nothing and saves a second copy
+/// of the function in the binary.
+pub fn encode_address(dst: &Destination, out: &mut dyn BufMut) {
     match &dst.address {
         Address::Ip(std::net::IpAddr::V4(ip)) => {
             out.put_u8(ATYP_IPV4);

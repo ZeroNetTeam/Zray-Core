@@ -99,7 +99,9 @@ struct BuildRequest {
     /// ClientHello fragment packets for `auto`/`strong` evasion: a write
     /// range, `1-1` by default (plain TCP segments of the ClientHello), or
     /// `tlshello` (TLS record re-framing), which stopped getting through in
-    /// Iran — 0 of 3 against 3 of 3, measured 2026-09-28.
+    /// Iran — 0 of 3 against 3 of 3, measured 2026-09-28 — or `tlssni` (TLS
+    /// record re-framing with the cut inside the server name), for a filter
+    /// that reassembles TCP but reads the name from one TLS record.
     fragment_packets: String,
     /// Put the fragmented variants of `auto` first: the app sets this when
     /// the crowd rankings say fragmenting works better than a plain
@@ -309,19 +311,21 @@ pub fn build_config_with_assets(
         }
     };
     // Fragment packets for auto/strong evasion: a write-count range (`1-1`,
-    // the default) or `tlshello`. Validated here so the error names the field
-    // rather than surfacing from the compiler.
+    // the default), `tlshello` (TLS record re-framing) or `tlssni` (re-framing
+    // with the cut inside the server name). Validated here so the error names
+    // the field rather than surfacing from the compiler.
     let fragment_packets = {
         let value = request.fragment_packets.trim();
         if value.is_empty() {
             "1-1".to_string()
-        } else if value == "tlshello" {
-            "tlshello".to_string()
-        } else if zero_config::RangeU32::parse(value).is_some() {
+        } else if value == "tlshello"
+            || value == "tlssni"
+            || zero_config::RangeU32::parse(value).is_some()
+        {
             value.to_string()
         } else {
             return Err(format!(
-                "fragment_packets must be \"tlshello\" or a range like \"1-1\", got {value:?}"
+                "fragment_packets must be \"tlshello\", \"tlssni\" or a range like \"1-1\", got {value:?}"
             ));
         }
     };
@@ -396,6 +400,22 @@ pub fn build_config_with_assets(
         }
     };
     let mut outbounds = Vec::with_capacity(request.links.len());
+    // Where `geosite.dat`/`geoip.dat` and the cached domestic-SNI list live,
+    // resolved once: the request's own path if it named one, else the host's.
+    // Used below for the decoy names and later for managed geodata.
+    let resolved_assets = request
+        .assets_dir
+        .clone()
+        .or_else(|| assets_dir.map(Path::to_path_buf));
+    // The extra decoy names the signed feed last cached there
+    // (`domestic_feed`), kept as borrowed `&str` for the per-link pick. Empty
+    // when the list has never been fetched, so the pick falls back to the
+    // bundled pool — the offline floor.
+    let domestic_names = resolved_assets
+        .as_deref()
+        .map(crate::domestic_feed::cached)
+        .unwrap_or_default();
+    let domestic_extra: Vec<&str> = domestic_names.iter().map(String::as_str).collect();
     for (index, link) in request.links.iter().enumerate() {
         let link = with_warp_order(link.trim(), warp_order);
         let parsed =
@@ -409,10 +429,28 @@ pub fn build_config_with_assets(
         // REALITY (see `fragmentable`); SNI spoofing rides any TLS/REALITY
         // carrier (it adds a decoy packet without touching the real hello).
         let can_fragment = fragmentable(&parsed.outbound);
+        // The decoy name for this server: one drawn from the allow-listed
+        // pool and kept stable for the server, in place of the single
+        // hard-coded host every link used to share (see
+        // `zero_evasion::domestic`). The pool is the compiled-in names plus
+        // whatever the signed feed last added (`domestic_extra`), so a name a
+        // network starts throttling can be diluted without an app update.
+        // Keyed on the server's own host, so it survives a subscription
+        // refresh and so a throttled name only costs the servers that drew it,
+        // not every link at once. Falls back to the one measured-good host for
+        // an endpoint with no address to key on (never a spoofed carrier, so
+        // it is academic).
+        let decoy_sni = parsed
+            .outbound
+            .endpoint()
+            .map(|(address, _)| {
+                zero_evasion::domestic::pick_from(&address.host_string(), &domestic_extra)
+            })
+            .unwrap_or(SPOOF_DECOY_SNI);
         // The hop count rides along for a device without the MD5 option;
         // one with it never uses it (`zero_evasion::Fooling::Auto`).
         let spoof = (request.sni_spoof && sni_spoofable(&parsed.outbound)).then(|| {
-            let mut spoof = json!({"fakeSni": SPOOF_DECOY_SNI});
+            let mut spoof = json!({"fakeSni": decoy_sni});
             if request.decoy_ttl > 0 {
                 spoof["ttl"] = json!(request.decoy_ttl);
             }
@@ -496,14 +534,14 @@ pub fn build_config_with_assets(
         if auto_decoy {
             outbounds.push(json!({
                 "link": parsed.link,
-                "evasion": {"sniSpoof": {"fakeSni": SPOOF_DECOY_SNI, "method": "decoy"}},
+                "evasion": {"sniSpoof": {"fakeSni": decoy_sni, "method": "decoy"}},
             }));
         }
         if auto_ttl_decoy {
             outbounds.push(json!({
                 "link": parsed.link,
                 "evasion": {"sniSpoof": {
-                    "fakeSni": SPOOF_DECOY_SNI,
+                    "fakeSni": decoy_sni,
                     "method": "decoy",
                     "fooling": "ttl",
                     "ttl": request.decoy_ttl,
@@ -537,10 +575,9 @@ pub fn build_config_with_assets(
     // balancer to choose among.
     let proxy_count = outbounds.len();
 
-    let assets_dir = request
-        .assets_dir
-        .clone()
-        .or_else(|| assets_dir.map(Path::to_path_buf));
+    // Resolved once above for the decoy names; reused here for managed
+    // geodata.
+    let assets_dir = resolved_assets;
     let assets_present = assets_dir
         .as_ref()
         .is_some_and(|dir| dir.join("geosite.dat").is_file() && dir.join("geoip.dat").is_file());
@@ -780,7 +817,9 @@ fn fragmentable(outbound: &zero_config::Outbound) -> bool {
     // manage their own QUIC handshake, so leave them untouched.
     if matches!(
         outbound.protocol,
-        zero_config::OutboundProtocol::Hysteria2(_) | zero_config::OutboundProtocol::Tuic(_)
+        zero_config::OutboundProtocol::Hysteria2(_)
+            | zero_config::OutboundProtocol::Tuic(_)
+            | zero_config::OutboundProtocol::Juicity(_)
     ) {
         return false;
     }
@@ -794,6 +833,10 @@ fn fragmentable(outbound: &zero_config::Outbound) -> bool {
         // fails the same way), so fragmenting a REALITY link breaks the tunnel
         // outright. Left whole, matching the TUI's `outbound_shreds_well`.
         zero_config::Security::Reality(_) => false,
+        // Splitting the ShadowTLS ClientHello across TLS records would break
+        // the relay's frame extraction and the data-stream HMAC the same way
+        // it breaks REALITY, so the hello is left whole.
+        zero_config::Security::ShadowTls(_) => false,
     }
 }
 
@@ -841,7 +884,9 @@ fn urgent_available() -> bool {
 pub(crate) fn sni_spoofable(outbound: &zero_config::Outbound) -> bool {
     if matches!(
         outbound.protocol,
-        zero_config::OutboundProtocol::Hysteria2(_) | zero_config::OutboundProtocol::Tuic(_)
+        zero_config::OutboundProtocol::Hysteria2(_)
+            | zero_config::OutboundProtocol::Tuic(_)
+            | zero_config::OutboundProtocol::Juicity(_)
     ) {
         return false;
     }
@@ -849,6 +894,10 @@ pub(crate) fn sni_spoofable(outbound: &zero_config::Outbound) -> bool {
         zero_config::Security::None => false,
         zero_config::Security::Tls(tls) => tls.ech.is_none(),
         zero_config::Security::Reality(_) => true,
+        // ShadowTLS already sends a genuine decoy SNI, and the model refuses
+        // any TCP evasion under it (`Outbound::validate`), so a spoof added
+        // here would only make the whole config fail to compile.
+        zero_config::Security::ShadowTls(_) => false,
     }
 }
 
@@ -1456,6 +1505,62 @@ mod tests {
             !decoys(json!({"links": [REALITY], "evasion": "off", "auto_decoy": true}))
                 .contains(&true)
         );
+    }
+
+    /// The decoy name discovery stamps into a spoof comes from the bundled
+    /// allow-listed pool, not a single hard-coded host, and is the same for a
+    /// given server every time, so a flow does not flap between names and one
+    /// name a network throttles costs only the servers that drew it.
+    #[test]
+    fn the_spoof_decoy_name_is_drawn_from_the_pool_and_stays_put() {
+        let names = |request: Value| -> Vec<String> {
+            compile(&build_config(&request).unwrap())
+                .outbounds
+                .iter()
+                .filter_map(|o| o.stream.evasion.sni_desync.as_ref())
+                .map(|desync| desync.fake_sni.to_string())
+                .collect()
+        };
+        let request = json!({"links": [REALITY], "sni_spoof": true});
+        let first = names(request.clone());
+        assert!(!first.is_empty(), "a spoof was generated");
+        for name in &first {
+            assert!(
+                zero_evasion::domestic::all().any(|pooled| pooled == name),
+                "{name} is not in the pool"
+            );
+        }
+        // Same server, same name on a rebuild — no flapping.
+        assert_eq!(first, names(request));
+    }
+
+    /// The model refuses any TCP evasion under ShadowTLS, so discovery must never
+    /// add one: a fragment or a fake-SNI packet on such a link would make the
+    /// whole generated config fail to compile.
+    #[test]
+    fn shadowtls_is_never_fragmented_or_spoofed() {
+        let (config, _) = zero_config::parse_config(&json!({
+            "inbounds": [],
+            "outbounds": [{
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{
+                    "address": "relay.example", "port": 443,
+                    "method": "2022-blake3-aes-128-gcm",
+                    "password": "AAECAwQFBgcICQoLDA0ODw=="
+                }]},
+                "streamSettings": {
+                    "network": "raw",
+                    "security": "shadowtls",
+                    "shadowtlsSettings": {
+                        "password": "stls", "tls": {"serverName": "www.microsoft.com"}
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        let outbound = &config.outbounds[0];
+        assert!(!fragmentable(outbound));
+        assert!(!sni_spoofable(outbound));
     }
 
     #[test]

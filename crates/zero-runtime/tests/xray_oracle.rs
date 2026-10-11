@@ -33,6 +33,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 const DECOY_CERTIFICATE: &str = include_str!("fixtures/loopback-cert.pem");
 const DECOY_PRIVATE_KEY: &str = include_str!("fixtures/loopback-key.pem");
+const LOOPBACK_CA: &str = include_str!("fixtures/loopback-ca.pem");
 const PASSWORD: &str = "an-example-shared-password";
 
 /// Locate the oracle, or explain why the comparison cannot be made.
@@ -1554,5 +1555,81 @@ async fn a_plain_http_request_through_vision_reads_a_clean_status_line() {
             "attempt {attempt}: the status line came back as {:?}",
             String::from_utf8_lossy(&head[..head.len().min(80)])
         );
+    }
+}
+
+/// A ClientHello re-framed into two TLS records, with the cut inside the server
+/// name (`packets: "tlssni"`), must still be a hello Xray's Go TLS stack accepts:
+/// a handshake message may span records, but only a real server can say whether
+/// the split lands somewhere it tolerates. `tlshello` rides along as the control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn vless_over_tls_with_a_hello_split_inside_the_name_matches_the_oracle() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!("oracle: {} (TLS, split hello)", oracle_version(&binary));
+    for packets in ["tlssni", "tlshello"] {
+        eprintln!("  fragment packets={packets}");
+        let echo = echo_service().await;
+        let relay_port = free_port();
+        let socks_port = free_port();
+        let _oracle = spawn_oracle(
+            &binary,
+            json!({
+                "log": {"loglevel": "warning"},
+                "inbounds": [{
+                    "tag": "in",
+                    "listen": "127.0.0.1",
+                    "port": relay_port,
+                    "protocol": "vless",
+                    "settings": {"clients": [{"id": UUID}], "decryption": "none"},
+                    "streamSettings": {
+                        "network": "tcp",
+                        "security": "tls",
+                        "tlsSettings": {"certificates": [{
+                            "certificate": [DECOY_CERTIFICATE],
+                            "key": [DECOY_PRIVATE_KEY],
+                        }]},
+                    },
+                }],
+                "outbounds": [oracle_loopback_freedom()],
+            }),
+        );
+        spawn_zray(json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "socks-in", "listen": "127.0.0.1",
+                "port": socks_port, "protocol": "socks",
+            }],
+            "outbounds": [{
+                "tag": "proxy",
+                "protocol": "vless",
+                "settings": {"vnext": [{
+                    "address": "127.0.0.1", "port": relay_port,
+                    "users": [{"id": UUID, "encryption": "none"}],
+                }]},
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "zray.test",
+                        "certificates": [{"usage": "verify", "certificate": [LOOPBACK_CA]}],
+                    },
+                    "finalmask": {"tcp": [{
+                        "type": "fragment",
+                        "settings": {"packets": packets, "length": "100-200", "delay": "1"},
+                    }]},
+                },
+            }],
+        }));
+        assert!(wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), relay_port)).await);
+        let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+        assert!(wait_for(socks).await);
+        for connection in 0..3u8 {
+            let mut tunnel = socks_connect(socks, echo).await.unwrap();
+            round_trip(&mut tunnel, &payload(connection, 64)).await;
+            round_trip(&mut tunnel, &payload(connection + 7, 96 * 1024)).await;
+        }
     }
 }

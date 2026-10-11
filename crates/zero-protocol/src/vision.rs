@@ -505,7 +505,13 @@ fn make_frame_into(
     out: &mut BytesMut,
 ) {
     let max_padding = MAX_FRAME_PLAINTEXT.saturating_sub(content.len());
-    let mut rng = rand::rngs::OsRng;
+    // Draw the padding length from the thread-local ChaCha CSPRNG, the way
+    // VMess and Shadowsocks2022 do in this crate, rather than from `OsRng`.
+    // The length only has to be unpredictable to an on-path observer, and a
+    // CSPRNG seeded from the OS already is; `OsRng` instead cost a `getrandom`
+    // syscall on every padded frame of every connection. Xray draws this
+    // length with `crypto/rand` by convention, not for a stronger guarantee.
+    let mut rng = rand::thread_rng();
     let padding = if long_padding && content.len() < LONG_PADDING_MIN {
         LONG_PADDING_MIN
             .saturating_sub(content.len())
@@ -523,9 +529,13 @@ fn make_frame_into(
     out.put_u16(content.len() as u16);
     out.put_u16(padding as u16);
     out.put_slice(content);
-    let old = out.len();
-    out.resize(old + padding, 0);
-    rng.fill_bytes(&mut out[old..]);
+    // Padding is length noise, not a secret: the outer TLS/REALITY layer
+    // encrypts the whole frame, so zeros read on the wire exactly like random
+    // bytes and cost nothing to produce. Xray leaves these bytes uninitialized
+    // for the same reason, and mux here already zero-fills its filler. Writing
+    // zeros drops a second per-frame `getrandom` and the keystream fill behind
+    // it; a reader discards the padding by length, so the content is unused.
+    out.resize(out.len() + padding, 0);
 }
 
 fn looks_like_tls_client_hello(input: &[u8]) -> bool {

@@ -429,6 +429,98 @@ mod tests {
     }
 
     #[test]
+    fn compiles_socks_outbound_in_both_xray_shapes() {
+        let config = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [
+                {"tag": "tor", "protocol": "socks", "settings": {"servers": [{
+                    "address": "127.0.0.1", "port": 9050,
+                    "users": [{"user": "a", "pass": "b"}]}]}},
+                {"tag": "flat", "protocol": "socks",
+                 "settings": {"address": "127.0.0.1", "port": 9150}}
+            ]
+        });
+        let (config, _) = parse_config(&config).unwrap();
+        match &config.outbounds[0].protocol {
+            OutboundProtocol::Socks(s) => {
+                assert_eq!(s.port, 9050);
+                assert_eq!(&*s.auth.as_ref().unwrap().username, "a");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &config.outbounds[1].protocol {
+            OutboundProtocol::Socks(s) => assert!(s.auth.is_none()),
+            other => panic!("{other:?}"),
+        }
+        let half = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [{"protocol": "socks",
+                "settings": {"address": "127.0.0.1", "port": 1, "user": "only"}}]
+        });
+        assert!(parse_config(&half).is_err());
+    }
+
+    #[test]
+    fn compiles_tor_outbound_with_bridges_and_a_transport_program() {
+        const BRIDGE: &str = "obfs4 192.0.2.55:38114 316E643333645F6D79216558614D3931657A5F5F cert=YXJlIGZyZXF1ZW50bHkgZnVsbCBvZiBsaXR0bGUgbWVzc2FnZXMgeW91IGNhbiBmaW5kLg iat-mode=0";
+        let config = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [
+                {"tag": "plain", "protocol": "tor"},
+                {"tag": "bridged", "protocol": "tor", "settings": {
+                    "bridges": [BRIDGE],
+                    "transports": {"obfs4": "/usr/bin/lyrebird"},
+                    "dataDir": "/var/lib/zray-tor",
+                    "memoryMiB": 48
+                }}
+            ]
+        });
+        let (config, _) = parse_config(&config).unwrap();
+        match &config.outbounds[0].protocol {
+            OutboundProtocol::Tor(t) => assert_eq!(t, &TorConfig::default()),
+            other => panic!("{other:?}"),
+        }
+        match &config.outbounds[1].protocol {
+            OutboundProtocol::Tor(t) => {
+                assert_eq!(t.bridges.len(), 1);
+                assert_eq!(&*t.transports[0].0, "obfs4");
+                assert_eq!(t.data_dir.as_deref(), Some("/var/lib/zray-tor"));
+                assert_eq!(t.memory_mib, 48);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Tor has no server address to report.
+        assert!(config.outbounds[0].endpoint().is_none());
+    }
+
+    #[test]
+    fn rejects_tor_settings_that_could_only_fail_later() {
+        let one = |settings: serde_json::Value| {
+            parse_config(&serde_json::json!({
+                "inbounds": [],
+                "outbounds": [{"protocol": "tor", "settings": settings}]
+            }))
+        };
+        // A bridge needing obfs4 with no program to run it.
+        let error = one(serde_json::json!({"bridges": ["obfs4 192.0.2.5:443 ABCD cert=x"]}))
+            .err()
+            .unwrap();
+        assert!(error.contains("obfs4"), "{error}");
+        // A bridge with just an address needs no transport program.
+        assert!(one(serde_json::json!({"bridges": ["192.0.2.5:443 ABCD"]})).is_ok());
+        // `Bridge ` prefix is the torrc spelling and is accepted.
+        assert!(one(serde_json::json!({
+            "bridges": ["Bridge obfs4 192.0.2.5:443 ABCD cert=x"],
+            "transports": {"obfs4": "lyrebird"}
+        }))
+        .is_ok());
+        // Too little memory would look like a dead network, not a setting.
+        assert!(one(serde_json::json!({"memoryMiB": 8})).is_err());
+        assert!(one(serde_json::json!({"bridges": [""]})).is_err());
+        assert!(one(serde_json::json!({"bridges": "oops"})).is_err());
+    }
+
+    #[test]
     fn compiles_hysteria2_client_with_certificate_tls() {
         let config = serde_json::json!({
             "inbounds": [],

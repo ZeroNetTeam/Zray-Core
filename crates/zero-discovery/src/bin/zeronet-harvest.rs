@@ -162,7 +162,7 @@ fn parse_args() -> Result<Args, String> {
 fn suits_iran(info: &serde_json::Value) -> bool {
     let security = info["security"].as_str().unwrap_or("");
     let protocol = info["protocol"].as_str().unwrap_or("");
-    matches!(security, "tls" | "reality") || matches!(protocol, "hysteria2" | "tuic")
+    matches!(security, "tls" | "reality") || matches!(protocol, "hysteria2" | "tuic" | "juicity")
 }
 
 struct Found {
@@ -989,6 +989,7 @@ mod tests {
         assert!(suits_iran(
             &json!({"security": "", "protocol": "hysteria2"})
         ));
+        assert!(suits_iran(&json!({"security": "", "protocol": "juicity"})));
         assert!(!suits_iran(
             &json!({"security": "none", "protocol": "vless"})
         ));

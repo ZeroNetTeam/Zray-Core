@@ -231,16 +231,27 @@ pub fn encode_packet(
     let kind = packet_kind(packet).ok_or_else(|| "unknown WireGuard packet type".to_string())?;
     let (padding, header) = params.packet_shape(kind);
     let padding = padding.choose(rng) as usize;
-    let mut output = vec![0u8; padding + packet.len()];
-    rng.fill(&mut output[..padding]);
-    output[padding..padding + 4].copy_from_slice(&header.choose(rng).to_le_bytes());
-    output[padding + 4..].copy_from_slice(&packet[4..]);
+    // Reserve, then write every byte exactly once. Only the padding prefix is
+    // zeroed, so `rng.fill` has an initialised slice to overwrite; the header
+    // word and the packet body are appended straight onto the end. The old
+    // shape `vec![0u8; padding + packet.len()]` memset the whole buffer first,
+    // paying a clear over the ~MTU-sized body on every datagram only to
+    // overwrite it immediately.
+    let mut output = Vec::with_capacity(padding + packet.len());
+    output.resize(padding, 0);
+    rng.fill(output.as_mut_slice());
+    output.extend_from_slice(&header.choose(rng).to_le_bytes());
+    output.extend_from_slice(&packet[4..]);
     Ok(output)
 }
 
-/// Remove an AmneziaWG prefix and restore the standard WireGuard type word.
-/// Random junk returns `Ok(None)` so callers can ignore it without feeding it
-/// into the authenticated tunnel engine.
+/// Remove an AmneziaWG prefix and restore the standard WireGuard type word in
+/// place, returning the offset at which the rebuilt packet begins. The restored
+/// type word overwrites the four H-magic bytes and the authenticated body
+/// already follows them, so the caller reads `packet[offset..]` without this
+/// path copying the datagram into a fresh `Vec`. Random junk returns `Ok(None)`
+/// so callers can ignore it without feeding it into the authenticated tunnel
+/// engine.
 ///
 /// The `params` are not re-validated here. Both callers sit on a receive loop
 /// holding one immutable config for the life of a session, and both validate it
@@ -249,7 +260,7 @@ pub fn encode_packet(
 /// a realistic padding width it cost 19 ns against a 6 ns scan, which was most
 /// of the cost of receiving a datagram. `encode_packet` does still validate,
 /// being reachable from setup as well.
-pub fn decode_packet(params: AmneziaParams, packet: &[u8]) -> Result<Option<Vec<u8>>, String> {
+pub fn decode_packet(params: AmneziaParams, packet: &mut [u8]) -> Result<Option<usize>, String> {
     for (kind, (padding, header)) in [
         (
             PacketKind::HandshakeInit,
@@ -278,10 +289,13 @@ pub fn decode_packet(params: AmneziaParams, packet: &[u8]) -> Result<Option<Vec<
                     .expect("four-byte header checked above"),
             );
             if header.contains(value) {
-                let mut output = Vec::with_capacity(packet.len() - padding);
-                output.extend_from_slice(&kind.standard_type().to_le_bytes());
-                output.extend_from_slice(&packet[padding + 4..]);
-                return Ok(Some(output));
+                // Restore the standard WireGuard type word in place over the
+                // AmneziaWG H-magic. The rebuilt packet is then `packet[padding..]`:
+                // the four type bytes followed by the body already sitting behind
+                // them, so the caller slices from the returned offset instead of
+                // this path allocating and copying a fresh `Vec` per datagram.
+                packet[padding..padding + 4].copy_from_slice(&kind.standard_type().to_le_bytes());
+                return Ok(Some(padding));
             }
         }
     }
@@ -420,14 +434,16 @@ impl AmneziaSession {
                 if source != self.endpoint {
                     continue;
                 }
-                let Some(normalized) =
-                    decode_packet(self.params.obfuscation, &self.datagram_buffer[..length])?
+                let Some(offset) =
+                    decode_packet(self.params.obfuscation, &mut self.datagram_buffer[..length])?
                 else {
                     continue;
                 };
-                let mut state =
-                    self.tunnel
-                        .decapsulate(Some(source.ip()), &normalized, &mut self.clear_buffer);
+                let mut state = self.tunnel.decapsulate(
+                    Some(source.ip()),
+                    &self.datagram_buffer[offset..length],
+                    &mut self.clear_buffer,
+                );
                 loop {
                     match state {
                         TunnResult::WriteToNetwork(packet) => {
@@ -761,7 +777,7 @@ mod tests {
         ] {
             let mut packet = kind.standard_type().to_le_bytes().to_vec();
             packet.extend_from_slice(b"authenticated payload");
-            let encoded = encode_packet(params, &packet, &mut rng).unwrap();
+            let mut encoded = encode_packet(params, &packet, &mut rng).unwrap();
             assert_eq!(
                 u32::from_le_bytes(
                     encoded[params.packet_shape(kind).0.min as usize..][..4]
@@ -770,7 +786,10 @@ mod tests {
                 ),
                 params.packet_shape(kind).1.min
             );
-            assert_eq!(decode_packet(params, &encoded).unwrap(), Some(packet));
+            let offset = decode_packet(params, &mut encoded)
+                .unwrap()
+                .expect("a well-formed packet decodes");
+            assert_eq!(&encoded[offset..], packet.as_slice());
         }
     }
 
@@ -811,7 +830,7 @@ mod tests {
         let mut invalid = params();
         invalid.junk_size = RangeU16 { min: 101, max: 50 };
         assert!(junk_packets(invalid, &mut rand::thread_rng()).is_err());
-        assert_eq!(decode_packet(params(), &[1, 2, 3, 4, 5]).unwrap(), None);
+        assert_eq!(decode_packet(params(), &mut [1, 2, 3, 4, 5]).unwrap(), None);
     }
 
     #[test]

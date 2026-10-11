@@ -8,6 +8,7 @@ pub mod amnezia;
 pub mod anytls;
 pub mod first_flight;
 mod io_util;
+pub mod masterdns;
 pub mod mux;
 pub mod shadowsocks;
 pub mod shadowsocks2022;

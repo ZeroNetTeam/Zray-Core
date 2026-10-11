@@ -610,10 +610,304 @@ pub fn parse_authority(s: &str, default_port: u16) -> Option<Destination> {
 /// The response sent after a successful CONNECT.
 pub const CONNECT_OK: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
 
+/// Run the client side of a SOCKS5 CONNECT over a stream that is already
+/// connected to the proxy (RFC 1928, with RFC 1929 user/password).
+///
+/// This is how a local Tor, Orbot or Psiphon client becomes an upstream: they
+/// all expose SOCKS5. A domain name is sent as a name (ATYP 3), never resolved
+/// here, so the far side does the lookup. That matters for Tor, where a local
+/// lookup would leak the name outside the circuit.
+///
+/// Only CONNECT is spoken, so UDP destinations are refused. On success the
+/// reply (including its bound address, which nobody needs) has been consumed
+/// and the stream carries the tunnelled bytes from here on.
+pub async fn connect_socks5<S>(
+    mut stream: S,
+    credential: Option<&Credential>,
+    destination: &Destination,
+) -> Result<S, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if destination.network != Network::Tcp {
+        return Err("SOCKS5 upstream carries TCP only".into());
+    }
+    // RFC 1929 caps user name and password at 255 bytes each.
+    if let Some(c) = credential {
+        if c.username.len() > 255 || c.password.len() > 255 {
+            return Err("SOCKS5 user name or password is longer than 255 bytes".into());
+        }
+    }
+
+    // Offer "no auth" first and user/password only when we have one, so a
+    // server that wants neither is not asked a question it cannot answer.
+    let greeting: &[u8] = if credential.is_some() {
+        &[SOCKS5, 2, AUTH_NONE, AUTH_USERPASS]
+    } else {
+        &[SOCKS5, 1, AUTH_NONE]
+    };
+    stream.write_all(greeting).await.map_err(io_err)?;
+    let mut choice = [0u8; 2];
+    stream.read_exact(&mut choice).await.map_err(io_err)?;
+    if choice[0] != SOCKS5 {
+        return Err("upstream is not a SOCKS5 server".into());
+    }
+    match (choice[1], credential) {
+        (AUTH_NONE, _) => {}
+        (AUTH_USERPASS, Some(c)) => {
+            let mut auth = Vec::with_capacity(3 + c.username.len() + c.password.len());
+            auth.push(0x01);
+            auth.push(c.username.len() as u8);
+            auth.extend_from_slice(c.username.as_bytes());
+            auth.push(c.password.len() as u8);
+            auth.extend_from_slice(c.password.as_bytes());
+            stream.write_all(&auth).await.map_err(io_err)?;
+            let mut status = [0u8; 2];
+            stream.read_exact(&mut status).await.map_err(io_err)?;
+            if status[1] != 0 {
+                return Err("SOCKS5 upstream rejected the user name or password".into());
+            }
+        }
+        // 0xFF, or a method we never offered.
+        _ => return Err("SOCKS5 upstream accepts none of our login methods".into()),
+    }
+
+    let mut request = BytesMut::with_capacity(22);
+    request.put_slice(&[SOCKS5, CMD_CONNECT, 0]);
+    match &destination.address {
+        Address::Ip(IpAddr::V4(ip)) => {
+            request.put_u8(ATYP_IPV4);
+            request.put_slice(&ip.octets());
+        }
+        Address::Ip(IpAddr::V6(ip)) => {
+            request.put_u8(ATYP_IPV6);
+            request.put_slice(&ip.octets());
+        }
+        Address::Domain(name) => {
+            if name.is_empty() || name.len() > 255 {
+                return Err("SOCKS5 domain must be 1 to 255 bytes".into());
+            }
+            request.put_u8(ATYP_DOMAIN);
+            request.put_u8(name.len() as u8);
+            request.put_slice(name.as_bytes());
+        }
+    }
+    request.put_u16(destination.port);
+    stream.write_all(&request).await.map_err(io_err)?;
+
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head).await.map_err(io_err)?;
+    if head[0] != SOCKS5 {
+        return Err("SOCKS5 reply has the wrong version".into());
+    }
+    if head[1] != REP_SUCCESS {
+        return Err(format!("SOCKS5 upstream refused: {}", reply_text(head[1])));
+    }
+    // Drain the bound address so the first tunnelled byte is the payload.
+    let bound = match head[3] {
+        ATYP_IPV4 => 4 + 2,
+        ATYP_IPV6 => 16 + 2,
+        ATYP_DOMAIN => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await.map_err(io_err)?;
+            len[0] as usize + 2
+        }
+        _ => return Err("SOCKS5 reply has an unknown address type".into()),
+    };
+    let mut skip = [0u8; 258];
+    stream
+        .read_exact(&mut skip[..bound])
+        .await
+        .map_err(io_err)?;
+    Ok(stream)
+}
+
+fn io_err(error: std::io::Error) -> String {
+    format!("SOCKS5 upstream: {error}")
+}
+
+/// RFC 1928 §6 reply codes, in words. Tor adds 0xF0-0xF7 (proxy extensions).
+fn reply_text(code: u8) -> &'static str {
+    match code {
+        0x01 => "general failure",
+        0x02 => "not allowed",
+        0x03 => "network unreachable",
+        0x04 => "host unreachable",
+        0x05 => "connection refused",
+        0x06 => "TTL expired",
+        0x07 => "command not supported",
+        0x08 => "address type not supported",
+        0xF0 => "onion service descriptor not found",
+        0xF1 => "onion service descriptor invalid",
+        0xF2 => "onion service introduction failed",
+        0xF3 => "onion service rendezvous failed",
+        0xF4 => "onion service client authorization needed",
+        0xF5 => "onion service client authorization wrong",
+        0xF6 => "onion service address invalid",
+        0xF7 => "onion service introduction timed out",
+        _ => "unknown reply code",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    /// A one-shot SOCKS5 server on the far end of a duplex pipe: replies to
+    /// the greeting with `method`, optionally checks user/password, then
+    /// answers the CONNECT with `reply` and returns the request it saw.
+    async fn fake_upstream(
+        mut server: tokio::io::DuplexStream,
+        method: u8,
+        reply: u8,
+        bound_domain: bool,
+    ) -> (Vec<u8>, tokio::io::DuplexStream) {
+        let mut hello = [0u8; 2];
+        server.read_exact(&mut hello).await.unwrap();
+        let mut methods = vec![0u8; hello[1] as usize];
+        server.read_exact(&mut methods).await.unwrap();
+        server.write_all(&[SOCKS5, method]).await.unwrap();
+        if method == AUTH_USERPASS {
+            let mut ver_len = [0u8; 2];
+            server.read_exact(&mut ver_len).await.unwrap();
+            let mut user = vec![0u8; ver_len[1] as usize];
+            server.read_exact(&mut user).await.unwrap();
+            let mut plen = [0u8; 1];
+            server.read_exact(&mut plen).await.unwrap();
+            let mut pass = vec![0u8; plen[0] as usize];
+            server.read_exact(&mut pass).await.unwrap();
+            let ok = user == b"alice" && pass == b"secret";
+            server
+                .write_all(&[1, if ok { 0 } else { 1 }])
+                .await
+                .unwrap();
+            if !ok {
+                return (Vec::new(), server);
+            }
+        }
+        let mut head = [0u8; 4];
+        server.read_exact(&mut head).await.unwrap();
+        let mut request = head.to_vec();
+        let rest = match head[3] {
+            ATYP_IPV4 => 4,
+            ATYP_IPV6 => 16,
+            _ => {
+                let mut len = [0u8; 1];
+                server.read_exact(&mut len).await.unwrap();
+                request.push(len[0]);
+                len[0] as usize
+            }
+        } + 2;
+        let mut tail = vec![0u8; rest];
+        server.read_exact(&mut tail).await.unwrap();
+        request.extend_from_slice(&tail);
+        let mut answer = vec![SOCKS5, reply, 0];
+        if bound_domain {
+            answer.extend_from_slice(&[ATYP_DOMAIN, 3, b'a', b'b', b'c', 0x1F, 0x90]);
+        } else {
+            answer.extend_from_slice(&[ATYP_IPV4, 0, 0, 0, 0, 0, 0]);
+        }
+        server.write_all(&answer).await.unwrap();
+        (request, server)
+    }
+
+    #[tokio::test]
+    async fn client_connect_sends_the_name_and_leaves_payload_untouched() {
+        let (client, server) = duplex(4096);
+        let upstream = tokio::spawn(fake_upstream(server, AUTH_NONE, REP_SUCCESS, true));
+        let target = Destination::tcp(Address::domain("example.onion"), 443);
+        let mut stream = connect_socks5(client, None, &target).await.unwrap();
+        let (request, mut server) = upstream.await.unwrap();
+        // The domain went out as a name, not a locally resolved address.
+        assert_eq!(&request[..4], &[SOCKS5, CMD_CONNECT, 0, ATYP_DOMAIN]);
+        assert_eq!(&request[5..18], b"example.onion");
+        assert_eq!(&request[18..], &443u16.to_be_bytes());
+        // The bound address was drained: the next byte is application data.
+        server.write_all(b"hi").await.unwrap();
+        let mut got = [0u8; 2];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hi");
+    }
+
+    #[tokio::test]
+    async fn client_connect_encodes_ip_destinations() {
+        let (client, server) = duplex(4096);
+        let upstream = tokio::spawn(fake_upstream(server, AUTH_NONE, REP_SUCCESS, false));
+        let target = Destination::tcp(Address::Ip("192.0.2.7".parse().unwrap()), 8080);
+        connect_socks5(client, None, &target).await.unwrap();
+        let (request, _) = upstream.await.unwrap();
+        assert_eq!(
+            request,
+            [SOCKS5, CMD_CONNECT, 0, ATYP_IPV4, 192, 0, 2, 7, 0x1F, 0x90]
+        );
+    }
+
+    #[tokio::test]
+    async fn client_connect_logs_in_with_user_and_password() {
+        let good = Credential {
+            username: "alice".into(),
+            password: "secret".into(),
+        };
+        let (client, server) = duplex(4096);
+        let upstream = tokio::spawn(fake_upstream(server, AUTH_USERPASS, REP_SUCCESS, false));
+        let target = Destination::tcp(Address::domain("example.com"), 80);
+        connect_socks5(client, Some(&good), &target).await.unwrap();
+        upstream.await.unwrap();
+
+        let bad = Credential {
+            username: "alice".into(),
+            password: "wrong".into(),
+        };
+        let (client, server) = duplex(4096);
+        tokio::spawn(fake_upstream(server, AUTH_USERPASS, REP_SUCCESS, false));
+        let error = connect_socks5(client, Some(&bad), &target)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("rejected"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn client_connect_reports_refusals_and_bad_peers() {
+        let target = Destination::tcp(Address::domain("example.com"), 80);
+
+        let (client, server) = duplex(4096);
+        tokio::spawn(fake_upstream(server, AUTH_NONE, 0x05, false));
+        let error = connect_socks5(client, None, &target).await.err().unwrap();
+        assert!(error.contains("connection refused"), "{error}");
+
+        // Tor's own extension codes are named, not "unknown".
+        let (client, server) = duplex(4096);
+        tokio::spawn(fake_upstream(server, AUTH_NONE, 0xF0, false));
+        let error = connect_socks5(client, None, &target).await.err().unwrap();
+        assert!(
+            error.contains("onion service descriptor not found"),
+            "{error}"
+        );
+
+        // No acceptable method.
+        let (client, server) = duplex(4096);
+        tokio::spawn(fake_upstream(server, AUTH_UNACCEPTABLE, REP_SUCCESS, false));
+        let error = connect_socks5(client, None, &target).await.err().unwrap();
+        assert!(error.contains("none of our login methods"), "{error}");
+
+        // Something that is not SOCKS5 at all (an HTTP server).
+        let (client, mut server) = duplex(4096);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 3];
+            server.read_exact(&mut buf).await.unwrap();
+            server.write_all(b"HT").await.unwrap();
+        });
+        let error = connect_socks5(client, None, &target).await.err().unwrap();
+        assert!(error.contains("not a SOCKS5"), "{error}");
+
+        // UDP is refused before anything is written.
+        let (client, _server) = duplex(64);
+        let udp = Destination::new(Address::domain("example.com"), 53, Network::Udp);
+        let error = connect_socks5(client, None, &udp).await.err().unwrap();
+        assert!(error.contains("TCP only"), "{error}");
+    }
 
     #[test]
     fn detects_socks5_by_first_byte() {

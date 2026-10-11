@@ -98,6 +98,7 @@ jobs:
           echo "$(jq length reports.json) reports"
 
       - name: rank
+        id: rank
         if: steps.relays.outputs.list != ''
         env:
           RELAYS: ${{ steps.relays.outputs.list }}
@@ -118,7 +119,17 @@ jobs:
                 --sources deploy/crowd/harvest-sources.json
                 --sources deploy/crowd/verified-source.json)
           if [ -f previous.json ]; then args+=(--previous previous.json); fi
-          target/release/zeronet-crowd "${args[@]}"
+          # Exit 3 is the guard keeping the published list (too few reports
+          # to rank, or a list that would shrink sharply): not a failure, but
+          # there is no new rankings.json, so the publish step must not use one.
+          status=0
+          target/release/zeronet-crowd "${args[@]}" || status=$?
+          case "$status" in
+            0) echo "fresh=true" >> "$GITHUB_OUTPUT" ;;
+            3) echo "fresh=false" >> "$GITHUB_OUTPUT"
+               echo "::warning::rankings not updated: too few reports to rank; the published list was kept" ;;
+            *) exit "$status" ;;
+          esac
 
       # How each connection mode does in real use: totals per UTC day, sealed
       # to the maintainer's public key (repository variable MODE_STATS_KEY),
@@ -138,18 +149,28 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           CROWD_SIGNING_KEY: ${{ secrets.CROWD_SIGNING_KEY }}
+          FRESH_RANKINGS: ${{ steps.rank.outputs.fresh }}
         run: |
-          if [ -n "$CROWD_SIGNING_KEY" ]; then
-            target/release/zeronet-sign sign rankings.json
-            # The app rejects a list whose signature does not verify against
-            # the key compiled into it. A secret that belongs to another key
-            # would publish lists nobody accepts, so stop here instead.
-            target/release/zeronet-sign verify rankings.json
-          else
-            echo "::warning::No CROWD_SIGNING_KEY; publishing rankings.json unsigned."
+          files=""
+          # A run that kept the published list has no new rankings.json: only
+          # the sealed mode totals (below) go out, next to the rankings already there.
+          if [ "$FRESH_RANKINGS" = "true" ]; then
+            if [ -n "$CROWD_SIGNING_KEY" ]; then
+              target/release/zeronet-sign sign rankings.json
+              # The app rejects a list whose signature does not verify against
+              # the key compiled into it. A secret that belongs to another key
+              # would publish lists nobody accepts, so stop here instead.
+              target/release/zeronet-sign verify rankings.json
+            else
+              echo "::warning::No CROWD_SIGNING_KEY; publishing rankings.json unsigned."
+            fi
+            files="rankings.json"
+            [ -f rankings.json.sig ] && files="$files rankings.json.sig"
           fi
-          files="rankings.json"
-          [ -f rankings.json.sig ] && files="$files rankings.json.sig"
           # The sealed mode totals, when there are any.
           [ -d modes ] && [ -n "$(ls -A modes)" ] && files="$files modes"
+          if [ -z "$files" ]; then
+            echo "Nothing new to publish."
+            exit 0
+          fi
           .github/scripts/publish-crowd-data.sh $files

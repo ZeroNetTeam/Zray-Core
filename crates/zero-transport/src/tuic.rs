@@ -848,11 +848,26 @@ fn receive_packet(
         return Ok(None);
     }
     let fragment = decode_packet_fragment(data)?;
-    let key = (fragment.association, fragment.packet);
     if fragment.fragment_total == 1 {
-        let mut single = PacketReassembler::new(&fragment);
-        return single.push(fragment);
+        // The common case on bulk UDP (DNS, QUIC-over-UDP, games) is a packet
+        // that fits in one datagram. Hand the payload straight back instead of
+        // routing it through the reassembler: that path allocated a one-slot
+        // `vec![None; 1]` and then copied the whole payload into a second
+        // buffer, both pure overhead when there is nothing to join.
+        // `decode_packet_fragment` only accepts `fragment_id < fragment_total`,
+        // so a lone fragment has id 0 and therefore its address, and its
+        // declared length already fits a `u16`.
+        let destination = fragment
+            .destination
+            .ok_or_else(|| "TUIC single-fragment packet without a destination".to_string())?;
+        return Ok(Some((
+            fragment.association,
+            fragment.packet,
+            destination,
+            fragment.payload,
+        )));
     }
+    let key = (fragment.association, fragment.packet);
     let now = Instant::now();
     reassembly.retain(|_, (_, started)| now.duration_since(*started) < REASSEMBLY_TIMEOUT);
     if !reassembly.contains_key(&key) && reassembly.len() >= MAX_REASSEMBLIES {
@@ -935,6 +950,22 @@ mod tests {
         assert_eq!((fragment.association, fragment.packet), (7, 9));
         assert_eq!(fragment.destination, Some(destination));
         assert_eq!(fragment.payload, b"query");
+    }
+
+    #[test]
+    fn a_single_fragment_packet_skips_the_reassembler() {
+        let destination = Destination::udp(zero_core::Address::domain("dns.example"), 53);
+        let encoded = encode_packet(7, 9, &destination, b"query").unwrap();
+        assert_eq!(encoded[6], 1, "the fixture must be one fragment");
+        let mut state = std::collections::HashMap::new();
+        let (association, packet, decoded, payload) = receive_packet(&encoded, &mut state)
+            .unwrap()
+            .expect("a lone fragment completes immediately");
+        assert_eq!((association, packet), (7, 9));
+        assert_eq!(decoded, destination);
+        assert_eq!(payload, b"query");
+        // The fast path must not leave reassembly state behind.
+        assert!(state.is_empty());
     }
 
     #[test]

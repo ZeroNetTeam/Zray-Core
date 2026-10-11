@@ -152,7 +152,9 @@ pub enum AntiSanctionDns {
     /// Every provider below, measured on each network by the runtime
     /// (`zero_runtime::sanction_dns`): the one that actually relays is used,
     /// and a name it does not relay goes through the tunnel instead of to a
-    /// service that would refuse an Iranian address.
+    /// service that would refuse an Iranian address. Shecan is preferred
+    /// while it relays here and keeps up with the best; otherwise the best
+    /// relaying provider wins.
     Auto,
     /// The only provider that relayed Google and AI services when measured
     /// from Tehran (FANAP) on 2026-09-28.
@@ -202,8 +204,8 @@ impl AntiSanctionDns {
             // One address per provider: the runtime measures each, and one
             // provider's second address adds a probe without adding a choice.
             Self::Auto => &[
-                "193.186.32.32",
                 "178.22.122.100",
+                "193.186.32.32",
                 "78.157.42.100",
                 "194.225.152.10",
                 "185.55.226.26",

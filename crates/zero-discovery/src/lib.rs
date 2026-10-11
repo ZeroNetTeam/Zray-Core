@@ -10,6 +10,8 @@
 //!   summarises them ([`LinkInfo`]) and classifies them;
 //! * [`order`] — interleaves candidates across server families;
 //! * [`feed`] — fetches feeds with gzip and an ETag/Last-Modified disk cache;
+//! * [`domestic_feed`] — the signed, remotely-updatable SNI-decoy name list,
+//!   with the bundled pool as its offline floor;
 //! * [`probe`] — the TCP and real (through-the-proxy) liveness tests;
 //! * [`discover`], [`test_links`], [`scan`] — the three long-running jobs;
 //! * [`events`] — batched event delivery to the host;
@@ -25,6 +27,7 @@ pub mod crowd;
 pub mod crowd_client;
 pub mod decoy_check;
 pub mod discover;
+pub mod domestic_feed;
 pub mod events;
 pub mod feed;
 pub mod github;

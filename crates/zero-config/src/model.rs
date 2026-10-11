@@ -6,7 +6,7 @@
 //! (RESEARCH-01 §4, §19).
 
 use std::collections::BTreeMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -148,6 +148,7 @@ pub enum Security {
     None,
     Tls(TlsConfig),
     Reality(RealityConfig),
+    ShadowTls(ShadowTlsConfig),
 }
 
 impl Security {
@@ -156,6 +157,7 @@ impl Security {
             Security::None => "none",
             Security::Tls(_) => "tls",
             Security::Reality(_) => "reality",
+            Security::ShadowTls(_) => "shadowtls",
         }
     }
 }
@@ -198,6 +200,21 @@ pub struct RealityConfig {
     /// certificate-binding check. Xray encodes this as 1952 raw bytes in
     /// `realitySettings.mldsa65Verify`.
     pub mldsa65_verify: Option<Box<[u8]>>,
+}
+
+/// ShadowTLS v3 settings.
+///
+/// ShadowTLS wraps an inner protocol (always Shadowsocks here) in a stream that
+/// looks like an ordinary TLS session to a decoy site. The client proves itself
+/// with `password` keyed into the ClientHello, and presents `server_name` as
+/// the decoy SNI. `alpn` is carried into the ClientHello for camouflage only;
+/// it never changes which protocol rides inside. Only version 3 is supported,
+/// so there is no version field — a non-3 config is rejected at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowTlsConfig {
+    pub password: Arc<str>,
+    pub server_name: Arc<str>,
+    pub alpn: Vec<Box<str>>,
 }
 
 /// uTLS ClientHello shape. A stock Rust TLS hello is itself a fingerprint.
@@ -412,10 +429,11 @@ pub struct SniDesyncConfig {
     pub method: SniMethod,
     /// How a decoy is kept from the server (`zero_evasion::Fooling`).
     pub fooling: DecoyFooling,
-    /// The hop limit for a decoy stopped by expiry. Zero means no hop count
-    /// is known: no TTL decoy is sent, so under [`DecoyFooling::Auto`] a
-    /// device without the MD5 option sends no decoy at all. A guess that
-    /// reaches the server is worse than none.
+    /// The hop limit for a decoy stopped by expiry, as a static guess. Zero
+    /// means none is configured; the runtime may still learn one from the
+    /// path at connection time (`zero_evasion::autottl`), and only where it
+    /// cannot does a device without the MD5 option fall back to the urgent
+    /// byte. A guess that reaches the server is worse than none.
     pub ttl: u8,
 }
 
@@ -532,6 +550,29 @@ impl FragmentConfig {
             lead_delays: Vec::new(),
         }
     }
+
+    /// Split the ClientHello into two TLS records with the cut inside the
+    /// server name, both in one write.
+    ///
+    /// A filter that reads the name out of the first TLS record of a
+    /// connection, after putting the TCP segments back together, finds only a
+    /// piece of it. The name's second-level label is where a suffix match
+    /// keys, so the cut is aimed there (`speedtest` in `www.speedtest.net`).
+    /// It costs five bytes and no delay, and the server reassembles the two
+    /// records into the one hello as it would any split handshake message.
+    pub fn sni_split() -> Self {
+        Self {
+            packets: FragmentPackets::TlsSni,
+            // `length` is unused for this mode; the cut comes from the name.
+            length: RangeU32::new(16_384, 16_384),
+            // No delay keeps both records in one write.
+            delay: RangeDuration::millis(0, 0),
+            max_split: RangeU32::new(0, 0),
+            empty_records: 0,
+            lead_lengths: Vec::new(),
+            lead_delays: Vec::new(),
+        }
+    }
 }
 
 impl Default for FragmentConfig {
@@ -557,6 +598,10 @@ impl Default for FragmentConfig {
 pub enum FragmentPackets {
     /// Fragment only the TLS ClientHello — cheapest and the BPB default.
     TlsHello,
+    /// Fragment only the TLS ClientHello, with a record cut inside the server
+    /// name (`zero_evasion::fragment::plan_tls_sni`). For a filter that
+    /// reassembles TCP but reads the name from a single TLS record.
+    TlsSni,
     /// Fragment writes `from..=to` counting from the first write.
     Range { from: u32, to: u32 },
 }
@@ -782,6 +827,20 @@ pub enum OutboundProtocol {
     Vmess(VmessConfig),
     /// AnyTLS v2 over ordinary certificate TLS.
     AnyTls(AnyTlsConfig),
+    /// A SOCKS5 upstream: a local Tor, Orbot or Psiphon client, or any other
+    /// SOCKS5 server. TCP only.
+    Socks(SocksConfig),
+    /// The Tor network, through the embedded Arti client (needs a build with
+    /// the `tor` feature; without it connections fail with a message saying so).
+    /// TCP only. It has no endpoint of its own: the circuit's far end is the
+    /// destination.
+    Tor(TorConfig),
+    /// A MasterDnsVPN server, reached through ordinary DNS resolvers: the
+    /// traffic is carried in DNS questions and answers under a domain the
+    /// server is the authority for. TCP only. Like Tor it has no endpoint of its
+    /// own: the resolvers are the way in, the destination is where the server
+    /// connects.
+    MasterDns(MasterDnsConfig),
     /// ZeroV1 (code name Tide): sessions carried in HTTP/2 request and
     /// response bodies.
     Tide(TideConfig),
@@ -789,6 +848,11 @@ pub enum OutboundProtocol {
     Hysteria2(Hysteria2Config),
     /// TUIC v5 over authenticated QUIC.
     Tuic(TuicConfig),
+    /// Juicity over authenticated QUIC. Like TUIC it rides one QUIC
+    /// connection per server, but each proxied request is a trojan-style
+    /// stream (`[network][addr][port]`) rather than a datagram, so UDP is
+    /// carried over a stream too.
+    Juicity(JuicityConfig),
     /// WireGuard/AmneziaWG UDP tunnel. TCP destinations are rejected at the
     /// runtime boundary because this protocol carries IP packets, not a byte
     /// stream.
@@ -806,9 +870,13 @@ impl OutboundProtocol {
             OutboundProtocol::Shadowsocks(_) => "shadowsocks",
             OutboundProtocol::Vmess(_) => "vmess",
             OutboundProtocol::AnyTls(_) => "anytls",
+            OutboundProtocol::Socks(_) => "socks",
+            OutboundProtocol::Tor(_) => "tor",
+            OutboundProtocol::MasterDns(_) => "masterdns",
             OutboundProtocol::Tide(_) => "zerov1",
             OutboundProtocol::Hysteria2(_) => "hysteria2",
             OutboundProtocol::Tuic(_) => "tuic",
+            OutboundProtocol::Juicity(_) => "juicity",
             OutboundProtocol::AmneziaWireguard(_) => "amnezia-wg",
         }
     }
@@ -822,9 +890,13 @@ impl OutboundProtocol {
                 | OutboundProtocol::Shadowsocks(_)
                 | OutboundProtocol::Vmess(_)
                 | OutboundProtocol::AnyTls(_)
+                | OutboundProtocol::Socks(_)
+                | OutboundProtocol::Tor(_)
+                | OutboundProtocol::MasterDns(_)
                 | OutboundProtocol::Tide(_)
                 | OutboundProtocol::Hysteria2(_)
                 | OutboundProtocol::Tuic(_)
+                | OutboundProtocol::Juicity(_)
                 | OutboundProtocol::AmneziaWireguard(_)
         )
     }
@@ -996,6 +1068,84 @@ pub struct AnyTlsConfig {
     pub password: Box<str>,
 }
 
+/// A SOCKS5 upstream (RFC 1928). The credential is RFC 1929 user/password; a
+/// local Tor or Psiphon client needs none, a remote SOCKS5 server often does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocksConfig {
+    pub address: Address,
+    pub port: u16,
+    pub auth: Option<SocksCredential>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocksCredential {
+    pub username: Box<str>,
+    pub password: Box<str>,
+}
+
+/// How the embedded Tor client reaches the Tor network.
+///
+/// All fields are optional: an empty config connects to Tor directly, which
+/// works wherever Tor is not blocked. Where it is (Iran, Russia, China) bridges
+/// are needed, and most bridge types need a pluggable-transport program that
+/// is not part of this build, so it is named in `transports`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct TorConfig {
+    /// Bridge lines as the Tor Project hands them out, with or without the
+    /// leading `Bridge `, e.g. `obfs4 192.0.2.5:443 FINGERPRINT cert=… iat-mode=0`.
+    pub bridges: Vec<Box<str>>,
+    /// Pluggable-transport programs, as (transport name, program path):
+    /// `("obfs4", "/usr/bin/lyrebird")`, `("snowflake", "…/snowflake-client")`.
+    pub transports: Vec<(Box<str>, Box<str>)>,
+    /// Where Tor keeps its directory cache and state. `None` picks a per-user
+    /// folder. A warm cache is what makes the second start fast.
+    pub data_dir: Option<Box<str>>,
+    /// Soft memory ceiling in MiB for the Tor client. `0` means the default.
+    pub memory_mib: u32,
+}
+
+/// How a MasterDnsVPN server picks the destination of a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum MasterDnsMode {
+    /// The stream names its destination and the server dials it
+    /// (`PROTOCOL_TYPE = "SOCKS5"`, what the installer sets up).
+    #[default]
+    Socks5,
+    /// The server forwards every stream to one fixed place.
+    Tcp,
+}
+
+/// How to reach one MasterDnsVPN server. See [`OutboundProtocol::MasterDns`].
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct MasterDnsConfig {
+    /// The tunnel domain, delegated to the server (`t.example.com`).
+    pub domain: Box<str>,
+    /// The shared key. A secret: it is never printed.
+    pub key: Box<str>,
+    /// The encryption method id (5 = AES-256-GCM).
+    pub method: u8,
+    /// Resolvers the queries go through; the server's own address works too
+    /// when it answers on UDP 53.
+    pub resolvers: Vec<SocketAddr>,
+    pub mode: MasterDnsMode,
+}
+
+impl std::fmt::Debug for MasterDnsConfig {
+    // The key never prints.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MasterDnsConfig")
+            .field("domain", &self.domain)
+            .field("method", &self.method)
+            .field("resolvers", &self.resolvers)
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Lowest memory ceiling the Tor client is given. Below this Arti refuses
+/// circuits it cannot hold, which looks like a dead network.
+pub const TOR_MIN_MEMORY_MIB: u32 = 32;
+
 /// A Tide server to connect to. The keys are the raw bytes; links and JSON
 /// write them as unpadded URL-safe base64.
 #[derive(Clone, PartialEq, Eq)]
@@ -1024,6 +1174,14 @@ pub struct Hysteria2Config {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuicConfig {
+    pub address: Address,
+    pub port: u16,
+    pub uuid: [u8; 16],
+    pub password: Box<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JuicityConfig {
     pub address: Address,
     pub port: u16,
     pub uuid: [u8; 16],
@@ -1244,6 +1402,7 @@ impl Outbound {
                 | OutboundProtocol::Trojan(_)
                 | OutboundProtocol::Shadowsocks(_)
                 | OutboundProtocol::AnyTls(_)
+                | OutboundProtocol::Socks(_)
         ) && !self.mux.enabled
             && matches!(
                 self.stream.transport,
@@ -1379,6 +1538,108 @@ impl Outbound {
             }
         }
 
+        if let OutboundProtocol::MasterDns(m) = &self.protocol {
+            let domain = m.domain.trim();
+            if domain.is_empty()
+                || domain.len() > 200
+                || domain.starts_with('.')
+                || !domain.contains('.')
+                || !domain
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            {
+                return Err(format!(
+                    "outbound {}: the MasterDNS domain must be a name like t.example.com",
+                    self.tag
+                ));
+            }
+            if m.key.is_empty() {
+                return Err(format!("outbound {}: the MasterDNS key is empty", self.tag));
+            }
+            // Method 2 (ChaCha20) is deliberately not offered: upstream runs it
+            // without authentication.
+            if !matches!(m.method, 0 | 1 | 3..=5) {
+                return Err(format!(
+                    "outbound {}: MasterDNS encryption method {} is not supported",
+                    self.tag, m.method
+                ));
+            }
+            if m.resolvers.is_empty() {
+                return Err(format!(
+                    "outbound {}: MasterDNS needs at least one resolver",
+                    self.tag
+                ));
+            }
+        }
+
+        if let OutboundProtocol::Tor(tor) = &self.protocol {
+            if tor.memory_mib != 0 && tor.memory_mib < TOR_MIN_MEMORY_MIB {
+                return Err(format!(
+                    "outbound {}: Tor needs at least {TOR_MIN_MEMORY_MIB} MiB of memory",
+                    self.tag
+                ));
+            }
+            if tor
+                .bridges
+                .iter()
+                .any(|b| b.trim().is_empty() || b.len() > 2048)
+            {
+                return Err(format!(
+                    "outbound {}: a Tor bridge line is empty or too long",
+                    self.tag
+                ));
+            }
+            if tor
+                .transports
+                .iter()
+                .any(|(name, path)| name.trim().is_empty() || path.trim().is_empty())
+            {
+                return Err(format!(
+                    "outbound {}: a Tor transport needs a name and a program path",
+                    self.tag
+                ));
+            }
+            // A bridge that names a transport nobody can run would only fail
+            // minutes later, inside Tor, with a message about circuits.
+            for line in &tor.bridges {
+                let line = line.trim();
+                let line = line.strip_prefix("Bridge ").map_or(line, str::trim);
+                let first = line.split_whitespace().next().unwrap_or("");
+                let is_transport = !first.contains(':') && !first.is_empty();
+                if is_transport
+                    && !tor
+                        .transports
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case(first))
+                {
+                    return Err(format!(
+                        "outbound {}: bridge uses the {first:?} transport but no program is set for it",
+                        self.tag
+                    ));
+                }
+            }
+        }
+
+        if let OutboundProtocol::Socks(socks) = &self.protocol {
+            if socks.port == 0 {
+                return Err(format!("outbound {}: SOCKS5 port must not be 0", self.tag));
+            }
+            if let Some(auth) = &socks.auth {
+                if auth.username.len() > 255 || auth.password.len() > 255 {
+                    return Err(format!(
+                        "outbound {}: SOCKS5 user name and password are at most 255 bytes",
+                        self.tag
+                    ));
+                }
+            }
+            if !matches!(self.stream.transport, Transport::Raw) {
+                return Err(format!(
+                    "outbound {}: SOCKS5 requires the raw carrier",
+                    self.tag
+                ));
+            }
+        }
+
         if let OutboundProtocol::AnyTls(anytls) = &self.protocol {
             if anytls.password.is_empty() {
                 return Err(format!(
@@ -1449,6 +1710,69 @@ impl Outbound {
             if !self.stream.evasion.is_empty() || self.stream.raw_http_header.is_some() {
                 return Err(format!(
                     "outbound {}: TUIC cannot carry TCP finalmask or raw HTTP camouflage",
+                    self.tag
+                ));
+            }
+        }
+
+        if let OutboundProtocol::Juicity(juicity) = &self.protocol {
+            if juicity.password.is_empty() {
+                return Err(format!(
+                    "outbound {}: Juicity password must not be empty",
+                    self.tag
+                ));
+            }
+            if !matches!(self.stream.security, Security::Tls(_)) {
+                return Err(format!(
+                    "outbound {}: Juicity requires ordinary certificate TLS",
+                    self.tag
+                ));
+            }
+            if !matches!(self.stream.transport, Transport::Raw) {
+                return Err(format!(
+                    "outbound {}: Juicity uses its own QUIC carrier",
+                    self.tag
+                ));
+            }
+            if !self.stream.evasion.is_empty() || self.stream.raw_http_header.is_some() {
+                return Err(format!(
+                    "outbound {}: Juicity cannot carry TCP finalmask or raw HTTP camouflage",
+                    self.tag
+                ));
+            }
+        }
+
+        if let Security::ShadowTls(shadowtls) = &self.stream.security {
+            if shadowtls.password.is_empty() {
+                return Err(format!(
+                    "outbound {}: ShadowTLS password must not be empty",
+                    self.tag
+                ));
+            }
+            if shadowtls.server_name.is_empty() {
+                return Err(format!(
+                    "outbound {}: ShadowTLS needs a decoy serverName",
+                    self.tag
+                ));
+            }
+            if !matches!(self.protocol, OutboundProtocol::Shadowsocks(_)) {
+                return Err(format!(
+                    "outbound {}: ShadowTLS carries Shadowsocks only",
+                    self.tag
+                ));
+            }
+            if !matches!(self.stream.transport, Transport::Raw) {
+                return Err(format!(
+                    "outbound {}: ShadowTLS runs over the raw carrier only",
+                    self.tag
+                ));
+            }
+            // Splitting the ClientHello would break the relay's frame
+            // extraction and the data-stream HMAC, so no TCP evasion or raw
+            // HTTP camouflage underneath it.
+            if !self.stream.evasion.is_empty() || self.stream.raw_http_header.is_some() {
+                return Err(format!(
+                    "outbound {}: ShadowTLS cannot carry TCP finalmask or raw HTTP camouflage",
                     self.tag
                 ));
             }
@@ -1607,9 +1931,11 @@ impl Outbound {
             OutboundProtocol::Shadowsocks(s) => Some((s.address.clone(), s.port)),
             OutboundProtocol::Vmess(v) => Some((v.address.clone(), v.port)),
             OutboundProtocol::AnyTls(a) => Some((a.address.clone(), a.port)),
+            OutboundProtocol::Socks(k) => Some((k.address.clone(), k.port)),
             OutboundProtocol::Tide(t) => Some((t.address.clone(), t.port)),
             OutboundProtocol::Hysteria2(h) => Some((h.address.clone(), h.port)),
             OutboundProtocol::Tuic(t) => Some((t.address.clone(), t.port)),
+            OutboundProtocol::Juicity(j) => Some((j.address.clone(), j.port)),
             OutboundProtocol::AmneziaWireguard(w) => Some((w.address.clone(), w.port)),
             _ => None,
         }
@@ -1649,6 +1975,29 @@ pub enum InboundProtocol {
         target: Option<(Address, u16)>,
         network: Network,
     },
+}
+
+impl InboundProtocol {
+    /// The protocol's name, for logs. Deliberately not the `Debug` form: that
+    /// prints every user id and password the inbound holds, and a log is the
+    /// last place those belong.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            InboundProtocol::Socks => "socks",
+            InboundProtocol::Http => "http",
+            InboundProtocol::Mixed => "mixed",
+            InboundProtocol::Vless(_) => "vless",
+            InboundProtocol::Trojan(_) => "trojan",
+            InboundProtocol::Vmess(_) => "vmess",
+            InboundProtocol::Shadowsocks(_) => "shadowsocks",
+            InboundProtocol::AnyTls(_) => "anytls",
+            InboundProtocol::Tide(_) => "zerov1",
+            InboundProtocol::Hysteria2(_) => "hysteria2",
+            InboundProtocol::Tuic(_) => "tuic",
+            InboundProtocol::Tun(_) => "tun",
+            InboundProtocol::Dokodemo { .. } => "dokodemo",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

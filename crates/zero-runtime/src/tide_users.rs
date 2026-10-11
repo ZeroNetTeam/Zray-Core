@@ -141,12 +141,15 @@ fn unpercent(text: &str) -> String {
     while at < bytes.len() {
         match bytes[at] {
             b'+' => out.push(b' '),
-            b'%' if at + 2 < bytes.len() => match u8::from_str_radix(&text[at + 1..at + 3], 16) {
-                Ok(byte) => {
+            b'%' if at + 2 < bytes.len() => match text
+                .get(at + 1..at + 3)
+                .map(|pair| u8::from_str_radix(pair, 16))
+            {
+                Some(Ok(byte)) => {
                     out.push(byte);
                     at += 2;
                 }
-                Err(_) => out.push(b'%'),
+                _ => out.push(b'%'),
             },
             byte => out.push(byte),
         }
@@ -342,6 +345,12 @@ pub(crate) fn admin(config: &TideInboundConfig, users: &Users) -> Option<Admin> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpercent_keeps_non_ascii_after_a_percent_sign() {
+        assert_eq!(unpercent("a%…b"), "a%…b");
+        assert_eq!(unpercent("a%41+b"), "aA b");
+    }
 
     fn config(users_file: Option<&str>) -> TideInboundConfig {
         TideInboundConfig {

@@ -123,7 +123,10 @@ pub fn set_enabled(enabled: bool) {
 ///
 /// `None` for anything else, including a hello that is cut short or has no
 /// name, so the caller sends such bytes as they are.
-#[cfg(any(target_os = "linux", target_os = "android", test))]
+///
+/// Platform-agnostic: the decoy socket paths that follow are Linux/Android
+/// only, but [`crate::fragment`] uses this to place a record cut inside the
+/// name on every target, so the parser itself is always compiled.
 pub(crate) fn server_name_range(record: &[u8]) -> Option<std::ops::Range<usize>> {
     let u16_at = |at: usize| {
         Some(usize::from(u16::from_be_bytes([

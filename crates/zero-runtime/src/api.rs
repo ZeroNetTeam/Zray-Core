@@ -203,6 +203,39 @@ async fn handle_connection(
                 .map_err(|error| format!("encoding traffic stats: {error}"))?;
             write_response(&mut stream, 200, "ok", &body).await
         }
+        ("GET", "/usage") => {
+            // Counts only: sessions and devices per inbound, plus its byte
+            // totals. See `crate::usage` for why nothing here can name a user.
+            let snapshot = server.stats.usage.snapshot();
+            let traffic: std::collections::HashMap<String, u64> =
+                server.stats.traffic_counters(false).into_iter().collect();
+            let bytes = |tag: &str, way: &str| {
+                traffic
+                    .get(&format!("inbound>>>{tag}>>>traffic>>>{way}"))
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let inbounds: Vec<_> = snapshot
+                .inbounds
+                .iter()
+                .map(|usage| {
+                    serde_json::json!({
+                        "tag": usage.tag,
+                        "sessions": usage.sessions,
+                        "devices_now": usage.devices_now,
+                        "devices_recent": usage.devices_recent,
+                        "uplink": bytes(&usage.tag, "uplink"),
+                        "downlink": bytes(&usage.tag, "downlink"),
+                    })
+                })
+                .collect();
+            let body = serde_json::to_vec(&serde_json::json!({
+                "window_secs": snapshot.window_secs,
+                "inbounds": inbounds,
+            }))
+            .map_err(|error| format!("encoding usage: {error}"))?;
+            write_response(&mut stream, 200, "ok", &body).await
+        }
         ("GET", "/health") => {
             let body = serde_json::to_vec(&server.health_snapshot())
                 .map_err(|error| format!("encoding health: {error}"))?;
@@ -374,6 +407,80 @@ Content-Length: 2\r\n",
             !direct.starts_with("HTTP/1.1 403"),
             "a local client was refused: {direct}"
         );
+    }
+
+    /// `/usage` reports counts and byte totals per inbound and nothing that
+    /// could name a client: not the address a session came from, not the key
+    /// the tracker made from it.
+    #[tokio::test]
+    async fn usage_reports_counts_and_no_address() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let generation = zero_config::RuntimeGeneration::compile(
+            zero_config::parse_config_array(
+                r#"{"inbounds": [], "outbounds": [{"tag": "direct", "protocol": "freedom"}]}"#,
+            )
+            .expect("a config the engine accepts")
+            .remove(0)
+            .1,
+            zero_core::GenerationId(1),
+        )
+        .expect("compiles");
+        let server = std::sync::Arc::new(crate::Server::new(crate::ServerConfig {
+            config: std::sync::Arc::clone(&generation.config),
+            generation: generation.id,
+        }));
+        let tag: std::sync::Arc<str> = std::sync::Arc::from("reality-in");
+        let address: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let _a = server.stats.usage.open(&tag, address);
+        let _b = server.stats.usage.open(&tag, address);
+        let _c = server
+            .stats
+            .usage
+            .open(&tag, "198.51.100.4".parse().unwrap());
+        server.stats.record_tag_traffic(
+            "reality-in",
+            None,
+            &crate::relay::Transferred {
+                uploaded: 11,
+                downloaded: 22,
+            },
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let config = ManagementConfig {
+            listen,
+            bearer_token: Some("t0ken".into()),
+        };
+        let serving = {
+            let server = std::sync::Arc::clone(&server);
+            async move {
+                let (accepted, peer) = listener.accept().await.unwrap();
+                handle_connection(accepted, peer, config, server).await
+            }
+        };
+        let client = async {
+            let mut stream = tokio::net::TcpStream::connect(listen).await.unwrap();
+            stream
+                .write_all(b"GET /usage HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer t0ken\r\n\r\n")
+                .await
+                .unwrap();
+            let mut reply = Vec::new();
+            stream.read_to_end(&mut reply).await.unwrap();
+            String::from_utf8_lossy(&reply).into_owned()
+        };
+        let (reply, _) = tokio::join!(client, serving);
+        let body = reply.split("\r\n\r\n").nth(1).expect("a body");
+        let json: serde_json::Value = serde_json::from_str(body).expect("JSON");
+        let usage = &json["inbounds"][0];
+        assert_eq!(usage["tag"], "reality-in");
+        assert_eq!(usage["sessions"], 3);
+        assert_eq!(usage["devices_now"], 2);
+        assert_eq!(usage["devices_recent"], 2);
+        assert_eq!(usage["uplink"], 11);
+        assert_eq!(usage["downlink"], 22);
+        assert!(!reply.contains("203.0.113.9") && !reply.contains("198.51.100.4"));
     }
 
     #[test]

@@ -36,6 +36,9 @@ use serde::{Deserialize, Serialize};
 
 /// Format of `rankings.json`.
 pub const RANKINGS_VERSION: u32 = 1;
+/// A published list older than this no longer blocks a smaller one (see
+/// [`refuse_publish`]).
+pub const STALE_SECS: i64 = 24 * 3600;
 /// Reports older than this are ignored.
 pub const WINDOW_SECS: i64 = 12 * 3600;
 /// A report's weight halves every this many seconds.
@@ -468,11 +471,18 @@ pub fn item_count(rankings: &Rankings) -> usize {
 /// that carries too few reports, or that would shrink the published list
 /// sharply, is refused and the previous commit left in place. `--force` is
 /// there for the times the shrink is real.
+///
+/// The shrink guard protects a *recent* list. Once the published one is older
+/// than [`STALE_SECS`], a smaller list that still has entries replaces it: few
+/// devices reporting is a thin crowd, not a broken run (that case is caught by
+/// `min_reports`), and a day-old list of servers nobody confirmed since is no
+/// better. An empty list never replaces a published one.
 pub fn refuse_publish(
     previous: Option<&Rankings>,
     next: &Rankings,
     reports: usize,
     min_reports: usize,
+    now: i64,
 ) -> Option<String> {
     // Nothing published yet: a first list, however thin, is better than none.
     let previous = previous?;
@@ -486,7 +496,8 @@ pub fn refuse_publish(
         ));
     }
     let new = item_count(next);
-    if new * 2 < old {
+    let stale = now.saturating_sub(previous.generated_at) > STALE_SECS;
+    if new * 2 < old && !(stale && new > 0) {
         return Some(format!(
             "would shrink the list from {old} to {new} entries; keeping the published list"
         ));
@@ -825,15 +836,22 @@ mod tests {
             rankings
         };
         // Nothing published yet: a first list goes out even from a thin run.
-        assert!(refuse_publish(None, &with_servers(1), 0, 10).is_none());
+        assert!(refuse_publish(None, &with_servers(1), 0, 10, 100).is_none());
         let published = with_servers(10);
         // Too few reports: refused, so a relay outage cannot empty the list.
-        assert!(refuse_publish(Some(&published), &with_servers(10), 3, 5).is_some());
+        assert!(refuse_publish(Some(&published), &with_servers(10), 3, 5, 100).is_some());
         // Half the entries gone: refused.
-        assert!(refuse_publish(Some(&published), &with_servers(4), 100, 5).is_some());
+        assert!(refuse_publish(Some(&published), &with_servers(4), 100, 5, 100).is_some());
         // A modest shrink, with enough reports, is published.
-        assert!(refuse_publish(Some(&published), &with_servers(6), 100, 5).is_none());
+        assert!(refuse_publish(Some(&published), &with_servers(6), 100, 5, 100).is_none());
+        // A published list that has gone stale no longer blocks a smaller one
+        // with entries, but an empty one never replaces it.
+        let later = 1 + STALE_SECS + 1;
+        assert!(refuse_publish(Some(&published), &with_servers(2), 100, 5, later).is_none());
+        assert!(refuse_publish(Some(&published), &with_servers(0), 100, 5, later).is_some());
+        // Still too few reports: stale or not, a relay outage cannot empty it.
+        assert!(refuse_publish(Some(&published), &with_servers(2), 3, 5, later).is_some());
         // An empty previous file does not block a real run.
-        assert!(refuse_publish(Some(&with_servers(0)), &with_servers(6), 1, 5).is_none());
+        assert!(refuse_publish(Some(&with_servers(0)), &with_servers(6), 1, 5, 100).is_none());
     }
 }

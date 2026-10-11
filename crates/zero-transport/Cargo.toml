@@ -20,6 +20,7 @@ quinn = { workspace = true }
 flate2 = { workspace = true }
 http = { workspace = true }
 sha1 = { workspace = true }
+hmac = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
 rustls = { workspace = true }

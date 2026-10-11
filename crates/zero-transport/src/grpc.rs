@@ -293,29 +293,23 @@ where
 {
     let mut pending = BytesMut::new();
     while let Some((chunk, capacity)) = body.next_chunk().await? {
-        pending.extend_from_slice(&chunk);
         body.release_capacity(capacity)?;
-        // Messages are consumed from the front with `advance`, which is O(1);
-        // `Vec::drain` shifted the whole remainder for every message.
-        while pending.len() >= 5 {
-            if pending[0] > 1 {
-                return Err("invalid gRPC compression flag".into());
-            }
-            let compressed = pending[0] != 0;
-            let length =
-                u32::from_be_bytes([pending[1], pending[2], pending[3], pending[4]]) as usize;
-            if length > MAX_MESSAGE {
-                return Err("gRPC message exceeds the size limit".into());
-            }
-            if pending.len() < 5 + length {
-                break;
-            }
-            let message = decode_message(&pending[5..5 + length], compressed, encoding)?;
-            let payload = decode_hunk(&message)?;
-            app.write_all(payload)
-                .await
-                .map_err(|error| format!("gRPC application write: {error}"))?;
-            pending.advance(5 + length);
+        if pending.is_empty() {
+            // No partial message is buffered, so parse completed messages
+            // straight out of the chunk. `chunk` is a reference-counted `Bytes`,
+            // so each whole message advances a cursor rather than being copied
+            // into `pending` first; only an incomplete tail is carried over.
+            // This is the common shape on a bulk download, where a chunk holds
+            // whole messages.
+            let consumed = drain_messages(&chunk, app, encoding).await?;
+            pending.extend_from_slice(&chunk[consumed..]);
+        } else {
+            // A message straddles the chunk boundary: join the carried head to
+            // the new bytes, drain whatever is now complete, and drop the
+            // consumed prefix with an O(1) `advance`.
+            pending.extend_from_slice(&chunk);
+            let consumed = drain_messages(&pending, app, encoding).await?;
+            pending.advance(consumed);
         }
     }
     if pending.is_empty() {
@@ -323,6 +317,41 @@ where
     } else {
         Err("gRPC body ended in an incomplete message".into())
     }
+}
+
+/// Write out every complete length-prefixed gRPC message at the front of
+/// `data`, returning how many bytes were consumed. Parsing stops at the first
+/// message whose body has not fully arrived, leaving its header in place for
+/// the caller to carry over. A length past `MAX_MESSAGE` is rejected before its
+/// body is awaited, so an attacker-declared size fails fast rather than growing
+/// a buffer. The envelope is the one-byte compression flag and a four-byte
+/// big-endian length, matching `encode_message`.
+async fn drain_messages<W>(data: &[u8], app: &mut W, encoding: &str) -> Result<usize, String>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut consumed = 0;
+    while data.len() - consumed >= 5 {
+        let frame = &data[consumed..];
+        if frame[0] > 1 {
+            return Err("invalid gRPC compression flag".into());
+        }
+        let compressed = frame[0] != 0;
+        let length = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+        if length > MAX_MESSAGE {
+            return Err("gRPC message exceeds the size limit".into());
+        }
+        if frame.len() < 5 + length {
+            break;
+        }
+        let message = decode_message(&frame[5..5 + length], compressed, encoding)?;
+        let payload = decode_hunk(&message)?;
+        app.write_all(payload)
+            .await
+            .map_err(|error| format!("gRPC application write: {error}"))?;
+        consumed += 5 + length;
+    }
+    Ok(consumed)
 }
 
 fn decode_message<'a>(
@@ -663,5 +692,119 @@ mod tests {
         assert!(decode_hunk(b"\x0a\x04no").is_err());
         assert!(decode_hunk(b"\x0f").is_err());
         assert!(decode_hunk(b"\x13\x14").is_err());
+    }
+
+    /// A body that hands out a fixed sequence of chunks, so a test can choose
+    /// exactly where the stream is cut between `next_chunk` calls.
+    struct ChunkedBody {
+        chunks: std::collections::VecDeque<Bytes>,
+    }
+
+    impl MessageBody for ChunkedBody {
+        async fn next_chunk(&mut self) -> Result<Option<(Bytes, usize)>, String> {
+            Ok(self.chunks.pop_front().map(|chunk| {
+                let length = chunk.len();
+                (chunk, length)
+            }))
+        }
+
+        fn release_capacity(&mut self, _capacity: usize) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// An `AsyncWrite` sink that keeps every byte written, for comparing the
+    /// reassembled payload against what was framed.
+    struct Collect(Vec<u8>);
+
+    impl AsyncWrite for Collect {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.0.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The reassembler must deliver the same payloads no matter where the
+    /// stream is split, which exercises both the in-place fast path (a chunk
+    /// holding whole messages, so `pending` stays empty) and the carried-head
+    /// fallback (a cut inside an envelope or a Hunk, so a partial head is
+    /// joined to the next chunk).
+    #[tokio::test]
+    async fn reassembles_messages_across_any_chunk_boundary() {
+        let payloads: [&[u8]; 3] = [b"first", b"a longer second message", b"3"];
+        let mut framed = BytesMut::new();
+        for payload in payloads {
+            framed.extend_from_slice(&grpc_message(payload));
+        }
+        let wire = framed.freeze();
+        let mut expected = Vec::new();
+        for payload in payloads {
+            expected.extend_from_slice(payload);
+        }
+
+        for first in 0..=wire.len() {
+            for second in first..=wire.len() {
+                let chunks = [
+                    wire.slice(0..first),
+                    wire.slice(first..second),
+                    wire.slice(second..wire.len()),
+                ]
+                .into_iter()
+                .filter(|chunk| !chunk.is_empty())
+                .collect::<std::collections::VecDeque<_>>();
+                let mut body = ChunkedBody { chunks };
+                let mut sink = Collect(Vec::new());
+                read_messages_with_encoding(&mut body, &mut sink, "identity")
+                    .await
+                    .expect("every chunk split reassembles");
+                assert_eq!(sink.0, expected, "split at {first},{second}");
+            }
+        }
+    }
+
+    /// A stream that ends mid-message is an error, and a declared length past
+    /// the ceiling fails before the body is awaited, both on the fast path.
+    #[tokio::test]
+    async fn an_incomplete_or_oversized_message_is_rejected() {
+        let mut whole = grpc_message(b"payload").to_vec();
+        whole.truncate(whole.len() - 1);
+        let mut body = ChunkedBody {
+            chunks: [Bytes::from(whole)].into_iter().collect(),
+        };
+        let mut sink = Collect(Vec::new());
+        assert!(
+            read_messages_with_encoding(&mut body, &mut sink, "identity")
+                .await
+                .is_err()
+        );
+
+        let oversized = Bytes::from(vec![0, 0xff, 0xff, 0xff, 0xff]);
+        let mut body = ChunkedBody {
+            chunks: [oversized].into_iter().collect(),
+        };
+        let mut sink = Collect(Vec::new());
+        assert!(
+            read_messages_with_encoding(&mut body, &mut sink, "identity")
+                .await
+                .is_err()
+        );
     }
 }

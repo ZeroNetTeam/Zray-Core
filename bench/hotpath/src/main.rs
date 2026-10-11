@@ -1,5 +1,5 @@
-//! Checks that the mux and Vision read paths still produce the same bytes, and
-//! counts what they allocate.
+//! Checks that the mux and Vision read and write paths still produce the same
+//! bytes, and counts what they allocate.
 //!
 //! Two claims, neither taken on trust:
 //!
@@ -93,7 +93,7 @@ fn payloads() -> Vec<(&'static str, Vec<u8>)> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    println!("hotpath: mux and Vision read path");
+    println!("hotpath: mux and Vision read and write paths");
     println!("allocation counts are exact; wall times are indicative only");
 
     let mut failures: Vec<String> = Vec::new();
@@ -328,6 +328,91 @@ async fn main() {
                 start.elapsed().as_secs_f64() * 1e3
             );
         }
+    }
+
+    // ------------------------------------------------- Vision write path
+    // The write path frames each application chunk and, until the inner TLS
+    // handshake finishes, pads it. Padding is where the stream used to draw OS
+    // randomness per frame. This section keeps a client stream in its padded
+    // branch, reads the frames back through a server stream to prove the bytes
+    // survive the change, then times a run of padded frames. The per-frame
+    // `getrandom` the padding used to cost is not visible to the allocator; it
+    // is measured out of process with `strace -c -e trace=getrandom` on this
+    // same binary.
+    {
+        use zero_protocol::vision::VisionStream;
+
+        let uuid = [0x11u8; 16];
+        // A chunk shaped like a TLS handshake record: byte 0 = 0x16 and byte 5
+        // = 0x01 mark the inner stream as TLS, so the stream keeps padding, and
+        // it never parses as *complete application data* (that needs 0x17), so
+        // padding never ends. The write path therefore stays in its padded,
+        // per-frame branch for the whole run — the branch the change touches.
+        let mut chunk = vec![0u8; 4096];
+        chunk[0] = 0x16;
+        chunk[1] = 0x03;
+        chunk[2] = 0x03;
+        chunk[5] = 0x01;
+        for (i, byte) in chunk.iter_mut().enumerate().skip(6) {
+            *byte = (i as u8).wrapping_mul(97);
+        }
+
+        // Bit-identity: one padded frame written by the client must unframe on
+        // a server stream back to exactly the bytes sent.
+        {
+            let (client_io, server_io) = tokio::io::duplex(1 << 20);
+            let mut client = VisionStream::new_client(client_io, uuid);
+            let mut server = VisionStream::new_server(server_io, uuid);
+            let sent = chunk.clone();
+            let writer = tokio::spawn(async move {
+                client.write_all(&sent).await.expect("write");
+                client.flush().await.expect("flush");
+                client // held open so the frame is not cut short by a close
+            });
+            let mut got = vec![0u8; chunk.len()];
+            server.read_exact(&mut got).await.expect("read_exact");
+            let client = writer.await.expect("join");
+            drop(client);
+            if got != chunk {
+                failures.push("Vision write path did not round-trip through a server read".into());
+            } else {
+                println!(
+                    "\nVision write path round trip: bit-identical ({} bytes framed, padded, and unframed)",
+                    chunk.len()
+                );
+            }
+        }
+
+        // Time and count a run of padded frames. The allocation count is
+        // context (it includes the drain task); the number the change moves is
+        // the `getrandom` count, measured with strace on this binary.
+        const FRAMES: usize = 4096;
+        let start = Instant::now();
+        let (_, counts) = measure_async(async {
+            let (client_io, mut drain) = tokio::io::duplex(1 << 20);
+            let mut client = VisionStream::new_client(client_io, uuid);
+            let drainer = tokio::spawn(async move {
+                let mut sink = vec![0u8; 64 * 1024];
+                while let Ok(n) = drain.read(&mut sink).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            });
+            for _ in 0..FRAMES {
+                client.write_all(&chunk).await.expect("write");
+            }
+            client.flush().await.expect("flush");
+            drop(client);
+            let _ = drainer.await;
+        })
+        .await;
+        let secs = start.elapsed().as_secs_f64();
+        println!(
+            "  Vision write of {FRAMES} padded frames: {:.1} ms total, {:.3} allocations/frame (incl. drain)",
+            secs * 1e3,
+            counts.allocs_per_iter(FRAMES)
+        );
     }
 
     println!();

@@ -9,6 +9,10 @@ build = "build.rs"
 name = "zray"
 path = "src/main.rs"
 
+[features]
+# Build in the Tor client (Arti). Off by default; see zero-runtime's `tor`.
+tor = ["zero-runtime/tor"]
+
 [dependencies]
 zero-core = { workspace = true }
 zero-config = { workspace = true }

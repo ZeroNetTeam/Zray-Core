@@ -87,14 +87,41 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-fn main() {
-    if let Err(e) = run() {
-        eprintln!("zeronet-crowd: {e}");
-        std::process::exit(1);
+/// Exit code of a run that chose to keep the published list (too few reports,
+/// or a list that would shrink sharply). That is the guard doing its job, not
+/// a broken run, so the workflow can tell it from a real failure (exit 1) and
+/// skip publishing rankings without turning the job red.
+const KEPT_PUBLISHED: i32 = 3;
+
+/// Why a run stopped without writing a file.
+enum Stop {
+    /// Something is broken: bad input, no feed, a file that cannot be written.
+    Failed(String),
+    /// The new ranking is not good enough to replace the published one.
+    Kept(String),
+}
+
+impl From<String> for Stop {
+    fn from(why: String) -> Self {
+        Stop::Failed(why)
     }
 }
 
-fn run() -> Result<(), String> {
+fn main() {
+    match run() {
+        Ok(()) => {}
+        Err(Stop::Failed(e)) => {
+            eprintln!("zeronet-crowd: {e}");
+            std::process::exit(1);
+        }
+        Err(Stop::Kept(e)) => {
+            eprintln!("zeronet-crowd: {e}");
+            std::process::exit(KEPT_PUBLISHED);
+        }
+    }
+}
+
+fn run() -> Result<(), Stop> {
     let args = parse_args()?;
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -131,7 +158,9 @@ fn run() -> Result<(), String> {
             .collect()
     });
     if bodies.is_empty() {
-        return Err("no feed could be fetched; not publishing".into());
+        return Err("no feed could be fetched; not publishing"
+            .to_string()
+            .into());
     }
     let known = crowd::known_servers(bodies.iter().map(String::as_str));
     eprintln!("{} public servers, {} reports", known.len(), reports.len());
@@ -161,10 +190,12 @@ fn run() -> Result<(), String> {
             &rankings,
             reports.len(),
             args.min_reports,
+            now,
         ) {
-            return Err(format!("refusing to publish: {reason}"));
+            return Err(Stop::Kept(format!("refusing to publish: {reason}")));
         }
     }
     let json = serde_json::to_string(&rankings).map_err(|e| e.to_string())?;
-    std::fs::write(&args.out, json).map_err(|e| format!("cannot write {}: {e}", args.out.display()))
+    std::fs::write(&args.out, json)
+        .map_err(|e| format!("cannot write {}: {e}", args.out.display()).into())
 }

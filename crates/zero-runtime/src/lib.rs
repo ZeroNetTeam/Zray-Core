@@ -6,12 +6,14 @@
 pub mod api;
 pub mod cdn_check;
 mod dns_out;
+mod masterdns;
 pub mod outbound;
 pub mod quic_sniff;
 pub mod relay;
 pub mod sanction_dns;
 pub mod server;
 pub mod tide_users;
+pub mod usage;
 pub mod warm;
 pub mod warp;
 mod xmux;

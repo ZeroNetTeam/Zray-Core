@@ -3,6 +3,8 @@ name = "zero-scanner"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Compresses the embedded Iranian-ISP range table at build time; see build.rs.
+build = "build.rs"
 
 [features]
 # The terminal front end (and the `zero-scanner` binary built on it). On by
@@ -43,4 +45,12 @@ crossterm = { version = "0.28", optional = true }
 httparse = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
+# Inflates the embedded Iranian-ISP table (built as a zstd blob by build.rs).
+# The decoder is already linked by zero-security, so this adds no new code to
+# the shipped library.
+zstd = { workspace = true }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
+
+[build-dependencies]
+# Compresses data/ir_isps.tsv into the crate's OUT_DIR at build time.
+zstd = { workspace = true }

@@ -75,7 +75,12 @@ jobs:
         env:
           CROWD_SIGNING_KEY: ${{ secrets.CROWD_SIGNING_KEY }}
         run: |
+          # The decoy-name list the apps fetch next to verified.txt; it is
+          # edited by hand in deploy/crowd and only copied and signed here.
+          cp deploy/crowd/domestic-sni.txt domestic-sni.txt
           if [ -n "$CROWD_SIGNING_KEY" ]; then
+            target/release/zeronet-sign sign domestic-sni.txt
+            target/release/zeronet-sign verify domestic-sni.txt
             target/release/zeronet-sign sign verified.txt
             # The app rejects a list whose signature does not verify against
             # the key compiled into it. A secret that belongs to another key
@@ -88,6 +93,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          files="verified.txt telegram-state.json github-state.json"
+          files="verified.txt domestic-sni.txt telegram-state.json github-state.json"
           [ -f verified.txt.sig ] && files="$files verified.txt.sig"
+          [ -f domestic-sni.txt.sig ] && files="$files domestic-sni.txt.sig"
           .github/scripts/publish-crowd-data.sh $files

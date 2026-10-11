@@ -2117,10 +2117,16 @@ async fn accept_h3_leg(
         H2LegKind::Download => {
             let (worker_read, _) = tokio::io::split(worker);
             tokio::spawn(async move {
-                let mut buffer = [0u8; 16 * 1024];
+                // Read into a reusable `BytesMut` and hand h3 a frozen slice of
+                // it, the way `h2_upload` does, rather than reading into a stack
+                // array and copying every chunk out with `Bytes::copy_from_slice`.
+                // `send_data` takes the chunk's allocation; `reserve` gets the
+                // next one. One copy per chunk on the download becomes none.
+                let mut buffer = BytesMut::with_capacity(H3_DOWNLOAD_CHUNK);
                 let mut app = worker_read;
                 loop {
-                    let n = match app.read(&mut buffer).await {
+                    buffer.reserve(H3_DOWNLOAD_CHUNK);
+                    let n = match app.read_buf(&mut buffer).await {
                         Ok(n) => n,
                         Err(error) => {
                             tracing::debug!(%error, "XHTTP H3 server download read failed");
@@ -2131,7 +2137,7 @@ async fn accept_h3_leg(
                         let _ = send.finish().await;
                         return;
                     }
-                    if let Err(error) = send.send_data(Bytes::copy_from_slice(&buffer[..n])).await {
+                    if let Err(error) = send.send_data(buffer.split().freeze()).await {
                         tracing::debug!(%error, "XHTTP H3 server download ended");
                         return;
                     }
@@ -2154,6 +2160,9 @@ async fn accept_h3_leg(
     }
     Ok((kind, session, zero_core::boxed(app)))
 }
+
+/// Bytes read from the application per HTTP/3 server download step.
+const H3_DOWNLOAD_CHUNK: usize = 16 * 1024;
 
 async fn pair_h3_server_legs(upload: BoxStream, download: BoxStream) -> BoxStream {
     let (app, worker) = tokio::io::duplex(128 * 1024);

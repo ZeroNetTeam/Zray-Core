@@ -57,6 +57,13 @@ use crate::probe::{real_test, tcp_ping, ProbeTarget, DEFAULT_PROBE_URL};
 pub struct DiscoverRequest {
     pub sources: Vec<FeedSource>,
     pub cache_dir: Option<PathBuf>,
+    /// Where the host keeps `build_config`'s assets, including the cached
+    /// domestic-SNI decoy list. When set and `fetch` is on, a search also
+    /// refreshes that signed list in the background (a search is already an
+    /// online, feed-fetching moment), so the decoy pool stays current without
+    /// a separate schedule. Unset leaves the list untouched; the bundled pool
+    /// is the floor either way.
+    pub assets_dir: Option<PathBuf>,
     pub priority_links: Vec<String>,
     pub extra_links: Vec<String>,
     pub exclude_keys: Vec<String>,
@@ -95,6 +102,7 @@ impl Default for DiscoverRequest {
         Self {
             sources: Vec::new(),
             cache_dir: None,
+            assets_dir: None,
             priority_links: Vec::new(),
             extra_links: Vec::new(),
             exclude_keys: Vec::new(),
@@ -400,6 +408,26 @@ pub async fn discover(
 async fn run(shared: Arc<Shared>) {
     let request = &shared.request;
     let mut seen: HashSet<String> = request.exclude_keys.iter().cloned().collect();
+
+    // A search is an online, feed-fetching moment, so it is also when the
+    // signed domestic-SNI decoy list is refreshed: fetched and verified in the
+    // background, written to the assets directory `build_config` reads next
+    // time it builds. Detached and bounded by the fetch timeout, so it never
+    // delays or fails the hunt for servers; a failure leaves the last good
+    // list (or the bundled floor) in place. Only when the host asked for
+    // fetching and named an assets directory.
+    if request.fetch {
+        if let Some(assets_dir) = request.assets_dir.clone() {
+            let timeout = Duration::from_millis(request.fetch_timeout_ms);
+            tokio::spawn(async move {
+                let result = crate::domestic_feed::refresh(&assets_dir, timeout).await;
+                tracing::debug!(
+                    status = result.status.as_str(),
+                    "domestic-SNI list refreshed"
+                );
+            });
+        }
+    }
 
     // 1. History: the last winners on this network, straight to the real
     //    test. Usually one of them still works and discovery ends here.

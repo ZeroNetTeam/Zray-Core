@@ -4,8 +4,10 @@
 //! among them from measured evidence; each one costs latency, syscalls or
 //! privileges, so none is applied unconditionally (PLAN-02 §4.2).
 
+pub mod autottl;
 pub mod choice;
 pub mod decoy;
+pub mod domestic;
 pub mod fragment;
 pub mod keepalive;
 pub mod noise;

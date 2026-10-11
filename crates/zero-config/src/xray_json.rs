@@ -68,10 +68,22 @@ pub fn parse_config(v: &Value) -> R<(RuntimeConfig, ParseOutput)> {
         None => Routing::default(),
     };
 
-    let dns = match obj.get("dns") {
+    let mut dns = match obj.get("dns") {
         Some(d) => parse_dns(d, &mut out)?,
         None => DnsSettings::default(),
     };
+    // `leakPolicy: fallback` lets names resolve with the machine's own
+    // resolver. That is right only where traffic leaves the machine directly
+    // (a server); any config with a proxy outbound is a client, where it would
+    // answer outside the tunnel, so a config from outside cannot ask for it.
+    if !outbounds.iter().all(|o| {
+        matches!(
+            o.protocol,
+            OutboundProtocol::Freedom { .. } | OutboundProtocol::Blackhole
+        )
+    }) {
+        dns.leak_policy = LeakPolicy::Strict;
+    }
 
     let observatory = obj
         .get("observatory")
@@ -908,9 +920,12 @@ fn parse_outbound(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Outbound> {
         "shadowsocks" => parse_shadowsocks(settings, &path)?,
         "vmess" => parse_vmess(settings, &path)?,
         "anytls" => parse_anytls(settings, &path)?,
+        "socks" => parse_socks(settings, &path)?,
+        "tor" => parse_tor(settings, &path)?,
         "zerov1" | "tide" => parse_tide(settings, &path)?,
         "hysteria2" => parse_hysteria2(settings, &path)?,
         "tuic" => parse_tuic(settings, &path)?,
+        "juicity" => parse_juicity(settings, &path)?,
         "wireguard" | "amnezia-wg" | "amneziawg" => parse_amnezia_wireguard(settings, &path)?,
         "warp" | "masque" => parse_warp(settings, &path)?,
         "" => {
@@ -1225,6 +1240,103 @@ fn parse_anytls(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
     }))
 }
 
+/// Xray's `socks` outbound: `servers[0]` with `address`, `port` and an
+/// optional `users[0]` (`user`, `pass`). Xray 26's flat form
+/// (`settings.address/port/user/pass`) is accepted as well.
+fn parse_socks(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
+    let settings = settings.ok_or_else(|| format!("{path}.settings is required for socks"))?;
+    let server = settings
+        .get("servers")
+        .and_then(Value::as_array)
+        .and_then(|servers| servers.first())
+        .unwrap_or(settings);
+    let address = server
+        .get("address")
+        .and_then(Value::as_str)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| format!("{path}.settings.address is required for socks"))?;
+    let port = server
+        .get("port")
+        .and_then(Value::as_u64)
+        .filter(|port| *port > 0 && *port <= u16::MAX as u64)
+        .ok_or_else(|| format!("{path}.settings.port is invalid for socks"))? as u16;
+    let user = server
+        .get("users")
+        .and_then(Value::as_array)
+        .and_then(|users| users.first())
+        .unwrap_or(server);
+    let text = |key: &str| {
+        user.get(key)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+    };
+    let auth = match (text("user"), text("pass")) {
+        (None, None) => None,
+        (Some(username), Some(password)) => Some(SocksCredential {
+            username: username.into(),
+            password: password.into(),
+        }),
+        _ => return Err(format!("{path}.settings: socks needs both user and pass")),
+    };
+    Ok(OutboundProtocol::Socks(SocksConfig {
+        address: Address::parse_host(address),
+        port,
+        auth,
+    }))
+}
+
+/// `{"protocol": "tor", "settings": {...}}`. Every field is optional:
+/// `bridges` (bridge lines), `transports` (`{"obfs4": "/path/to/lyrebird"}`),
+/// `dataDir` and `memoryMiB`.
+fn parse_tor(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
+    let Some(settings) = settings else {
+        return Ok(OutboundProtocol::Tor(TorConfig::default()));
+    };
+    let bridges = match settings.get("bridges") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(lines)) => lines
+            .iter()
+            .map(|line| {
+                line.as_str()
+                    .map(Box::from)
+                    .ok_or_else(|| format!("{path}.settings.bridges must be strings"))
+            })
+            .collect::<R<Vec<Box<str>>>>()?,
+        Some(_) => return Err(format!("{path}.settings.bridges must be an array")),
+    };
+    let transports = match settings.get("transports") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(name, program)| {
+                program
+                    .as_str()
+                    .map(|program| (Box::from(name.as_str()), Box::from(program)))
+                    .ok_or_else(|| format!("{path}.settings.transports.{name} must be a path"))
+            })
+            .collect::<R<Vec<_>>>()?,
+        Some(_) => return Err(format!("{path}.settings.transports must be an object")),
+    };
+    let memory_mib = match settings.get("memoryMiB") {
+        None | Some(Value::Null) => 0,
+        Some(value) => value
+            .as_u64()
+            .filter(|mib| *mib <= u32::MAX as u64)
+            .ok_or_else(|| format!("{path}.settings.memoryMiB must be a number"))?
+            as u32,
+    };
+    Ok(OutboundProtocol::Tor(TorConfig {
+        bridges,
+        transports,
+        data_dir: settings
+            .get("dataDir")
+            .and_then(Value::as_str)
+            .filter(|dir| !dir.is_empty())
+            .map(Box::from),
+        memory_mib,
+    }))
+}
+
 /// A Tide key or user id: unpadded URL-safe base64 of exactly `N` bytes.
 fn tide_key<const N: usize>(value: Option<&Value>, what: &str) -> R<[u8; N]> {
     use base64::Engine as _;
@@ -1425,6 +1537,45 @@ fn parse_tuic(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
         .filter(|password| !password.is_empty())
         .ok_or_else(|| format!("{path}.settings.password is required for tuic"))?;
     Ok(OutboundProtocol::Tuic(TuicConfig {
+        address: Address::parse_host(address),
+        port,
+        uuid,
+        password: password.into(),
+    }))
+}
+
+fn parse_juicity(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
+    let settings = settings.ok_or_else(|| format!("{path}.settings is required for juicity"))?;
+    let server = settings
+        .get("servers")
+        .and_then(Value::as_array)
+        .and_then(|servers| servers.first());
+    let address = server
+        .and_then(|s| s.get("address"))
+        .or_else(|| settings.get("address"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{path}.settings.address is required for juicity"))?;
+    let port = server
+        .and_then(|s| s.get("port"))
+        .or_else(|| settings.get("port"))
+        .and_then(Value::as_u64)
+        .filter(|port| *port > 0 && *port <= u16::MAX as u64)
+        .ok_or_else(|| format!("{path}.settings.port is invalid for juicity"))?
+        as u16;
+    let uuid = server
+        .and_then(|s| s.get("uuid"))
+        .or_else(|| settings.get("uuid"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{path}.settings.uuid is required for juicity"))
+        .and_then(crate::share_link::parse_uuid)
+        .map_err(|error| format!("{path}.settings.uuid: {error}"))?;
+    let password = server
+        .and_then(|s| s.get("password"))
+        .or_else(|| settings.get("password"))
+        .and_then(Value::as_str)
+        .filter(|password| !password.is_empty())
+        .ok_or_else(|| format!("{path}.settings.password is required for juicity"))?;
+    Ok(OutboundProtocol::Juicity(JuicityConfig {
         address: Address::parse_host(address),
         port,
         uuid,
@@ -2269,6 +2420,42 @@ fn parse_stream(v: &Value, path: &str, _out: &mut ParseOutput) -> R<StreamSettin
                 mldsa65_verify: parse_reality_mldsa65_verify(r, path)?,
             })
         }
+        "shadowtls" => {
+            let s = v
+                .get("shadowtlsSettings")
+                .ok_or_else(|| format!("{path}.streamSettings.shadowtlsSettings is required"))?;
+            // Only v3 is implemented. sing-box also speaks v1/v2; a config for
+            // either is rejected rather than silently treated as v3.
+            let version = s.get("version").and_then(Value::as_u64).unwrap_or(3);
+            if version != 3 {
+                return Err(format!(
+                    "{path}: ShadowTLS version {version} is unsupported, only 3"
+                ));
+            }
+            let password = s
+                .get("password")
+                .and_then(Value::as_str)
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| format!("{path}: ShadowTLS password is required"))?;
+            let tls = s.get("tls");
+            let server_name = tls
+                .and_then(|t| t.get("serverName"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{path}: ShadowTLS tls.serverName is required"))?;
+            // ALPN is camouflage only (it rides the decoy ClientHello, not the
+            // inner protocol). Default to what a browser offers so the hello
+            // does not stand out when a config omits it.
+            let alpn: Vec<Box<str>> = tls
+                .and_then(|t| t.get("alpn"))
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(Box::from).collect())
+                .unwrap_or_else(|| vec![Box::from("h2"), Box::from("http/1.1")]);
+            Security::ShadowTls(ShadowTlsConfig {
+                password: Arc::from(password),
+                server_name: Arc::from(server_name),
+                alpn,
+            })
+        }
         other => {
             return Err(format!(
                 "{path}.streamSettings.security: unsupported {other:?}"
@@ -3005,6 +3192,7 @@ fn parse_fragment(s: Option<&Value>, path: &str) -> R<FragmentConfig> {
 
     let packets = match get("packets").unwrap_or("tlshello") {
         "tlshello" => FragmentPackets::TlsHello,
+        "tlssni" => FragmentPackets::TlsSni,
         other => {
             let r = RangeU32::parse(other)
                 .ok_or_else(|| format!("{path}: bad packets value {other:?}"))?;
@@ -3700,7 +3888,13 @@ fn parse_dns(v: &Value, out: &mut ParseOutput) -> R<DnsSettings> {
             .and_then(Value::as_str)
             .and_then(QueryStrategy::parse)
             .unwrap_or_default(),
-        leak_policy: LeakPolicy::Strict,
+        // Zray's own key. Strict (the default) refuses the operating system's
+        // resolver because on a client it would answer outside the tunnel; on a
+        // server the system resolver is the right one, and the operator says so.
+        leak_policy: match v.get("leakPolicy").and_then(Value::as_str) {
+            Some("fallback") => LeakPolicy::Fallback,
+            _ => LeakPolicy::Strict,
+        },
         disable_cache: v
             .get("disableCache")
             .and_then(Value::as_bool)
@@ -3839,13 +4033,225 @@ fn parse_hex(s: &str) -> Result<Vec<u8>, String> {
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| format!("bad hex: {s:?}")))
+        .map(|i| {
+            s.get(i..i + 2)
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(|| format!("bad hex: {s:?}"))
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_with_non_ascii_text_is_an_error_not_a_panic() {
+        assert!(parse_hex("a…").is_err());
+        assert!(parse_hex("\u{e9}\u{e9}").is_err());
+        assert_eq!(parse_hex("0aff").unwrap(), vec![0x0a, 0xff]);
+    }
+
+    /// A server resolves names with the machine's own resolver, which strict
+    /// mode refuses; the Zray-only `leakPolicy` key is how a server asks.
+    #[test]
+    fn the_dns_leak_policy_is_strict_unless_a_server_says_otherwise() {
+        let policy = |dns: serde_json::Value| {
+            let (config, _) = parse_config(&serde_json::json!({
+                "inbounds": [], "outbounds": [{"protocol": "freedom"}], "dns": dns
+            }))
+            .unwrap();
+            config.dns.leak_policy
+        };
+        // A config that sends traffic through a proxy is a client, and cannot
+        // ask for the machine's resolver.
+        let (client, _) = parse_config(&serde_json::json!({
+            "inbounds": [],
+            "outbounds": [{"protocol": "freedom"}, {"protocol": "socks", "settings": {"address": "127.0.0.1", "port": 9050}}],
+            "dns": {"servers": ["localhost"], "leakPolicy": "fallback"}
+        }))
+        .unwrap();
+        assert_eq!(client.dns.leak_policy, LeakPolicy::Strict);
+        assert_eq!(
+            policy(serde_json::json!({"servers": ["localhost"]})),
+            LeakPolicy::Strict
+        );
+        assert_eq!(
+            policy(serde_json::json!({"servers": ["localhost"], "leakPolicy": "fallback"})),
+            LeakPolicy::Fallback
+        );
+        assert_eq!(
+            policy(serde_json::json!({"servers": ["localhost"], "leakPolicy": "nonsense"})),
+            LeakPolicy::Strict
+        );
+    }
+
+    #[test]
+    fn juicity_outbound_reads_uuid_password_and_server() {
+        let value = serde_json::json!({
+            "outbounds": [{
+                "protocol": "juicity",
+                "settings": {
+                    "address": "proxy.example",
+                    "port": 20000,
+                    "uuid": "00000000-0000-0000-0000-000000000001",
+                    "password": "correct-horse"
+                },
+                "streamSettings": {
+                    "network": "raw",
+                    "security": "tls",
+                    "tlsSettings": {"serverName": "proxy.example", "alpn": ["h3"]}
+                }
+            }]
+        });
+        let (config, _) = parse_config(&value).unwrap();
+        let OutboundProtocol::Juicity(juicity) = &config.outbounds[0].protocol else {
+            panic!("expected juicity, got {:?}", config.outbounds[0].protocol);
+        };
+        assert_eq!(juicity.port, 20000);
+        assert_eq!(&*juicity.password, "correct-horse");
+        assert_eq!(juicity.uuid[15], 1);
+    }
+
+    #[test]
+    fn shadowtls_outbound_reads_password_sni_and_alpn() {
+        let value = serde_json::json!({
+            "outbounds": [{
+                "protocol": "shadowsocks",
+                "settings": {
+                    "servers": [{
+                        "address": "relay.example",
+                        "port": 443,
+                        "method": "2022-blake3-aes-128-gcm",
+                        "password": "inner-ss-key"
+                    }]
+                },
+                "streamSettings": {
+                    "network": "raw",
+                    "security": "shadowtls",
+                    "shadowtlsSettings": {
+                        "version": 3,
+                        "password": "stls-secret",
+                        "tls": {"serverName": "www.microsoft.com", "alpn": ["h2"]}
+                    }
+                }
+            }]
+        });
+        let (config, _) = parse_config(&value).unwrap();
+        let outbound = &config.outbounds[0];
+        assert!(matches!(
+            &outbound.protocol,
+            OutboundProtocol::Shadowsocks(_)
+        ));
+        let Security::ShadowTls(stls) = &outbound.stream.security else {
+            panic!("expected shadowtls, got {:?}", outbound.stream.security);
+        };
+        assert_eq!(&*stls.password, "stls-secret");
+        assert_eq!(&*stls.server_name, "www.microsoft.com");
+        assert_eq!(stls.alpn.len(), 1);
+        assert_eq!(&*stls.alpn[0], "h2");
+    }
+
+    #[test]
+    fn shadowtls_defaults_alpn_when_omitted() {
+        let value = serde_json::json!({
+            "outbounds": [{
+                "protocol": "shadowsocks",
+                "settings": {
+                    "servers": [{
+                        "address": "relay.example",
+                        "port": 443,
+                        "method": "aes-256-gcm",
+                        "password": "inner-ss-key"
+                    }]
+                },
+                "streamSettings": {
+                    "network": "raw",
+                    "security": "shadowtls",
+                    "shadowtlsSettings": {
+                        "password": "stls-secret",
+                        "tls": {"serverName": "www.microsoft.com"}
+                    }
+                }
+            }]
+        });
+        let (config, _) = parse_config(&value).unwrap();
+        let Security::ShadowTls(stls) = &config.outbounds[0].stream.security else {
+            panic!("expected shadowtls");
+        };
+        assert_eq!(
+            stls.alpn.iter().map(|a| &**a).collect::<Vec<_>>(),
+            vec!["h2", "http/1.1"]
+        );
+    }
+
+    #[test]
+    fn shadowtls_rejects_non_v3_and_missing_fields() {
+        let v2 = serde_json::json!({
+            "outbounds": [{
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{
+                    "address": "relay.example", "port": 443,
+                    "method": "aes-256-gcm", "password": "k"
+                }]},
+                "streamSettings": {
+                    "network": "raw",
+                    "security": "shadowtls",
+                    "shadowtlsSettings": {
+                        "version": 2,
+                        "password": "stls-secret",
+                        "tls": {"serverName": "www.microsoft.com"}
+                    }
+                }
+            }]
+        });
+        assert!(parse_config(&v2).is_err(), "v2 must be rejected");
+
+        let no_sni = serde_json::json!({
+            "outbounds": [{
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{
+                    "address": "relay.example", "port": 443,
+                    "method": "aes-256-gcm", "password": "k"
+                }]},
+                "streamSettings": {
+                    "network": "raw",
+                    "security": "shadowtls",
+                    "shadowtlsSettings": {"password": "stls-secret", "tls": {}}
+                }
+            }]
+        });
+        assert!(
+            parse_config(&no_sni).is_err(),
+            "missing serverName rejected"
+        );
+    }
+
+    #[test]
+    fn shadowtls_requires_a_shadowsocks_inner() {
+        // ShadowTLS over a non-Shadowsocks protocol must fail the model's
+        // validation: the client only knows how to carry Shadowsocks inside.
+        let value = serde_json::json!({
+            "outbounds": [{
+                "protocol": "trojan",
+                "settings": {"servers": [{
+                    "address": "relay.example", "port": 443, "password": "k"
+                }]},
+                "streamSettings": {
+                    "network": "raw",
+                    "security": "shadowtls",
+                    "shadowtlsSettings": {
+                        "password": "stls-secret",
+                        "tls": {"serverName": "www.microsoft.com"}
+                    }
+                }
+            }]
+        });
+        assert!(
+            parse_config(&value).is_err(),
+            "shadowtls must reject a non-shadowsocks inner protocol"
+        );
+    }
 
     #[test]
     fn ports_are_range_checked_instead_of_truncated() {
