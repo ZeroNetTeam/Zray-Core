@@ -45,8 +45,20 @@ fn netstat(field: &str) -> u64 {
 fn the_hello_rides_in_the_syn_once_the_cookie_is_held() {
     if std::env::var_os(INSIDE).is_none() {
         let exe = std::env::current_exe().unwrap();
+        let setup = "ip link set lo up && sysctl -qw net.ipv4.tcp_fastopen=3";
+        // Some hosts refuse unprivileged user namespaces (or lack `ip` or
+        // `sysctl`): the setup is tried on its own first, and a failure there
+        // is a skip, not a failed test.
+        let usable = Command::new("unshare")
+            .args(["-rn", "sh", "-c", setup])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !usable {
+            eprintln!("skipped: no private network namespace here");
+            return;
+        }
         let script = format!(
-            "ip link set lo up && sysctl -qw net.ipv4.tcp_fastopen=3 && exec {} --exact \
+            "{setup} && exec {} --exact \
              the_hello_rides_in_the_syn_once_the_cookie_is_held --nocapture",
             exe.display()
         );
