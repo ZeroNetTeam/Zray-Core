@@ -28,6 +28,7 @@ tokio-rustls = { workspace = true }
 ring = { workspace = true }
 quinn-proto = { workspace = true }
 futures = { workspace = true }
+blake2 = { workspace = true }
 
 [features]
 # The loopback WARP stand-ins of `masque::mock`, for other crates' tests.

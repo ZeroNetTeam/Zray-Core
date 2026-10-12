@@ -277,6 +277,7 @@ pub fn apply(condition: CdnCondition, outbound: &mut Outbound) {
             tls.ech = Some(zero_config::EchConfig {
                 config_list: Box::default(),
                 server_name: None,
+                query_name: None,
             });
         }
         _ => {}

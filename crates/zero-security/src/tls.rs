@@ -44,6 +44,9 @@ pub struct TlsParams {
     /// still happens, the name still has to match, and the trust it grants is
     /// limited to the certificates the operator named.
     pub extra_roots: Vec<Vec<u8>>,
+    /// Accept any certificate: Xray's `allowInsecure`. Only ever set from a
+    /// link or config that says so itself (see [`TlsParams::with_insecure`]).
+    pub insecure: bool,
 }
 
 impl TlsParams {
@@ -56,7 +59,20 @@ impl TlsParams {
             ech_config_list: None,
             ech_server_name: None,
             extra_roots: Vec::new(),
+            insecure: false,
         }
+    }
+
+    /// Do not check the server's certificate chain or name (Xray's
+    /// `allowInsecure`). The handshake signatures are still checked, so the
+    /// peer must hold the key of whatever certificate it sends, but anyone on
+    /// the path can present a certificate of their own and be accepted: this
+    /// trades protection from an on-path attacker for reaching servers with a
+    /// self-signed certificate or a name that does not match (a Worker behind
+    /// a custom CDN address). Never the default; a link has to ask.
+    pub fn with_insecure(mut self, insecure: bool) -> Self {
+        self.insecure = insecure;
+        self
     }
 
     pub fn with_extra_roots(mut self, roots: Vec<Vec<u8>>) -> Self {
@@ -107,6 +123,9 @@ struct ConfigKey {
     /// Part of the key: two outbounds that trust different anchors must never
     /// share a cached config, or one would silently inherit the other's trust.
     extra_roots: Vec<Vec<u8>>,
+    /// Part of the key for the same reason as `extra_roots`: a config that
+    /// accepts any certificate must never be handed to a verifying outbound.
+    insecure: bool,
 }
 
 /// Upper bound on cached client configs.
@@ -180,7 +199,7 @@ fn parse_trust_anchor(
     }
 }
 
-/// Build (or reuse) a verifying client config.
+/// Build (or reuse) a client config.
 ///
 /// Configs are cached per fingerprint and ALPN set, for two reasons that both
 /// matter on a proxy hot path:
@@ -192,9 +211,9 @@ fn parse_trust_anchor(
 ///   connection pays a full handshake. Against a distant CDN edge that is an
 ///   extra round trip on every single request.
 ///
-/// There is no code path that disables certificate verification. Xray's
-/// `allowInsecure` is rejected during parsing rather than plumbed through, so
-/// a misconfigured profile cannot silently downgrade a user's security.
+/// Certificates are verified unless the params say `insecure`, which only a
+/// link or config that sets Xray's `allowInsecure` itself can do; nothing
+/// turns it on by default or by guess.
 pub fn client_config(params: &TlsParams) -> Arc<ClientConfig> {
     try_client_config(params).expect("invalid ECH/TLS configuration")
 }
@@ -209,6 +228,7 @@ pub fn try_client_config(params: &TlsParams) -> Result<Arc<ClientConfig>, Failur
         alpn: params.alpn.clone(),
         ech_config_list: params.ech_config_list.clone(),
         extra_roots: params.extra_roots.clone(),
+        insecure: params.insecure,
     };
 
     if let Ok(mut cache) = config_cache().lock() {
@@ -263,6 +283,14 @@ fn build_client_config(params: &TlsParams) -> Result<ClientConfig, String> {
         params.profile.apply_to_builder(roots).with_no_client_auth()
     };
 
+    if params.insecure {
+        let algorithms = params
+            .profile
+            .aws_provider()
+            .signature_verification_algorithms;
+        cfg.dangerous()
+            .set_certificate_verifier(Arc::new(AcceptAnyCertificate(algorithms)));
+    }
     cfg.alpn_protocols = params.alpn.clone();
     params.profile.apply_to_config(&mut cfg);
     let profile_name = params
@@ -286,6 +314,46 @@ fn build_client_config(params: &TlsParams) -> Result<ClientConfig, String> {
         )?;
     }
     Ok(cfg)
+}
+
+/// The verifier behind [`TlsParams::insecure`]: every certificate is
+/// accepted, the handshake signatures are checked against it as usual.
+#[derive(Debug)]
+struct AcceptAnyCertificate(rustls::crypto::WebPkiSupportedAlgorithms);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.supported_schemes()
+    }
 }
 
 /// Wrap a connected stream in TLS.
@@ -604,6 +672,7 @@ mod tests {
             // Stands in for an ECHConfigList rotated by the DNS provider.
             ech_config_list: Some(index.to_be_bytes().to_vec()),
             extra_roots: Vec::new(),
+            insecure: false,
         };
         let mut cache = ConfigCache {
             entries: HashMap::new(),
@@ -648,5 +717,60 @@ mod tests {
         let f = classify_handshake_error(&e);
         assert_eq!(f.kind, FailureKind::TlsHandshakeMalformed);
         assert!(f.kind.suggests_interference());
+    }
+
+    /// A self-signed certificate for `dns.test`, and its key.
+    const SELF_SIGNED_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIBlTCCATugAwIBAgIUGS+8Fs1U1nZuhCCERiq/cE2I/EwwCgYIKoZIzj0EAwIw\nEzERMA8GA1UEAwwIZG5zLnRlc3QwIBcNMjYwOTIzMDM0MjE0WhgPMjEyNjA4MzAw\nMzQyMTRaMBMxETAPBgNVBAMMCGRucy50ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0D\nAQcDQgAE4SqQn7qEa4DtfdAqi9OaEwN90Nw7fFYqJZpApbzJvAx1SEqxXCzJyCEB\na8NVtrWewNSLFBsFbk6lRLJoZU/NkKNrMGkwHQYDVR0OBBYEFJK+70IhxQ31fNnu\nfzTg7k6NSpO9MB8GA1UdIwQYMBaAFJK+70IhxQ31fNnufzTg7k6NSpO9MBkGA1Ud\nEQQSMBCCCGRucy50ZXN0hwR/AAABMAwGA1UdEwEB/wQCMAAwCgYIKoZIzj0EAwID\nSAAwRQIgNg84WOdtnUk+Q6MYOs83T0huf9SA6szJaAKPxRL6vf8CIQDqMr+gBsfi\n5i5jHcRxCnpNYCzjPGH0FgdOY12pKnFHpQ==\n-----END CERTIFICATE-----";
+    const SELF_SIGNED_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7Gv8nckw9qy+6eL/\ng88Sxzpwfuq9C7IA8LrrBIkNWIChRANCAAThKpCfuoRrgO190CqL05oTA33Q3Dt8\nViolmkClvMm8DHVISrFcLMnIIQFrw1W2tZ7A1IsUGwVuTqVEsmhlT82Q\n-----END PRIVATE KEY-----";
+
+    /// A TLS server with the self-signed certificate; returns its address.
+    async fn self_signed_server() -> std::net::SocketAddr {
+        use rustls_pki_types::pem::PemObject;
+        let certs =
+            vec![
+                rustls_pki_types::CertificateDer::from_pem_slice(SELF_SIGNED_CERT.as_bytes())
+                    .unwrap(),
+            ];
+        let key =
+            rustls_pki_types::PrivateKeyDer::from_pem_slice(SELF_SIGNED_KEY.as_bytes()).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = acceptor.accept(stream).await;
+                });
+            }
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn a_certificate_nobody_vouches_for_is_refused_unless_the_link_asked() {
+        let address = self_signed_server().await;
+        let dial = |params: TlsParams| async move {
+            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            connect(stream, &params).await.map(|_| ())
+        };
+        // The name does not match and no root vouches for it.
+        let refused = dial(TlsParams::new("other.example")).await.unwrap_err();
+        assert_eq!(refused.kind, FailureKind::TlsCertificateFailure);
+        // The same server, with `allowInsecure` set, is reached.
+        dial(TlsParams::new("other.example").with_insecure(true))
+            .await
+            .expect("an insecure handshake completes");
+        // And the verifying config was not replaced by the insecure one in
+        // the cache: asking again without it is still refused.
+        assert!(dial(TlsParams::new("other.example")).await.is_err());
     }
 }

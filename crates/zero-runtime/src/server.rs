@@ -219,9 +219,31 @@ async fn carry_to_exit(
     Ok(carried)
 }
 
+/// Give `dialed` the TCP fragmentation of the direct outbound `dialer`, unless
+/// `dialed` has shaping of its own or cannot carry it (see
+/// `GatewayServer::resolve_chain`).
+fn lend_direct_dial(dialed: &mut zero_config::Outbound, dialer: &zero_config::Outbound) {
+    use zero_config::Security;
+    let fits = match &dialed.stream.security {
+        Security::None => true,
+        Security::Tls(tls) => tls.ech.is_none(),
+        Security::Reality(_) | Security::ShadowTls(_) => false,
+    };
+    let evasion = &mut dialed.stream.evasion;
+    if fits && evasion.tcp_fragment.is_none() && evasion.sni_desync.is_none() {
+        evasion.tcp_fragment = dialer.stream.evasion.tcp_fragment.clone();
+        evasion.tcp_fragment_under = dialer.stream.evasion.tcp_fragment_under.clone();
+    }
+}
+
 /// Most outbounds one `dialerProxy` chain may pass through, the exit
 /// included. Each hop adds a round trip to every connection.
 const MAX_CHAIN: usize = 4;
+
+/// How long a balancer member gets to connect before the next best is tried
+/// beside it (`Server::connect_balanced`). Above the handshake of a healthy
+/// server over a slow international path, well below the connect timeout.
+const HEDGE_AFTER: Duration = Duration::from_millis(3000);
 
 /// How many datagrams one UDP ingress may have in flight at once. Each one
 /// waits up to the exchange deadline for its answer, so the ingress must not
@@ -1802,50 +1824,13 @@ impl Server {
                 Ok(())
             }
             Decision::Outbound(tag) | Decision::Balancer(tag) => {
-                let ob = self
-                    .pick_outbound(&tag)
-                    .ok_or_else(|| format!("no usable outbound for {tag:?}"))?;
                 ctx.outbound = None;
-
-                let remote = match &ob.protocol {
-                    OutboundProtocol::Freedom { .. } => outbound::connect_direct_with_resolver(
-                        &accepted.destination,
-                        &ob.stream,
-                        &self.resolver(),
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?,
-                    OutboundProtocol::Blackhole => {
-                        self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                        self.finish_handshake(&mut stream, &accepted, false, replied)
-                            .await;
-                        return Ok(());
-                    }
-                    OutboundProtocol::Vless(_)
-                    | OutboundProtocol::Trojan(_)
-                    | OutboundProtocol::Shadowsocks(_)
-                    | OutboundProtocol::Vmess(_)
-                    | OutboundProtocol::AnyTls(_)
-                    | OutboundProtocol::Socks(_)
-                    | OutboundProtocol::Tor(_)
-                    | OutboundProtocol::MasterDns(_)
-                    | OutboundProtocol::Tide(_)
-                    | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_)
-                    | OutboundProtocol::Juicity(_)
-                    | OutboundProtocol::AmneziaWireguard(_) => {
-                        let s = self
-                            .open_outbound(&ob, &accepted.destination)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        outbound::strip_response(&ob, s)
-                    }
-                    other => {
-                        return Err(format!(
-                            "outbound protocol {} cannot carry a session",
-                            other.name()
-                        ))
-                    }
+                let Some((ob, remote)) = self.connect_balanced(&tag, &accepted.destination).await?
+                else {
+                    self.stats.blocked.fetch_add(1, Ordering::Relaxed);
+                    self.finish_handshake(&mut stream, &accepted, false, replied)
+                        .await;
+                    return Ok(());
                 };
 
                 self.finish_handshake(&mut stream, &accepted, true, replied)
@@ -3997,7 +3982,7 @@ impl Server {
         // Datagrams cannot follow a `dialerProxy` chain yet. Sending them
         // straight to the server instead would show its address to the very
         // network the chain exists to hide it from, so refuse.
-        if outbound.stream.sockopt.dialer_proxy.is_some() {
+        if !matches!(self.resolve_chain(outbound), Ok(chain) if chain.len() == 1) {
             return Err(format!(
                 "outbound {} runs through dialerProxy, which does not carry UDP yet",
                 outbound.tag
@@ -4125,6 +4110,7 @@ impl Server {
                 &addrs,
                 &tls,
                 &hysteria.password,
+                hysteria.obfs_password.as_deref(),
                 &datagram.destination,
                 &datagram.payload,
             )
@@ -4450,6 +4436,12 @@ impl Server {
         }
         let chain = self.resolve_chain(outbound)?;
         let resolver = self.resolver();
+        // A `dialerProxy` that only names a direct, fragmenting outbound
+        // leaves one hop: the exit, dialled directly with that outbound's
+        // fragmentation.
+        if chain.len() == 1 {
+            return outbound::connect_with_resolver(&chain[0], destination, &resolver).await;
+        }
         Box::pin(outbound::within_setup_deadline(async {
             let carried = Box::pin(carry_to_exit(&chain, &resolver)).await?;
             Box::pin(outbound::connect_over(&chain[0], carried, destination)).await
@@ -4459,6 +4451,14 @@ impl Server {
 
     /// The outbounds a connection through `outbound` passes: `outbound`
     /// (the exit) first, then each hop that carries the one before it.
+    ///
+    /// A `freedom` outbound named as a `dialerProxy` is not a hop. It stands
+    /// for "dial the TCP connection the way that outbound does", which is how
+    /// panels ask for a fragmented ClientHello (`"dialerProxy": "fragment"`).
+    /// So its fragmentation is copied onto the outbound it dials for, when
+    /// that outbound can take it (a plain or certificate-TLS one that has no
+    /// ECH and no shaping of its own; fragmenting REALITY or ShadowTLS breaks
+    /// them), and the chain ends there.
     fn resolve_chain(
         &self,
         outbound: &zero_config::Outbound,
@@ -4481,8 +4481,23 @@ impl Server {
             let hop = self
                 .pick_outbound(&tag)
                 .ok_or_else(|| refuse(format!("dialerProxy {tag:?} is not a usable outbound")))?;
+            if matches!(hop.protocol, OutboundProtocol::Freedom { .. }) {
+                if let Some(dialed) = chain.last_mut() {
+                    lend_direct_dial(dialed, &hop);
+                }
+                break;
+            }
             next = hop.stream.sockopt.dialer_proxy.clone();
             chain.push(hop);
+        }
+        // Mux is an optimisation of how many streams share a connection, and
+        // a chained hop opens one connection per stream (the hops cannot be
+        // multiplexed here), so the setting is dropped rather than refusing
+        // a chain a panel built with it on.
+        if chain.len() > 1 {
+            for hop in &mut chain {
+                hop.mux.enabled = false;
+            }
         }
         Ok(chain)
     }
@@ -4518,7 +4533,148 @@ impl Server {
         });
     }
 
+    /// Open a connection to `destination` through `tag`, an outbound or a
+    /// balancer, and return the outbound that carried it. `Ok(None)` is a
+    /// black hole: the session is refused, not failed.
+    ///
+    /// For a balancer, one dead or silent member must cost a slow session,
+    /// not a failed one:
+    ///
+    /// * a member that fails to connect is noted in the health table and the
+    ///   next best is tried, once;
+    /// * a member that has not connected after [`HEDGE_AFTER`] gets a second
+    ///   attempt through the next best, in parallel, and whichever connects
+    ///   first carries the session (the other is dropped where it stands).
+    ///
+    /// Trade-off: a server that is merely slow to set up (a cold Worker) gets
+    /// a second, wasted connection attempt now and then.
+    async fn connect_balanced(
+        &self,
+        tag: &str,
+        destination: &Destination,
+    ) -> Result<Option<(zero_config::Outbound, zero_core::BoxStream)>, String> {
+        let first = self
+            .pick_outbound(tag)
+            .ok_or_else(|| format!("no usable outbound for {tag:?}"))?;
+        let start = |ob: zero_config::Outbound| {
+            Box::pin(async move { self.connect_session(&ob, destination).await })
+        };
+        let mut attempt_a = start(first.clone());
+        if self.config().balancer_by_tag(tag).is_none() {
+            return attempt_a.await.map(|r| r.map(|stream| (first, stream)));
+        }
+        let note_failure = |ob: &zero_config::Outbound, error: &str| {
+            debug!(outbound = %ob.tag, %error, "connect failed");
+            self.health
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record_failure(&ob.tag);
+        };
+        // The first member gets HEDGE_AFTER to connect on its own.
+        let early = tokio::select! {
+            result = &mut attempt_a => Some(result),
+            () = tokio::time::sleep(HEDGE_AFTER) => None,
+        };
+        let mut skip = vec![first.tag.clone()];
+        let mut second_error = None;
+        let a_done = early.is_some();
+        match early {
+            Some(Ok(connected)) => return Ok(connected.map(|stream| (first, stream))),
+            Some(Err(error)) => {
+                note_failure(&first, &error);
+                second_error = Some(error);
+            }
+            None => {}
+        }
+        let Some(second) = self.pick_outbound_skipping(tag, &skip) else {
+            // Nothing else to turn to: wait for the first as long as it takes.
+            return if a_done {
+                Err(second_error.unwrap_or_default())
+            } else {
+                attempt_a.await.map(|r| r.map(|stream| (first, stream)))
+            };
+        };
+        skip.push(second.tag.clone());
+        let mut attempt_b = start(second.clone());
+        // Both in flight (or only the second, when the first already failed):
+        // the first to connect wins.
+        let mut a_open = !a_done;
+        let mut b_open = true;
+        let mut last_error = second_error.unwrap_or_default();
+        while a_open || b_open {
+            tokio::select! {
+                result = &mut attempt_a, if a_open => match result {
+                    Ok(connected) => return Ok(connected.map(|stream| (first, stream))),
+                    Err(error) => {
+                        note_failure(&first, &error);
+                        a_open = false;
+                        last_error = error;
+                    }
+                },
+                result = &mut attempt_b, if b_open => match result {
+                    Ok(connected) => return Ok(connected.map(|stream| (second, stream))),
+                    Err(error) => {
+                        note_failure(&second, &error);
+                        b_open = false;
+                        last_error = error;
+                    }
+                },
+            }
+        }
+        Err(last_error)
+    }
+
+    /// Open the connection to `destination` through `ob`: `Ok(None)` for a
+    /// black hole (the session is refused, not failed).
+    async fn connect_session(
+        &self,
+        ob: &zero_config::Outbound,
+        destination: &Destination,
+    ) -> Result<Option<zero_core::BoxStream>, String> {
+        match &ob.protocol {
+            OutboundProtocol::Freedom { .. } => {
+                outbound::connect_direct_with_resolver(destination, &ob.stream, &self.resolver())
+                    .await
+                    .map(Some)
+                    .map_err(|e| e.to_string())
+            }
+            OutboundProtocol::Blackhole => Ok(None),
+            OutboundProtocol::Vless(_)
+            | OutboundProtocol::Trojan(_)
+            | OutboundProtocol::Shadowsocks(_)
+            | OutboundProtocol::Vmess(_)
+            | OutboundProtocol::AnyTls(_)
+            | OutboundProtocol::Socks(_)
+            | OutboundProtocol::Tor(_)
+            | OutboundProtocol::MasterDns(_)
+            | OutboundProtocol::Tide(_)
+            | OutboundProtocol::Hysteria2(_)
+            | OutboundProtocol::Tuic(_)
+            | OutboundProtocol::Juicity(_)
+            | OutboundProtocol::AmneziaWireguard(_) => self
+                .open_outbound(ob, destination)
+                .await
+                .map(|s| Some(outbound::strip_response(ob, s)))
+                .map_err(|e| e.to_string()),
+            other => Err(format!(
+                "outbound protocol {} cannot carry a session",
+                other.name()
+            )),
+        }
+    }
+
     fn pick_outbound(&self, tag: &str) -> Option<zero_config::Outbound> {
+        self.pick_outbound_skipping(tag, &[])
+    }
+
+    /// [`Self::pick_outbound`], leaving out the balancer members named in
+    /// `skip` (the ones a connection just failed through). A plain outbound
+    /// tag has no other member to turn to and is returned as it is.
+    fn pick_outbound_skipping(
+        &self,
+        tag: &str,
+        skip: &[Arc<str>],
+    ) -> Option<zero_config::Outbound> {
         let config = self.config();
         let cdn = self.stats.cdn_condition();
         if let Some(o) = config.outbound_by_tag(tag) {
@@ -4529,6 +4685,7 @@ impl Server {
         }
         let b = config.balancer_by_tag(tag)?;
         let mut members = config.expand_balancer(b);
+        members.retain(|id| !skip.contains(&config.outbounds[id.0 as usize].tag));
         // With the CDN unusable here, choose among the other members, if
         // there are any; a balancer of CDN configs only keeps trying them.
         if cdn == crate::cdn_check::CdnCondition::Blocked {
@@ -4595,12 +4752,17 @@ impl Server {
         use crate::cdn_check::{self, CdnCondition};
         let mut failures = 0u8;
         loop {
+            // Only an outbound that is dialled directly can be probed as it
+            // stands; one behind another hop would be dialled around it.
             let candidate = self
                 .config()
                 .outbounds
                 .iter()
-                .find(|outbound| cdn_check::is_cloudflare_cdn(outbound))
-                .cloned();
+                .filter_map(|outbound| match self.resolve_chain(outbound) {
+                    Ok(mut chain) if chain.len() == 1 => Some(chain.remove(0)),
+                    _ => None,
+                })
+                .find(cdn_check::is_cloudflare_cdn);
             let wait = match candidate {
                 None => {
                     self.stats
@@ -6542,6 +6704,49 @@ async fn bind_outbound_udp(ipv4: bool) -> Result<UdpSocket, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::lend_direct_dial;
+
+    #[test]
+    fn a_direct_dialer_lends_its_fragmentation_where_it_fits() {
+        let fragmenting =
+            zero_config::parse_link("trojan://pw@203.0.113.9:443?security=tls&sni=a.example#d")
+                .unwrap()
+                .outbound;
+        let mut dialer = fragmenting.clone();
+        dialer.stream.evasion.tcp_fragment = Some(zero_config::FragmentConfig::default());
+        let link = |text: &str| zero_config::parse_link(text).unwrap().outbound;
+
+        // A certificate-TLS outbound takes it.
+        let mut tls = link("trojan://pw@203.0.113.9:443?security=tls&sni=a.example#t");
+        lend_direct_dial(&mut tls, &dialer);
+        assert!(tls.stream.evasion.tcp_fragment.is_some());
+
+        // Its own shaping is kept.
+        let mut shaped = link("trojan://pw@203.0.113.9:443?security=tls&sni=a.example#t");
+        shaped.stream.evasion.tcp_fragment = Some(zero_config::FragmentConfig::empty_record());
+        lend_direct_dial(&mut shaped, &dialer);
+        assert_eq!(
+            shaped.stream.evasion.tcp_fragment,
+            Some(zero_config::FragmentConfig::empty_record())
+        );
+
+        // REALITY breaks when its hello is cut up, so it is left whole.
+        let mut reality = link(
+            "vless://00000000-0000-0000-0000-000000000001@203.0.113.10:443\
+             ?security=reality&sni=www.example.com&pbk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\
+             &sid=0123456789abcdef&type=tcp&encryption=none#r",
+        );
+        lend_direct_dial(&mut reality, &dialer);
+        assert!(reality.stream.evasion.tcp_fragment.is_none());
+
+        // Nor does one that already hides its name with ECH.
+        let mut sealed = link(
+            "trojan://pw@203.0.113.9:443?security=tls&sni=a.example&ech=udp%3A%2F%2F1.1.1.1#e",
+        );
+        lend_direct_dial(&mut sealed, &dialer);
+        assert!(sealed.stream.evasion.tcp_fragment.is_none());
+    }
+
     use super::choose_balancer_index;
     use super::{preserve_stream_host, replace_outbound_endpoint};
     use super::{Server, ServerConfig};

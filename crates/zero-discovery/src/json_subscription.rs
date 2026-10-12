@@ -15,6 +15,13 @@
 
 use serde_json::{Map, Value};
 
+/// The tag BPB gives the stand-in outbound of its serverless ("WorkerLess")
+/// configs: a VLESS entry for `google.com` with a made-up id that the client
+/// needs only because Xray refuses a config with no proxy in it. Nothing is
+/// routed to it, and as a share link it would answer a TCP test (Google is
+/// up) and carry nothing.
+const PLACEHOLDER_TAG: &str = "fake-outbound";
+
 /// Share links for every proxy outbound in a JSON subscription body, or
 /// `None` when the body is not JSON of a shape this module knows.
 pub fn links_from_json(text: &str) -> Option<Vec<String>> {
@@ -40,17 +47,52 @@ pub fn links_from_json(text: &str) -> Option<Vec<String>> {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|remarks| !remarks.is_empty());
-        let proxies: Vec<(String, String)> = outbounds
+        // The fragmentation of every direct outbound, by tag: a proxy that is
+        // dialled through one (`dialerProxy`) is fragmented the same way.
+        let dialers: std::collections::HashMap<&str, Value> = outbounds
             .iter()
             .filter_map(Value::as_object)
+            .filter(|outbound| str_of(outbound, "protocol") == Some("freedom"))
+            .filter_map(|outbound| Some((str_of(outbound, "tag")?, fragment_mask(outbound)?)))
+            .collect();
+        let mut proxies: Vec<(String, String)> = outbounds
+            .iter()
+            .filter_map(Value::as_object)
+            .filter(|outbound| str_of(outbound, "tag") != Some(PLACEHOLDER_TAG))
             .filter_map(|outbound| {
                 if outbound.contains_key("protocol") {
-                    xray_outbound(outbound)
+                    let (link, tag) = xray_outbound(outbound)?;
+                    let own = fragment_mask(outbound).or_else(|| {
+                        let via = outbound
+                            .get("streamSettings")?
+                            .get("sockopt")?
+                            .get("dialerProxy")?
+                            .as_str()?;
+                        dialers.get(via).cloned()
+                    });
+                    Some((with_fragment(link, own), tag))
                 } else {
                     sing_box_outbound(outbound)
                 }
             })
             .collect();
+        // A config with no server in it whose traffic all leaves through a
+        // fragmenting direct outbound (BPB's "Serverless"): one direct
+        // profile, preferring the outbound the panel calls `proxy`.
+        if proxies.is_empty() {
+            let direct = outbounds
+                .iter()
+                .filter_map(Value::as_object)
+                .filter(|outbound| str_of(outbound, "protocol") == Some("freedom"))
+                .filter_map(|outbound| Some((str_of(outbound, "tag")?, fragment_mask(outbound)?)))
+                .min_by_key(|(tag, _)| *tag != "proxy");
+            if let Some((tag, mask)) = direct {
+                proxies.push((
+                    format!("direct://?fm={}", encode(&mask.to_string())),
+                    tag.to_string(),
+                ));
+            }
+        }
         let single = proxies.len() == 1;
         for (index, (link, tag)) in proxies.into_iter().enumerate() {
             let name = match (remarks, single) {
@@ -62,10 +104,50 @@ pub fn links_from_json(text: &str) -> Option<Vec<String>> {
             links.push(format!("{link}#{}", encode(&name)));
         }
     }
+    // A panel lists the same direct profile once per DNS choice and the like;
+    // two links that differ only in their names are one link.
+    let mut seen = std::collections::HashSet::new();
+    links.retain(|link| seen.insert(link.split('#').next().unwrap_or(link).to_string()));
     recognised.then_some(links)
 }
 
 // ------------------------------------------------------------------- Xray
+
+/// The TCP fragmentation an Xray outbound asks for, as a `finalmask` object
+/// (what a link's `fm=` carries): from `streamSettings.finalmask`, or from
+/// the older `settings.fragment` of a direct outbound.
+fn fragment_mask(outbound: &Map<String, Value>) -> Option<Value> {
+    let masks: Vec<Value> = outbound
+        .get("streamSettings")
+        .and_then(|stream| stream.get("finalmask"))
+        .and_then(|mask| mask.get("tcp"))
+        .and_then(Value::as_array)
+        .map(|masks| {
+            masks
+                .iter()
+                .filter(|mask| mask.get("type").and_then(Value::as_str) == Some("fragment"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if !masks.is_empty() {
+        return Some(serde_json::json!({"tcp": masks}));
+    }
+    let fragment = outbound.get("settings")?.get("fragment")?.as_object()?;
+    Some(serde_json::json!({"tcp": [{"type": "fragment", "settings": fragment}]}))
+}
+
+/// `link` with the fragmentation it was meant to be dialled with, for the
+/// link kinds that have a query (VMess and Shadowsocks links do not).
+fn with_fragment(link: String, mask: Option<Value>) -> String {
+    match mask {
+        Some(mask) if link.starts_with("vless://") || link.starts_with("trojan://") => {
+            let joiner = if link.contains('?') { '&' } else { '?' };
+            format!("{link}{joiner}fm={}", encode(&mask.to_string()))
+        }
+        _ => link,
+    }
+}
 
 /// One Xray outbound as `(link without remark, tag)`.
 fn xray_outbound(outbound: &Map<String, Value>) -> Option<(String, String)> {
@@ -325,6 +407,31 @@ fn sing_box_outbound(outbound: &Map<String, Value>) -> Option<(String, String)> 
                 port,
             )
         }
+        "hysteria2" => {
+            // The certificate settings and Salamander are all a link carries
+            // of a Hysteria 2 outbound; bandwidth hints and ports ranges are
+            // the client's own business.
+            let tls = outbound.get("tls").and_then(Value::as_object);
+            let mut query: Vec<(&'static str, String)> = Vec::new();
+            push_opt(
+                &mut query,
+                "sni",
+                tls.and_then(|t| str_of(t, "server_name")),
+            );
+            if tls.and_then(|t| t.get("insecure")).and_then(Value::as_bool) == Some(true) {
+                query.push(("insecure", "1".into()));
+            }
+            if let Some(obfs) = outbound.get("obfs").and_then(Value::as_object) {
+                query.push(("obfs", str_of(obfs, "type")?.to_string()));
+                query.push(("obfs-password", str_of(obfs, "password")?.to_string()));
+            }
+            format!(
+                "hysteria2://{}@{}/?{}",
+                encode(str_of(outbound, "password")?),
+                endpoint(host, port),
+                join(&query)
+            )
+        }
         _ => return None,
     };
     Some((link, tag))
@@ -538,6 +645,128 @@ mod tests {
         ]
       }
     ]"#;
+
+    #[test]
+    fn a_sing_box_hysteria2_outbound_keeps_its_salamander_password() {
+        let body = r#"{"outbounds": [
+            {"type": "hysteria2", "tag": "hy", "server": "203.0.113.9", "server_port": 8443,
+             "password": "secret pw", "up_mbps": 20,
+             "obfs": {"type": "salamander", "password": "gawrgura"},
+             "tls": {"enabled": true, "server_name": "a.example", "insecure": true}}
+        ]}"#;
+        let links = links_from_json(body).expect("recognised as JSON");
+        assert_eq!(links.len(), 1);
+        let parsed = zero_config::parse_link(&links[0]).expect("the link parses");
+        let zero_config::OutboundProtocol::Hysteria2(config) = parsed.outbound.protocol else {
+            panic!("expected Hysteria2");
+        };
+        assert_eq!(&*config.password, "secret pw");
+        assert_eq!(config.obfs_password.as_deref(), Some("gawrgura"));
+        let zero_config::Security::Tls(tls) = parsed.outbound.stream.security else {
+            panic!("expected certificate TLS");
+        };
+        assert!(tls.allow_insecure);
+        assert_eq!(tls.server_name.as_deref(), Some("a.example"));
+    }
+
+    #[test]
+    fn a_serverless_config_becomes_one_direct_profile() {
+        // BPB's "Serverless": all traffic goes out through a fragmenting
+        // `freedom` outbound; the VLESS entry (older panels) is only there to
+        // satisfy Xray. Two configs differing only in their DNS are one profile.
+        let config = |remarks: &str| {
+            format!(
+                r#"{{"remarks": "{remarks}", "outbounds": [
+                {{"tag": "proxy", "protocol": "freedom", "streamSettings": {{"finalmask": {{"tcp": [
+                    {{"type": "fragment", "settings": {{"packets": "tlshello", "length": "100-200",
+                      "delay": "1-1", "maxSplit": "0"}}}}]}}}}}},
+                {{"tag": "http-fragment", "protocol": "freedom", "streamSettings": {{"finalmask": {{"tcp": [
+                    {{"type": "fragment", "settings": {{"packets": "1-1", "length": "100-200", "delay": "1-1"}}}}]}}}}}},
+                {{"tag": "fake-outbound", "protocol": "vless",
+                  "settings": {{"vnext": [{{"address": "google.com", "port": 443,
+                    "users": [{{"id": "8b876217-143b-4108-a7c6-abd1d0581fba", "encryption": "none"}}]}}]}},
+                  "streamSettings": {{"network": "ws", "security": "tls",
+                    "tlsSettings": {{"serverName": "google.com"}}}}}}
+            ]}}"#
+            )
+        };
+        let body = format!("[{}, {}]", config("Serverless 1"), config("Serverless 2"));
+        let links = links_from_json(&body).expect("recognised as JSON");
+        assert_eq!(links.len(), 1, "{links:?}");
+        let parsed = zero_config::parse_link(&links[0]).expect("the link parses");
+        let zero_config::OutboundProtocol::Freedom { .. } = parsed.outbound.protocol else {
+            panic!("expected a direct outbound");
+        };
+        // The TLS fragmentation, not the HTTP one.
+        let fragment = parsed
+            .outbound
+            .stream
+            .evasion
+            .tcp_fragment
+            .expect("fragmented");
+        assert_eq!(fragment.packets, zero_config::FragmentPackets::TlsHello);
+        assert_eq!(parsed.remark, "Serverless 1");
+    }
+
+    #[test]
+    fn a_smart_fragment_config_keeps_each_servers_fragment_settings() {
+        // BPB's "Smart Fragment": the same server once per fragment length.
+        let outbound = |tag: &str, length: &str| {
+            format!(
+                r#"{{"tag": "{tag}", "protocol": "vless",
+                "settings": {{"vnext": [{{"address": "188.114.96.3", "port": 443,
+                  "users": [{{"id": "00000000-0000-0000-0000-000000000002", "encryption": "none"}}]}}]}},
+                "streamSettings": {{"network": "ws", "security": "tls",
+                  "tlsSettings": {{"serverName": "W.example.dev", "alpn": ["http/1.1"]}},
+                  "wsSettings": {{"path": "/p?ed=2560"}},
+                  "finalmask": {{"tcp": [{{"type": "fragment", "settings": {{"packets": "tlshello",
+                    "length": "{length}", "delay": "1-1", "maxSplit": "0"}}}}]}}}}}}"#
+            )
+        };
+        let body = format!(
+            r#"{{"remarks": "Smart Fragment", "outbounds": [{}, {}, {}]}}"#,
+            outbound("proxy-1", "1-5"),
+            outbound("proxy-2", "10-20"),
+            outbound("proxy-3", "100-200"),
+        );
+        let links = links_from_json(&body).expect("recognised as JSON");
+        assert_eq!(links.len(), 3);
+        let lengths: Vec<_> = links
+            .iter()
+            .map(|link| {
+                let parsed = zero_config::parse_link(link).expect("the link parses");
+                parsed
+                    .outbound
+                    .stream
+                    .evasion
+                    .tcp_fragment
+                    .expect("fragmented")
+                    .length
+            })
+            .collect();
+        assert_eq!(
+            lengths.iter().map(|l| (l.min, l.max)).collect::<Vec<_>>(),
+            [(1, 5), (10, 20), (100, 200)]
+        );
+    }
+
+    #[test]
+    fn a_proxy_dialled_through_a_fragmenting_outbound_is_fragmented_too() {
+        // The older BPB shape: `dialerProxy` names a direct outbound.
+        let body = r#"{"outbounds": [
+            {"tag": "proxy", "protocol": "vless",
+             "settings": {"vnext": [{"address": "188.114.96.3", "port": 443,
+               "users": [{"id": "00000000-0000-0000-0000-000000000002", "encryption": "none"}]}]},
+             "streamSettings": {"network": "ws", "security": "tls", "sockopt": {"dialerProxy": "fragment"},
+               "tlsSettings": {"serverName": "W.example.dev"}}},
+            {"tag": "fragment", "protocol": "freedom",
+             "settings": {"fragment": {"packets": "tlshello", "length": "100-200", "interval": "1-1"}}}
+        ]}"#;
+        let links = links_from_json(body).expect("recognised as JSON");
+        assert_eq!(links.len(), 1);
+        let parsed = zero_config::parse_link(&links[0]).expect("the link parses");
+        assert!(parsed.outbound.stream.evasion.tcp_fragment.is_some());
+    }
 
     #[test]
     fn a_bpb_xray_subscription_becomes_links_the_parser_accepts() {

@@ -801,7 +801,7 @@ async fn hysteria2_reconnects_in_zero_rtt_when_the_server_allows_it() {
     }
 
     let before = zero_transport::hysteria2::zero_rtt_accepted();
-    let first = zero_transport::hysteria2::connect(&[server], &tls, PASSWORD, &destination)
+    let first = zero_transport::hysteria2::connect(&[server], &tls, PASSWORD, None, &destination)
         .await
         .expect("first connection");
     echo_once(first, b"first, in 1-RTT").await;
@@ -810,7 +810,7 @@ async fn hysteria2_reconnects_in_zero_rtt_when_the_server_allows_it() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     zero_transport::quic_pool::close_all_to(server);
 
-    let second = zero_transport::hysteria2::connect(&[server], &tls, PASSWORD, &destination)
+    let second = zero_transport::hysteria2::connect(&[server], &tls, PASSWORD, None, &destination)
         .await
         .expect("resumed connection");
     echo_once(second, b"second, resumed").await;

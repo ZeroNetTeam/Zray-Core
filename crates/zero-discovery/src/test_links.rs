@@ -110,8 +110,9 @@ pub async fn test_links(
                                     real_test(&candidate.outbound, target, timeout, request_confirm)
                                         .await
                                 }
-                                None if candidate.is_udp_based() => {
-                                    Err("tcp: not applicable to a UDP-based protocol".to_string())
+                                None if candidate.skips_tcp_stage() => {
+                                    Err("tcp: not applicable to a UDP-based or direct profile"
+                                        .to_string())
                                 }
                                 None => {
                                     tcp_ping(&candidate.info.host, candidate.info.port, timeout)

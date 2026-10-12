@@ -114,6 +114,28 @@ and an ignored live check that needs the real Tor network: it opens a circuit to
 check.torproject.org and reads the answer back). Arti buffers writes until they
 are flushed, so a caller that writes and then only reads must flush first.
 
+## Hysteria 2: Salamander, and certificate checks
+
+A Hysteria 2 link reads `obfs=salamander&obfs-password=…` (the password also
+as `obfs_password`). Every UDP datagram of the connection is then wrapped the
+way the Hysteria 2 server does it: an 8-byte salt in front, the payload XORed
+with `BLAKE2b-256(password || salt)`. The password must be at least 4 bytes;
+another `obfs` type is refused, not ignored, because connecting without the
+obfuscation to a server that wants it only looks like a dead server. sing-box
+configs carry it as `"obfs": {"type": "salamander", "password": …}`, which the
+subscription import turns into the same link. Verified against the
+`apernet/hysteria` server: the right password carries traffic, a wrong or
+missing one does not.
+
+The Hysteria 2 *server* side of ZeroNet (the inbound) does not take a
+Salamander password yet.
+
+`insecure=1` (Hysteria 2), `allow_insecure=1` (TUIC, Juicity) and
+`allowInsecure=1` (the TCP carriers) skip the certificate check for that one
+link. Without them the certificate is verified, so a self-signed server needs
+the flag or a trusted certificate. Skipping the check lets anyone on the path
+pose as the server.
+
 ## The `juicity` outbound has no Xray counterpart
 
 `{"protocol": "juicity"}` and the `juicity://<uuid>:<password>@host:port` link

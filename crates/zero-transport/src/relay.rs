@@ -158,6 +158,34 @@ pub(crate) fn protected_client_endpoint(
     )
 }
 
+/// `socket` as a QUIC endpoint's socket with every datagram Salamander-
+/// obfuscated (see [`crate::salamander`]).
+pub(crate) fn obfuscated_socket(
+    socket: std::net::UdpSocket,
+    salamander: &crate::salamander::Salamander,
+) -> std::io::Result<std::sync::Arc<dyn h3_quinn::quinn::AsyncUdpSocket>> {
+    use h3_quinn::quinn::Runtime;
+    let inner = h3_quinn::quinn::TokioRuntime.wrap_udp_socket(socket)?;
+    Ok(crate::salamander::ObfuscatedSocket::wrap(
+        inner,
+        salamander.clone(),
+    ))
+}
+
+/// [`protected_client_endpoint`], on an obfuscated socket.
+pub(crate) fn protected_obfuscated_client_endpoint(
+    bind: std::net::SocketAddr,
+    salamander: &crate::salamander::Salamander,
+) -> std::io::Result<h3_quinn::quinn::Endpoint> {
+    let socket = zero_core::platform::bind_protected_udp(bind)?;
+    h3_quinn::quinn::Endpoint::new_with_abstract_socket(
+        h3_quinn::quinn::EndpointConfig::default(),
+        None,
+        obfuscated_socket(socket, salamander)?,
+        std::sync::Arc::new(h3_quinn::quinn::TokioRuntime),
+    )
+}
+
 /// Per-stream QUIC receive window. quinn's default (1.25 MB) is sized for
 /// 100 Mbit/s at 100 ms; on the long, lossy paths these carriers exist for it
 /// caps a single stream well below the link. This matches the Hysteria2

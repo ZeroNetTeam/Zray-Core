@@ -54,6 +54,11 @@ pub struct SocketOptions {
     /// on the system default — the same contract Xray offers, and the only
     /// honest one for a config that can outlive the kernel it lands on.
     pub tcp_congestion: Option<String>,
+    /// Asked about each candidate before it is dialled: `true` puts the
+    /// ClientHello in the SYN (TCP Fast Open, see [`crate::fastopen`]). The
+    /// answer comes from the caller's memory of what worked towards that
+    /// server; `None` never uses Fast Open.
+    pub fast_open_if: Option<fn(SocketAddr) -> bool>,
 }
 
 /// Order candidates by address family according to the policy.
@@ -186,8 +191,7 @@ async fn connect_one(
     timeout: Duration,
 ) -> Result<TcpStream, Failure> {
     let fut = async {
-        let socket = new_socket(addr, opts)?;
-        let stream = socket.connect(addr).await?;
+        let stream = connect_stream(addr, opts).await?;
         // Keepalive only after the race is won: the losers never need it.
         set_keepalive(&stream);
         let _ = stream.set_nodelay(true);
@@ -207,6 +211,34 @@ async fn connect_one(
                 .with_elapsed(timeout),
         ),
     }
+}
+
+/// One connected (or, for Fast Open, ready-to-connect) socket to `addr`.
+///
+/// With Fast Open wanted, the first connect to a server only fetches the
+/// cookie and is an ordinary handshake, which would show the name; it is
+/// dropped and the dial repeated, now with the cookie held. A server that
+/// still gives no deferred connect does not do Fast Open: the plain
+/// connection is kept and the caller sees it is not deferred.
+async fn connect_stream(addr: SocketAddr, opts: &SocketOptions) -> io::Result<TcpStream> {
+    let fast = opts.fast_open_if.is_some_and(|wanted| wanted(addr)) && crate::fastopen::supported();
+    for round in 0..if fast { 2 } else { 1 } {
+        let socket = new_socket(addr, opts)?;
+        if fast {
+            crate::fastopen::enable(&socket)?;
+        }
+        let stream = socket.connect(addr).await?;
+        if !fast || crate::fastopen::deferred(&stream) {
+            if fast {
+                crate::fastopen::register(&stream, addr);
+            }
+            return Ok(stream);
+        }
+        if round == 1 {
+            return Ok(stream);
+        }
+    }
+    unreachable!("the loop returns on its last round")
 }
 
 fn new_socket(addr: SocketAddr, opts: &SocketOptions) -> io::Result<tokio::net::TcpSocket> {
@@ -535,5 +567,32 @@ mod tests {
         let socket = new_socket(sa("127.0.0.1:443"), &opts)
             .expect("an unknown congestion name must not fail the socket");
         assert!(!current_congestion(&socket).is_empty());
+    }
+
+    /// Towards a server that does no Fast Open the dial still ends in a
+    /// connection (an ordinary one, since the cookie never comes), and the
+    /// caller can see it is not deferred.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn a_server_without_fast_open_gets_an_ordinary_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let opts = SocketOptions {
+            fast_open_if: Some(|_| true),
+            ..Default::default()
+        };
+        let accepting = tokio::spawn(async move {
+            // The throwaway connection and the one that is kept.
+            let _first = listener.accept().await.unwrap();
+            let _second = listener.accept().await.unwrap();
+        });
+        let dialed = dial_tcp(&[addr], &RacePolicy::default(), &opts)
+            .await
+            .expect("must connect");
+        assert!(!crate::fastopen::deferred(&dialed.stream));
+        assert_eq!(dialed.stream.peer_addr().unwrap(), addr);
+        if crate::fastopen::supported() {
+            accepting.await.unwrap();
+        }
     }
 }

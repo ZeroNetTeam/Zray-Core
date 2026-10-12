@@ -666,7 +666,7 @@ async fn pipeline(shared: &Arc<Shared>, pool: Vec<Candidate>) {
                 {
                     break;
                 }
-                if candidate.is_udp_based() {
+                if candidate.skips_tcp_stage() {
                     // Nothing to connect to over TCP; the real test decides.
                     if open_sender.send(candidate).await.is_err() {
                         break;

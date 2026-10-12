@@ -898,10 +898,53 @@ fn parse_outbound(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Outbound> {
                 outbound.stream.sockopt.dialer_proxy = Some(Arc::from(via));
             }
         }
+        // ECH is the same kind of thing: whether this network needs the name
+        // hidden is not the server's to say. `true` asks for it (the list is
+        // looked up when the outbound is dialled), `false` drops what the
+        // link asked for, so one link can be tried both ways.
+        if let Some(on) = v.get("ech").and_then(Value::as_bool) {
+            let crate::model::Security::Tls(tls) = &mut outbound.stream.security else {
+                return Err(format!("{path}.ech needs certificate TLS"));
+            };
+            tls.ech = on.then(|| {
+                tls.ech.take().unwrap_or(EchConfig {
+                    config_list: Box::new([]),
+                    server_name: None,
+                    query_name: None,
+                })
+            });
+        }
+        // A different port on the same server, for a network that cuts one
+        // port and not another (Cloudflare answers on 443, 2053, 8443 ...).
+        if let Some(port) = v.get("port").and_then(Value::as_u64) {
+            let port = u16::try_from(port)
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or_else(|| format!("{path}.port must be 1..=65535"))?;
+            if !outbound.set_port(port) {
+                return Err(format!("{path}.port needs a TCP protocol link"));
+            }
+        }
+        // `finalmask: null` takes off the fragmentation the link asked for
+        // (`fm=`), so one link can be tried with and without it. It comes
+        // first: what is layered on below is meant to stay.
+        if v.get("finalmask").is_some_and(Value::is_null) {
+            outbound.stream.evasion.tcp_fragment = None;
+            outbound.stream.evasion.tcp_fragment_under = None;
+        }
         // Evasion is the one thing a link cannot express, because it is a
         // property of this network rather than of the server. Allow it to be
         // layered on without re-describing the whole outbound.
         layer_evasion(&mut outbound.stream.evasion, v.get("evasion"), &path)?;
+        // The same in Xray's current spelling, as recipes are passed around:
+        // a `finalmask` object with one or two stacked fragment masks.
+        if let Some(mask) = v.get("finalmask").filter(|mask| !mask.is_null()) {
+            let overlay = parse_finalmask(mask, &path)?;
+            if overlay.tcp_fragment.is_some() {
+                outbound.stream.evasion.tcp_fragment = overlay.tcp_fragment;
+                outbound.stream.evasion.tcp_fragment_under = overlay.tcp_fragment_under;
+            }
+        }
         outbound.validate()?;
         return Ok(outbound);
     }
@@ -1499,10 +1542,41 @@ fn parse_hysteria2(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> 
         .and_then(Value::as_str)
         .filter(|password| !password.is_empty())
         .ok_or_else(|| format!("{path}.settings.password is required for hysteria2"))?;
+    // sing-box's `"obfs": {"type": "salamander", "password": …}`, or a bare
+    // `obfsPassword` next to it.
+    let obfs = settings
+        .get("obfs")
+        .filter(|obfs| !obfs.is_null())
+        .or_else(|| {
+            server
+                .and_then(|s| s.get("obfs"))
+                .filter(|obfs| !obfs.is_null())
+        });
+    let obfs_password = match obfs {
+        Some(obfs) => {
+            let kind = obfs
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("salamander");
+            if !kind.eq_ignore_ascii_case("salamander") {
+                return Err(format!(
+                    "{path}.settings.obfs.type: only salamander is supported, not {kind:?}"
+                ));
+            }
+            let password = obfs
+                .get("password")
+                .and_then(Value::as_str)
+                .filter(|password| password.len() >= 4)
+                .ok_or_else(|| format!("{path}.settings.obfs.password must be at least 4 bytes"))?;
+            Some(Box::from(password))
+        }
+        None => None,
+    };
     Ok(OutboundProtocol::Hysteria2(Hysteria2Config {
         address: Address::parse_host(address),
         port,
         password: password.into(),
+        obfs_password,
     }))
 }
 
@@ -2075,6 +2149,10 @@ fn parse_optional_wireguard_key(value: Option<&Value>, path: &str) -> R<Option<[
     let value = value
         .as_str()
         .ok_or_else(|| format!("{path} must be a base64 string"))?;
+    // Panels write `"preSharedKey": ""` for "none".
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
     parse_wireguard_key(Some(value), path).map(Some)
 }
 
@@ -2371,8 +2449,9 @@ fn parse_stream(v: &Value, path: &str, _out: &mut ParseOutput) -> R<StreamSettin
         }
     };
 
+    // Panels write `"security": ""` for "none" as well as omitting it.
     let security = match v.get("security").and_then(Value::as_str).unwrap_or("none") {
-        "none" => Security::None,
+        "none" | "" => Security::None,
         "tls" => {
             let t = v.get("tlsSettings");
             let allow_insecure = t
@@ -2477,6 +2556,8 @@ fn parse_stream(v: &Value, path: &str, _out: &mut ParseOutput) -> R<StreamSettin
         }
     }
 
+    host_from_server_name(&mut transport, &security);
+
     let sockopt = v
         .get("sockopt")
         .map(|sockopt| parse_sockopt(sockopt, path))
@@ -2526,48 +2607,97 @@ fn parse_ech_config(settings: Option<&Value>, path: &str) -> R<Option<EchConfig>
         ));
     }
 
-    // Xray also takes a DNS query here in place of the list itself, such as
-    // `cloudflare-ech.com+udp://1.1.1.1` or `https://1.1.1.1/dns-query`: look
-    // the list up instead of carrying it. That is the same request as leaving
-    // the list out, and it is answered the same way, by this core's own
-    // resolver rather than the server the string names, so the lookup follows
-    // the DNS settings and cannot leak around them.
-    let encoded = encoded
-        .and_then(Value::as_str)
-        .filter(|value| !value.contains("://"));
-    let Some(encoded) = encoded else {
-        // Xray also permits discovery from the HTTPS/SVCB record of the
+    let Some(text) = encoded.and_then(Value::as_str) else {
+        // No list given: discovery from the HTTPS/SVCB record of the
         // configured public name. The runtime fills this bounded marker from
         // its managed resolver before constructing Rustls.
         return Ok(Some(EchConfig {
             config_list: Box::new([]),
             server_name: inner_name.map(Arc::from),
+            query_name: None,
         }));
     };
-    if encoded.trim().is_empty() {
-        return Err(format!(
-            "{path}.streamSettings.tlsSettings.echConfigList must not be empty"
-        ));
+    ech_from_text(text, inner_name)
+        .map(Some)
+        .map_err(|error| format!("{path}.streamSettings.tlsSettings.echConfigList {error}"))
+}
+
+/// The ECH setting as Xray and the share links write it: either the
+/// base64 `ECHConfigList` itself, or a DNS query that finds it, such as
+/// `cloudflare-ech.com+udp://1.1.1.1` or `https://1.1.1.1/dns-query`.
+///
+/// A query is not carried out here and its server is not used: the runtime
+/// looks the list up with its own resolver, so the lookup follows the DNS
+/// settings and cannot leak around them. Only the name before the `+` is
+/// kept (`query_name`), because that is the part that changes the answer.
+/// `inner` is the name to encrypt, when it differs from the TLS server name.
+///
+/// The error is the end of a sentence the caller starts ("... must not be
+/// empty"), so each caller can say where the value came from.
+pub(crate) fn ech_from_text(text: &str, inner: Option<&str>) -> Result<EchConfig, String> {
+    let text = text.trim();
+    let inner_name = inner.map(Arc::from);
+    if text.contains("://") {
+        let query_name = text
+            .split_once('+')
+            .map(|(name, _)| name)
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+            })
+            .map(Arc::from);
+        return Ok(EchConfig {
+            config_list: Box::new([]),
+            server_name: inner_name,
+            query_name,
+        });
+    }
+    if text.is_empty() {
+        return Err("must not be empty".into());
     }
 
     use base64::Engine;
+    // A `+` in a link's query can arrive as a space when something on the
+    // way read it as a form.
+    let text = text.replace(' ', "+");
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(encoded))
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded))
-        .map_err(|error| {
-            format!("{path}.streamSettings.tlsSettings.echConfigList is not valid base64: {error}")
-        })?;
+        .decode(&text)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&text))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&text))
+        .map_err(|error| format!("is not valid base64: {error}"))?;
     if bytes.is_empty() || bytes.len() > 64 * 1024 {
-        return Err(format!(
-            "{path}.streamSettings.tlsSettings.echConfigList must decode to 1..65536 bytes"
-        ));
+        return Err("must decode to 1..65536 bytes".into());
     }
-
-    Ok(Some(EchConfig {
+    Ok(EchConfig {
         config_list: bytes.into_boxed_slice(),
-        server_name: inner_name.map(Arc::from),
-    }))
+        server_name: inner_name,
+        query_name: None,
+    })
+}
+
+/// Give a WebSocket, HTTPUpgrade or XHTTP transport that names no `Host` the
+/// TLS server name as its Host, which is Xray's rule: the configured host,
+/// else the SNI, else the address. Without it a config that reaches a
+/// Cloudflare edge by IP, with the Worker's name only in the SNI, would send
+/// the IP as the Host and be turned away.
+pub(crate) fn host_from_server_name(transport: &mut Transport, security: &Security) {
+    let Security::Tls(TlsConfig {
+        server_name: Some(name),
+        ..
+    }) = security
+    else {
+        return;
+    };
+    if let Transport::WebSocket(config)
+    | Transport::HttpUpgrade(config)
+    | Transport::Xhttp(config) = transport
+    {
+        if config.host.is_none() {
+            config.host = Some(name.clone());
+        }
+    }
 }
 
 fn parse_raw_http_header(v: &Value, path: &str) -> R<Option<RawHttpHeader>> {
@@ -2676,7 +2806,9 @@ fn parse_ws(v: Option<&Value>) -> WebSocketConfig {
     let mut headers: BTreeMap<Box<str>, Box<str>> = BTreeMap::new();
     if let Some(h) = v.and_then(|w| w.get("headers")).and_then(Value::as_object) {
         for (k, val) in h {
-            if let Some(s) = val.as_str() {
+            // `"Host": ""` is how panels say "use the server name"; sent as
+            // it stands it would be an empty Host header.
+            if let Some(s) = val.as_str().filter(|s| !s.is_empty()) {
                 headers.insert(Box::from(k.as_str()), Box::from(s));
             }
         }
@@ -2686,6 +2818,7 @@ fn parse_ws(v: Option<&Value>) -> WebSocketConfig {
     let host = v
         .and_then(|w| w.get("host"))
         .and_then(Value::as_str)
+        .filter(|host| !host.is_empty())
         .map(Arc::from)
         .or_else(|| {
             headers
@@ -2945,6 +3078,21 @@ fn parse_sockopt(v: &Value, path: &str) -> R<Sockopt> {
     })
 }
 
+/// The TCP fragmentation a share link's `fm=` carries: Xray's `finalmask`
+/// object as JSON text, one or two stacked `fragment` masks. Anything else in
+/// it (UDP noise, keepalive) is not part of what a link can ask for. `None`
+/// when the text is not that.
+pub(crate) fn fragment_from_finalmask(text: &str) -> Option<Evasion> {
+    let value: Value = serde_json::from_str(text.trim()).ok()?;
+    let parsed = parse_finalmask(&value, "fm").ok()?;
+    parsed.tcp_fragment.as_ref()?;
+    Some(Evasion {
+        tcp_fragment: parsed.tcp_fragment,
+        tcp_fragment_under: parsed.tcp_fragment_under,
+        ..Evasion::default()
+    })
+}
+
 /// `streamSettings.finalmask` — Xray's current fragment/noise schema.
 fn parse_finalmask(v: &Value, path: &str) -> R<Evasion> {
     let mut ev = Evasion::default();
@@ -3041,8 +3189,9 @@ fn parse_legacy_freedom_evasion(settings: Option<&Value>, path: &str) -> R<Evasi
 
 /// `{"fakeSni": "www.example.com", "sequence": 0, "method": "decoy"}` — the
 /// decoy SNI (and the optional out-of-window sequence) for a fake
-/// ClientHello, or `{"method": "urgent"}` for the urgent-byte method, which
-/// has no decoy and so needs no `fakeSni`. Without `method` the device
+/// ClientHello, or `{"method": "urgent"}` for the urgent-byte method (or
+/// `"fastopen"` for the hello in the SYN), which have no decoy and so need
+/// no `fakeSni`. Without `method` the device
 /// decides (`SniMethod::Auto`).
 ///
 /// `fakeSni` accepts `?` (a letter), `#` (a digit) and `*` (either), drawn
@@ -3060,9 +3209,10 @@ fn parse_sni_spoof(value: &Value, path: &str) -> R<SniDesyncConfig> {
         None | Some("auto") => crate::model::SniMethod::Auto,
         Some("decoy") => crate::model::SniMethod::Decoy,
         Some("urgent") => crate::model::SniMethod::Urgent,
+        Some("fastopen" | "tfo") => crate::model::SniMethod::FastOpen,
         Some(other) => {
             return Err(format!(
-                "{path}.method must be auto, decoy or urgent, not {other:?}"
+                "{path}.method must be auto, decoy, urgent or fastopen, not {other:?}"
             ))
         }
     };
@@ -3072,7 +3222,13 @@ fn parse_sni_spoof(value: &Value, path: &str) -> R<SniDesyncConfig> {
         .and_then(Value::as_str)
     {
         Some(name) => name,
-        None if method == crate::model::SniMethod::Urgent => "www.speedtest.net",
+        None if matches!(
+            method,
+            crate::model::SniMethod::Urgent | crate::model::SniMethod::FastOpen
+        ) =>
+        {
+            "www.speedtest.net"
+        }
         None => return Err(format!("{path}.fakeSni is required")),
     };
     // Match the injector's own bound (zero_evasion::build_fake_client_hello):
@@ -3701,7 +3857,12 @@ fn parse_routing(v: &Value, out: &mut ParseOutput) -> R<Routing> {
 fn parse_rule(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Rule> {
     let path = format!("routing.rules[{idx}]");
 
-    let target = if let Some(tag) = v.get("outboundTag").and_then(Value::as_str) {
+    // Panels write `"outboundTag": ""` next to a `balancerTag`, as "not this".
+    let target = if let Some(tag) = v
+        .get("outboundTag")
+        .and_then(Value::as_str)
+        .filter(|tag| !tag.is_empty())
+    {
         RuleTarget::Outbound(Arc::from(tag))
     } else if let Some(tag) = v.get("balancerTag").and_then(Value::as_str) {
         RuleTarget::Balancer(Arc::from(tag))
@@ -4938,7 +5099,171 @@ mod tests {
         let Security::Tls(tls) = &config.outbounds[0].stream.security else {
             panic!("expected certificate TLS")
         };
-        assert!(tls.ech.as_ref().expect("ECH marker").config_list.is_empty());
+        let ech = tls.ech.as_ref().expect("ECH marker");
+        assert!(ech.config_list.is_empty());
+        // The name before the `+` is where the list is looked up.
+        assert_eq!(ech.query_name.as_deref(), Some("cloudflare-ech.com"));
+
+        // A query with no name leaves the lookup to the server name.
+        queried["outbounds"][0]["streamSettings"]["tlsSettings"]["echConfigList"] =
+            serde_json::json!("udp://8.8.8.8");
+        let (config, _) = parse_config(&queried).unwrap();
+        let Security::Tls(tls) = &config.outbounds[0].stream.security else {
+            panic!("expected certificate TLS")
+        };
+        assert_eq!(tls.ech.as_ref().expect("ECH marker").query_name, None);
+    }
+
+    #[test]
+    fn a_link_outbound_takes_stacked_fragment_masks_in_finalmask_form() {
+        let link = "vless://00000000-0000-0000-0000-000000000002@cdn.example.com:443\
+            ?security=tls&sni=cdn.example.com&type=ws&path=%2Fws&encryption=none";
+        let mask = serde_json::json!({"tcp": [
+            {"type": "fragment", "settings": {"packets": "tlshello",
+                "lengths": ["0", "104", "1"], "delays": ["0"], "maxSplit": "0"}},
+            {"type": "fragment", "settings": {"packets": "1-1",
+                "lengths": ["114", "1"], "delays": ["1"], "maxSplit": "11"}},
+        ]});
+        let value = serde_json::json!({"outbounds": [{"link": link, "finalmask": mask}]});
+        let (config, _) = parse_config(&value).unwrap();
+        let evasion = &config.outbounds[0].stream.evasion;
+        // The later entry sits on top and cuts first; the earlier one is under.
+        assert_eq!(
+            evasion.tcp_fragment.as_ref().unwrap().packets,
+            FragmentPackets::Range { from: 1, to: 1 }
+        );
+        assert_eq!(
+            evasion.tcp_fragment_under.as_ref().unwrap().packets,
+            FragmentPackets::TlsHello
+        );
+        // Without it the link has no evasion.
+        let value = serde_json::json!({"outbounds": [{"link": link}]});
+        let (config, _) = parse_config(&value).unwrap();
+        assert!(config.outbounds[0].stream.evasion.is_empty());
+    }
+
+    #[test]
+    fn panel_configs_that_write_empty_strings_for_nothing_load() {
+        // `"security": ""`, `"preSharedKey": ""` and `"outboundTag": ""` next
+        // to a `balancerTag` are how BPB's WoW and WorkerLess configs say
+        // "none".
+        let value = serde_json::json!({
+            "outbounds": [
+                {"tag": "a", "protocol": "freedom", "settings": {},
+                 "streamSettings": {"network": "tcp", "security": ""}},
+                {"tag": "b", "protocol": "freedom", "settings": {}}
+            ],
+            "routing": {
+                "balancers": [{"tag": "all", "selector": ["a", "b"],
+                               "strategy": {"type": "leastPing"}}],
+                "rules": [{"type": "field", "network": "tcp,udp",
+                           "balancerTag": "all", "outboundTag": ""}]
+            }
+        });
+        let (config, _) = parse_config(&value).unwrap();
+        assert!(matches!(
+            config.outbounds[0].stream.security,
+            Security::None
+        ));
+        assert!(matches!(
+            config.routing.rules[0].target,
+            crate::routing::RuleTarget::Balancer(_)
+        ));
+    }
+
+    #[test]
+    fn an_empty_ws_host_means_the_server_name_not_an_empty_header() {
+        // BPB writes `"Host": ""` in its fragment configs.
+        let value = serde_json::json!({"outbounds": [{
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "188.114.96.3", "port": 443,
+                "users": [{"id": "00000000-0000-0000-0000-000000000002"}]}]},
+            "streamSettings": {"network": "ws", "security": "tls",
+                "tlsSettings": {"serverName": "MySub.Example.WORKERS.dev"},
+                "wsSettings": {"headers": {"Host": ""}, "path": "/p?ed=2560"}}
+        }]});
+        let (config, _) = parse_config(&value).unwrap();
+        let Transport::WebSocket(ws) = &config.outbounds[0].stream.transport else {
+            panic!("expected WebSocket");
+        };
+        assert_eq!(ws.host.as_deref(), Some("MySub.Example.WORKERS.dev"));
+        assert!(ws.headers.is_empty());
+    }
+
+    #[test]
+    fn hysteria2_settings_take_a_salamander_obfs() {
+        let outbound = |obfs: serde_json::Value| {
+            serde_json::json!({"outbounds": [{
+                "protocol": "hysteria2",
+                "settings": {"address": "203.0.113.9", "port": 8443,
+                             "password": "secret", "obfs": obfs},
+                "streamSettings": {"security": "tls", "tlsSettings": {"serverName": "a.example"}}
+            }]})
+        };
+        let (config, _) = parse_config(&outbound(
+            serde_json::json!({"type": "salamander", "password": "gawrgura"}),
+        ))
+        .unwrap();
+        let OutboundProtocol::Hysteria2(hysteria) = &config.outbounds[0].protocol else {
+            panic!("expected Hysteria2");
+        };
+        assert_eq!(hysteria.obfs_password.as_deref(), Some("gawrgura"));
+        // Another type, or a password the server would not take, is refused.
+        let error = |obfs| parse_config(&outbound(obfs)).unwrap_err();
+        assert!(
+            error(serde_json::json!({"type": "gecko", "password": "gawrgura"}))
+                .contains("only salamander")
+        );
+        assert!(
+            error(serde_json::json!({"type": "salamander", "password": "abc"})).contains("4 bytes")
+        );
+        let (config, _) = parse_config(&outbound(serde_json::Value::Null)).unwrap();
+        let OutboundProtocol::Hysteria2(hysteria) = &config.outbounds[0].protocol else {
+            panic!("expected Hysteria2");
+        };
+        assert_eq!(hysteria.obfs_password, None);
+    }
+
+    #[test]
+    fn a_link_outbound_can_be_given_or_stripped_of_ech() {
+        let link = "vless://00000000-0000-0000-0000-000000000002@cdn.example.com:443\
+            ?security=tls&sni=cdn.example.com&type=ws&path=%2Fws&encryption=none";
+        let ech_of = |entry: serde_json::Value| {
+            let value = serde_json::json!({"outbounds": [entry]});
+            let (config, _) = parse_config(&value).unwrap();
+            let Security::Tls(tls) = &config.outbounds[0].stream.security else {
+                panic!("expected certificate TLS")
+            };
+            tls.ech.is_some()
+        };
+        assert!(!ech_of(serde_json::json!({"link": link})));
+        assert!(ech_of(serde_json::json!({"link": link, "ech": true})));
+        let asked = format!("{link}&ech=cloudflare-ech.com%2Budp%3A%2F%2F1.1.1.1");
+        assert!(ech_of(serde_json::json!({"link": asked})));
+        assert!(!ech_of(serde_json::json!({"link": asked, "ech": false})));
+        // It needs a TLS name to hide: REALITY has none to encrypt.
+        let reality = "vless://00000000-0000-0000-0000-000000000001@203.0.113.10:443\
+            ?security=reality&sni=www.example.com&pbk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\
+            &sid=0123456789abcdef&type=tcp&encryption=none";
+        let value = serde_json::json!({"outbounds": [{"link": reality, "ech": true}]});
+        assert!(parse_config(&value).unwrap_err().contains("ech needs"));
+    }
+
+    #[test]
+    fn a_link_outbound_can_be_moved_to_another_port() {
+        let link = "vless://00000000-0000-0000-0000-000000000002@cdn.example.com:443\
+            ?security=tls&sni=cdn.example.com&type=ws&path=%2Fws&encryption=none";
+        let port_of = |entry: serde_json::Value| {
+            let value = serde_json::json!({"outbounds": [entry]});
+            parse_config(&value).map(|(config, _)| config.outbounds[0].endpoint().unwrap().1)
+        };
+        assert_eq!(port_of(serde_json::json!({"link": link})), Ok(443));
+        assert_eq!(
+            port_of(serde_json::json!({"link": link, "port": 2053})),
+            Ok(2053)
+        );
+        assert!(port_of(serde_json::json!({"link": link, "port": 0})).is_err());
+        assert!(port_of(serde_json::json!({"link": link, "port": 70000})).is_err());
     }
 
     #[test]

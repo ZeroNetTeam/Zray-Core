@@ -126,6 +126,10 @@ struct BuildRequest {
     /// Whether `auto` adds the TTL-decoy variant. Left out, the device is
     /// asked (it is added only where the kernel has no MD5 option).
     auto_ttl_decoy: Option<bool>,
+    /// Whether `auto` adds the Fast Open variant (the hello in the SYN).
+    /// Left out, the device is asked: it needs a kernel with
+    /// `TCP_FASTOPEN_CONNECT`, and a TLS port to dial.
+    auto_fast_open: Option<bool>,
     /// Reuse of XHTTP's HTTP/2 connections (XMUX): `off` (a connection per
     /// proxied request, as before), `on` (what each link says, or Xray's
     /// defaults), or `auto`, which under `evasion = "auto"` adds a reusing
@@ -193,6 +197,7 @@ impl Default for BuildRequest {
             auto_decoy: None,
             decoy_ttl: zero_evasion::decoy::DEFAULT_TTL,
             auto_ttl_decoy: None,
+            auto_fast_open: None,
             xmux: "auto".into(),
             dns: DnsRequest::default(),
             log_level: "warning".into(),
@@ -251,6 +256,10 @@ struct DnsRequest {
     /// `remote`".
     custom: String,
     local: String,
+    /// Optional user-supplied resolver for Iranian names, overriding `local`.
+    /// The same forms and rule as `custom` (an IP, or an IP-addressed
+    /// `tls://` / `https://` URL). Empty means "use `local`".
+    custom_local: String,
     /// The Iranian anti-sanction resolver: a built-in name
     /// (`shecan`/`electro`/`begzar`/`radar`), or `none`/`off` to disable the
     /// third verdict. Sanctioned services resolve here and route direct.
@@ -269,6 +278,7 @@ impl Default for DnsRequest {
             remote: "google".into(),
             custom: String::new(),
             local: "google".into(),
+            custom_local: String::new(),
             anti_sanction: "auto".into(),
             custom_anti_sanction: String::new(),
             fakedns: true,
@@ -376,6 +386,18 @@ pub fn build_config_with_assets(
             }
         }
     };
+    // The same for the resolver of Iranian names, which is asked directly.
+    let custom_local_dns = {
+        let trimmed = request.dns.custom_local.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            match zero_config::dns::ResolverEndpoint::parse(trimmed) {
+                Some(endpoint) if !endpoint.needs_bootstrap() => Some(trimmed.to_string()),
+                _ => return Err(format!("unusable custom local DNS {trimmed:?}")),
+            }
+        }
+    };
     if !(576..=65_535).contains(&request.tun.mtu) {
         return Err("tun.mtu must be between 576 and 65535".into());
     }
@@ -428,7 +450,41 @@ pub fn build_config_with_assets(
         // on rather than folded into it. Fragmentation skips ECH/plaintext and
         // REALITY (see `fragmentable`); SNI spoofing rides any TLS/REALITY
         // carrier (it adds a decoy packet without touching the real hello).
-        let can_fragment = fragmentable(&parsed.outbound);
+        //
+        // Under `auto`, a link that already asks for ECH hides its own name,
+        // which the splitting and decoy variants cannot be layered on. They are built
+        // from the link without ECH instead (`"ech": false`), and the link as
+        // written stays first: whichever of them gets through is kept.
+        //
+        // The same goes for a link that carries fragmentation of its own
+        // (`fm=`, the setting its author found to work): it is tried as
+        // written, and the other variants are built without it.
+        let ech_written = evasion == Evasion::Auto
+            && matches!(
+                &parsed.outbound.stream.security,
+                zero_config::Security::Tls(tls) if tls.ech.is_some()
+            );
+        let fm_written = evasion == Evasion::Auto
+            && parsed.outbound.stream.evasion.tcp_fragment.is_some()
+            && !matches!(
+                parsed.outbound.protocol,
+                zero_config::OutboundProtocol::Freedom { .. }
+            );
+        let written = ech_written || fm_written;
+        let stripped;
+        let shape = if written {
+            let mut copy = parsed.outbound.clone();
+            if let zero_config::Security::Tls(tls) = &mut copy.stream.security {
+                tls.ech = None;
+            }
+            copy.stream.evasion.tcp_fragment = None;
+            copy.stream.evasion.tcp_fragment_under = None;
+            stripped = copy;
+            &stripped
+        } else {
+            &parsed.outbound
+        };
+        let can_fragment = fragmentable(shape);
         // The decoy name for this server: one drawn from the allow-listed
         // pool and kept stable for the server, in place of the single
         // hard-coded host every link used to share (see
@@ -449,7 +505,7 @@ pub fn build_config_with_assets(
             .unwrap_or(SPOOF_DECOY_SNI);
         // The hop count rides along for a device without the MD5 option;
         // one with it never uses it (`zero_evasion::Fooling::Auto`).
-        let spoof = (request.sni_spoof && sni_spoofable(&parsed.outbound)).then(|| {
+        let spoof = (request.sni_spoof && sni_spoofable(shape)).then(|| {
             let mut spoof = json!({"fakeSni": decoy_sni});
             if request.decoy_ttl > 0 {
                 spoof["ttl"] = json!(request.decoy_ttl);
@@ -480,9 +536,23 @@ pub fn build_config_with_assets(
             }
             (!block.is_empty()).then_some(Value::Object(block))
         };
-        let push = |outbounds: &mut Vec<Value>, length: Option<&str>| match evasion_block(length) {
-            Some(evasion) => outbounds.push(json!({"link": parsed.link, "evasion": evasion})),
-            None => outbounds.push(json!({"link": parsed.link})),
+        // One variant of this link: the link, what to layer on it, and the
+        // ECH the link asked for dropped when that is what the layer needs.
+        let variant = |evasion: Option<Value>| {
+            let mut outbound = json!({"link": parsed.link});
+            if let Some(evasion) = evasion {
+                outbound["evasion"] = evasion;
+            }
+            if ech_written {
+                outbound["ech"] = json!(false);
+            }
+            if fm_written {
+                outbound["finalmask"] = Value::Null;
+            }
+            outbound
+        };
+        let push = |outbounds: &mut Vec<Value>, length: Option<&str>| {
+            outbounds.push(variant(evasion_block(length)));
         };
         // Under `auto`, variants that hide the server name, for any link
         // with a name a filter can read, REALITY included: one with an
@@ -493,8 +563,7 @@ pub fn build_config_with_assets(
         // last, so the balancer settles on them only when the others do not
         // get through. Left out when the user turned hiding on for every
         // variant.
-        let hide_name =
-            evasion == Evasion::Auto && spoof.is_none() && sni_spoofable(&parsed.outbound);
+        let hide_name = evasion == Evasion::Auto && spoof.is_none() && sni_spoofable(shape);
         let auto_urgent = hide_name && request.auto_decoy.unwrap_or_else(urgent_available);
         let auto_decoy = hide_name && request.auto_decoy.unwrap_or_else(decoy_available);
         // The TTL decoy, for a device that cannot send the MD5 one: its own
@@ -504,7 +573,19 @@ pub fn build_config_with_assets(
             && request.decoy_ttl > 0
             && request.auto_decoy != Some(false)
             && request.auto_ttl_decoy.unwrap_or_else(ttl_decoy_available);
+        // Fast Open too: free like the urgent byte, and it gets past a filter
+        // the urgent byte does not (and the other way round). A TLS port only,
+        // where the client speaks first.
+        let auto_fast = hide_name
+            && request.auto_fast_open.unwrap_or_else(fast_open_available)
+            && parsed
+                .outbound
+                .endpoint()
+                .is_some_and(|(_, port)| zero_net::fastopen::client_first_port(port));
         let first = outbounds.len();
+        if written {
+            outbounds.push(json!({"link": parsed.link}));
+        }
         match evasion {
             Evasion::Auto if can_fragment => {
                 // Plain first, fragmented after — or the other way round when
@@ -526,27 +607,43 @@ pub fn build_config_with_assets(
             _ => push(&mut outbounds, None),
         }
         if auto_urgent {
-            outbounds.push(json!({
-                "link": parsed.link,
-                "evasion": {"sniSpoof": {"method": "urgent"}},
-            }));
+            outbounds.push(variant(Some(json!({"sniSpoof": {"method": "urgent"}}))));
+        }
+        if auto_fast {
+            outbounds.push(variant(Some(json!({"sniSpoof": {"method": "fastopen"}}))));
         }
         if auto_decoy {
-            outbounds.push(json!({
-                "link": parsed.link,
-                "evasion": {"sniSpoof": {"fakeSni": decoy_sni, "method": "decoy"}},
-            }));
+            outbounds.push(variant(Some(
+                json!({"sniSpoof": {"fakeSni": decoy_sni, "method": "decoy"}}),
+            )));
         }
         if auto_ttl_decoy {
-            outbounds.push(json!({
-                "link": parsed.link,
-                "evasion": {"sniSpoof": {
-                    "fakeSni": decoy_sni,
-                    "method": "decoy",
-                    "fooling": "ttl",
-                    "ttl": request.decoy_ttl,
-                }},
-            }));
+            outbounds.push(variant(Some(json!({"sniSpoof": {
+                "fakeSni": decoy_sni,
+                "method": "decoy",
+                "fooling": "ttl",
+                "ttl": request.decoy_ttl,
+            }}))));
+        }
+        // ECH last: it answers a filter that reads the name however the hello
+        // is cut up, which is what a Cloudflare Worker's address meets.
+        if evasion == Evasion::Auto && ech_variant_fits(&parsed.outbound) {
+            let mut sealed = json!({"link": parsed.link, "ech": true});
+            if fm_written {
+                // A hello cannot be both encrypted and cut up.
+                sealed["finalmask"] = Value::Null;
+            }
+            outbounds.push(sealed);
+        }
+        // The same link on other ports Cloudflare answers on: a network can
+        // cut a name on 443 and leave it alone on 2053. Last, since most
+        // links need none of them.
+        if evasion == Evasion::Auto && alt_port_fits(&parsed.outbound) {
+            for port in ALT_PORTS {
+                let mut moved = variant(None);
+                moved["port"] = json!(port);
+                outbounds.push(moved);
+            }
         }
         // Connection reuse, for a link that has an HTTP/2 connection to
         // reuse. Under `auto` with auto evasion every variant above keeps a
@@ -602,6 +699,7 @@ pub fn build_config_with_assets(
         remote_dns,
         custom_remote_dns,
         local_dns,
+        custom_local_dns,
         anti_sanction_dns,
         custom_anti_sanction_dns,
         block_ads: request.block_ads,
@@ -811,6 +909,40 @@ fn with_warp_order(
 }
 
 /// Whether ClientHello fragmentation applies to this outbound.
+/// Whether `auto` adds a variant that encrypts the server name with ECH: a
+/// certificate-TLS link over a CDN transport that does not ask for ECH
+/// itself and could be behind Cloudflare, which is the only CDN whose edge
+/// takes the shared list. That is a known Cloudflare name or address, or any
+/// domain (a Worker on its own domain is written that way), where a wrong
+/// guess costs one more variant for the balancer to probe.
+pub(crate) fn ech_variant_fits(outbound: &zero_config::Outbound) -> bool {
+    use zero_config::{Security, Transport};
+    let cdn_transport = matches!(
+        outbound.stream.transport,
+        Transport::WebSocket(_)
+            | Transport::HttpUpgrade(_)
+            | Transport::Grpc(_)
+            | Transport::Xhttp(_)
+    );
+    matches!(&outbound.stream.security, Security::Tls(tls) if tls.ech.is_none())
+        && cdn_transport
+        && (zero_runtime::cdn_check::is_cloudflare_cdn(outbound)
+            || matches!(
+                outbound.endpoint(),
+                Some((zero_core::Address::Domain(_), _))
+            ))
+}
+
+/// Ports other than 443 that Cloudflare serves TLS on.
+pub(crate) const ALT_PORTS: [u16; 2] = [2053, 8443];
+
+/// Whether `auto` adds variants on [`ALT_PORTS`]: a link on 443 to a known
+/// Cloudflare name or address over a CDN transport with certificate TLS.
+pub(crate) fn alt_port_fits(outbound: &zero_config::Outbound) -> bool {
+    outbound.endpoint().is_some_and(|(_, port)| port == 443)
+        && zero_runtime::cdn_check::is_cloudflare_cdn(outbound)
+}
+
 fn fragmentable(outbound: &zero_config::Outbound) -> bool {
     // QUIC carriers (Hysteria2/TUIC) run over UDP: there is no TCP ClientHello
     // to split, and the model forbids layering TCP-shaped evasion on them. They
@@ -870,6 +1002,11 @@ fn reuses_connections(outbound: &zero_config::Outbound) -> bool {
         zero_config::Transport::Xhttp(xhttp)
             if xhttp.xhttp_http_version == zero_config::XhttpHttpVersion::Http2
     )
+}
+
+/// Whether this device can put a hello in the SYN. A fixed "no" in tests.
+fn fast_open_available() -> bool {
+    !cfg!(test) && zero_net::fastopen::supported()
 }
 
 /// The same question for the urgent byte, with the same fixed "no" in tests.
@@ -1092,6 +1229,39 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_local_dns_replaces_the_resolver_of_iranian_names() {
+        let servers = |dns: Value| -> Vec<Value> {
+            let config = build_config(&json!({"links": [REALITY], "dns": dns})).unwrap();
+            config["dns"]["servers"].as_array().unwrap().clone()
+        };
+        let local_address = |servers: &[Value]| {
+            servers
+                .iter()
+                .find(|s| s["tag"] == "local")
+                .map(|s| s["address"].clone())
+        };
+        assert_eq!(local_address(&servers(json!({}))), Some(json!("8.8.8.8")));
+        assert_eq!(
+            local_address(&servers(json!({"local": "cloudflare"}))),
+            Some(json!("1.1.1.1"))
+        );
+        assert_eq!(
+            local_address(&servers(json!({"custom_local": "178.22.122.100"}))),
+            Some(json!("178.22.122.100"))
+        );
+        // Blank means none; one that could not be used is said so.
+        assert_eq!(
+            local_address(&servers(json!({"custom_local": "  "}))),
+            Some(json!("8.8.8.8"))
+        );
+        let error = build_config(&json!({
+            "links": [REALITY], "dns": {"custom_local": "resolver.example.com"}
+        }))
+        .unwrap_err();
+        assert!(error.contains("custom local DNS"), "{error}");
+    }
+
+    #[test]
     fn an_unparseable_custom_remote_dns_is_an_error() {
         let error = build_config(&json!({
             "links": [REALITY], "dns": {"remote": "google", "custom": "not a resolver!!"}
@@ -1237,6 +1407,7 @@ mod tests {
                 o["tag"]
                     .as_str()
                     .is_some_and(|t| t == "proxy" || t.starts_with("proxy-"))
+                    && o["ech"] != true
             })
             .map(|o| {
                 let fragment = &o["evasion"]["fragment"];
@@ -1262,7 +1433,8 @@ mod tests {
             compiled
                 .expand_balancer(&compiled.routing.balancers[0])
                 .len(),
-            3
+            // Plain, the two shaped ones, and the ECH one.
+            4
         );
         // The shaped variants: an empty record ahead of the hello, then the
         // hello as TCP segments.
@@ -1277,6 +1449,147 @@ mod tests {
             fragments[1].packets,
             zero_config::FragmentPackets::Range { from: 1, to: 1 }
         );
+    }
+
+    /// The ECH settings of each proxy outbound of `config`, in order:
+    /// `None` without ECH, else whether the list is still to be looked up.
+    fn ech_of(config: &Value) -> Vec<Option<bool>> {
+        compile(config)
+            .outbounds
+            .iter()
+            .filter(|o| o.tag.as_ref() == "proxy" || o.tag.starts_with("proxy-"))
+            .map(|o| match &o.stream.security {
+                zero_config::Security::Tls(tls) => {
+                    tls.ech.as_ref().map(|ech| ech.config_list.is_empty())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn auto_ends_a_cdn_links_variants_with_one_that_encrypts_its_name() {
+        let config = build_config(&json!({
+            "links": [WS_TLS], "evasion": "auto", "auto_decoy": false
+        }))
+        .unwrap();
+        // Plain, the two shaped ones, then ECH.
+        assert_eq!(ech_of(&config), [None, None, None, Some(true)]);
+        // Not asked for, not added: a fixed mode has no variants, and a
+        // REALITY or plain TCP link has no CDN to hide behind.
+        let off = build_config(&json!({"links": [WS_TLS], "evasion": "off"})).unwrap();
+        assert_eq!(ech_of(&off), [None]);
+        let reality = build_config(&json!({"links": [REALITY], "evasion": "auto"})).unwrap();
+        assert!(ech_of(&reality).iter().all(Option::is_none));
+        let trojan = build_config(&json!({"links": [TROJAN], "evasion": "auto"})).unwrap();
+        assert!(ech_of(&trojan).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_link_that_asks_for_ech_stays_first_and_gets_unhidden_variants_too() {
+        // Xray's own spelling of "look the list up", as feeds write it.
+        let link = WS_TLS.replace(
+            "&encryption=none",
+            "&encryption=none&ech=cloudflare-ech.com%2Budp%3A%2F%2F1.1.1.1",
+        );
+        let config = build_config(&json!({
+            "links": [link], "evasion": "auto", "auto_decoy": false
+        }))
+        .unwrap();
+        // As written, then plain, the empty record and the segments without
+        // ECH (it cannot be split), and no second ECH variant.
+        assert_eq!(ech_of(&config), [Some(true), None, None, None]);
+        let compiled = compile(&config);
+        let written = compiled
+            .outbounds
+            .iter()
+            .find(|o| o.tag.as_ref() == "proxy");
+        let Some(zero_config::Security::Tls(tls)) = written.map(|o| &o.stream.security) else {
+            panic!("first outbound is not TLS");
+        };
+        let ech = tls.ech.as_ref().expect("the link's ECH is kept");
+        assert_eq!(ech.query_name.as_deref(), Some("cloudflare-ech.com"));
+        // With fragmentation forced on, the link is left as written.
+        let strong = build_config(&json!({"links": [link], "evasion": "strong"})).unwrap();
+        assert_eq!(ech_of(&strong), [Some(true)]);
+    }
+
+    /// The fragment length of each proxy outbound of the compiled `config`,
+    /// `None` where it is not fragmented.
+    fn fragment_lengths(config: &Value) -> Vec<Option<(u32, u32)>> {
+        compile(config)
+            .outbounds
+            .iter()
+            .filter(|o| o.tag.as_ref() == "proxy" || o.tag.starts_with("proxy-"))
+            .map(|o| {
+                o.stream
+                    .evasion
+                    .tcp_fragment
+                    .as_ref()
+                    .map(|f| (f.length.min, f.length.max))
+            })
+            .collect()
+    }
+
+    const FM: &str = "%7B%22tcp%22%3A%5B%7B%22type%22%3A%22fragment%22%2C%22settings%22%3A%7B%22packets%22%3A%22tlshello%22%2C%22length%22%3A%2210-20%22%2C%22delay%22%3A%221-1%22%7D%7D%5D%7D";
+
+    #[test]
+    fn a_link_with_its_own_fragmentation_is_tried_as_written_then_without() {
+        let link = WS_TLS.replace("&encryption=none", &format!("&encryption=none&fm={FM}"));
+        let config = build_config(&json!({
+            "links": [link], "evasion": "auto", "auto_decoy": false
+        }))
+        .unwrap();
+        // As written; plain; the two shaped ones (an empty record, whose
+        // piece is the rest of the hello, then 40-80); ECH, which cannot be cut.
+        assert_eq!(
+            fragment_lengths(&config),
+            [
+                Some((10, 20)),
+                None,
+                Some((16384, 16384)),
+                Some((40, 80)),
+                None
+            ]
+        );
+        // A fixed mode keeps the link's own and adds nothing.
+        let off = build_config(&json!({"links": [link], "evasion": "off"})).unwrap();
+        assert_eq!(fragment_lengths(&off), [Some((10, 20))]);
+    }
+
+    #[test]
+    fn a_direct_profile_builds_one_fragmenting_outbound_and_nothing_else() {
+        let link = format!("direct://?fm={FM}#Serverless");
+        for mode in ["auto", "off", "strong"] {
+            let config = build_config(&json!({"links": [link], "evasion": mode})).unwrap();
+            assert_eq!(fragment_lengths(&config), [Some((10, 20))], "{mode}");
+            let compiled = compile(&config);
+            assert!(matches!(
+                compiled.outbounds[0].protocol,
+                zero_config::OutboundProtocol::Freedom { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn ech_fits_only_cdn_links_that_could_be_behind_cloudflare() {
+        let fits = |link: &str| ech_variant_fits(&zero_config::parse_link(link).unwrap().outbound);
+        assert!(fits(WS_TLS));
+        // A Cloudflare address, written as an address.
+        assert!(fits(
+            &WS_TLS.replace("cdn.example.com:443", "104.16.10.2:443")
+        ));
+        // An address that is not Cloudflare's has no shared list to use.
+        assert!(!fits(
+            &WS_TLS.replace("cdn.example.com:443", "203.0.113.5:443")
+        ));
+        // Nothing to encrypt, or nothing to hide behind a CDN.
+        assert!(!fits(REALITY));
+        assert!(!fits(TROJAN));
+        // Already asks for it.
+        assert!(!fits(
+            &WS_TLS.replace("#NL-edge", "&ech=udp%3A%2F%2F1.1.1.1#NL-edge")
+        ));
     }
 
     #[test]
@@ -1475,7 +1788,8 @@ mod tests {
             [false, true, true]
         );
         let tls = decoys(json!({"links": [WS_TLS], "evasion": "auto", "auto_decoy": true}));
-        assert_eq!(tls[tls.len() - 2..], [true, true]);
+        // The decoys, then the ECH variant, which hides its name by itself.
+        assert_eq!(tls[tls.len() - 3..], [true, true, false]);
         assert_eq!(tls.iter().filter(|decoy| **decoy).count(), 2);
         // The urgent byte first, then the decoy.
         let methods: Vec<_> = compile(
@@ -1493,6 +1807,25 @@ mod tests {
                 zero_config::SniMethod::Decoy
             ]
         );
+        // Fast Open sits between the urgent byte and the decoy, on a TLS port.
+        let with_fast: Vec<_> = compile(
+            &build_config(&json!({
+                "links": [REALITY], "evasion": "auto", "auto_decoy": true, "auto_fast_open": true,
+            }))
+            .unwrap(),
+        )
+        .outbounds
+        .iter()
+        .filter_map(|o| o.stream.evasion.sni_desync.as_ref().map(|d| d.method))
+        .collect();
+        assert_eq!(
+            with_fast,
+            [
+                zero_config::SniMethod::Urgent,
+                zero_config::SniMethod::FastOpen,
+                zero_config::SniMethod::Decoy
+            ]
+        );
         // Not when the device cannot, and not on top of the user's own switch.
         assert!(!decoys(json!({"links": [REALITY], "evasion": "auto"})).contains(&true));
         assert_eq!(
@@ -1505,6 +1838,25 @@ mod tests {
             !decoys(json!({"links": [REALITY], "evasion": "off", "auto_decoy": true}))
                 .contains(&true)
         );
+    }
+
+    /// A Cloudflare link on 443 gets the same link on the other ports
+    /// Cloudflare answers on, after the others; a link elsewhere gets none.
+    #[test]
+    fn auto_adds_other_cloudflare_ports_for_a_cloudflare_link() {
+        let ports = |link: &str| -> Vec<u16> {
+            compile(&build_config(&json!({"links": [link], "evasion": "auto"})).unwrap())
+                .outbounds
+                .iter()
+                .filter_map(|o| o.endpoint().map(|(_, port)| port))
+                .collect()
+        };
+        let worker = "vless://00000000-0000-0000-0000-000000000002@w.example.workers.dev:443\
+            ?security=tls&sni=w.example.workers.dev&type=ws&path=%2Fws&encryption=none#w";
+        let found = ports(worker);
+        assert_eq!(found[found.len() - 2..], ALT_PORTS);
+        assert!(found[0] == 443);
+        assert!(ports(WS_TLS).iter().all(|port| !ALT_PORTS.contains(port)));
     }
 
     /// The decoy name discovery stamps into a spoof comes from the bundled

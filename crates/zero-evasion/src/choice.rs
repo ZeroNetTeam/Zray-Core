@@ -1,11 +1,15 @@
 //! Which way to hide a server name, picked per server from what happened on
 //! the last connections to it.
 //!
-//! There are two ways of hiding a name from a socket without root: the
-//! urgent byte ([`crate::urgent`]) and the decoy ([`crate::decoy`]). They
-//! cost very different amounts:
+//! There are three ways of hiding a name from a socket without root: the
+//! urgent byte ([`crate::urgent`]), TCP Fast Open (the hello rides in the
+//! SYN, `zero_net::fastopen`) and the decoy ([`crate::decoy`]). They cost
+//! very different amounts:
 //!
 //! * the urgent byte costs nothing: one extra byte, no wait;
+//! * Fast Open costs nothing either (it saves a round trip) once the
+//!   kernel holds the server's cookie; the first connection to a server only
+//!   fetches that cookie;
 //! * the decoy costs every connection one round trip and a bit more, because
 //!   the real hello only leaves once the server has said it is missing (about
 //!   0.33 s per connection measured from Tehran, against 0.35 s for the whole
@@ -13,14 +17,17 @@
 //!
 //! But they do not get past the same things. Some servers read the urgent
 //! byte badly: the handshake completes and then the server never answers
-//! again. So the rule here is "urgent byte first, decoy where the urgent byte
-//! has been seen to fail":
+//! again. Some servers do not do Fast Open, and some paths drop a SYN that
+//! carries data. So the rule here is "the free ways first, the decoy where
+//! they have been seen to fail", one rung at a time:
 //!
 //! ```text
 //! connection to 1.2.3.4:443   urgent byte → answered twice → stays urgent
 //! connection to 5.6.7.8:443   urgent byte → went silent    → 1 strike
 //! connection to 5.6.7.8:443   urgent byte → went silent    → 2 strikes:
-//!                             decoy for this server for the next 10 minutes
+//!                             Fast Open for this server for the next 10 minutes
+//! connection to 5.6.7.8:443   Fast Open   → went silent    → 1, then 2 strikes:
+//!                             the decoy for the next 10 minutes
 //! ```
 //!
 //! A connection is *answered* when the server replied to the client's second
@@ -33,7 +40,7 @@
 //!
 //! Two strikes in a row, and a strike is wiped by any answered connection, so
 //! one page the user closed early does not move a server to the slow way.
-//! After [`DECOY_FOR`] the server gets the urgent byte again: filters and
+//! After [`DECOY_FOR`] the server gets the cheap way again: filters and
 //! servers change, and the cheap way is worth a new try. The table holds at
 //! most [`MAX_SERVERS`] servers; the oldest are forgotten first.
 
@@ -48,10 +55,12 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// How long a server whose connections went silent with the urgent byte
-/// gets the decoy instead.
+/// How long a server whose connections went silent stays on the next way
+/// down the ladder.
 pub const DECOY_FOR: Duration = Duration::from_secs(10 * 60);
-/// Silent connections in a row that move a server to the decoy.
+/// How long a server that gave no Fast Open is left alone by it.
+const NO_FAST_FOR: Duration = Duration::from_secs(60 * 60);
+/// Silent connections in a row that move a server one way down.
 const STRIKES: u8 = 2;
 /// Most servers remembered at once.
 const MAX_SERVERS: usize = 256;
@@ -59,47 +68,129 @@ const MAX_SERVERS: usize = 256;
 /// above a slow line's round trip, well below the time a person waits.
 pub const SILENT_AFTER: Duration = Duration::from_secs(5);
 
-/// The two ways of hiding a name from the socket itself.
+/// The ways of hiding a name from the socket itself, cheapest first: this
+/// is the order of the ladder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Way {
     Urgent,
+    /// The hello rides in the SYN (`zero_net::fastopen`).
+    Fast,
     Decoy,
+}
+
+const LADDER: [Way; 3] = [Way::Urgent, Way::Fast, Way::Decoy];
+
+fn rung_of(way: Way) -> u8 {
+    LADDER.iter().position(|&w| w == way).unwrap_or(0) as u8
+}
+
+/// Which ways this device has.
+#[derive(Debug, Clone, Copy)]
+pub struct Have {
+    pub urgent: bool,
+    pub fast: bool,
+    pub decoy: bool,
+}
+
+impl Have {
+    fn has(self, way: Way) -> bool {
+        match way {
+            Way::Urgent => self.urgent,
+            Way::Fast => self.fast,
+            Way::Decoy => self.decoy,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Record {
     strikes: u8,
-    decoy_until: Option<Instant>,
+    /// The rung of [`LADDER`] this server is on, while `until` is ahead.
+    rung: u8,
+    until: Option<Instant>,
     touched: Instant,
 }
 
 static SERVERS: Mutex<Option<HashMap<SocketAddr, Record>>> = Mutex::new(None);
+/// The rung most servers on this network ended up on, and until when: where a
+/// server nobody has tried yet starts.
+static PRIOR: Mutex<Option<(u8, Instant)>> = Mutex::new(None);
+static NO_FAST: Mutex<Option<HashMap<SocketAddr, Instant>>> = Mutex::new(None);
 
 fn with_table<T>(f: impl FnOnce(&mut HashMap<SocketAddr, Record>) -> T) -> T {
     let mut guard = SERVERS.lock().unwrap_or_else(|e| e.into_inner());
     f(guard.get_or_insert_with(HashMap::new))
 }
 
-/// The way to use towards `server`, given which ways this device has.
-/// `None` when it has neither.
-pub fn pick(server: SocketAddr, urgent: bool, decoy: bool) -> Option<Way> {
+/// Note that `server` took no Fast Open (the connection to it was not
+/// deferred even with a cookie fetched), so [`pick`] leaves it alone for an
+/// hour.
+pub fn no_fast(server: SocketAddr) {
+    let mut guard = NO_FAST.lock().unwrap_or_else(|e| e.into_inner());
+    let table = guard.get_or_insert_with(HashMap::new);
     let now = Instant::now();
-    let wants_decoy = with_table(|table| {
-        table
-            .get(&server)
-            .and_then(|record| record.decoy_until)
-            .is_some_and(|until| until > now)
-    });
-    match (urgent, decoy) {
-        (true, true) if wants_decoy => Some(Way::Decoy),
-        (true, _) => Some(Way::Urgent),
-        (false, true) => Some(Way::Decoy),
-        (false, false) => None,
+    table.retain(|_, until| *until > now);
+    if table.len() < MAX_SERVERS {
+        table.insert(server, now + NO_FAST_FOR);
     }
 }
 
-/// What one connection that used the urgent byte showed about `server`.
-fn report(server: SocketAddr, answered: bool) {
+fn fast_refused(server: SocketAddr) -> bool {
+    let guard = NO_FAST.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|table| table.get(&server))
+        .is_some_and(|until| *until > Instant::now())
+}
+
+/// The way to use towards `server`, given which ways this device has.
+/// `None` when it has none.
+///
+/// A server starts on the first way it can use, or on the rung that worked
+/// for the last servers when two of them had to move down. Each pair of silent
+/// connections moves it one rung down for [`DECOY_FOR`]; a rung this device
+/// lacks is skipped, and past the last one it has it stays there.
+pub fn pick(server: SocketAddr, have: Have) -> Option<Way> {
+    let have = Have {
+        fast: have.fast && !fast_refused(server),
+        ..have
+    };
+    let now = Instant::now();
+    let prior = PRIOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .filter(|(_, until)| *until > now)
+        .map_or(0, |(rung, _)| usize::from(rung));
+    let rung = with_table(|table| {
+        table
+            .get(&server)
+            .filter(|record| record.until.is_some_and(|until| until > now))
+            .map_or(prior, |record| usize::from(record.rung))
+    });
+    LADDER[rung..]
+        .iter()
+        .chain(LADDER[..rung].iter().rev())
+        .copied()
+        .find(|&way| have.has(way))
+}
+
+/// Whether a dial to `server` should put the hello in the SYN. The question
+/// [`zero_net::SocketOptions::fast_open_if`] asks before each candidate:
+/// Fast Open is picked when the ladder says so, whatever the other ways.
+pub fn wants_fast(server: SocketAddr) -> bool {
+    server.ip().is_ipv4()
+        && pick(
+            server,
+            Have {
+                urgent: crate::urgent::supported(),
+                fast: true,
+                decoy: crate::decoy::any_available(),
+            },
+        ) == Some(Way::Fast)
+}
+
+/// What one connection that used `way` showed about `server`.
+fn report(server: SocketAddr, way: Way, answered: bool) {
     let now = Instant::now();
     with_table(|table| {
         if !answered && table.len() >= MAX_SERVERS && !table.contains_key(&server) {
@@ -112,22 +203,53 @@ fn report(server: SocketAddr, answered: bool) {
                 table.remove(&oldest);
             }
         }
+        let held = |record: &Record| record.until.is_some_and(|until| until > now);
         if answered {
-            // Nothing to keep for a server the cheap way works for.
-            table.remove(&server);
+            let rung = rung_of(way);
+            match table.get_mut(&server) {
+                // A late answer from a way the server has moved down from.
+                Some(record) if held(record) && rung < record.rung => {}
+                // The way it moved to works: keep it, so the cheap way is not
+                // tried again at every third connection.
+                Some(record) if held(record) => {
+                    record.strikes = 0;
+                    record.until = Some(now + DECOY_FOR);
+                    // Two servers on this network got somewhere only below
+                    // the cheap way: the next one starts there.
+                    if table
+                        .values()
+                        .filter(|r| r.until.is_some_and(|u| u > now))
+                        .count()
+                        >= 2
+                    {
+                        *PRIOR.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((rung, now + DECOY_FOR));
+                    }
+                }
+                // Nothing to keep for a server the cheap way works for.
+                _ => {
+                    table.remove(&server);
+                }
+            }
             return;
         }
         let record = table.entry(server).or_insert(Record {
             strikes: 0,
-            decoy_until: None,
+            rung: 0,
+            until: None,
             touched: now,
         });
         record.touched = now;
+        // A connection from before the server moved down says nothing new.
+        if record.until.is_some_and(|until| until > now) && rung_of(way) < record.rung {
+            return;
+        }
         record.strikes = record.strikes.saturating_add(1);
         if record.strikes >= STRIKES {
             record.strikes = 0;
-            record.decoy_until = Some(now + DECOY_FOR);
-            tracing::info!(%server, "urgent byte went unanswered; using the decoy for this server");
+            record.rung = (rung_of(way) + 1).min(LADDER.len() as u8 - 1);
+            record.until = Some(now + DECOY_FOR);
+            tracing::info!(%server, ?way, "no answer; moving this server down to {:?}", LADDER[usize::from(record.rung)]);
         }
     });
 }
@@ -153,6 +275,7 @@ enum Phase {
 pub struct Watched<S> {
     inner: S,
     server: SocketAddr,
+    way: Way,
     phase: Phase,
     /// Set once the verdict has been reported, so it is reported once.
     reported: bool,
@@ -161,10 +284,11 @@ pub struct Watched<S> {
 }
 
 impl<S> Watched<S> {
-    pub fn new(inner: S, server: SocketAddr) -> Self {
+    pub fn new(inner: S, server: SocketAddr, way: Way) -> Self {
         Self {
             inner,
             server,
+            way,
             phase: Phase::Idle,
             reported: false,
             waiting: None,
@@ -173,7 +297,7 @@ impl<S> Watched<S> {
 
     fn verdict(&mut self, answered: bool) {
         if !std::mem::replace(&mut self.reported, true) {
-            report(self.server, answered);
+            report(self.server, self.way, answered);
         }
     }
 
@@ -262,31 +386,122 @@ mod tests {
         SocketAddr::from(([192, 0, 2, 1], port))
     }
 
+    /// The learned starting rung is shared by every server, so tests that
+    /// pick a way take turns and start without one.
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        static TURN: Mutex<()> = Mutex::new(());
+        let guard = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        *PRIOR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        guard
+    }
+
+    fn have(urgent: bool, fast: bool, decoy: bool) -> Have {
+        Have {
+            urgent,
+            fast,
+            decoy,
+        }
+    }
+
+    /// With Fast Open on the device the ladder has a rung between the urgent
+    /// byte and the decoy; a server that gives no Fast Open skips it.
+    #[test]
+    fn fast_open_is_the_rung_between_the_urgent_byte_and_the_decoy() {
+        let _turn = lock();
+        let s = server(1010);
+        let all = have(true, true, true);
+        assert_eq!(pick(s, all), Some(Way::Urgent));
+        report(s, Way::Urgent, false);
+        report(s, Way::Urgent, false);
+        assert_eq!(pick(s, all), Some(Way::Fast));
+        // A late strike from a connection that used the urgent byte changes
+        // nothing now.
+        report(s, Way::Urgent, false);
+        report(s, Way::Urgent, false);
+        assert_eq!(pick(s, all), Some(Way::Fast));
+        report(s, Way::Fast, false);
+        report(s, Way::Fast, false);
+        assert_eq!(pick(s, all), Some(Way::Decoy));
+        // Without Fast Open on the device the urgent byte goes straight to
+        // the decoy, as before.
+        let t = server(1011);
+        report(t, Way::Urgent, false);
+        report(t, Way::Urgent, false);
+        assert_eq!(pick(t, have(true, true, true)), Some(Way::Fast));
+        assert_eq!(pick(t, have(true, false, true)), Some(Way::Decoy));
+    }
+
+    /// A connection that gets an answer on the rung a server moved to keeps it
+    /// there, and two servers that ended up on the same rung send the next
+    /// one straight to it.
+    #[test]
+    fn the_rung_that_works_is_kept_and_learned() {
+        let _turn = lock();
+        let all = have(true, true, true);
+        let (a, b, c) = (server(1020), server(1021), server(1022));
+        for s in [a, b] {
+            report(s, Way::Urgent, false);
+            report(s, Way::Urgent, false);
+            report(s, Way::Fast, true);
+            assert_eq!(pick(s, all), Some(Way::Fast), "kept after an answer");
+        }
+        // c was never tried, and starts on Fast.
+        assert_eq!(pick(c, all), Some(Way::Fast));
+        // A server the urgent byte works for is forgotten as before.
+        report(c, Way::Urgent, true);
+        assert_eq!(pick(c, all), Some(Way::Fast), "prior still holds");
+        *PRIOR.lock().unwrap() = None;
+        assert_eq!(pick(c, all), Some(Way::Urgent));
+    }
+
+    /// A server that answered no Fast Open is not offered it, and the next
+    /// rung is used instead.
+    #[test]
+    fn a_server_without_fast_open_skips_that_rung() {
+        let _turn = lock();
+        let s = server(1012);
+        report(s, Way::Urgent, false);
+        report(s, Way::Urgent, false);
+        no_fast(s);
+        assert_eq!(pick(s, have(true, true, true)), Some(Way::Decoy));
+        assert_eq!(pick(s, have(true, true, false)), Some(Way::Urgent));
+    }
+
     /// Two silent connections move a server to the decoy; one answered
     /// connection in between wipes the strike.
     #[test]
     fn two_silent_connections_in_a_row_move_a_server_to_the_decoy() {
+        let _turn = lock();
         let s = server(1001);
-        assert_eq!(pick(s, true, true), Some(Way::Urgent));
-        report(s, false);
-        report(s, true);
-        report(s, false);
-        assert_eq!(pick(s, true, true), Some(Way::Urgent), "strike was wiped");
-        report(s, false);
-        assert_eq!(pick(s, true, true), Some(Way::Decoy));
+        assert_eq!(pick(s, have(true, false, true)), Some(Way::Urgent));
+        report(s, Way::Urgent, false);
+        report(s, Way::Urgent, true);
+        report(s, Way::Urgent, false);
+        assert_eq!(
+            pick(s, have(true, false, true)),
+            Some(Way::Urgent),
+            "strike was wiped"
+        );
+        report(s, Way::Urgent, false);
+        assert_eq!(pick(s, have(true, false, true)), Some(Way::Decoy));
         // Without the decoy on this device it stays on the urgent byte.
-        assert_eq!(pick(s, true, false), Some(Way::Urgent));
-        assert_eq!(pick(server(1002), false, true), Some(Way::Decoy));
-        assert_eq!(pick(server(1002), false, false), None);
+        assert_eq!(pick(s, have(true, false, false)), Some(Way::Urgent));
+        assert_eq!(
+            pick(server(1002), have(false, false, true)),
+            Some(Way::Decoy)
+        );
+        assert_eq!(pick(server(1002), have(false, false, false)), None);
     }
 
     /// The phases: a connection that got its second answer counts as
     /// answered, one dropped while waiting counts as silent.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_connection_is_judged_by_the_answer_to_its_second_flight() {
+        let _turn = lock();
         let (client, mut far) = tokio::io::duplex(64);
         let s = server(1003);
-        let mut watched = Watched::new(client, s);
+        let mut watched = Watched::new(client, s, Way::Urgent);
         watched.write_all(b"hello").await.unwrap();
         let mut got = [0u8; 5];
         far.read_exact(&mut got).await.unwrap();
@@ -296,13 +511,13 @@ mod tests {
         watched.write_all(b"finished").await.unwrap();
         // Dropped while the second flight waits: a strike.
         drop(watched);
-        report(s, false);
-        assert_eq!(pick(s, true, true), Some(Way::Decoy));
+        report(s, Way::Urgent, false);
+        assert_eq!(pick(s, have(true, false, true)), Some(Way::Decoy));
 
         let (client, mut far) = tokio::io::duplex(64);
         let s = server(1004);
-        report(s, false);
-        let mut watched = Watched::new(client, s);
+        report(s, Way::Urgent, false);
+        let mut watched = Watched::new(client, s, Way::Urgent);
         watched.write_all(b"hello").await.unwrap();
         far.write_all(b"a").await.unwrap();
         watched.read_exact(&mut [0u8; 1]).await.unwrap();
@@ -311,22 +526,24 @@ mod tests {
         watched.read_exact(&mut [0u8; 1]).await.unwrap();
         drop(watched);
         // The answered connection wiped the earlier strike.
-        report(s, false);
-        assert_eq!(pick(s, true, true), Some(Way::Urgent));
+        report(s, Way::Urgent, false);
+        assert_eq!(pick(s, have(true, false, true)), Some(Way::Urgent));
     }
 
     /// A reply that never comes is a strike once it is overdue, before the
     /// connection is closed, and only one.
     #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)]
     async fn an_overdue_reply_is_a_strike_while_the_connection_is_open() {
+        let _turn = lock();
         let (client, _far) = tokio::io::duplex(64);
         let s = server(1005);
-        let mut watched = Watched::new(client, s);
+        let mut watched = Watched::new(client, s, Way::Urgent);
         watched.write_all(b"hello").await.unwrap();
         let read = tokio::time::timeout(SILENT_AFTER * 2, watched.read(&mut [0u8; 1])).await;
         assert!(read.is_err(), "no reply came");
-        report(s, false);
-        assert_eq!(pick(s, true, true), Some(Way::Decoy));
+        report(s, Way::Urgent, false);
+        assert_eq!(pick(s, have(true, false, true)), Some(Way::Decoy));
         drop(watched);
         // Dropping it afterwards did not count it a second time: one more
         // strike after the move is the first of a new pair.

@@ -167,8 +167,8 @@ pub struct TlsConfig {
     pub server_name: Option<Arc<str>>,
     pub alpn: Vec<Box<str>>,
     pub fingerprint: Fingerprint,
-    /// Canonical Xray `allowInsecure`. Kept so the parser can fail closed on
-    /// `true` rather than silently ignoring it.
+    /// Xray's `allowInsecure`: accept any certificate. Set only by a link or
+    /// config that asks for it, never by default.
     pub allow_insecure: bool,
     /// Explicit ECH configuration and the inner SNI to encrypt. The outer
     /// public name is carried by the ECHConfigList itself.
@@ -187,6 +187,12 @@ pub struct EchConfig {
     pub config_list: Box<[u8]>,
     /// Inner SNI. When omitted, the ordinary TLS `serverName` is used.
     pub server_name: Option<Arc<str>>,
+    /// The name whose HTTPS record carries the list, when `config_list` is
+    /// empty and has to be looked up. Omitted means the TLS `serverName`.
+    /// Xray's `cloudflare-ech.com+udp://1.1.1.1` names it before the `+`:
+    /// Cloudflare serves one list for every site it hosts, so a site with
+    /// no record of its own can still use it.
+    pub query_name: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,6 +475,12 @@ pub enum SniMethod {
     /// (`zero_evasion::urgent`). No delay and no kernel feature; `fake_sni`
     /// is not used.
     Urgent,
+    /// The hello rides in the SYN (TCP Fast Open, `zero_net::fastopen`), so a
+    /// filter that reads the stream after the handshake never sees the name.
+    /// No delay and no privilege; needs a kernel with `TCP_FASTOPEN_CONNECT`
+    /// and a server that does Fast Open, and only applies to ports where the client speaks first (443, 80 and the like).
+    /// `fake_sni` is not used.
+    FastOpen,
 }
 
 impl SniDesyncConfig {
@@ -477,6 +489,14 @@ impl SniDesyncConfig {
     pub fn urgent() -> Self {
         Self {
             method: SniMethod::Urgent,
+            ..Self::default()
+        }
+    }
+
+    /// The Fast Open method and nothing else.
+    pub fn fast_open() -> Self {
+        Self {
+            method: SniMethod::FastOpen,
             ..Self::default()
         }
     }
@@ -1170,6 +1190,10 @@ pub struct Hysteria2Config {
     pub address: Address,
     pub port: u16,
     pub password: Box<str>,
+    /// The Salamander obfuscation password (`obfs=salamander`), the only
+    /// obfuscation Hysteria 2 defines. Every UDP datagram is wrapped in it;
+    /// the server must be set up with the same one.
+    pub obfs_password: Option<Box<str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1874,15 +1898,6 @@ impl Outbound {
             }
         }
 
-        if let Security::Tls(t) = &self.stream.security {
-            if t.allow_insecure {
-                return Err(format!(
-                    "outbound {}: allowInsecure is refused; it disables certificate verification",
-                    self.tag
-                ));
-            }
-        }
-
         if let Security::Reality(r) = &self.stream.security {
             if !r.fingerprint.supports_reality() {
                 return Err(format!(
@@ -1921,6 +1936,20 @@ impl Outbound {
         }
 
         Ok(())
+    }
+
+    /// Dial port `port` instead of the one this outbound names. Only the
+    /// TCP protocols have a port to move; others are left and `false` says so.
+    pub fn set_port(&mut self, port: u16) -> bool {
+        match &mut self.protocol {
+            OutboundProtocol::Vless(v) => v.port = port,
+            OutboundProtocol::Trojan(t) => t.port = port,
+            OutboundProtocol::Shadowsocks(s) => s.port = port,
+            OutboundProtocol::Vmess(v) => v.port = port,
+            OutboundProtocol::AnyTls(a) => a.port = port,
+            _ => return false,
+        }
+        true
     }
 
     /// The remote endpoint this outbound dials, if any.

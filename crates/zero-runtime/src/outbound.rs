@@ -221,8 +221,27 @@ fn race_policy(stream: &StreamSettings) -> RacePolicy {
     p
 }
 
+/// Whether a dial to a client-first port puts the hello in the SYN (Fast Open): the
+/// configuration asks for it, or the device chose it and the server's record
+/// says so (`zero_evasion::choice`).
+fn fast_open_rule(stream: &StreamSettings) -> Option<fn(SocketAddr) -> bool> {
+    use zero_config::SniMethod;
+    if !zero_net::fastopen::supported() {
+        return None;
+    }
+    match stream.evasion.sni_desync.as_ref()?.method {
+        SniMethod::FastOpen => Some(|peer| zero_net::fastopen::client_first_port(peer.port())),
+        SniMethod::Auto => Some(|peer| {
+            zero_net::fastopen::client_first_port(peer.port())
+                && zero_evasion::choice::wants_fast(peer)
+        }),
+        _ => None,
+    }
+}
+
 fn socket_options(stream: &StreamSettings) -> SocketOptions {
     SocketOptions {
+        fast_open_if: fast_open_rule(stream),
         tcp_fast_open: stream.sockopt.tcp_fast_open,
         mark: stream.sockopt.mark,
         bind_interface: stream
@@ -257,7 +276,7 @@ fn socket_options(stream: &StreamSettings) -> SocketOptions {
 fn shaped(tcp: TcpStream, stream: &StreamSettings, injected: bool) -> BoxStream {
     use zero_config::SniMethod;
     if let Some(spoof) = stream.evasion.sni_desync.as_ref().filter(|_| !injected) {
-        use zero_evasion::choice::{self, Way};
+        use zero_evasion::choice::{self, Have, Way};
         let policy = zero_evasion::DecoyPolicy {
             name: spoof.fake_sni.clone(),
             fooling: match spoof.fooling {
@@ -268,7 +287,10 @@ fn shaped(tcp: TcpStream, stream: &StreamSettings, injected: bool) -> BoxStream 
             ttl: spoof.ttl,
         };
         let urgent = zero_evasion::urgent::supported();
-        let peer = tcp.peer_addr().ok();
+        // A socket whose SYN is still waiting for the hello (Fast Open) has
+        // no peer to ask; the dial recorded it.
+        let deferred = zero_net::fastopen::deferred(&tcp);
+        let peer = zero_net::fastopen::peer_addr(&tcp);
         // On a kernel with no MD5 option the decoy is stopped by a hop limit,
         // which has to match the path. `zero_evasion::autottl` learns that
         // distance from the server itself, so the decoy counts as a possible
@@ -286,11 +308,28 @@ fn shaped(tcp: TcpStream, stream: &StreamSettings, injected: bool) -> BoxStream 
         let way = match spoof.method {
             SniMethod::Decoy => decoy.then_some(Way::Decoy),
             SniMethod::Urgent => urgent.then_some(Way::Urgent),
-            // The free way first, the decoy where it went unanswered
+            SniMethod::FastOpen => deferred.then_some(Way::Fast),
+            // The free ways first, the decoy where they went unanswered
             // (`zero_evasion::choice`). Without a peer address there is no
-            // memory to ask, so the urgent byte it is.
+            // memory to ask, so the urgent byte it is. A deferred socket can
+            // only carry the hello in its SYN: it was dialled for that.
+            SniMethod::Auto if deferred => Some(Way::Fast),
             SniMethod::Auto => match peer {
-                Some(peer) => choice::pick(peer, urgent, decoy),
+                Some(peer) => {
+                    if zero_evasion::choice::wants_fast(peer) {
+                        // The dial asked for Fast Open and the server gave
+                        // none: leave it alone for a while.
+                        zero_evasion::choice::no_fast(peer);
+                    }
+                    choice::pick(
+                        peer,
+                        Have {
+                            urgent,
+                            fast: false,
+                            decoy,
+                        },
+                    )
+                }
                 None => urgent.then_some(Way::Urgent),
             },
         };
@@ -314,12 +353,17 @@ fn shaped(tcp: TcpStream, stream: &StreamSettings, injected: bool) -> BoxStream 
                     return boxed(zero_evasion::UrgentStream::new(tcp));
                 }
             }
-            // Only an urgent byte the device chose is watched: one the
-            // configuration asked for is kept whatever happens.
+            // Only a way the device chose is watched: one the configuration
+            // asked for is kept whatever happens.
+            (Some(Way::Fast), SniMethod::Auto, Some(peer)) => {
+                return boxed(choice::Watched::new(tcp, peer, Way::Fast))
+            }
+            (Some(Way::Fast), ..) => return boxed(tcp),
             (Some(Way::Urgent), SniMethod::Auto, Some(peer)) => {
                 return boxed(choice::Watched::new(
                     zero_evasion::UrgentStream::new(tcp),
                     peer,
+                    Way::Urgent,
                 ))
             }
             (Some(Way::Urgent), ..) => return boxed(zero_evasion::UrgentStream::new(tcp)),
@@ -400,9 +444,31 @@ pub(crate) fn tls_params(stream: &StreamSettings, fallback_host: &str) -> Option
                 .to_string();
             let profile = FingerprintProfile::parse(fingerprint_family_name(&t.fingerprint))
                 .unwrap_or_default();
-            let mut p = TlsParams::new(sni).with_profile(profile);
+            let mut p = TlsParams::new(sni)
+                .with_profile(profile)
+                .with_insecure(t.allow_insecure);
             p = p.with_fingerprint_name(t.fingerprint.name());
-            if !t.alpn.is_empty() {
+            if matches!(
+                stream.transport,
+                Transport::WebSocket(_) | Transport::HttpUpgrade(_)
+            ) {
+                // These upgrade an HTTP/1.1 request, so HTTP/1.1 is the only
+                // protocol to offer: a server that is offered `h2` picks it
+                // and answers the upgrade in HTTP/2 frames, which this
+                // client cannot read (Cloudflare does exactly that). Panels
+                // write `h2,http/1.1` anyway; Xray drops the `h2` here too.
+                let kept: Vec<String> = t
+                    .alpn
+                    .iter()
+                    .filter(|a| &***a != "h2")
+                    .map(|a| a.to_string())
+                    .collect();
+                p = if kept.is_empty() {
+                    p.with_alpn(&["http/1.1"])
+                } else {
+                    p.with_alpn(&kept)
+                };
+            } else if !t.alpn.is_empty() {
                 p = p.with_alpn(&t.alpn.iter().map(|a| a.to_string()).collect::<Vec<_>>());
             } else if matches!(stream.transport, Transport::Grpc(_)) {
                 p = p.with_alpn(&["h2"]);
@@ -690,11 +756,17 @@ async fn connect_resolved(
             Failure::new(FailureKind::LocalPolicy, Stage::TlsStarted)
                 .with_detail("Hysteria2 requires ordinary certificate TLS")
         })?;
-        return zero_transport::hysteria2::connect(&addrs, &tls, &hysteria.password, destination)
-            .await
-            .map_err(|error| {
-                Failure::new(FailureKind::ProtocolRejected, Stage::RequestSent).with_detail(error)
-            });
+        return zero_transport::hysteria2::connect(
+            &addrs,
+            &tls,
+            &hysteria.password,
+            hysteria.obfs_password.as_deref(),
+            destination,
+        )
+        .await
+        .map_err(|error| {
+            Failure::new(FailureKind::ProtocolRejected, Stage::RequestSent).with_detail(error)
+        });
     }
     if let OutboundProtocol::Tuic(tuic) = &outbound.protocol {
         let fallback_host = address.host_string();
@@ -807,9 +879,21 @@ async fn connect_resolved(
     Ok(out)
 }
 
+/// The name Cloudflare serves its one shared ECH list under. Every site on
+/// Cloudflare accepts a hello encrypted to it, so it stands in for a site
+/// whose own HTTPS record has none (a Worker's custom domain, a name whose
+/// zone has ECH switched off in the listing but not at the edge).
+const SHARED_ECH_NAME: &str = "cloudflare-ech.com";
+
 /// The outbound with its ECH configuration list filled in, borrowed unchanged
 /// when there is nothing to discover (every connection that does not use
 /// ECH discovery, i.e. almost all of them, avoids a deep clone).
+///
+/// The list is looked up under the name the config gives (`query_name`), else
+/// the TLS server name, and then under [`SHARED_ECH_NAME`]. The fallback
+/// cannot downgrade anything: a server that is not Cloudflare ignores a hello
+/// encrypted to Cloudflare's key, and ECH is mandatory once it is on, so the
+/// handshake fails instead of going out in the clear.
 async fn materialize_ech<'a>(
     outbound: &'a Outbound,
     resolver: &zero_dns::Resolver,
@@ -826,19 +910,30 @@ async fn materialize_ech<'a>(
     }
     let public_name = match &outbound.stream.security {
         Security::Tls(tls) => tls
-            .server_name
-            .as_deref()
+            .ech
+            .as_ref()
+            .and_then(|ech| ech.query_name.as_deref())
+            .or(tls.server_name.as_deref())
             .unwrap_or(fallback_host)
             .to_string(),
         _ => unreachable!("ECH discovery requires certificate TLS"),
     };
-    let config_list = resolver
-        .lookup_ech_config_list(&public_name, resolver.settings().query_strategy)
-        .await
-        .map_err(|error| {
-            Failure::new(FailureKind::DnsNoData, Stage::Resolving)
-                .with_detail(format!("ECH discovery for {public_name}: {error}"))
-        })?;
+    let strategy = resolver.settings().query_strategy;
+    let mut found = resolver
+        .lookup_ech_config_list(&public_name, strategy)
+        .await;
+    if found.is_err() && !public_name.eq_ignore_ascii_case(SHARED_ECH_NAME) {
+        if let Ok(list) = resolver
+            .lookup_ech_config_list(SHARED_ECH_NAME, strategy)
+            .await
+        {
+            found = Ok(list);
+        }
+    }
+    let config_list = found.map_err(|error| {
+        Failure::new(FailureKind::DnsNoData, Stage::Resolving)
+            .with_detail(format!("ECH discovery for {public_name}: {error}"))
+    })?;
     let mut compiled = outbound.clone();
     if let Security::Tls(tls) = &mut compiled.stream.security {
         if let Some(ech) = &mut tls.ech {
@@ -1081,8 +1176,11 @@ async fn protect_socket(
     // decoy asked to expire by TTL, which is a way of its own that auto mode
     // tests separately; a raw packet in its place would test something else.
     let wants_decoy = |config: &&zero_config::SniDesyncConfig| {
-        config.method != zero_config::SniMethod::Urgent
-            && config.fooling != zero_config::DecoyFooling::Ttl
+        !matches!(
+            config.method,
+            zero_config::SniMethod::Urgent | zero_config::SniMethod::FastOpen
+        ) && config.fooling != zero_config::DecoyFooling::Ttl
+            && !zero_net::fastopen::deferred(&tcp)
     };
     if let Some(config) = stream.evasion.sni_desync.as_ref().filter(wants_decoy) {
         let config = zero_evasion::SniDesyncConfig {
@@ -2274,8 +2372,41 @@ pub async fn connect_direct(
     if let Some(proxy) = env_proxy_for(&destination.address.host_string()) {
         return dial_via_env_proxy(proxy, destination, stream).await;
     }
+    let addrs = google_fronts_first(addrs, destination, stream).await;
     let dialed = dial_tcp(&addrs, &race_policy(stream), &socket_options(stream)).await?;
     Ok(shaped(dialed.stream, stream, false))
+}
+
+/// For a direct connection that hides its name and goes to a Google-hosted
+/// site, the front ends known to answer (`crate::google_front`) go ahead of
+/// the addresses DNS gave, which may be the blocked ones. Anything else is
+/// left as resolved.
+async fn google_fronts_first(
+    addrs: Vec<SocketAddr>,
+    destination: &Destination,
+    stream: &StreamSettings,
+) -> Vec<SocketAddr> {
+    let Address::Domain(host) = &destination.address else {
+        return addrs;
+    };
+    if stream.evasion.sni_desync.is_none()
+        || destination.port != 443
+        || !crate::google_front::hosted(host)
+    {
+        return addrs;
+    }
+    let mut ordered: Vec<SocketAddr> = crate::google_front::reachable()
+        .await
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, destination.port))
+        .collect();
+    let rest: Vec<_> = addrs
+        .into_iter()
+        .filter(|addr| !ordered.contains(addr))
+        .collect();
+    tracing::debug!(%host, fronts = ordered.len(), "Google front ends go first");
+    ordered.extend(rest);
+    ordered
 }
 
 /// Direct connection using the compiled, leak-aware DNS resolver.
@@ -2305,6 +2436,7 @@ pub async fn connect_direct_with_resolver(
     if let Some(proxy) = env_proxy_for(&destination.address.host_string()) {
         return dial_via_env_proxy(proxy, destination, stream).await;
     }
+    let addrs = google_fronts_first(addrs, destination, stream).await;
     let dialed = dial_tcp(&addrs, &race_policy(stream), &socket_options(stream)).await?;
     Ok(shaped(dialed.stream, stream, false))
 }
@@ -2609,6 +2741,40 @@ mod tests {
     }
 
     #[test]
+    fn websocket_never_offers_h2() {
+        use zero_config::{TlsConfig, WebSocketConfig};
+        let alpn_of = |alpn: &[&str], transport: Transport| {
+            let s = StreamSettings {
+                transport,
+                security: Security::Tls(TlsConfig {
+                    alpn: alpn.iter().map(|a| Box::from(*a)).collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            tls_params(&s, "host.example").unwrap().alpn
+        };
+        let h1 = vec![b"http/1.1".to_vec()];
+        let ws = || Transport::WebSocket(WebSocketConfig::default());
+        // What a BPB panel writes, and what a link without a list means.
+        assert_eq!(alpn_of(&["h2", "http/1.1"], ws()), h1);
+        assert_eq!(alpn_of(&[], ws()), h1);
+        assert_eq!(alpn_of(&["h2"], ws()), h1);
+        assert_eq!(
+            alpn_of(
+                &["h2", "http/1.1"],
+                Transport::HttpUpgrade(WebSocketConfig::default())
+            ),
+            h1
+        );
+        // Carriers that speak HTTP/2 keep what they were given.
+        assert_eq!(
+            alpn_of(&["h2", "http/1.1"], Transport::Raw),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    #[test]
     fn unresolved_ech_never_downgrades_to_plain_tls() {
         use zero_config::{EchConfig, TlsConfig};
         let s = StreamSettings {
@@ -2616,6 +2782,7 @@ mod tests {
                 ech: Some(EchConfig {
                     config_list: Box::new([]),
                     server_name: Some("inner.example".into()),
+                    query_name: None,
                 }),
                 ..Default::default()
             }),

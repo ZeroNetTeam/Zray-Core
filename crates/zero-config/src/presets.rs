@@ -345,6 +345,11 @@ pub struct IranPreset {
     /// …). `None` keeps the built-in `remote_dns`.
     pub custom_remote_dns: Option<String>,
     pub local_dns: LocalDns,
+    /// A resolver of the user's own for domestic names, replacing
+    /// [`Self::local_dns`] when it parses (a bare IP, or an IP-addressed
+    /// `tls://` / `https://` URL: it is asked directly, so a name could not
+    /// be looked up first).
+    pub custom_local_dns: Option<String>,
     pub anti_sanction_dns: AntiSanctionDns,
     pub custom_anti_sanction_dns: Option<String>,
     pub block_ads: bool,
@@ -512,6 +517,7 @@ impl Default for IranPreset {
             remote_dns: RemoteDns::Auto,
             custom_remote_dns: None,
             local_dns: LocalDns::Google,
+            custom_local_dns: None,
             anti_sanction_dns: AntiSanctionDns::Auto,
             custom_anti_sanction_dns: None,
             block_ads: true,
@@ -694,8 +700,14 @@ impl IranPreset {
         // Tier 2 — domestic names, resolved directly. `expectIPs` rejects an
         // answer outside Iran, which is what a poisoned or hijacked response
         // to a domestic name looks like.
+        let custom_local = self
+            .custom_local_dns
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .filter(|value| crate::dns::ResolverEndpoint::parse(value).is_some());
         servers.push(json!({
-            "address": self.local_dns.server(),
+            "address": custom_local.unwrap_or(self.local_dns.server()),
             "domains": IRAN_DIRECT_DOMAINS,
             "expectIPs": ["geoip:ir"],
             "tag": LOCAL_TAG,

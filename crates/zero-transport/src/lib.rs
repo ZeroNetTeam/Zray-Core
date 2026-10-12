@@ -12,6 +12,7 @@ pub mod juicity;
 pub mod masque;
 pub mod quic_pool;
 mod relay;
+pub mod salamander;
 pub mod shadowtls;
 pub mod tcp_header;
 pub mod tide;

@@ -6,6 +6,7 @@
 pub mod api;
 pub mod cdn_check;
 mod dns_out;
+mod google_front;
 mod masterdns;
 pub mod outbound;
 pub mod quic_sniff;

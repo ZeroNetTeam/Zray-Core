@@ -66,6 +66,9 @@ pub struct Pooled {
     /// with none, like the platform's network callback) the socket would
     /// belong to that one and die with it.
     runtime: tokio::runtime::Handle,
+    /// The Salamander password the endpoint's socket obfuscates with, so a
+    /// rebind onto a new network keeps obfuscating.
+    obfs: Option<crate::salamander::Salamander>,
     v6: bool,
     last_used: AtomicU64,
     /// Streams currently open on the connection.
@@ -75,12 +78,18 @@ pub struct Pooled {
 }
 
 impl Pooled {
-    fn new(endpoint: Endpoint, connection: Connection) -> Self {
+    fn new(dialed: Dialed) -> Self {
+        let Dialed {
+            endpoint,
+            connection,
+            obfs,
+        } = dialed;
         let v6 = connection.remote_address().is_ipv6();
         Self {
             endpoint,
             connection,
             runtime: tokio::runtime::Handle::current(),
+            obfs,
             v6,
             last_used: AtomicU64::new(now_ms()),
             active: AtomicUsize::new(0),
@@ -179,12 +188,43 @@ pub fn key(
     format!("{protocol}|{}|{:016x}", sorted.join(","), hasher.finish())
 }
 
+/// What a dial returns: the connection, the endpoint that owns its socket,
+/// and the Salamander password that socket obfuscates with, if any.
+pub struct Dialed {
+    endpoint: Endpoint,
+    connection: Connection,
+    obfs: Option<crate::salamander::Salamander>,
+}
+
+impl From<(Endpoint, Connection)> for Dialed {
+    fn from((endpoint, connection): (Endpoint, Connection)) -> Self {
+        Self {
+            endpoint,
+            connection,
+            obfs: None,
+        }
+    }
+}
+
+impl From<(Endpoint, Connection, Option<crate::salamander::Salamander>)> for Dialed {
+    fn from(
+        (endpoint, connection, obfs): (Endpoint, Connection, Option<crate::salamander::Salamander>),
+    ) -> Self {
+        Self {
+            endpoint,
+            connection,
+            obfs,
+        }
+    }
+}
+
 /// The live connection for `key`, or a new one from `connect` (which must
 /// return it authenticated). Callers asking at the same time share one dial.
-pub async fn get<F, Fut>(key: &str, connect: F) -> Result<Arc<Pooled>, String>
+pub async fn get<F, Fut, D>(key: &str, connect: F) -> Result<Arc<Pooled>, String>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<(Endpoint, Connection), String>>,
+    Fut: std::future::Future<Output = Result<D, String>>,
+    D: Into<Dialed>,
 {
     let slot = lock(&POOL).entry(key.to_string()).or_default().clone();
     let mut held = slot.lock().await;
@@ -194,8 +234,8 @@ where
             return Ok(Arc::clone(pooled));
         }
     }
-    let (endpoint, connection) = connect().await?;
-    let pooled = Arc::new(Pooled::new(endpoint, connection));
+    let dialed = connect().await?.into();
+    let pooled = Arc::new(Pooled::new(dialed));
     *held = Some(Arc::clone(&pooled));
     tokio::spawn(reap(key.to_string(), Arc::downgrade(&pooled)));
     Ok(pooled)
@@ -270,9 +310,14 @@ fn rebind_slots(slots: &[Slot]) -> usize {
             (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
         };
         let _runtime = pooled.runtime.enter();
-        match zero_core::platform::bind_protected_udp(bind)
-            .and_then(|socket| pooled.endpoint.rebind(socket))
-        {
+        let rebound =
+            zero_core::platform::bind_protected_udp(bind).and_then(|socket| match &pooled.obfs {
+                Some(obfs) => pooled
+                    .endpoint
+                    .rebind_abstract(crate::relay::obfuscated_socket(socket, obfs)?),
+                None => pooled.endpoint.rebind(socket),
+            });
+        match rebound {
             Ok(()) => moved += 1,
             Err(error) => {
                 tracing::debug!(%error, "QUIC migration: could not rebind; the connection will be re-dialled");

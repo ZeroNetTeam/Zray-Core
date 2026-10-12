@@ -167,6 +167,23 @@ pub async fn real_delay(
 /// Host of the TLS confirmation request.
 pub const TLS_CONFIRM_HOST: &str = "www.gstatic.com";
 
+/// Host of the TLS confirmation for a direct profile. A direct connection
+/// reaches `www.gstatic.com` with or without fragmentation, so confirming
+/// there would call every direct profile alive. A name the filter reads out
+/// of the hello is what the fragmentation is for.
+pub const DIRECT_CONFIRM_HOST: &str = "www.youtube.com";
+
+fn confirm_host(outbound: &zero_config::Outbound) -> &'static str {
+    if matches!(
+        outbound.protocol,
+        zero_config::OutboundProtocol::Freedom { .. }
+    ) {
+        DIRECT_CONFIRM_HOST
+    } else {
+        TLS_CONFIRM_HOST
+    }
+}
+
 /// A verified HTTPS request through `outbound` to
 /// `https://www.gstatic.com/generate_204`, timed to the status line.
 ///
@@ -182,20 +199,21 @@ pub async fn tls_confirm(
     timeout: Duration,
 ) -> Result<Duration, String> {
     let started = Instant::now();
+    let host = confirm_host(outbound);
     let attempt = async {
-        let destination = Destination::tcp(Address::parse_host(TLS_CONFIRM_HOST), 443);
+        let destination = Destination::tcp(Address::parse_host(host), 443);
         let stream = zero_runtime::outbound::connect(outbound, &destination)
             .await
             .map_err(|failure| format!("connect: {failure}"))?;
         let stream = zero_runtime::outbound::strip_response(outbound, stream);
-        let server_name = rustls_pki_types::ServerName::try_from(TLS_CONFIRM_HOST.to_string())
+        let server_name = rustls_pki_types::ServerName::try_from(host.to_string())
             .map_err(|error| format!("tls: {error}"))?;
         let mut tls = tokio_rustls::TlsConnector::from(tls_config())
             .connect(server_name, stream)
             .await
             .map_err(|error| format!("tls: {error}"))?;
         let request = format!(
-            "GET /generate_204 HTTP/1.1\r\nHost: {TLS_CONFIRM_HOST}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+            "GET /generate_204 HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
         );
         tls.write_all(request.as_bytes())
             .await
@@ -278,18 +296,22 @@ fn alternate_target(target: &ProbeTarget) -> ProbeTarget {
 /// The real test of one server, as the finder and the "test" buttons run it:
 /// the server as its link describes it, and when that dies in the handshake
 /// on a server that does answer, again with its name hidden from the filter
-/// (an urgent byte in the name, then a decoy ClientHello).
+/// (an urgent byte in the name, then a decoy ClientHello, then ECH).
 ///
-/// Why the second try: where the network filters by server name, every TLS
-/// server with a filtered name fails the plain test, so automatic selection
-/// would never pick one, although the tunnel itself gets it through with a
-/// decoy (auto mode adds that variant, and the planner turns to it after a
-/// failed handshake). A server that only works behind the decoy is alive
-/// here, and its delay is the decoy's, which is what the user will get.
+/// Why the further tries: where the network filters by server name, every
+/// TLS server with a filtered name fails the plain test, so automatic
+/// selection would never pick one, although the tunnel itself gets it through
+/// with a decoy (auto mode adds that variant, and the planner turns to it
+/// after a failed handshake). A server that only works behind the decoy is
+/// alive here, and its delay is the decoy's, which is what the user will get.
+/// ECH is the way for a Cloudflare Worker whose name is read however the hello
+/// is cut up: a panel's config that connects and then carries nothing is
+/// exactly that, and without this rung it would be reported dead.
 ///
 /// The further tries are only made when they can help: the device can hide
-/// a name, the link has a name to hide (`sni_spoofable`), and the failure was
-/// a handshake cut off, not an address that does not answer at all.
+/// a name and the link has a name to hide (`sni_spoofable`), or the link is a
+/// CDN one ECH fits (`ech_variant_fits`), and the failure was a handshake cut
+/// off, not an address that does not answer at all.
 pub async fn real_test(
     outbound: &zero_config::Outbound,
     target: &ProbeTarget,
@@ -300,40 +322,91 @@ pub async fn real_test(
     let Err(error) = &plain else {
         return plain;
     };
-    if outbound.stream.evasion.sni_desync.is_some()
-        || !crate::config::sni_spoofable(outbound)
-        || !zero_evasion::decoy::any_available()
-        || !cut_off_in_the_handshake(outbound, error).await
-    {
+    // A link that carries its own fragmentation (`fm=`) is tried as written
+    // first, and without it when that fails: where fragmenting is what the
+    // network cuts, the server is still alive without it.
+    let fragmented = outbound.stream.evasion.tcp_fragment.is_some()
+        && !matches!(
+            outbound.protocol,
+            zero_config::OutboundProtocol::Freedom { .. }
+        );
+    if fragmented {
+        let mut unfragmented = outbound.clone();
+        unfragmented.stream.evasion.tcp_fragment = None;
+        unfragmented.stream.evasion.tcp_fragment_under = None;
+        if let Ok(delay) = Box::pin(real_test(&unfragmented, target, timeout, confirm)).await {
+            return Ok(delay);
+        }
+        return plain;
+    }
+    let can_hide = outbound.stream.evasion.sni_desync.is_none()
+        && crate::config::sni_spoofable(outbound)
+        && (zero_evasion::decoy::any_available() || zero_net::fastopen::supported());
+    let can_ech = crate::config::ech_variant_fits(outbound)
+        && outbound.stream.evasion.tcp_fragment.is_none()
+        && outbound.stream.evasion.sni_desync.is_none();
+    let can_move = crate::config::alt_port_fits(outbound);
+    if !(can_hide || can_ech || can_move) || !cut_off_in_the_handshake(outbound, error).await {
         return plain;
     }
     // The urgent byte first (it costs nothing), then the decoy where this
-    // device can send one. Every failure is reported when none gets through:
-    // the later ones say how far the server got once its name was out of the
-    // filter's sight.
+    // device can send one, then ECH (a lookup, and a name a filter may know).
+    // Every failure is reported when none gets through: the later ones say
+    // how far the server got once its name was out of the filter's sight.
     let mut failures = error.clone();
-    let ways = [
-        (
-            zero_evasion::urgent::supported(),
-            zero_config::SniDesyncConfig::urgent(),
-            "with the name hidden",
-        ),
-        (
-            zero_evasion::decoy::available(),
-            zero_config::SniDesyncConfig {
-                fake_sni: crate::config::SPOOF_DECOY_SNI.into(),
-                ..zero_config::SniDesyncConfig::decoy()
-            },
-            "behind a decoy",
-        ),
-    ];
-    for (possible, way, label) in ways {
-        if !possible {
-            continue;
+    let mut ways: Vec<(zero_config::Outbound, &str)> = Vec::new();
+    if can_hide {
+        let hidden = |way| {
+            let mut hidden = outbound.clone();
+            hidden.stream.evasion.sni_desync = Some(way);
+            hidden
+        };
+        if zero_evasion::urgent::supported() {
+            ways.push((
+                hidden(zero_config::SniDesyncConfig::urgent()),
+                "with the name hidden",
+            ));
         }
-        let mut hidden = outbound.clone();
-        hidden.stream.evasion.sni_desync = Some(way);
-        match real_test_as_is(&hidden, target, timeout, confirm).await {
+        if zero_net::fastopen::supported()
+            && outbound
+                .endpoint()
+                .is_some_and(|(_, port)| zero_net::fastopen::client_first_port(port))
+        {
+            ways.push((
+                hidden(zero_config::SniDesyncConfig::fast_open()),
+                "with the hello in the SYN",
+            ));
+        }
+        if zero_evasion::decoy::available() {
+            ways.push((
+                hidden(zero_config::SniDesyncConfig {
+                    fake_sni: crate::config::SPOOF_DECOY_SNI.into(),
+                    ..zero_config::SniDesyncConfig::decoy()
+                }),
+                "behind a decoy",
+            ));
+        }
+    }
+    if can_ech {
+        let mut sealed = outbound.clone();
+        if let zero_config::Security::Tls(tls) = &mut sealed.stream.security {
+            tls.ech = Some(zero_config::EchConfig {
+                config_list: Box::default(),
+                server_name: None,
+                query_name: None,
+            });
+        }
+        ways.push((sealed, "with ECH"));
+    }
+    if can_move {
+        for port in crate::config::ALT_PORTS {
+            let mut moved = outbound.clone();
+            moved.set_port(port);
+            ways.push((moved, "on another port"));
+        }
+    }
+    for (attempt, label) in ways {
+        match real_test_as_is(&attempt, target, timeout, confirm).await {
             Ok(delay) => return Ok(delay),
             Err(second) => failures = format!("{failures}; {label}: {second}"),
         }

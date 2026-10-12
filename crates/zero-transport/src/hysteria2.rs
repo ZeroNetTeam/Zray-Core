@@ -145,9 +145,21 @@ async fn pooled(
     addrs: &[SocketAddr],
     tls: &zero_security::TlsParams,
     password: &str,
+    obfs: Option<&str>,
 ) -> Result<(String, std::sync::Arc<crate::quic_pool::Pooled>), String> {
-    let key = crate::quic_pool::key("hysteria2", addrs, tls, password.as_bytes());
-    let pooled = crate::quic_pool::get(&key, || connect_resumed(addrs, tls, password)).await?;
+    // A wrong or missing obfuscation password is a different server as far
+    // as a connection goes, so it is part of the key.
+    let mut secret = password.as_bytes().to_vec();
+    if let Some(obfs) = obfs {
+        secret.extend_from_slice(b"\0salamander\0");
+        secret.extend_from_slice(obfs.as_bytes());
+    }
+    let salamander = obfs.map(crate::salamander::Salamander::new).transpose()?;
+    let key = crate::quic_pool::key("hysteria2", addrs, tls, &secret);
+    let pooled = crate::quic_pool::get(&key, || {
+        connect_resumed(addrs, tls, password, salamander.as_ref())
+    })
+    .await?;
     Ok((key, pooled))
 }
 
@@ -160,14 +172,23 @@ async fn connect_resumed(
     addrs: &[SocketAddr],
     tls: &zero_security::TlsParams,
     password: &str,
-) -> Result<(h3_quinn::quinn::Endpoint, h3_quinn::quinn::Connection), String> {
-    match connect_authenticated_with(addrs, tls, password, true).await {
+    obfs: Option<&crate::salamander::Salamander>,
+) -> Result<
+    (
+        h3_quinn::quinn::Endpoint,
+        h3_quinn::quinn::Connection,
+        Option<crate::salamander::Salamander>,
+    ),
+    String,
+> {
+    let dialed = match connect_authenticated_with(addrs, tls, password, obfs, true).await {
         Err(error) if error.contains(ZERO_RTT_REJECTED) => {
             tracing::debug!(%error, "Hysteria2 0-RTT rejected; reconnecting in 1-RTT");
-            connect_authenticated_with(addrs, tls, password, false).await
+            connect_authenticated_with(addrs, tls, password, obfs, false).await
         }
         other => other,
-    }
+    }?;
+    Ok((dialed.0, dialed.1, obfs.cloned()))
 }
 
 /// Marker in the error of an attempt whose early data the server refused.
@@ -185,6 +206,7 @@ async fn connect_authenticated_with(
     addrs: &[SocketAddr],
     tls: &zero_security::TlsParams,
     password: &str,
+    obfs: Option<&crate::salamander::Salamander>,
     early: bool,
 ) -> Result<(h3_quinn::quinn::Endpoint, h3_quinn::quinn::Connection), String> {
     if addrs.is_empty() {
@@ -210,8 +232,11 @@ async fn connect_authenticated_with(
     } else {
         (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
     };
-    let mut endpoint = crate::relay::protected_client_endpoint(bind)
-        .map_err(|error| format!("Hysteria2 endpoint: {error}"))?;
+    let mut endpoint = match obfs {
+        Some(obfs) => crate::relay::protected_obfuscated_client_endpoint(bind, obfs),
+        None => crate::relay::protected_client_endpoint(bind),
+    }
+    .map_err(|error| format!("Hysteria2 endpoint: {error}"))?;
     endpoint.set_default_client_config(client_config);
     let mut last_error = None;
     let mut connection = None;
@@ -335,13 +360,14 @@ pub async fn exchange_udp(
     addrs: &[SocketAddr],
     tls: &zero_security::TlsParams,
     password: &str,
+    obfs: Option<&str>,
     destination: &Destination,
     payload: &[u8],
 ) -> Result<(Destination, Vec<u8>), String> {
     let mut last = String::new();
     // Once more on a fresh connection if the pooled one turns out dead.
     for attempt in 0..2 {
-        let (key, pooled) = pooled(addrs, tls, password).await?;
+        let (key, pooled) = pooled(addrs, tls, password, obfs).await?;
         match exchange_on(&pooled, destination, payload).await {
             Ok(response) => return Ok(response),
             Err((error, retry)) => {
@@ -414,6 +440,7 @@ pub async fn connect(
     addrs: &[SocketAddr],
     tls: &zero_security::TlsParams,
     password: &str,
+    obfs: Option<&str>,
     destination: &Destination,
 ) -> Result<BoxStream, String> {
     if destination.network != zero_core::Network::Tcp {
@@ -426,7 +453,7 @@ pub async fn connect(
     // the pooled one has died since it was last used.
     let mut opened = None;
     for attempt in 0..2 {
-        let (key, pooled) = pooled(addrs, tls, password).await?;
+        let (key, pooled) = pooled(addrs, tls, password, obfs).await?;
         match pooled.connection.open_bi().await {
             Ok(pair) => {
                 opened = Some((pooled.stream_guard(), pair));

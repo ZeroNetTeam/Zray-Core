@@ -157,6 +157,7 @@ fn parse_link_inner(link: &str) -> Result<ShareLink, String> {
         "juicity" => parse_juicity(rest),
         "wireguard" | "wg" => parse_wireguard(rest),
         "warp" => parse_warp_link(rest),
+        "direct" => parse_direct(rest),
         _ => Err(format!("unsupported share link scheme {scheme:?}")),
     }
 }
@@ -724,11 +725,61 @@ fn parse_tide(rest: &str) -> Result<ShareLink, String> {
     })
 }
 
+/// `direct://?hide=auto#name` or `direct://?fm=<finalmask JSON>#name`: no
+/// server. Connections leave this device directly, with the server name in
+/// the TLS hello kept from the filter (`hide=`: `auto`, `urgent`, `tfo` or `decoy`,
+/// see [`SniMethod`]) and/or the hello cut up as `fm` says (BPB's
+/// "Serverless" / "WorkerLess"). It helps where the filter reads the name out
+/// of the hello and the address itself is not blocked; with neither it would
+/// be a plain direct connection, which is refused as pointless.
+fn parse_direct(rest: &str) -> Result<ShareLink, String> {
+    let rest = rest.trim_start_matches('/');
+    let (body, remark) = rest.split_once('#').unwrap_or((rest, ""));
+    let query = parse_query(body.strip_prefix('?').unwrap_or(body));
+    let mut evasion = query
+        .get("fm")
+        .and_then(|text| crate::xray_json::fragment_from_finalmask(text))
+        .unwrap_or_default();
+    evasion.sni_desync = match query
+        .get("hide")
+        .map(|hide| hide.to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("") | Some("none") => None,
+        Some("auto") => Some(SniDesyncConfig::default()),
+        Some("urgent") => Some(SniDesyncConfig::urgent()),
+        Some("tfo" | "fastopen") => Some(SniDesyncConfig::fast_open()),
+        Some("decoy") => Some(SniDesyncConfig::decoy()),
+        Some(other) => return Err(format!("unknown direct hide mode {other:?}")),
+    };
+    if evasion.is_empty() {
+        return Err("a direct link needs hide= (auto, urgent, tfo, decoy) or fm= (the fragment settings as finalmask JSON)".into());
+    }
+    let outbound = Outbound {
+        tag: Arc::from("proxy"),
+        protocol: OutboundProtocol::Freedom {
+            domain_strategy: DomainStrategy::UseIp,
+        },
+        stream: StreamSettings {
+            evasion,
+            ..StreamSettings::default()
+        },
+        mux: MuxConfig::default(),
+    };
+    outbound.validate()?;
+    Ok(ShareLink {
+        link: String::new(),
+        remark: decode(remark),
+        outbound,
+    })
+}
+
 fn parse_hysteria2(rest: &str) -> Result<ShareLink, String> {
     let p = split_link(rest)?;
     if p.credential.is_empty() {
         return Err("Hysteria2 link has an empty password".into());
     }
+    let obfs_password = hysteria2_obfs(&p.query)?;
     let mut stream = build_stream(&p.query, p.host)?;
     if matches!(stream.security, Security::None) {
         let fingerprint = Fingerprint::parse(p.query.get("fp").map(String::as_str).unwrap_or(""))
@@ -739,7 +790,7 @@ fn parse_hysteria2(rest: &str) -> Result<ShareLink, String> {
             )),
             alpn: vec![Box::from("h3")],
             fingerprint,
-            allow_insecure: false,
+            allow_insecure: link_insecure(&p.query),
             ech: None,
             trusted_roots: Vec::new(),
         });
@@ -750,6 +801,7 @@ fn parse_hysteria2(rest: &str) -> Result<ShareLink, String> {
             address: Address::parse_host(p.host),
             port: p.port,
             password: p.credential.into(),
+            obfs_password,
         }),
         stream,
         mux: MuxConfig::default(),
@@ -782,7 +834,7 @@ fn parse_tuic(rest: &str) -> Result<ShareLink, String> {
             )),
             alpn: vec![Box::from("h3")],
             fingerprint,
-            allow_insecure: false,
+            allow_insecure: link_insecure(&p.query),
             ech: None,
             trusted_roots: Vec::new(),
         });
@@ -813,9 +865,7 @@ fn parse_tuic(rest: &str) -> Result<ShareLink, String> {
 /// `congestion_control` hint is accepted and ignored (the QUIC stack picks the
 /// controller), and `pinned_certchain_sha256` is accepted and ignored because
 /// this client verifies the ordinary certificate chain rather than a pinned
-/// hash. `allow_insecure` is not honoured: the model refuses to disable
-/// certificate verification for any outbound, so a Juicity server must present
-/// a chain this client can verify.
+/// hash. `allow_insecure=1` is honoured like on every other TLS carrier.
 fn parse_juicity(rest: &str) -> Result<ShareLink, String> {
     let p = split_link(rest)?;
     let (uuid_text, password) = p
@@ -836,7 +886,7 @@ fn parse_juicity(rest: &str) -> Result<ShareLink, String> {
             )),
             alpn: vec![Box::from("h3")],
             fingerprint,
-            allow_insecure: false,
+            allow_insecure: link_insecure(&p.query),
             ech: None,
             trusted_roots: Vec::new(),
         });
@@ -974,15 +1024,15 @@ fn build_stream(q: &BTreeMap<String, String>, host: &str) -> Result<StreamSettin
 
     let transport = match network.as_str() {
         "" | "tcp" | "raw" => Transport::Raw,
-        "ws" => Transport::WebSocket(build_ws(q, host)),
-        "httpupgrade" => Transport::HttpUpgrade(build_ws(q, host)),
+        "ws" => Transport::WebSocket(build_ws(q)),
+        "httpupgrade" => Transport::HttpUpgrade(build_ws(q)),
         "grpc" => {
             // Query keys are lower-cased by `parse_query`, so the link's
             // `serviceName` arrives as `servicename`. The path is built the
             // way the Xray JSON parser builds it (`/<service>/Tun`); a bare
             // `/<service>` is rejected by every real gRPC server.
             let service = q.get("servicename").map(String::as_str).unwrap_or("");
-            let mut config = build_ws(q, host);
+            let mut config = build_ws(q);
             config.path = Arc::from(crate::xray_json::grpc_path(service));
             if let Some(authority) = q.get("authority").filter(|value| !value.is_empty()) {
                 config.host = Some(Arc::from(authority.as_str()));
@@ -990,16 +1040,29 @@ fn build_stream(q: &BTreeMap<String, String>, host: &str) -> Result<StreamSettin
             Transport::Grpc(config)
         }
         "xhttp" | "splithttp" => {
-            let mut config = build_ws(q, host);
+            let mut config = build_ws(q);
             config.xhttp_mode = XhttpMode::parse(get("mode"))
                 .ok_or_else(|| format!("unsupported xhttp mode {:?}", get("mode")))?;
             // `extra` is the rest of Xray's `xhttpSettings` as JSON: padding
             // and placement settings, headers, and `downloadSettings`.
-            if let Some(extra) = q.get("extra").filter(|extra| !extra.trim().is_empty()) {
-                let extra = match serde_json::from_str::<serde_json::Value>(extra) {
-                    Ok(serde_json::Value::Object(extra)) => extra,
+            //
+            // The sing-box family writes the padding range as its own
+            // `x_padding_bytes=100-1000` instead; it counts for a link whose
+            // `extra` does not set it.
+            let mut extra = match q.get("extra").filter(|extra| !extra.trim().is_empty()) {
+                None => None,
+                Some(extra) => match serde_json::from_str::<serde_json::Value>(extra) {
+                    Ok(serde_json::Value::Object(extra)) => Some(extra),
                     _ => return Err("xhttp extra is not a JSON object".into()),
-                };
+                },
+            };
+            if let Some(range) = q.get("x_padding_bytes").filter(|range| !range.is_empty()) {
+                extra
+                    .get_or_insert_with(Default::default)
+                    .entry("xPaddingBytes")
+                    .or_insert_with(|| range.as_str().into());
+            }
+            if let Some(extra) = extra {
                 if let Some(headers) = extra.get("headers").and_then(|h| h.as_object()) {
                     for (name, value) in headers {
                         if let Some(value) = value.as_str() {
@@ -1044,8 +1107,8 @@ fn build_stream(q: &BTreeMap<String, String>, host: &str) -> Result<StreamSettin
                 server_name: sni,
                 alpn: parse_alpn(get("alpn")),
                 fingerprint,
-                allow_insecure: matches!(get("allowinsecure"), "1" | "true"),
-                ech: None,
+                allow_insecure: link_insecure(q),
+                ech: link_ech(q),
                 trusted_roots: Vec::new(),
             })
         }
@@ -1073,6 +1136,7 @@ fn build_stream(q: &BTreeMap<String, String>, host: &str) -> Result<StreamSettin
     };
 
     let mut transport = transport;
+    crate::xray_json::host_from_server_name(&mut transport, &security);
     if let Transport::Xhttp(config) = &mut transport {
         // Same rule as the Xray JSON parser (Xray's `decideHTTPVersion`).
         let alpn: Vec<&str> = match &security {
@@ -1093,22 +1157,83 @@ fn build_stream(q: &BTreeMap<String, String>, host: &str) -> Result<StreamSettin
         }
     }
 
+    // The fragmentation the link's author found to work, for certificate TLS
+    // that does not hide its name already (a hello cannot be both).
+    let evasion = match &security {
+        Security::Tls(tls) if tls.ech.is_none() => get_fm(q),
+        _ => Evasion::default(),
+    };
+
     Ok(StreamSettings {
         transport,
         security,
         sockopt: Sockopt::default(),
-        evasion: Evasion::default(),
+        evasion,
         raw_http_header: None,
     })
 }
 
-fn build_ws(q: &BTreeMap<String, String>, host: &str) -> WebSocketConfig {
+/// The `fm=` of a link as evasion, empty when there is none or it is not
+/// readable (the link then connects as it did before it was read).
+fn get_fm(q: &BTreeMap<String, String>) -> Evasion {
+    q.get("fm")
+        .and_then(|text| crate::xray_json::fragment_from_finalmask(text))
+        .unwrap_or_default()
+}
+
+/// The `ech=` of a TLS link (v2rayN and NekoBox write the list there, many
+/// feeds write Xray's `cloudflare-ech.com+udp://1.1.1.1` query instead; see
+/// [`crate::xray_json::ech_from_text`]). A value that cannot be read is left
+/// out rather than failing the link: it connected without ECH before this
+/// was read, and the engine can still turn ECH on by itself where it helps.
+/// Whether a link asks to skip certificate checks. The spellings in use:
+/// `allowInsecure=1` (Xray), `insecure=1` (Hysteria 2, panels) and
+/// `allow_insecure=1` (TUIC, Juicity). Keys are lower-cased by `parse_query`.
+fn link_insecure(q: &BTreeMap<String, String>) -> bool {
+    ["allowinsecure", "insecure", "allow_insecure"]
+        .iter()
+        .any(|key| matches!(q.get(*key).map(String::as_str), Some("1" | "true")))
+}
+
+/// The Salamander password of a Hysteria 2 link
+/// (`obfs=salamander&obfs-password=…`), `None` for a link without one. A
+/// type other than Salamander is an error: connecting without obfuscation
+/// to a server that expects some would only look like a dead server.
+fn hysteria2_obfs(q: &BTreeMap<String, String>) -> Result<Option<Box<str>>, String> {
+    let kind = q.get("obfs").map(String::as_str).unwrap_or("");
+    if kind.is_empty() || kind.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    if !kind.eq_ignore_ascii_case("salamander") {
+        return Err(format!("unsupported Hysteria2 obfs type {kind:?}"));
+    }
+    let password = ["obfs-password", "obfs_password", "obfspassword"]
+        .iter()
+        .find_map(|key| q.get(*key))
+        .map(String::as_str)
+        .unwrap_or("");
+    if password.len() < 4 {
+        return Err("the Hysteria2 Salamander password must be at least 4 bytes".into());
+    }
+    Ok(Some(password.into()))
+}
+
+fn link_ech(q: &BTreeMap<String, String>) -> Option<EchConfig> {
+    let text = q.get("ech").or_else(|| q.get("echconfiglist"))?;
+    crate::xray_json::ech_from_text(text, None).ok()
+}
+
+fn build_ws(q: &BTreeMap<String, String>) -> WebSocketConfig {
     let raw_path = q.get("path").map(String::as_str).unwrap_or("/");
     // Xray encodes the early-data budget in the path query as `ed=N`.
     let (path, early_data_len) = extract_early_data(raw_path);
     WebSocketConfig {
         path: Arc::from(path.as_str()),
-        host: Some(Arc::from(q.get("host").map(String::as_str).unwrap_or(host))),
+        // No `host=` leaves it to `host_from_server_name`, then the address.
+        host: q
+            .get("host")
+            .filter(|host| !host.is_empty())
+            .map(|host| Arc::from(host.as_str())),
         headers: BTreeMap::new(),
         early_data_len,
         xhttp_mode: XhttpMode::StreamOne,
@@ -1608,9 +1733,91 @@ mod tests {
     }
 
     #[test]
-    fn rejects_allow_insecure() {
-        let bad = VLESS_WS.replace("&alpn=http%2F1.1", "&alpn=http%2F1.1&allowInsecure=1");
-        assert!(parse_link(&bad).unwrap_err().contains("allowInsecure"));
+    fn allow_insecure_is_kept_when_a_tls_link_asks_for_it() {
+        let insecure_of = |link: &str| {
+            let Security::Tls(tls) = parse_link(link).unwrap().outbound.stream.security else {
+                panic!("expected certificate TLS");
+            };
+            tls.allow_insecure
+        };
+        assert!(!insecure_of(VLESS_WS));
+        for spelling in ["allowInsecure=1", "insecure=1", "allowInsecure=true"] {
+            let link =
+                VLESS_WS.replace("&alpn=http%2F1.1", &format!("&alpn=http%2F1.1&{spelling}"));
+            assert!(insecure_of(&link), "{spelling}");
+        }
+        // `=0` is what panels write for "verify".
+        let link = VLESS_WS.replace(
+            "&alpn=http%2F1.1",
+            "&alpn=http%2F1.1&allowInsecure=0&insecure=0",
+        );
+        assert!(!insecure_of(&link));
+    }
+
+    #[test]
+    fn quic_links_take_insecure_the_same_way() {
+        let insecure_of = |link: &str| {
+            let Security::Tls(tls) = parse_link(link).unwrap().outbound.stream.security else {
+                panic!("expected certificate TLS");
+            };
+            tls.allow_insecure
+        };
+        let uuid = "00000000-0000-0000-0000-000000000001";
+        for (base, key) in [
+            (
+                "hysteria2://secret@example.com:443?sni=a.example",
+                "insecure",
+            ),
+            (
+                &format!("tuic://{uuid}:pw@example.com:443?sni=a.example"),
+                "allow_insecure",
+            ),
+            (
+                &format!("juicity://{uuid}:pw@example.com:443?sni=a.example"),
+                "allow_insecure",
+            ),
+        ] {
+            assert!(!insecure_of(&format!("{base}#a")), "{base}");
+            assert!(insecure_of(&format!("{base}&{key}=1#a")), "{base}");
+            assert!(!insecure_of(&format!("{base}&{key}=0#a")), "{base}");
+            assert!(insecure_of(&format!("{base}&allowInsecure=1#a")), "{base}");
+        }
+    }
+
+    #[test]
+    fn a_hysteria2_link_reads_its_salamander_password() {
+        let obfs_of = |query: &str| {
+            let link = parse_link(&format!("hysteria2://secret@example.com:443/?{query}#h"));
+            link.map(|link| match link.outbound.protocol {
+                OutboundProtocol::Hysteria2(config) => config.obfs_password.map(String::from),
+                _ => panic!("expected Hysteria2"),
+            })
+        };
+        assert_eq!(obfs_of("sni=a.example"), Ok(None));
+        assert_eq!(
+            obfs_of("obfs=salamander&obfs-password=gawrgura"),
+            Ok(Some("gawrgura".into()))
+        );
+        // The type is case-insensitive, `none` is no obfuscation, and the
+        // password may be spelled the other ways in use.
+        assert_eq!(
+            obfs_of("obfs=Salamander&obfs_password=gawrgura"),
+            Ok(Some("gawrgura".into()))
+        );
+        assert_eq!(obfs_of("obfs=none"), Ok(None));
+        // A percent-encoded password is decoded.
+        assert_eq!(
+            obfs_of("obfs=salamander&obfs-password=pass%20word%2B1"),
+            Ok(Some("pass word+1".into()))
+        );
+        // What the server could not use is refused, not connected without.
+        assert!(obfs_of("obfs=salamander").unwrap_err().contains("4 bytes"));
+        assert!(obfs_of("obfs=salamander&obfs-password=abc")
+            .unwrap_err()
+            .contains("4 bytes"));
+        assert!(obfs_of("obfs=gecko&obfs-password=gawrgura")
+            .unwrap_err()
+            .contains("unsupported"));
     }
 
     #[test]
@@ -1727,6 +1934,151 @@ mod tests {
     }
 
     #[test]
+    fn a_websocket_link_with_no_host_sends_the_server_name_as_host() {
+        let host_of = |link: &str| {
+            let Transport::WebSocket(ws) = parse_link(link).unwrap().outbound.stream.transport
+            else {
+                panic!("expected WebSocket");
+            };
+            ws.host.map(|host| host.to_string())
+        };
+        // Reached by IP, named by the SNI: the Worker is the SNI, not the IP.
+        let by_ip = "vless://00000000-0000-0000-0000-000000000002@188.114.96.3:443\
+            ?security=tls&sni=Worker.Example.dev&type=ws&path=%2Fws&encryption=none#a";
+        assert_eq!(host_of(by_ip).as_deref(), Some("Worker.Example.dev"));
+        // An explicit host wins; an empty one is no host.
+        let explicit = by_ip.replace("&type=ws", "&host=real.example.com&type=ws");
+        assert_eq!(host_of(&explicit).as_deref(), Some("real.example.com"));
+        let empty = by_ip.replace("&type=ws", "&host=&type=ws");
+        assert_eq!(host_of(&empty).as_deref(), Some("Worker.Example.dev"));
+        // No TLS name to fall back to: left for the address.
+        let plain = "vless://00000000-0000-0000-0000-000000000002@203.0.113.7:80\
+            ?security=none&type=ws&path=%2Fws&encryption=none#a";
+        assert_eq!(host_of(plain), None);
+    }
+
+    #[test]
+    fn xhttp_padding_can_come_as_its_own_link_parameter() {
+        let padding_of = |query: &str| {
+            let link = parse_link(&format!(
+                "vless://00000000-0000-0000-0000-000000000002@cdn.example.com:443\
+                 ?security=tls&sni=cdn.example.com&type=xhttp&path=%2Fx&mode=packet-up\
+                 &encryption=none{query}#x"
+            ))
+            .unwrap();
+            let Transport::Xhttp(config) = link.outbound.stream.transport else {
+                panic!("expected XHTTP");
+            };
+            config.xhttp.x_padding_bytes
+        };
+        // The sing-box spelling.
+        assert_eq!(padding_of("&x_padding_bytes=100-1000"), (100, 1000));
+        // `extra` says it already, and wins.
+        assert_eq!(
+            padding_of("&x_padding_bytes=100-1000&extra=%7B%22xPaddingBytes%22%3A%2210-20%22%7D"),
+            (10, 20)
+        );
+        // Not a range: refused, as it is inside `extra`.
+        assert!(parse_link(
+            "vless://00000000-0000-0000-0000-000000000002@cdn.example.com:443\
+             ?security=tls&type=xhttp&mode=packet-up&x_padding_bytes=lots#x"
+        )
+        .is_err());
+    }
+
+    const FM: &str = "%7B%22tcp%22%3A%5B%7B%22type%22%3A%22fragment%22%2C%22settings%22%3A%7B%22packets%22%3A%22tlshello%22%2C%22length%22%3A%2210-20%22%2C%22delay%22%3A%221-1%22%7D%7D%5D%7D";
+
+    #[test]
+    fn a_tls_link_keeps_the_fragmentation_it_carries() {
+        let fragment_of = |extra: &str, security: &str| {
+            let link = parse_link(&format!(
+                "vless://00000000-0000-0000-0000-000000000002@188.114.97.6:443\
+                 ?security={security}&sni=x.example.com&type=ws&path=%2Fws&encryption=none{extra}#cdn"
+            ))
+            .unwrap();
+            link.outbound.stream.evasion.tcp_fragment
+        };
+        assert!(fragment_of("", "tls").is_none());
+        let fragment = fragment_of(&format!("&fm={FM}"), "tls").expect("fragmented");
+        assert_eq!((fragment.length.min, fragment.length.max), (10, 20));
+        // Text that is not a finalmask object, or has no fragment in it, is
+        // left out and the link connects as before.
+        assert!(fragment_of("&fm=tlshello-0-len", "tls").is_none());
+        assert!(fragment_of("&fm=%7B%22udp%22%3A%5B%5D%7D", "tls").is_none());
+        // Plain TCP has no hello to cut.
+        assert!(fragment_of(&format!("&fm={FM}"), "none").is_none());
+        // And a hello that is encrypted is not cut up as well.
+        assert!(fragment_of(&format!("&fm={FM}&ech=udp%3A%2F%2F1.1.1.1"), "tls").is_none());
+    }
+
+    #[test]
+    fn a_direct_link_is_a_server_less_profile_with_its_fragmentation() {
+        let link = parse_link(&format!("direct://?fm={FM}#Serverless")).unwrap();
+        assert_eq!(link.remark, "Serverless");
+        assert!(matches!(
+            link.outbound.protocol,
+            OutboundProtocol::Freedom { .. }
+        ));
+        assert!(link.outbound.endpoint().is_none());
+        assert!(link.outbound.stream.evasion.tcp_fragment.is_some());
+        // The slash after the scheme is allowed, as in the other links.
+        assert!(parse_link(&format!("direct:///?fm={FM}#x")).is_ok());
+        // Without fragmentation or hiding it would be a plain direct connection.
+        assert!(parse_link("direct://#plain").is_err());
+        assert!(parse_link("direct://?fm=nothing#plain").is_err());
+    }
+
+    #[test]
+    fn a_direct_link_can_hide_the_name_instead_of_cutting_the_hello() {
+        let method_of = |hide: &str| {
+            parse_link(&format!("direct://?hide={hide}#h"))
+                .map(|link| link.outbound.stream.evasion.sni_desync.map(|d| d.method))
+        };
+        assert_eq!(method_of("auto"), Ok(Some(SniMethod::Auto)));
+        assert_eq!(method_of("urgent"), Ok(Some(SniMethod::Urgent)));
+        assert_eq!(method_of("Decoy"), Ok(Some(SniMethod::Decoy)));
+        assert_eq!(method_of("tfo"), Ok(Some(SniMethod::FastOpen)));
+        assert!(method_of("none").is_err());
+        assert!(method_of("sudoku").unwrap_err().contains("unknown"));
+        // Both together is allowed: the name hidden and the hello cut up.
+        let both = parse_link(&format!("direct://?hide=urgent&fm={FM}#b")).unwrap();
+        assert!(both.outbound.stream.evasion.sni_desync.is_some());
+        assert!(both.outbound.stream.evasion.tcp_fragment.is_some());
+    }
+
+    #[test]
+    fn a_tls_link_keeps_the_ech_it_asks_for() {
+        let ech_of = |extra: &str| {
+            let link = parse_link(&format!(
+                "vless://00000000-0000-0000-0000-000000000002@188.114.97.6:443\
+                 ?security=tls&sni=x.example.com&type=ws&path=%2Fws&encryption=none{extra}#cdn"
+            ))
+            .unwrap();
+            let Security::Tls(tls) = link.outbound.stream.security else {
+                panic!("expected certificate TLS");
+            };
+            tls.ech
+        };
+        assert!(ech_of("").is_none());
+
+        // The feed spelling: look it up under Cloudflare's shared name.
+        let query = ech_of("&ech=cloudflare-ech.com%2Budp%3A%2F%2F1.1.1.1").unwrap();
+        assert!(query.config_list.is_empty());
+        assert_eq!(query.query_name.as_deref(), Some("cloudflare-ech.com"));
+
+        // The list itself, with its `+` read as a space by a form decoder.
+        let list = ech_of("&ech=AEX+DQBBVgAgACDzZYk23tgiGbAeubeC2MHb6tSC9Ds5cheCtbyYkeAseQAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=").unwrap();
+        assert_eq!(list.config_list.len(), 71);
+        assert_eq!(list.query_name, None);
+        let spaced = ech_of("&ech=AEX%20DQBBVgAgACDzZYk23tgiGbAeubeC2MHb6tSC9Ds5cheCtbyYkeAseQAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=").unwrap();
+        assert_eq!(spaced.config_list, list.config_list);
+
+        // Unreadable, or empty: the link still works, without ECH.
+        assert!(ech_of("&ech=%%%not-base64").is_none());
+        assert!(ech_of("&ech=").is_none());
+    }
+
+    #[test]
     fn parses_tuic_link_with_uuid_password_and_h3() {
         let link = parse_link(
             "tuic://00000000-0000-0000-0000-000000000001:secret@example.com:443?sni=cdn.example#TUIC",
@@ -1764,11 +2116,10 @@ mod tests {
 
     #[test]
     fn juicity_link_imports_securely_and_rejects_empty_password() {
-        // A plain Juicity link verifies the certificate chain: the model
-        // refuses to disable verification, so `allow_insecure` in the query is
-        // not honoured and the connection stays secure.
+        // A plain Juicity link verifies the certificate chain; only a link
+        // that says `allow_insecure=1` skips it.
         let link = parse_link(
-            "juicity://00000000-0000-0000-0000-000000000001:pw@example.com:443?allow_insecure=1#J",
+            "juicity://00000000-0000-0000-0000-000000000001:pw@example.com:443?sni=a.example#J",
         )
         .unwrap();
         let Security::Tls(tls) = &link.outbound.stream.security else {

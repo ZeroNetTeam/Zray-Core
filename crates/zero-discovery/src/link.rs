@@ -89,6 +89,16 @@ pub struct Candidate {
 impl Candidate {
     /// Protocols carried over UDP (QUIC). A TCP connect to their port proves
     /// nothing, so the TCP stage passes them straight to the real test.
+    pub fn skips_tcp_stage(&self) -> bool {
+        self.is_udp_based() || self.is_direct()
+    }
+
+    /// A `direct://` profile: no server, connections leave directly with the
+    /// hello fragmented. There is nothing to connect to first either.
+    pub fn is_direct(&self) -> bool {
+        matches!(self.outbound.protocol, OutboundProtocol::Freedom { .. })
+    }
+
     pub fn is_udp_based(&self) -> bool {
         matches!(
             self.outbound.protocol,
@@ -402,7 +412,7 @@ pub fn guess_country(remark: &str) -> String {
 
 // ------------------------------------------------------------ text to links
 
-const SCHEMES: [&str; 13] = [
+const SCHEMES: [&str; 14] = [
     "vless://",
     "vmess://",
     "trojan://",
@@ -416,6 +426,7 @@ const SCHEMES: [&str; 13] = [
     "warp://",
     "masterdns://",
     "juicity://",
+    "direct://",
 ];
 
 /// Pull every proxy share link out of arbitrary text: one link per line, a

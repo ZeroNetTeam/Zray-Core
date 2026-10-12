@@ -2,6 +2,7 @@
 
 pub mod clean_ip;
 pub mod dial;
+pub mod fastopen;
 pub mod fetch;
 pub mod socket;
 pub mod tls_check;
