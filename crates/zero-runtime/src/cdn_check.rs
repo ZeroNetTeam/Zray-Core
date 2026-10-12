@@ -211,7 +211,8 @@ const CLOUDFLARE_PREFIXES_V6: [(u128, u8); 7] = [
     (0x2c0f_f248 << 96, 32),
 ];
 
-fn is_cloudflare_ip(ip: IpAddr) -> bool {
+/// Whether `ip` is in a published Cloudflare range.
+pub fn is_cloudflare_ip(ip: IpAddr) -> bool {
     let v4 = match ip {
         IpAddr::V4(v4) => v4,
         IpAddr::V6(v6) => {

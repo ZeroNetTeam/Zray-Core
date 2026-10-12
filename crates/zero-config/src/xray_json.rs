@@ -3190,8 +3190,8 @@ fn parse_legacy_freedom_evasion(settings: Option<&Value>, path: &str) -> R<Evasi
 /// `{"fakeSni": "www.example.com", "sequence": 0, "method": "decoy"}` — the
 /// decoy SNI (and the optional out-of-window sequence) for a fake
 /// ClientHello, or `{"method": "urgent"}` for the urgent-byte method (or
-/// `"fastopen"` for the hello in the SYN), which have no decoy and so need
-/// no `fakeSni`. Without `method` the device
+/// `"fastopen"` for the hello in the SYN, `"record"` for another version in the
+/// first record header, `"empty"` for an empty record ahead of the hello), which have no decoy and so need no `fakeSni`. Without `method` the device
 /// decides (`SniMethod::Auto`).
 ///
 /// `fakeSni` accepts `?` (a letter), `#` (a digit) and `*` (either), drawn
@@ -3210,10 +3210,12 @@ fn parse_sni_spoof(value: &Value, path: &str) -> R<SniDesyncConfig> {
         Some("decoy") => crate::model::SniMethod::Decoy,
         Some("urgent") => crate::model::SniMethod::Urgent,
         Some("fastopen" | "tfo") => crate::model::SniMethod::FastOpen,
+        Some("record" | "recordversion") => crate::model::SniMethod::Record,
+        Some("empty" | "emptyrecord") => crate::model::SniMethod::EmptyRecord,
         Some(other) => {
             return Err(format!(
-                "{path}.method must be auto, decoy, urgent or fastopen, not {other:?}"
-            ))
+            "{path}.method must be auto, decoy, urgent, record, empty or fastopen, not {other:?}"
+        ))
         }
     };
     let fake_sni = match value
@@ -3224,7 +3226,10 @@ fn parse_sni_spoof(value: &Value, path: &str) -> R<SniDesyncConfig> {
         Some(name) => name,
         None if matches!(
             method,
-            crate::model::SniMethod::Urgent | crate::model::SniMethod::FastOpen
+            crate::model::SniMethod::Urgent
+                | crate::model::SniMethod::FastOpen
+                | crate::model::SniMethod::Record
+                | crate::model::SniMethod::EmptyRecord
         ) =>
         {
             "www.speedtest.net"
@@ -5338,5 +5343,15 @@ mod tests {
             }]
         });
         assert!(parse_config(&value).is_ok(), "alterId 0 is the AEAD case");
+    }
+    #[test]
+    fn the_record_method_needs_no_decoy_name() {
+        let parsed = parse_sni_spoof(&serde_json::json!({"method": "record"}), "x").unwrap();
+        assert_eq!(parsed.method, crate::model::SniMethod::Record);
+        let alias = parse_sni_spoof(&serde_json::json!({"method": "recordversion"}), "x").unwrap();
+        assert_eq!(alias.method, crate::model::SniMethod::Record);
+        let empty = parse_sni_spoof(&serde_json::json!({"method": "empty"}), "x").unwrap();
+        assert_eq!(empty.method, crate::model::SniMethod::EmptyRecord);
+        assert!(parse_sni_spoof(&serde_json::json!({"method": "sudoku"}), "x").is_err());
     }
 }

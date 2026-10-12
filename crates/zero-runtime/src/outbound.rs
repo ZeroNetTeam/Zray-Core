@@ -88,83 +88,150 @@ fn parse_proxy_addr(raw: &str) -> Option<SocketAddr> {
 pub async fn resolve_endpoint(address: &Address, port: u16) -> Result<Vec<SocketAddr>, Failure> {
     match address {
         Address::Ip(ip) => Ok(vec![SocketAddr::new(*ip, port)]),
-        Address::Domain(d) => {
-            let name: &str = d;
-            // The system resolver first: it is fast and, for most names,
-            // right. In Iran it is also the ISP's, which answers a filtered
-            // name with the block page (10.10.34.x) or a dead address, so
-            // those answers are thrown away rather than dialled: connecting
-            // to them only ever yields "connection refused".
-            let system = tokio::time::timeout(
-                SYSTEM_DNS_TIMEOUT,
-                tokio::net::lookup_host(format!("{name}:{port}")),
-            )
-            .await;
-            let mut hijacked = false;
-            let system_error = match system {
-                Ok(Ok(iter)) => {
-                    let all: Vec<SocketAddr> = iter.collect();
-                    // `localhost` is loopback by definition, not by forgery.
-                    let local_name = name.eq_ignore_ascii_case("localhost")
-                        || name.to_ascii_lowercase().ends_with(".localhost");
-                    let usable: Vec<SocketAddr> = all
-                        .iter()
-                        .copied()
-                        .filter(|a| local_name || !is_hijacked_answer(a.ip()))
-                        .collect();
-                    if !usable.is_empty() {
-                        return Ok(usable);
-                    }
-                    hijacked = !all.is_empty();
-                    None
-                }
-                Ok(Err(e)) => Some(e.to_string()),
-                Err(_) => Some("timed out".to_string()),
-            };
-            // Then encrypted DNS, which a middlebox can block but not forge.
-            let encrypted = fallback_resolver()
-                .lookup(name, zero_config::dns::QueryStrategy::UseIp)
-                .await;
-            match encrypted {
-                Ok(ips) => {
-                    let usable: Vec<SocketAddr> = ips
-                        .into_iter()
-                        .filter(|ip| !is_hijacked_answer(*ip))
-                        .map(|ip| SocketAddr::new(ip, port))
-                        .collect();
-                    if !usable.is_empty() {
-                        return Ok(usable);
-                    }
-                    Err(Failure::new(FailureKind::DnsNoData, Stage::Resolving)
-                        .with_confidence(Confidence::Confirmed)
-                        .with_detail(format!("no usable addresses for {name}")))
-                }
-                Err(error) => {
-                    let detail = if hijacked {
-                        format!(
-                            "{name} resolves to a filtering address on this network, \
-                             and encrypted DNS failed: {error}"
-                        )
-                    } else {
-                        format!(
-                            "{name}: {}; encrypted DNS: {error}",
-                            system_error.unwrap_or_else(|| "no addresses".into())
-                        )
-                    };
-                    let kind = if hijacked {
-                        FailureKind::DnsSuspectedInterference
-                    } else {
-                        FailureKind::DnsNoData
-                    };
-                    Err(Failure::new(kind, Stage::Resolving).with_detail(detail))
-                }
-            }
-        }
+        Address::Domain(name) => resolve_domain(name, port).await,
     }
 }
 
-/// How long the system resolver gets before encrypted DNS is asked instead.
+/// Why the system resolver gave nothing usable.
+enum SystemMiss {
+    /// It answered with the block page or another address no server has.
+    Hijacked,
+    Failed(String),
+}
+
+/// Why encrypted DNS gave nothing usable.
+enum EncryptedMiss {
+    /// It answered, and every address was one no server has.
+    NoUsable,
+    Failed(String),
+}
+
+/// A domain's addresses: the system resolver first, encrypted DNS beside it.
+///
+/// The system resolver is fast and, for most names, right. In Iran it is also
+/// the ISP's, which answers a filtered name with the block page (10.10.34.x)
+/// or a dead address, so those answers are thrown away rather than dialled:
+/// connecting to them only ever yields "connection refused". Encrypted DNS can
+/// be blocked by a middlebox but not forged, so it is the fallback.
+///
+/// The fallback starts at once when the system resolver misses, and after
+/// [`SYSTEM_HEAD_START`] when it is only slow (an ISP resolver that drops the
+/// query would otherwise cost its whole timeout before the second try). The
+/// first usable answer wins; the other is dropped.
+async fn resolve_domain(name: &str, port: u16) -> Result<Vec<SocketAddr>, Failure> {
+    let system = system_lookup(name, port);
+    let encrypted = encrypted_lookup(name, port);
+    tokio::pin!(system, encrypted);
+    let mut early = None;
+    tokio::select! {
+        found = &mut system => match found {
+            Ok(addrs) => return Ok(addrs),
+            Err(miss) => early = Some(miss),
+        },
+        _ = tokio::time::sleep(SYSTEM_HEAD_START) => {}
+    }
+    // Each branch awaits only a future that has not finished yet.
+    let (system_miss, encrypted_miss) = match early {
+        Some(miss) => match (&mut encrypted).await {
+            Ok(addrs) => return Ok(addrs),
+            Err(other) => (miss, other),
+        },
+        None => tokio::select! {
+            found = &mut system => match found {
+                Ok(addrs) => return Ok(addrs),
+                Err(miss) => match (&mut encrypted).await {
+                    Ok(addrs) => return Ok(addrs),
+                    Err(other) => (miss, other),
+                },
+            },
+            found = &mut encrypted => match found {
+                Ok(addrs) => return Ok(addrs),
+                Err(other) => match (&mut system).await {
+                    Ok(addrs) => return Ok(addrs),
+                    Err(miss) => (miss, other),
+                },
+            },
+        },
+    };
+    Err(endpoint_failure(name, system_miss, encrypted_miss))
+}
+
+async fn system_lookup(name: &str, port: u16) -> Result<Vec<SocketAddr>, SystemMiss> {
+    let found = tokio::time::timeout(
+        SYSTEM_DNS_TIMEOUT,
+        tokio::net::lookup_host(format!("{name}:{port}")),
+    )
+    .await;
+    let all: Vec<SocketAddr> = match found {
+        Ok(Ok(iter)) => iter.collect(),
+        Ok(Err(e)) => return Err(SystemMiss::Failed(e.to_string())),
+        Err(_) => return Err(SystemMiss::Failed("timed out".into())),
+    };
+    // `localhost` is loopback by definition, not by forgery.
+    let local_name =
+        name.eq_ignore_ascii_case("localhost") || name.to_ascii_lowercase().ends_with(".localhost");
+    let usable: Vec<SocketAddr> = all
+        .iter()
+        .copied()
+        .filter(|a| local_name || !is_hijacked_answer(a.ip()))
+        .collect();
+    if !usable.is_empty() {
+        Ok(usable)
+    } else if all.is_empty() {
+        Err(SystemMiss::Failed("no addresses".into()))
+    } else {
+        Err(SystemMiss::Hijacked)
+    }
+}
+
+async fn encrypted_lookup(name: &str, port: u16) -> Result<Vec<SocketAddr>, EncryptedMiss> {
+    let ips = fallback_resolver()
+        .lookup(name, zero_config::dns::QueryStrategy::UseIp)
+        .await
+        .map_err(|error| EncryptedMiss::Failed(error.to_string()))?;
+    let usable: Vec<SocketAddr> = ips
+        .into_iter()
+        .filter(|ip| !is_hijacked_answer(*ip))
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    if usable.is_empty() {
+        Err(EncryptedMiss::NoUsable)
+    } else {
+        Ok(usable)
+    }
+}
+
+#[cold]
+fn endpoint_failure(name: &str, system: SystemMiss, encrypted: EncryptedMiss) -> Failure {
+    let error = match encrypted {
+        EncryptedMiss::NoUsable => {
+            return Failure::new(FailureKind::DnsNoData, Stage::Resolving)
+                .with_confidence(Confidence::Confirmed)
+                .with_detail(format!("no usable addresses for {name}"))
+        }
+        EncryptedMiss::Failed(error) => error,
+    };
+    let (kind, detail) = match system {
+        SystemMiss::Hijacked => (
+            FailureKind::DnsSuspectedInterference,
+            format!(
+                "{name} resolves to a filtering address on this network, \
+                 and encrypted DNS failed: {error}"
+            ),
+        ),
+        SystemMiss::Failed(why) => (
+            FailureKind::DnsNoData,
+            format!("{name}: {why}; encrypted DNS: {error}"),
+        ),
+    };
+    Failure::new(kind, Stage::Resolving).with_detail(detail)
+}
+
+/// How long the system resolver gets before it is given up on.
 const SYSTEM_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+/// How long the system resolver is on its own before encrypted DNS is asked
+/// beside it.
+const SYSTEM_HEAD_START: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// An answer no public proxy server has: Iran's filtering block page
 /// (10.10.34.34–36), the unspecified address and loopback, which filtering
@@ -231,11 +298,43 @@ fn fast_open_rule(stream: &StreamSettings) -> Option<fn(SocketAddr) -> bool> {
     }
     match stream.evasion.sni_desync.as_ref()?.method {
         SniMethod::FastOpen => Some(|peer| zero_net::fastopen::client_first_port(peer.port())),
+        // REALITY and ShadowTLS cannot take the empty record, and the pick
+        // after the dial has to see the same ways as this question.
+        SniMethod::Auto if hides_behind_own_handshake(stream) => Some(|peer| {
+            zero_net::fastopen::client_first_port(peer.port())
+                && zero_evasion::choice::wants_fast(peer, ways_towards(peer, false, true))
+        }),
         SniMethod::Auto => Some(|peer| {
             zero_net::fastopen::client_first_port(peer.port())
-                && zero_evasion::choice::wants_fast(peer)
+                && zero_evasion::choice::wants_fast(peer, ways_towards(peer, true, true))
         }),
         _ => None,
+    }
+}
+
+/// Whether the security layer reads the first record itself (REALITY,
+/// ShadowTLS) and so drops a connection that opens with an empty one.
+fn hides_behind_own_handshake(stream: &StreamSettings) -> bool {
+    matches!(
+        stream.security,
+        zero_config::Security::Reality(_) | zero_config::Security::ShadowTls(_)
+    )
+}
+
+/// The ways `auto` may hide a name from a filter towards `peer`, without Fast
+/// Open (the dial decides that). Cloudflare's addresses let a hello with an
+/// urgent byte, another record version or an empty record through and then
+/// go quiet, so there only Fast Open and the decoy are left. `empty_ok` is
+/// false for a security layer that cannot take the empty record, `decoy` is
+/// what the caller found about the decoy.
+fn ways_towards(peer: SocketAddr, empty_ok: bool, decoy: bool) -> zero_evasion::choice::Have {
+    let odd = !crate::cdn_check::is_cloudflare_ip(peer.ip());
+    zero_evasion::choice::Have {
+        urgent: odd && zero_evasion::urgent::supported(),
+        record: odd,
+        empty: odd && empty_ok,
+        fast: false,
+        decoy,
     }
 }
 
@@ -276,7 +375,7 @@ fn socket_options(stream: &StreamSettings) -> SocketOptions {
 fn shaped(tcp: TcpStream, stream: &StreamSettings, injected: bool) -> BoxStream {
     use zero_config::SniMethod;
     if let Some(spoof) = stream.evasion.sni_desync.as_ref().filter(|_| !injected) {
-        use zero_evasion::choice::{self, Have, Way};
+        use zero_evasion::choice::{self, Way};
         let policy = zero_evasion::DecoyPolicy {
             name: spoof.fake_sni.clone(),
             fooling: match spoof.fooling {
@@ -287,6 +386,9 @@ fn shaped(tcp: TcpStream, stream: &StreamSettings, injected: bool) -> BoxStream 
             ttl: spoof.ttl,
         };
         let urgent = zero_evasion::urgent::supported();
+        // REALITY and ShadowTLS read the first record themselves and drop a
+        // connection that opens with an empty one.
+        let empty = !hides_behind_own_handshake(stream);
         // A socket whose SYN is still waiting for the hello (Fast Open) has
         // no peer to ask; the dial recorded it.
         let deferred = zero_net::fastopen::deferred(&tcp);
@@ -308,6 +410,8 @@ fn shaped(tcp: TcpStream, stream: &StreamSettings, injected: bool) -> BoxStream 
         let way = match spoof.method {
             SniMethod::Decoy => decoy.then_some(Way::Decoy),
             SniMethod::Urgent => urgent.then_some(Way::Urgent),
+            SniMethod::Record => Some(Way::Record),
+            SniMethod::EmptyRecord => empty.then_some(Way::Empty),
             SniMethod::FastOpen => deferred.then_some(Way::Fast),
             // The free ways first, the decoy where they went unanswered
             // (`zero_evasion::choice`). Without a peer address there is no
@@ -316,21 +420,15 @@ fn shaped(tcp: TcpStream, stream: &StreamSettings, injected: bool) -> BoxStream 
             SniMethod::Auto if deferred => Some(Way::Fast),
             SniMethod::Auto => match peer {
                 Some(peer) => {
-                    if zero_evasion::choice::wants_fast(peer) {
+                    let ways = ways_towards(peer, empty, decoy);
+                    if zero_evasion::choice::wants_fast(peer, ways) {
                         // The dial asked for Fast Open and the server gave
                         // none: leave it alone for a while.
                         zero_evasion::choice::no_fast(peer);
                     }
-                    choice::pick(
-                        peer,
-                        Have {
-                            urgent,
-                            fast: false,
-                            decoy,
-                        },
-                    )
+                    choice::pick(peer, ways)
                 }
-                None => urgent.then_some(Way::Urgent),
+                None => Some(if urgent { Way::Urgent } else { Way::Record }),
             },
         };
         match (way, spoof.method, peer) {
@@ -367,6 +465,22 @@ fn shaped(tcp: TcpStream, stream: &StreamSettings, injected: bool) -> BoxStream 
                 ))
             }
             (Some(Way::Urgent), ..) => return boxed(zero_evasion::UrgentStream::new(tcp)),
+            (Some(Way::Record), SniMethod::Auto, Some(peer)) => {
+                return boxed(choice::Watched::new(
+                    zero_evasion::RecordVersionStream::new(tcp),
+                    peer,
+                    Way::Record,
+                ))
+            }
+            (Some(Way::Record), ..) => return boxed(zero_evasion::RecordVersionStream::new(tcp)),
+            (Some(Way::Empty), SniMethod::Auto, Some(peer)) => {
+                return boxed(choice::Watched::new(
+                    zero_evasion::EmptyRecordStream::new(tcp),
+                    peer,
+                    Way::Empty,
+                ))
+            }
+            (Some(Way::Empty), ..) => return boxed(zero_evasion::EmptyRecordStream::new(tcp)),
             (None, ..) => {}
         }
     }
@@ -1178,7 +1292,10 @@ async fn protect_socket(
     let wants_decoy = |config: &&zero_config::SniDesyncConfig| {
         !matches!(
             config.method,
-            zero_config::SniMethod::Urgent | zero_config::SniMethod::FastOpen
+            zero_config::SniMethod::Urgent
+                | zero_config::SniMethod::FastOpen
+                | zero_config::SniMethod::Record
+                | zero_config::SniMethod::EmptyRecord
         ) && config.fooling != zero_config::DecoyFooling::Ttl
             && !zero_net::fastopen::deferred(&tcp)
     };

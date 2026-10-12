@@ -749,11 +749,13 @@ fn parse_direct(rest: &str) -> Result<ShareLink, String> {
         Some("auto") => Some(SniDesyncConfig::default()),
         Some("urgent") => Some(SniDesyncConfig::urgent()),
         Some("tfo" | "fastopen") => Some(SniDesyncConfig::fast_open()),
+        Some("record" | "recordversion") => Some(SniDesyncConfig::record()),
+        Some("empty" | "emptyrecord") => Some(SniDesyncConfig::empty_record()),
         Some("decoy") => Some(SniDesyncConfig::decoy()),
         Some(other) => return Err(format!("unknown direct hide mode {other:?}")),
     };
     if evasion.is_empty() {
-        return Err("a direct link needs hide= (auto, urgent, tfo, decoy) or fm= (the fragment settings as finalmask JSON)".into());
+        return Err("a direct link needs hide= (auto, urgent, record, empty, tfo, decoy) or fm= (the fragment settings as finalmask JSON)".into());
     }
     let outbound = Outbound {
         tag: Arc::from("proxy"),
@@ -2038,6 +2040,8 @@ mod tests {
         assert_eq!(method_of("urgent"), Ok(Some(SniMethod::Urgent)));
         assert_eq!(method_of("Decoy"), Ok(Some(SniMethod::Decoy)));
         assert_eq!(method_of("tfo"), Ok(Some(SniMethod::FastOpen)));
+        assert_eq!(method_of("record"), Ok(Some(SniMethod::Record)));
+        assert_eq!(method_of("empty"), Ok(Some(SniMethod::EmptyRecord)));
         assert!(method_of("none").is_err());
         assert!(method_of("sudoku").unwrap_err().contains("unknown"));
         // Both together is allowed: the name hidden and the hello cut up.

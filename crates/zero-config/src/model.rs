@@ -481,6 +481,16 @@ pub enum SniMethod {
     /// and a server that does Fast Open, and only applies to ports where the client speaks first (443, 80 and the like).
     /// `fake_sni` is not used.
     FastOpen,
+    /// The first record header carries version 0x0304 instead of 0x0301
+    /// (`zero_evasion::record`): a filter that only parses records up to
+    /// 0x0303 sees no name, and servers read the hello as usual. No delay, no
+    /// privilege and no kernel feature; `fake_sni` is not used.
+    Record,
+    /// One empty handshake record ahead of the hello
+    /// (`zero_evasion::record`): the filter reads it as the start of the
+    /// stream and gives up on the next record; servers skip it. Needs nothing
+    /// from the system; `fake_sni` is not used.
+    EmptyRecord,
 }
 
 impl SniDesyncConfig {
@@ -489,6 +499,22 @@ impl SniDesyncConfig {
     pub fn urgent() -> Self {
         Self {
             method: SniMethod::Urgent,
+            ..Self::default()
+        }
+    }
+
+    /// The record-version method and nothing else.
+    pub fn record() -> Self {
+        Self {
+            method: SniMethod::Record,
+            ..Self::default()
+        }
+    }
+
+    /// The empty-record method and nothing else.
+    pub fn empty_record() -> Self {
+        Self {
+            method: SniMethod::EmptyRecord,
             ..Self::default()
         }
     }

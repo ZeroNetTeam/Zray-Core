@@ -12,6 +12,7 @@ pub mod fragment;
 pub mod keepalive;
 pub mod noise;
 pub mod rand_between;
+pub mod record;
 pub mod sni_desync;
 pub mod urgent;
 
@@ -23,6 +24,7 @@ pub use keepalive::{
 };
 pub use noise::{NoiseEntry, NoisePacket, NoisePolicy};
 pub use rand_between::rand_between;
+pub use record::{EmptyRecordStream, RecordVersionStream};
 pub use sni_desync::{
     build_fake_client_hello, has_raw_socket_capability, inject_fake_client_hello, SniDesyncConfig,
 };

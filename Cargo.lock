@@ -8084,6 +8084,7 @@ dependencies = [
  "webpki-roots",
  "zero-config",
  "zero-core",
+ "zero-net",
 ]
 
 [[package]]

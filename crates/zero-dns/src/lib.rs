@@ -30,6 +30,8 @@ use zero_config::dns::{
 use zero_config::routing::{DomainPattern, IpPattern};
 use zero_core::Address;
 
+mod hide;
+
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Classic UDP retransmission interval: a single lost datagram costs one
 /// second, not the whole query budget.
@@ -1402,18 +1404,10 @@ impl Resolver {
             }
         }
 
-        let tcp = timeout(DNS_TIMEOUT, zero_core::platform::connect_protected(target))
-            .await
-            .map_err(|_| ResolveError::Transport("DoT connect timed out".into()))?
-            .map_err(io_error)?;
-        let _ = tcp.set_nodelay(true);
         let tls_name = rustls_pki_types::ServerName::try_from(server_name.to_string())
             .map_err(|e| ResolveError::Protocol(format!("invalid DoT server name: {e}")))?;
         let connector = TlsConnector::from(Arc::clone(&self.tls.plain));
-        let mut stream = timeout(DNS_TIMEOUT, connector.connect(tls_name, tcp))
-            .await
-            .map_err(|_| ResolveError::Transport("DoT handshake timed out".into()))?
-            .map_err(|e| ResolveError::Transport(e.to_string()))?;
+        let mut stream = hide::tls_connect(target, &connector, &tls_name, "DoT").await?;
         let response = timeout(DNS_TIMEOUT, exchange_framed(&mut stream, &framed))
             .await
             .map_err(|_| ResolveError::Transport("DoT response timed out".into()))??;
@@ -1464,19 +1458,11 @@ impl Resolver {
             }
         }
 
-        let tcp = timeout(DNS_TIMEOUT, zero_core::platform::connect_protected(target))
-            .await
-            .map_err(|_| ResolveError::Transport(format!("{label} connect timed out")))?
-            .map_err(io_error)?;
-        let _ = tcp.set_nodelay(true);
         let tls_name = rustls_pki_types::ServerName::try_from(server_name.to_string())
             .map_err(|e| ResolveError::Protocol(format!("invalid {label} server name: {e}")))?;
         let config = if h2_only { &self.tls.h2 } else { &self.tls.doh };
         let connector = TlsConnector::from(Arc::clone(config));
-        let stream = timeout(DNS_TIMEOUT, connector.connect(tls_name, tcp))
-            .await
-            .map_err(|_| ResolveError::Transport(format!("{label} handshake timed out")))?
-            .map_err(|e| ResolveError::Transport(e.to_string()))?;
+        let stream = hide::tls_connect(target, &connector, &tls_name, label).await?;
         let negotiated_h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
         if !h2_only && !negotiated_h2 {
             return self
@@ -3481,6 +3467,15 @@ mod tests {
     /// A local encrypted resolver answering every A query with 10.0.0.1.
     /// Returns its port and a count of accepted TCP connections.
     async fn tls_dns_server(mode: TlsMode) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        tls_dns_server_dropping(mode, 0).await
+    }
+
+    /// [`tls_dns_server`] that closes the first `dropped` connections before
+    /// the handshake, the way a filter resets a hello it dislikes.
+    async fn tls_dns_server_dropping(
+        mode: TlsMode,
+        dropped: usize,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         use rustls_pki_types::pem::PemObject;
         let certs =
             vec![rustls_pki_types::CertificateDer::from_pem_slice(TEST_CERT.as_bytes()).unwrap()];
@@ -3513,7 +3508,9 @@ mod tests {
         };
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
-                counter.fetch_add(1, Ordering::SeqCst);
+                if counter.fetch_add(1, Ordering::SeqCst) < dropped {
+                    continue;
+                }
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(tcp).await else {
@@ -3621,6 +3618,29 @@ mod tests {
             let ips = resolver.lookup(name, QueryStrategy::UseIpv4).await.unwrap();
             assert_eq!(ips, vec!["10.0.0.1".parse::<IpAddr>().unwrap()]);
         }
+    }
+
+    /// A resolver whose first handshake is cut still answers: the plain
+    /// attempt fails, the retry with Fast Open (an ordinary connection here,
+    /// the test server does none) carries the query, and the cut is not
+    /// charged to the caller.
+    #[tokio::test]
+    async fn a_cut_handshake_is_retried_with_fast_open() {
+        if !zero_net::fastopen::supported() {
+            return;
+        }
+        let (port, connections) = tls_dns_server_dropping(TlsMode::Dot, 1).await;
+        let resolver = tls_resolver(ResolverEndpoint::Dot {
+            address: Address::parse_host("dns.test"),
+            port,
+        });
+        let ips = resolver
+            .lookup("a.example", QueryStrategy::UseIpv4)
+            .await
+            .unwrap();
+        assert_eq!(ips, vec!["10.0.0.1".parse::<IpAddr>().unwrap()]);
+        // The cut one, the cookie fetch that Fast Open starts with, the real one.
+        assert_eq!(connections.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

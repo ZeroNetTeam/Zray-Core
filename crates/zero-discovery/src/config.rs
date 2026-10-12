@@ -130,6 +130,11 @@ struct BuildRequest {
     /// Left out, the device is asked: it needs a kernel with
     /// `TCP_FASTOPEN_CONNECT`, and a TLS port to dial.
     auto_fast_open: Option<bool>,
+    /// Whether `auto` adds the record-version variant (another version in
+    /// the first record header). Left out, it is added where name hiding is
+    /// on: it needs nothing
+    /// from the device but the name-hiding switch.
+    auto_record: Option<bool>,
     /// Reuse of XHTTP's HTTP/2 connections (XMUX): `off` (a connection per
     /// proxied request, as before), `on` (what each link says, or Xray's
     /// defaults), or `auto`, which under `evasion = "auto"` adds a reusing
@@ -198,6 +203,7 @@ impl Default for BuildRequest {
             decoy_ttl: zero_evasion::decoy::DEFAULT_TTL,
             auto_ttl_decoy: None,
             auto_fast_open: None,
+            auto_record: None,
             xmux: "auto".into(),
             dns: DnsRequest::default(),
             log_level: "warning".into(),
@@ -582,6 +588,11 @@ pub fn build_config_with_assets(
                 .outbound
                 .endpoint()
                 .is_some_and(|(_, port)| zero_net::fastopen::client_first_port(port));
+        // The record version: free as well, needs nothing from the system, and
+        // gets past a filter that only reads records of the usual versions.
+        let auto_record = hide_name
+            && request.auto_record.unwrap_or_else(record_available)
+            && !zero_runtime::cdn_check::is_cloudflare_cdn(&parsed.outbound);
         let first = outbounds.len();
         if written {
             outbounds.push(json!({"link": parsed.link}));
@@ -608,6 +619,14 @@ pub fn build_config_with_assets(
         }
         if auto_urgent {
             outbounds.push(variant(Some(json!({"sniSpoof": {"method": "urgent"}}))));
+        }
+        if auto_record {
+            outbounds.push(variant(Some(json!({"sniSpoof": {"method": "record"}}))));
+            // Not for REALITY or ShadowTLS, which drop a connection that
+            // opens with an empty record.
+            if crate::probe::empty_record_fits(&parsed.outbound) {
+                outbounds.push(variant(Some(json!({"sniSpoof": {"method": "empty"}}))));
+            }
         }
         if auto_fast {
             outbounds.push(variant(Some(json!({"sniSpoof": {"method": "fastopen"}}))));
@@ -1007,6 +1026,12 @@ fn reuses_connections(outbound: &zero_config::Outbound) -> bool {
 /// Whether this device can put a hello in the SYN. A fixed "no" in tests.
 fn fast_open_available() -> bool {
     !cfg!(test) && zero_net::fastopen::supported()
+}
+
+/// Whether the record-version variant is worth adding: name hiding is on.
+/// It needs nothing else from the device. A fixed "no" in tests.
+fn record_available() -> bool {
+    !cfg!(test) && zero_evasion::decoy::enabled()
 }
 
 /// The same question for the urgent byte, with the same fixed "no" in tests.
@@ -1823,6 +1848,49 @@ mod tests {
             [
                 zero_config::SniMethod::Urgent,
                 zero_config::SniMethod::FastOpen,
+                zero_config::SniMethod::Decoy
+            ]
+        );
+        // The record version and the empty record sit between the urgent byte
+        // and Fast Open.
+        let with_record: Vec<_> = compile(
+            &build_config(&json!({
+                "links": [REALITY], "evasion": "auto", "auto_decoy": true,
+                "auto_fast_open": true, "auto_record": true,
+            }))
+            .unwrap(),
+        )
+        .outbounds
+        .iter()
+        .filter_map(|o| o.stream.evasion.sni_desync.as_ref().map(|d| d.method))
+        .collect();
+        assert_eq!(
+            with_record,
+            [
+                zero_config::SniMethod::Urgent,
+                zero_config::SniMethod::Record,
+                zero_config::SniMethod::FastOpen,
+                zero_config::SniMethod::Decoy
+            ]
+        );
+        // The empty record is for a link with ordinary TLS; REALITY drops it.
+        let with_tls: Vec<_> = compile(
+            &build_config(&json!({
+                "links": [WS_TLS], "evasion": "auto", "auto_decoy": true,
+                "auto_fast_open": false, "auto_record": true,
+            }))
+            .unwrap(),
+        )
+        .outbounds
+        .iter()
+        .filter_map(|o| o.stream.evasion.sni_desync.as_ref().map(|d| d.method))
+        .collect();
+        assert_eq!(
+            with_tls,
+            [
+                zero_config::SniMethod::Urgent,
+                zero_config::SniMethod::Record,
+                zero_config::SniMethod::EmptyRecord,
                 zero_config::SniMethod::Decoy
             ]
         );

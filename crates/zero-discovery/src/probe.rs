@@ -339,9 +339,10 @@ pub async fn real_test(
         }
         return plain;
     }
-    let can_hide = outbound.stream.evasion.sni_desync.is_none()
-        && crate::config::sni_spoofable(outbound)
-        && (zero_evasion::decoy::any_available() || zero_net::fastopen::supported());
+    // The record version needs nothing from the system, so any link with a
+    // name to hide can try at least that.
+    let can_hide =
+        outbound.stream.evasion.sni_desync.is_none() && crate::config::sni_spoofable(outbound);
     let can_ech = crate::config::ech_variant_fits(outbound)
         && outbound.stream.evasion.tcp_fragment.is_none()
         && outbound.stream.evasion.sni_desync.is_none();
@@ -365,6 +366,16 @@ pub async fn real_test(
             ways.push((
                 hidden(zero_config::SniDesyncConfig::urgent()),
                 "with the name hidden",
+            ));
+        }
+        ways.push((
+            hidden(zero_config::SniDesyncConfig::record()),
+            "with another record version",
+        ));
+        if empty_record_fits(outbound) {
+            ways.push((
+                hidden(zero_config::SniDesyncConfig::empty_record()),
+                "behind an empty record",
             ));
         }
         if zero_net::fastopen::supported()
@@ -412,6 +423,16 @@ pub async fn real_test(
         }
     }
     Err(failures)
+}
+
+/// Whether the empty-record way can be tried on this link: REALITY and
+/// ShadowTLS read the first record themselves and drop a connection that
+/// opens with an empty one.
+pub(crate) fn empty_record_fits(outbound: &zero_config::Outbound) -> bool {
+    !matches!(
+        outbound.stream.security,
+        zero_config::Security::Reality(_) | zero_config::Security::ShadowTls(_)
+    )
 }
 
 /// How long the server gets to accept a TCP connection when a test timed out

@@ -1,12 +1,17 @@
 //! Which way to hide a server name, picked per server from what happened on
 //! the last connections to it.
 //!
-//! There are three ways of hiding a name from a socket without root: the
-//! urgent byte ([`crate::urgent`]), TCP Fast Open (the hello rides in the
-//! SYN, `zero_net::fastopen`) and the decoy ([`crate::decoy`]). They cost
-//! very different amounts:
+//! There are five ways of hiding a name from a socket without root: the
+//! urgent byte ([`crate::urgent`]), another version in the record header and
+//! an empty record ahead of the hello ([`crate::record`]), TCP Fast Open (the hello rides in the SYN,
+//! `zero_net::fastopen`) and the decoy ([`crate::decoy`]). They cost very
+//! different amounts:
 //!
 //! * the urgent byte costs nothing: one extra byte, no wait;
+//! * the record version and the empty record cost nothing and need nothing
+//!   from the system; they come after the urgent byte because the filter in
+//!   front of the Cloudflare ranges judges the connection afterwards and
+//!   leaves it silent;
 //! * Fast Open costs nothing either (it saves a round trip) once the
 //!   kernel holds the server's cookie; the first connection to a server only
 //!   fetches that cookie;
@@ -73,12 +78,16 @@ pub const SILENT_AFTER: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Way {
     Urgent,
+    /// The first record header carries another version (`crate::record`).
+    Record,
+    /// An empty handshake record goes ahead of the hello (`crate::record`).
+    Empty,
     /// The hello rides in the SYN (`zero_net::fastopen`).
     Fast,
     Decoy,
 }
 
-const LADDER: [Way; 3] = [Way::Urgent, Way::Fast, Way::Decoy];
+const LADDER: [Way; 5] = [Way::Urgent, Way::Record, Way::Empty, Way::Fast, Way::Decoy];
 
 fn rung_of(way: Way) -> u8 {
     LADDER.iter().position(|&w| w == way).unwrap_or(0) as u8
@@ -88,6 +97,10 @@ fn rung_of(way: Way) -> u8 {
 #[derive(Debug, Clone, Copy)]
 pub struct Have {
     pub urgent: bool,
+    pub record: bool,
+    /// The empty record: not for a handshake that checks the first record
+    /// itself (REALITY, ShadowTLS), which drops the connection.
+    pub empty: bool,
     pub fast: bool,
     pub decoy: bool,
 }
@@ -96,6 +109,8 @@ impl Have {
     fn has(self, way: Way) -> bool {
         match way {
             Way::Urgent => self.urgent,
+            Way::Record => self.record,
+            Way::Empty => self.empty,
             Way::Fast => self.fast,
             Way::Decoy => self.decoy,
         }
@@ -176,15 +191,16 @@ pub fn pick(server: SocketAddr, have: Have) -> Option<Way> {
 
 /// Whether a dial to `server` should put the hello in the SYN. The question
 /// [`zero_net::SocketOptions::fast_open_if`] asks before each candidate:
-/// Fast Open is picked when the ladder says so, whatever the other ways.
-pub fn wants_fast(server: SocketAddr) -> bool {
+/// Fast Open is picked when the ladder says so. `others` is the same set of
+/// ways the caller will pick from once the connection is open (it must be
+/// the same, or the dial and the pick disagree about where the ladder is).
+pub fn wants_fast(server: SocketAddr, others: Have) -> bool {
     server.ip().is_ipv4()
         && pick(
             server,
             Have {
-                urgent: crate::urgent::supported(),
                 fast: true,
-                decoy: crate::decoy::any_available(),
+                ..others
             },
         ) == Some(Way::Fast)
 }
@@ -398,9 +414,34 @@ mod tests {
     fn have(urgent: bool, fast: bool, decoy: bool) -> Have {
         Have {
             urgent,
+            record: false,
+            empty: false,
             fast,
             decoy,
         }
+    }
+
+    /// The record-version and empty-record rungs sit between the urgent byte
+    /// and Fast Open, and a device without them skips both.
+    #[test]
+    fn the_record_rungs_come_after_the_urgent_byte() {
+        let _turn = lock();
+        let s = server(1090);
+        let all = Have {
+            record: true,
+            empty: true,
+            ..have(true, true, true)
+        };
+        report(s, Way::Urgent, false);
+        report(s, Way::Urgent, false);
+        assert_eq!(pick(s, all), Some(Way::Record));
+        report(s, Way::Record, false);
+        report(s, Way::Record, false);
+        assert_eq!(pick(s, all), Some(Way::Empty));
+        report(s, Way::Empty, false);
+        report(s, Way::Empty, false);
+        assert_eq!(pick(s, all), Some(Way::Fast));
+        assert_eq!(pick(s, have(true, true, true)), Some(Way::Fast));
     }
 
     /// With Fast Open on the device the ladder has a rung between the urgent

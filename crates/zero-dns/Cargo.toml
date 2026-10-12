@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 zero-config = { workspace = true }
 zero-core = { workspace = true }
+zero-net = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
