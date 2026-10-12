@@ -481,10 +481,13 @@ pub enum SniMethod {
     /// and a server that does Fast Open, and only applies to ports where the client speaks first (443, 80 and the like).
     /// `fake_sni` is not used.
     FastOpen,
-    /// The first record header carries version 0x0304 instead of 0x0301
-    /// (`zero_evasion::record`): a filter that only parses records up to
-    /// 0x0303 sees no name, and servers read the hello as usual. No delay, no
-    /// privilege and no kernel feature; `fake_sni` is not used.
+    /// The first record header and the hello's own `legacy_version` carry
+    /// 0x0304 instead of 0x0301 and 0x0303 (`zero_evasion::record`, and the
+    /// TLS layer on top for the second): a filter that only parses records
+    /// and hellos of the usual versions sees no name, and servers read the
+    /// hello as usual. The first alone is all a plain relay (`direct://`)
+    /// can do. No delay, no privilege and no kernel feature; `fake_sni` is
+    /// not used.
     Record,
     /// One empty handshake record ahead of the hello
     /// (`zero_evasion::record`): the filter reads it as the start of the

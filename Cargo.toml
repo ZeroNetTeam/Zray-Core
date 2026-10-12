@@ -171,9 +171,11 @@ opt-level = "s"
 
 [patch.crates-io]
 # The ordinary crates.io rustls API cannot control ClientHello extension order,
-# GREASE, or padding. Keep the exact shaping support pinned to the same audited
-# revision used by the bundled Xray reference (the fork itself is MPL-2.0).
-rustls = { git = "https://github.com/aimalygin/shaped-rustls", rev = "3a131beaef0183b0cb61e5a9070a703b6be39ed3" }
+# GREASE, or padding. This is the shaping fork pinned to the same audited
+# revision used by the bundled Xray reference (the fork itself is MPL-2.0),
+# vendored so the ClientHello can carry another legacy version. See
+# vendor/rustls/PATCHES.md.
+rustls = { path = "vendor/rustls" }
 # TUN userspace stack with local fixes for per-connection memory: duplicate
 # sockets from retransmitted SYNs and orphaned connections held for two
 # hours. See vendor/netstack-smoltcp/PATCHES.md.

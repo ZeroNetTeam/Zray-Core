@@ -244,8 +244,13 @@ impl FingerprintProfile {
         alpn: &[Vec<u8>],
         managed_ech: bool,
         profile_name: &str,
+        legacy_version: Option<u16>,
     ) -> Result<(), String> {
         if self == Self::Unshaped {
+            // No browser shape to follow, but the odd version is still asked for.
+            if let Some(version) = legacy_version {
+                cfg.client_hello_customizer = Some(Arc::new(LegacyVersionCustomizer(version)));
+            }
             return Ok(());
         }
 
@@ -262,6 +267,7 @@ impl FingerprintProfile {
             profile_name: profile_name.to_owned(),
             alpn: (!alpn.is_empty()).then(|| alpn.to_vec()),
             managed_ech,
+            legacy_version,
         }));
         Ok(())
     }
@@ -272,6 +278,22 @@ struct BrowserClientHelloCustomizer {
     profile_name: String,
     alpn: Option<Vec<Vec<u8>>>,
     managed_ech: bool,
+    /// The value for the hello's `legacy_version` field, when not the usual.
+    legacy_version: Option<u16>,
+}
+
+/// A hello left as rustls writes it apart from the `legacy_version` field.
+#[derive(Debug)]
+struct LegacyVersionCustomizer(u16);
+
+impl rustls::client::ClientHelloCustomizer for LegacyVersionCustomizer {
+    fn build_client_hello_plan(
+        &self,
+        context: rustls::client::ClientHelloContext<'_>,
+    ) -> Result<Option<ClientHelloPlan>, RustlsError> {
+        // QUIC hellos are not read by the filter this answers.
+        Ok((!context.is_quic).then(|| ClientHelloPlan::new().with_legacy_version(self.0)))
+    }
 }
 
 impl rustls::client::ClientHelloCustomizer for BrowserClientHelloCustomizer {
@@ -317,6 +339,9 @@ impl rustls::client::ClientHelloCustomizer for BrowserClientHelloCustomizer {
         }
         if let Some(alpn) = &self.alpn {
             plan = apply_alpn_override(plan, profile, alpn, shuffle)?;
+        }
+        if let Some(version) = self.legacy_version {
+            plan = plan.with_legacy_version(version);
         }
 
         Ok(Some(plan))

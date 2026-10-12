@@ -373,6 +373,23 @@ fn socket_options(stream: &StreamSettings) -> SocketOptions {
 /// would cut the hello into pieces that neither of them can read a name out
 /// of.
 fn shaped(tcp: TcpStream, stream: &StreamSettings, injected: bool) -> BoxStream {
+    shaped_with(tcp, stream, injected, &mut None)
+}
+
+/// The `legacy_version` the Record way writes into the hello itself, next to
+/// the record header (`zero_evasion::record`). Servers read the field as
+/// "TLS 1.2 or later", a filter that picks hellos out by it does not know the
+/// value, and the two settings are separate gaps in it.
+const ODD_HELLO_VERSION: u16 = 0x0304;
+
+/// [`shaped`], also saying through `hello_version` what the TLS layer on top
+/// has to write in the hello for the chosen way to hold.
+fn shaped_with(
+    tcp: TcpStream,
+    stream: &StreamSettings,
+    injected: bool,
+    hello_version: &mut Option<u16>,
+) -> BoxStream {
     use zero_config::SniMethod;
     if let Some(spoof) = stream.evasion.sni_desync.as_ref().filter(|_| !injected) {
         use zero_evasion::choice::{self, Way};
@@ -466,13 +483,17 @@ fn shaped(tcp: TcpStream, stream: &StreamSettings, injected: bool) -> BoxStream 
             }
             (Some(Way::Urgent), ..) => return boxed(zero_evasion::UrgentStream::new(tcp)),
             (Some(Way::Record), SniMethod::Auto, Some(peer)) => {
+                *hello_version = Some(ODD_HELLO_VERSION);
                 return boxed(choice::Watched::new(
                     zero_evasion::RecordVersionStream::new(tcp),
                     peer,
                     Way::Record,
-                ))
+                ));
             }
-            (Some(Way::Record), ..) => return boxed(zero_evasion::RecordVersionStream::new(tcp)),
+            (Some(Way::Record), ..) => {
+                *hello_version = Some(ODD_HELLO_VERSION);
+                return boxed(zero_evasion::RecordVersionStream::new(tcp));
+            }
             (Some(Way::Empty), SniMethod::Auto, Some(peer)) => {
                 return boxed(choice::Watched::new(
                     zero_evasion::EmptyRecordStream::new(tcp),
@@ -1319,7 +1340,9 @@ async fn protect_socket(
             }
         }
     }
-    secure(outbound, shaped(tcp, stream, injected), fallback_host).await
+    let mut hello_version = None;
+    let base = shaped_with(tcp, stream, injected, &mut hello_version);
+    secure(outbound, base, fallback_host, hello_version).await
 }
 
 /// TLS or REALITY over an already open byte stream: a TCP socket, or a
@@ -1328,15 +1351,19 @@ async fn secure(
     outbound: &Outbound,
     base: BoxStream,
     fallback_host: &str,
+    hello_version: Option<u16>,
 ) -> Result<BoxStream, Failure> {
     let stream = &outbound.stream;
     match &stream.security {
         Security::None => Ok(base),
         Security::Tls(_) => {
-            let params = tls_params(stream, fallback_host).ok_or_else(|| {
+            let mut params = tls_params(stream, fallback_host).ok_or_else(|| {
                 Failure::new(FailureKind::LocalPolicy, Stage::TlsStarted)
                     .with_detail("ECH configuration discovery did not produce a usable list")
             })?;
+            if let Some(version) = hello_version {
+                params = params.with_hello_version(version);
+            }
             Ok(boxed(zero_security::connect(base, &params).await?))
         }
         Security::Reality(reality) => {
@@ -1360,7 +1387,8 @@ async fn secure(
             .with_fingerprint_name(match &reality.fingerprint {
                 zero_config::Fingerprint::Named(name) => Some(name.to_string()),
                 _ => None,
-            });
+            })
+            .with_hello_version(hello_version);
             let secured = zero_security::reality_connect(base, &params).await?;
             // Vision must reach the REALITY stream itself: once the inner TLS
             // handshake is through, both ends switch that stream to raw bytes
@@ -1858,7 +1886,7 @@ pub async fn connect_over(
         .endpoint()
         .map(|(address, _)| address.host_string())
         .unwrap_or_default();
-    let secured = secure(outbound, carried, &fallback_host).await?;
+    let secured = secure(outbound, carried, &fallback_host, None).await?;
     finish_stack(outbound, destination, secured, &fallback_host).await
 }
 
@@ -1929,7 +1957,7 @@ pub(crate) async fn secure_over(
         .endpoint()
         .map(|(address, _)| address.host_string())
         .unwrap_or_default();
-    let secured = secure(outbound, carried, &fallback_host).await?;
+    let secured = secure(outbound, carried, &fallback_host, None).await?;
     Ok((secured, fallback_host))
 }
 

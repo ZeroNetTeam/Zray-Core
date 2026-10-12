@@ -47,6 +47,9 @@ pub struct TlsParams {
     /// Accept any certificate: Xray's `allowInsecure`. Only ever set from a
     /// link or config that says so itself (see [`TlsParams::with_insecure`]).
     pub insecure: bool,
+    /// What to write in the ClientHello's `legacy_version` field instead of
+    /// 0x0303 (see [`TlsParams::with_hello_version`]).
+    pub hello_version: Option<u16>,
 }
 
 impl TlsParams {
@@ -60,6 +63,7 @@ impl TlsParams {
             ech_server_name: None,
             extra_roots: Vec::new(),
             insecure: false,
+            hello_version: None,
         }
     }
 
@@ -72,6 +76,17 @@ impl TlsParams {
     /// a custom CDN address). Never the default; a link has to ask.
     pub fn with_insecure(mut self, insecure: bool) -> Self {
         self.insecure = insecure;
+        self
+    }
+
+    /// Write `version` in the hello's `legacy_version` field. The version
+    /// that counts is negotiated through `supported_versions`, and servers
+    /// take this field as "TLS 1.2 or later", so an odd 0x03xx value (0x0304)
+    /// is read as usual; a filter that picks out hellos by the field does not
+    /// recognise it and lets the name by. Left off with ECH, which hides the
+    /// name already and whose inner hello must not differ.
+    pub fn with_hello_version(mut self, version: u16) -> Self {
+        self.hello_version = Some(version);
         self
     }
 
@@ -126,6 +141,9 @@ struct ConfigKey {
     /// Part of the key for the same reason as `extra_roots`: a config that
     /// accepts any certificate must never be handed to a verifying outbound.
     insecure: bool,
+    /// Part of the key: the field is written by the config's hello
+    /// customizer, so configs that disagree about it are different configs.
+    hello_version: Option<u16>,
 }
 
 /// Upper bound on cached client configs.
@@ -229,6 +247,7 @@ pub fn try_client_config(params: &TlsParams) -> Result<Arc<ClientConfig>, Failur
         ech_config_list: params.ech_config_list.clone(),
         extra_roots: params.extra_roots.clone(),
         insecure: params.insecure,
+        hello_version: params.hello_version,
     };
 
     if let Ok(mut cache) = config_cache().lock() {
@@ -311,6 +330,7 @@ fn build_client_config(params: &TlsParams) -> Result<ClientConfig, String> {
             &params.alpn,
             false,
             profile_name,
+            params.hello_version,
         )?;
     }
     Ok(cfg)
@@ -673,6 +693,7 @@ mod tests {
             ech_config_list: Some(index.to_be_bytes().to_vec()),
             extra_roots: Vec::new(),
             insecure: false,
+            hello_version: None,
         };
         let mut cache = ConfigCache {
             entries: HashMap::new(),
@@ -772,5 +793,59 @@ mod tests {
         // And the verifying config was not replaced by the insecure one in
         // the cache: asking again without it is still refused.
         assert!(dial(TlsParams::new("other.example")).await.is_err());
+    }
+    /// The hello's own `legacy_version` is what the params say, with and
+    /// without a browser shape, and the handshake still completes (the
+    /// field is part of the transcript the Finished messages sign).
+    #[tokio::test]
+    async fn the_hello_version_field_is_written_as_asked_and_the_handshake_holds() {
+        use rustls_pki_types::pem::PemObject;
+        let certs =
+            vec![
+                rustls_pki_types::CertificateDer::from_pem_slice(SELF_SIGNED_CERT.as_bytes())
+                    .unwrap(),
+            ];
+        let key =
+            rustls_pki_types::PrivateKeyDer::from_pem_slice(SELF_SIGNED_KEY.as_bytes()).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                // Bytes 9 and 10 of the stream: record header (5), handshake
+                // header (4), then the hello's two version bytes.
+                let mut head = [0u8; 11];
+                while stream.peek(&mut head).await.is_ok_and(|n| n < 11) {}
+                let _ = seen_tx.send([head[9], head[10]]);
+                let _ = acceptor.accept(stream).await;
+            }
+        });
+        for (profile, name) in [
+            (FingerprintProfile::Unshaped, "unshaped"),
+            (FingerprintProfile::Chrome, "chrome"),
+        ] {
+            for (version, expected) in [(None, [0x03, 0x03]), (Some(0x0304), [0x03, 0x04])] {
+                let mut params = TlsParams::new("dns.test")
+                    .with_profile(profile)
+                    .with_insecure(true);
+                if let Some(version) = version {
+                    params = params.with_hello_version(version);
+                }
+                let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+                connect(stream, &params)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name} {version:?}: handshake failed: {e}"));
+                assert_eq!(seen.recv().await.unwrap(), expected, "{name} {version:?}");
+            }
+        }
     }
 }

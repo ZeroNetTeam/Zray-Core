@@ -1534,7 +1534,6 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.40"
-source = "git+https://github.com/aimalygin/shaped-rustls?rev=3a131beaef0183b0cb61e5a9070a703b6be39ed3#3a131beaef0183b0cb61e5a9070a703b6be39ed3"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -2330,12 +2329,14 @@ name = "zero-transport"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "blake2",
  "bytes",
  "flate2",
  "futures",
  "h2",
  "h3",
  "h3-quinn",
+ "hmac",
  "http",
  "httparse",
  "quinn",

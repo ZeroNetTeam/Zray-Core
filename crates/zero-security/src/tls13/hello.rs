@@ -112,6 +112,11 @@ pub struct HelloParams {
     pub session_id: [u8; 32],
     /// Include the optional X25519MLKEM768 key share.
     pub hybrid_kem: bool,
+    /// The `legacy_version` field: 0x0303 as every TLS 1.3 client writes it.
+    /// Another 0x03xx value is read the same by servers, which take the
+    /// field as "TLS 1.2 or later", and unrecognised by a filter that picks
+    /// hellos out by it.
+    pub legacy_version: u16,
 }
 
 impl HelloParams {
@@ -122,6 +127,7 @@ impl HelloParams {
             fingerprint: FingerprintProfile::Chrome,
             session_id: [0u8; 32],
             hybrid_kem: false,
+            legacy_version: 0x0303,
         }
     }
 }
@@ -162,7 +168,7 @@ pub fn build(params: &HelloParams) -> (Vec<u8>, ClientKeypair) {
 
     msg.push(0x01); // handshake type: client_hello
     msg.extend_from_slice(&[0, 0, 0]); // body length, patched at the end
-    msg.extend_from_slice(&[0x03, 0x03]); // legacy_version
+    msg.extend_from_slice(&params.legacy_version.to_be_bytes());
     msg.extend_from_slice(&random32());
     msg.push(32);
     msg.extend_from_slice(&params.session_id);
@@ -360,6 +366,19 @@ mod tests {
         let mut p = HelloParams::new("www.example.com");
         p.session_id = [0x42; 32];
         build(&p)
+    }
+
+    #[test]
+    fn the_legacy_version_is_the_one_asked_for_and_nothing_else_moves() {
+        let mut p = HelloParams::new("www.example.com");
+        p.session_id = [0x42; 32];
+        let (usual, _) = build(&p);
+        p.legacy_version = 0x0304;
+        let (odd, _) = build(&p);
+        assert_eq!(&odd[4..6], &[0x03, 0x04]);
+        assert_eq!(odd.len(), usual.len());
+        // The session id stays where REALITY seals it.
+        assert_eq!(&odd[39..71], &[0x42u8; 32]);
     }
 
     #[test]

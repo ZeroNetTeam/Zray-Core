@@ -17,7 +17,7 @@ cargo-fuzz = true
 # `zero-security` does not compile against, so the fuzzers would not build at
 # all -- let alone build the code that ships.
 [patch.crates-io]
-rustls = { git = "https://github.com/aimalygin/shaped-rustls", rev = "3a131beaef0183b0cb61e5a9070a703b6be39ed3" }
+rustls = { path = "../vendor/rustls" }
 netstack-smoltcp = { path = "../vendor/netstack-smoltcp" }
 
 [dependencies]

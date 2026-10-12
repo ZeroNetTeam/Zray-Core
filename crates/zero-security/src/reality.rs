@@ -52,6 +52,9 @@ pub struct RealityParams {
     /// rather than a browser family. Carried so the compatibility record can
     /// check the X25519 constraint against the exact shape going on the wire.
     pub fingerprint_name: Option<Box<str>>,
+    /// The hello's `legacy_version` field when not the usual 0x0303; the
+    /// seal covers the hello as written, so the server still verifies it.
+    pub hello_version: Option<u16>,
 }
 
 impl RealityParams {
@@ -82,6 +85,7 @@ impl RealityParams {
             mldsa65_verify: None,
             hybrid_kem: crate::reality_compat::RealityGeneration::default().offers_hybrid_kem(),
             fingerprint_name: None,
+            hello_version: None,
         }
     }
 
@@ -96,6 +100,11 @@ impl RealityParams {
             Self::from_config_with_fingerprint(server_name, public_key, short_id, fingerprint);
         params.mldsa65_verify = mldsa65_verify;
         params
+    }
+
+    pub fn with_hello_version(mut self, version: Option<u16>) -> Self {
+        self.hello_version = version;
+        self
     }
 
     pub fn with_hybrid_kem(mut self, enabled: bool) -> Self {
@@ -281,6 +290,9 @@ where
     let mut hello_params = tls13::HelloParams::new(params.server_name.to_string());
     hello_params.fingerprint = params.fingerprint;
     hello_params.hybrid_kem = compatibility.protocol_generation.offers_hybrid_kem();
+    if let Some(version) = params.hello_version {
+        hello_params.legacy_version = version;
+    }
     hello_params.session_id = [0u8; 32]; // the AAD form; sealed below
     let mut pending = PendingHello::new(&hello_params);
 

@@ -6,7 +6,8 @@
   material named in `PLAN-01.md`; no upstream REALITY or TLS 1.3 substrate source
   file is copied here.
 - Ordinary TLS fingerprinting uses the pinned MPL-2.0 shaped-rustls revision
-  `3a131beaef0183b0cb61e5a9070a703b6be39ed3` and the product-owned uTLS profile
+  `3a131beaef0183b0cb61e5a9070a703b6be39ed3`, vendored in `vendor/rustls` with
+  the one change listed in its `PATCHES.md`, and the product-owned uTLS profile
   registry in `utls_profiles.rs`/`utls_shaping.rs`. The registry is the Xray
   profile corpus with its random-profile selection kept deterministic per
   process; the adapter is responsible for provider capability filtering and
