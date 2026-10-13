@@ -150,10 +150,23 @@ pub struct Chunk {
     pub delay_ms: i64,
 }
 
+/// The version in the header of the empty records written ahead of a hello.
+///
+/// A ClientHello record says 0x0301, and an empty record that says the same
+/// is the one shape the Iranian filter was seen to stall on: measured
+/// 2026-10-13, 0x0300, 0x0302, 0x0303 and 0x0304 all got through to Cloudflare,
+/// Fastly and Google while 0x0301 got nothing back, whatever the hello's own
+/// header said. 0x0303 is what a TLS 1.2 or 1.3 record is meant to say, and
+/// the servers it was tried against (Cloudflare, Fastly, Google) read it as
+/// they read any empty record; REALITY drops empty records of any version.
+const EMPTY_RECORD_VERSION: [u8; 2] = [0x03, 0x03];
+
 /// Plan the fragmentation of a TLS handshake record.
 ///
 /// Returns `None` when the input is not a fragmentable ClientHello, in which
-/// case the caller must pass the buffer through untouched.
+/// case the caller must pass the buffer through untouched. The `empty_records`
+/// of the policy are written ahead of the hello with [`EMPTY_RECORD_VERSION`];
+/// every other record keeps the version of the hello.
 pub fn plan_tls_hello(buf: &[u8], policy: &FragmentPolicy) -> Option<Vec<Chunk>> {
     if buf.len() <= 5 || buf[0] != 22 {
         return None;
@@ -182,9 +195,15 @@ pub fn plan_tls_hello(buf: &[u8], policy: &FragmentPolicy) -> Option<Vec<Chunk>>
         let l = to - from;
 
         // Each fragment is a complete TLS record: the original content type
-        // and version, a rewritten length, then the slice.
+        // and version, a rewritten length, then the slice. The empty records
+        // in front carry [`EMPTY_RECORD_VERSION`] instead.
         let mut rec = Vec::with_capacity(5 + l);
-        rec.extend_from_slice(&buf[..3]);
+        rec.push(buf[0]);
+        if piece < usize::from(policy.empty_records) {
+            rec.extend_from_slice(&EMPTY_RECORD_VERSION);
+        } else {
+            rec.extend_from_slice(&buf[1..3]);
+        }
         rec.push((l >> 8) as u8);
         rec.push(l as u8);
         rec.extend_from_slice(&data[from..to]);
@@ -545,7 +564,7 @@ mod tests {
         };
         let chunks = plan_tls_hello(&hello, &policy).unwrap();
         assert_eq!(chunks.len(), 1, "both records must share one write");
-        let mut expected = vec![0x16, 0x03, 0x01, 0x00, 0x00];
+        let mut expected = vec![0x16, 0x03, 0x03, 0x00, 0x00];
         expected.extend_from_slice(&hello);
         assert_eq!(chunks[0].bytes, expected);
 
@@ -558,7 +577,7 @@ mod tests {
             ..policy
         };
         let bytes = &plan_tls_hello(&hello, &pieces).unwrap()[0].bytes;
-        assert_eq!(&bytes[..10], [0x16, 3, 1, 0, 0, 0x16, 3, 1, 0, 0]);
+        assert_eq!(&bytes[..10], [0x16, 3, 3, 0, 0, 0x16, 3, 3, 0, 0]);
         let mut body = Vec::new();
         let mut at = 10;
         while at < bytes.len() {
@@ -568,6 +587,30 @@ mod tests {
             at += 5 + len;
         }
         assert_eq!(body, hello[5..]);
+    }
+
+    /// The empty records say 0x0303 whatever the hello says, and only they:
+    /// the pieces of the hello keep the hello's own version.
+    #[test]
+    fn empty_records_carry_their_own_version() {
+        for hello_version in [[3u8, 1], [3, 3], [3, 4]] {
+            let mut hello = tls_record(200);
+            hello[1..3].copy_from_slice(&hello_version);
+            let policy = FragmentPolicy {
+                length_min: 100,
+                length_max: 100,
+                empty_records: 2,
+                ..FragmentPolicy::empty_record()
+            };
+            let chunks = plan_tls_hello(&hello, &policy).unwrap();
+            let bytes = &chunks[0].bytes;
+            assert_eq!(bytes[..10], [0x16, 3, 3, 0, 0, 0x16, 3, 3, 0, 0]);
+            let mut at = 10;
+            while at < bytes.len() {
+                assert_eq!(bytes[at + 1..at + 3], hello_version);
+                at += 5 + (usize::from(bytes[at + 3]) << 8 | usize::from(bytes[at + 4]));
+            }
+        }
     }
 
     /// Build a synthetic TLS handshake record of `payload` bytes.
@@ -642,7 +685,7 @@ mod tests {
         let chunks = plan_tls_hello(&hello, &p).unwrap();
         let delays: Vec<i64> = chunks.iter().map(|chunk| chunk.delay_ms).collect();
         assert_eq!(delays, [0, 7, 3, 3]);
-        assert_eq!(chunks[0].bytes, [0x16, 3, 1, 0, 0]);
+        assert_eq!(chunks[0].bytes, [0x16, 3, 3, 0, 0]);
 
         let zeros = FragmentPolicy {
             lead_delays: vec![(0, 0)],

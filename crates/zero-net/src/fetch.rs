@@ -431,22 +431,13 @@ async fn send_once(
     }
 }
 
-pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
+/// The TLS client for every plain HTTPS request this crate (and the callers
+/// that borrow it) makes: a browser-shaped hello, HTTP/1.1 only because that
+/// is all [`exchange`] speaks, certificates checked against the public roots.
+/// Built once; see [`zero_security::https_client_config`].
+pub fn tls_config() -> Arc<rustls::ClientConfig> {
     static CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
-    Arc::clone(CONFIG.get_or_init(|| {
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        Arc::new(
-            rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .expect("ring provider supports the default protocol versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-        )
-    }))
+    Arc::clone(CONFIG.get_or_init(|| zero_security::https_client_config(&["http/1.1"])))
 }
 
 async fn exchange<S>(

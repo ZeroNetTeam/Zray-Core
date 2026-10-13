@@ -384,7 +384,7 @@ where
         .map_err(|error| FetchError::Url(error.to_string()))?;
     let tls = tokio::time::timeout(
         api.timeout,
-        tokio_rustls::TlsConnector::from(tls_config()).connect(name, stream),
+        tokio_rustls::TlsConnector::from(zero_net::fetch::tls_config()).connect(name, stream),
     )
     .await
     .map_err(|_| FetchError::Timeout(api.timeout))?
@@ -399,25 +399,6 @@ where
         &limits(api),
     )
     .await
-}
-
-fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
-    static CONFIG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> =
-        std::sync::OnceLock::new();
-    std::sync::Arc::clone(CONFIG.get_or_init(|| {
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        std::sync::Arc::new(
-            rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .expect("ring provider supports the default protocol versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-        )
-    }))
 }
 
 /// What the registration reply holds.

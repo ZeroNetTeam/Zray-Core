@@ -19,14 +19,24 @@
 //!   censor cannot kill every Zray decoy by throttling one host, and a name
 //!   that stops working on one network only costs the servers that drew it.
 //!
-//! The trade-off: only `www.speedtest.net` is measured un-throttled from
-//! inside Iran (Xray-core #3318); the rest are reasoned candidates — national
-//! payment, operator and super-app domains a censor is unlikely to throttle
-//! because doing so breaks commerce, and global speed-test hosts that tend to
-//! be left alone. A pick that a given network does throttle is not a dead end:
-//! the decoy is always one balancer-probed variant among others, and
-//! [`crate::choice`] falls back to the urgent byte or a plain hello when it
-//! does not get through, so a bad pick loses a probe and nothing more.
+//! The trade-off: the pool has to suit two kinds of network, and a name that
+//! suits one can be useless on the other. On a blocklist network (a decoy is
+//! read, and only the names on the list are cut) any name that is not blocked
+//! works, domestic or foreign: measured 2026-10-13 from Iran, `digikala.com`,
+//! `aparat.com`, `hcaptcha.com`, `www.google.com`, `www.bing.com`,
+//! `www.cloudflare.com`, `www.speedtest.net` and an unregistered name all
+//! carried a decoy to blocked sites, while a decoy that repeated the blocked
+//! name did not. On an allowlist network (the destination address has to be on
+//! a list too), reports from the field say only foreign names that the address
+//! really serves get through (`hcaptcha.com`, `www.google.com`, `www.bing.com`,
+//! `www.cloudflare.com`), and nothing shows a domestic name working there. So
+//! the pool carries both kinds, and the unmeasured domestic hosts are reasoned
+//! candidates: national payment, operator and super-app domains a censor is
+//! unlikely to cut because doing so breaks commerce. A pick that a given
+//! network does cut is not a dead end: the decoy is always one balancer-probed
+//! variant among others, and [`crate::choice`] falls back to the urgent byte
+//! or a plain hello when it does not get through, so a bad pick loses a probe
+//! and nothing more.
 //!
 //! Every name here is a real site, so a censor that actively probes the decoy
 //! finds one, and every name is a plain host of visible ASCII within the
@@ -34,8 +44,10 @@
 //!
 //! Where the names come from, so the set can be refreshed by hand: the
 //! speed-test hosts are the ones the circumvention community cites as
-//! un-throttled; the Iranian hosts are the largest public super-app, payment,
-//! operator, bank and CDN domains (the kind collected in
+//! un-throttled; the foreign CDN hosts are the decoy names used in the field
+//! (Xray-core and sing-box examples, net4people threads); the Iranian hosts
+//! are the largest public super-app, payment, operator, bank and CDN domains
+//! (the kind collected in
 //! `bootmortis/iran-hosted-domains` and `v2fly/domain-list-community`'s
 //! `category-ir`).
 //!
@@ -46,7 +58,7 @@
 //! and [`pick_from`] draws from the bundled pool and the fetched names
 //! together. The feed only ever adds — the bundled set is the offline floor
 //! that always works with no network, the names a fetched line is checked
-//! against for duplicates, and the home of the one measured-good host.
+//! against for duplicates, and the home of the default host.
 
 /// Global speed-test and bandwidth hosts, which tend to be left un-throttled
 /// so a provider's own speed numbers look good. `www.speedtest.net` is the
@@ -60,9 +72,21 @@ pub const SPEEDTEST: &[&str] = &[
     "speed.cloudflare.com",
 ];
 
-/// Iranian cloud and CDN hosts: traffic to them is domestic, so it rides the
-/// national network rather than the throttled international gateway, and they
-/// front so many sites that throttling them is costly.
+/// Foreign sites on large CDNs, the names the field uses where a decoy only
+/// helps when the name belongs to the address it is sent to. Each carried a
+/// decoy through to blocked sites on a blocklist network (see the module
+/// documentation).
+pub const FOREIGN_CDN: &[&str] = &[
+    "hcaptcha.com",
+    "www.bing.com",
+    "www.google.com",
+    "www.cloudflare.com",
+];
+
+/// Iranian cloud and CDN hosts. Not measured as decoys: they front many sites,
+/// so a filter that cuts them is costly to itself. The decoy goes to the real
+/// server's address, not to theirs, so being reachable inside Iran does not
+/// help it.
 pub const IRANIAN_CDN: &[&str] = &[
     "www.arvancloud.ir",
     "arvancloud.ir",
@@ -70,10 +94,11 @@ pub const IRANIAN_CDN: &[&str] = &[
     "www.derak.cloud",
 ];
 
-/// Large Iranian consumer, payment, operator and bank domains. These are the
-/// durable ones: a filter that throttles the national payment switch, the
-/// largest mobile operators or the biggest super-apps breaks everyday commerce,
-/// so they are the names least likely to be touched.
+/// Large Iranian consumer, payment, operator and bank domains. Only
+/// `digikala.com` and `aparat.com` are measured (as decoys on a blocklist
+/// network); the rest are reasoned: a filter that cuts the national payment
+/// switch, the largest mobile operators or the biggest super-apps breaks
+/// everyday commerce, so they are the names least likely to be touched.
 pub const DOMESTIC_SITES: &[&str] = &[
     "www.aparat.com",
     "www.digikala.com",
@@ -88,14 +113,16 @@ pub const DOMESTIC_SITES: &[&str] = &[
 ];
 
 /// The default name, used when a caller has no key to pick from and as the
-/// first entry of the pool. The one host measured un-throttled from Iran.
+/// first entry of the pool. The host Xray-core #3318 measured un-throttled
+/// from Iran.
 pub const DEFAULT: &str = SPEEDTEST[0];
 
-/// Every name in the pool, speed-test hosts first (so the measured-good one is
-/// index 0), then the domestic clouds and sites.
+/// Every name in the pool, speed-test hosts first (so the default is index 0),
+/// then the foreign CDN hosts, then the domestic clouds and sites.
 pub fn all() -> impl Iterator<Item = &'static str> {
     SPEEDTEST
         .iter()
+        .chain(FOREIGN_CDN)
         .chain(IRANIAN_CDN)
         .chain(DOMESTIC_SITES)
         .copied()
@@ -105,8 +132,7 @@ pub fn all() -> impl Iterator<Item = &'static str> {
 /// across keys. `key` is whatever identifies the server — its host name is the
 /// natural choice, so every link to the same server draws the same decoy.
 ///
-/// An empty key gets [`DEFAULT`], the one measured-good host, rather than a
-/// hash of nothing.
+/// An empty key gets [`DEFAULT`] rather than a hash of nothing.
 ///
 /// ```
 /// # use zero_evasion::domestic;
@@ -295,7 +321,7 @@ mod tests {
         assert!(seen.len() > 1, "pick never spread off one name");
     }
 
-    /// The measured-good host is index 0 and the empty-key fallback.
+    /// The default host is index 0 and the empty-key fallback.
     #[test]
     fn speedtest_is_first_and_the_fallback() {
         assert_eq!(all().next(), Some("www.speedtest.net"));

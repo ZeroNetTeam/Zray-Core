@@ -8084,6 +8084,7 @@ dependencies = [
  "zero-config",
  "zero-core",
  "zero-net",
+ "zero-security",
 ]
 
 [[package]]
@@ -8132,8 +8133,8 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "url",
- "webpki-roots",
  "zero-core",
+ "zero-security",
 ]
 
 [[package]]
@@ -8487,6 +8488,7 @@ dependencies = [
  "zero-provision",
  "zero-runtime",
  "zero-scanner",
+ "zero-security",
  "zero-transport",
  "zero-tun",
 ]

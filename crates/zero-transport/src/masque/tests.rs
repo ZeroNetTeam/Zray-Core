@@ -578,3 +578,41 @@ async fn a_connection_that_freezes_without_closing_is_replaced() {
         started.elapsed()
     );
 }
+
+/// The HTTP/2 leg's ClientHello is the browser's, and still offers `h2`.
+#[test]
+fn the_http2_leg_wears_a_browser_hello_and_offers_h2() {
+    let server = MasqueKey::generate().unwrap();
+    let spec = spec_to(&server, "127.0.0.1:443".parse().unwrap(), true);
+    let config = h2_tls_config(&spec).unwrap();
+    let name = ServerName::try_from("cloudflareaccess.com".to_owned()).unwrap();
+    let mut connection = rustls::ClientConnection::new(config, name).unwrap();
+    let mut flight = Vec::new();
+    connection.write_tls(&mut flight).unwrap();
+
+    // record header (5) + handshake header (4) + version (2) + random (32).
+    let hello = &flight[9..];
+    let mut at = 34;
+    at += 1 + usize::from(hello[at]);
+    let suites = usize::from(u16::from_be_bytes([hello[at], hello[at + 1]])) / 2;
+    assert_eq!(suites, 16, "Chrome's suite list, not rustls's own");
+    at += 2 + suites * 2;
+    at += 1 + usize::from(hello[at]);
+    let end = at + 2 + usize::from(u16::from_be_bytes([hello[at], hello[at + 1]]));
+    at += 2;
+    let mut kinds = Vec::new();
+    let mut alpn = Vec::new();
+    while at < end {
+        let kind = u16::from_be_bytes([hello[at], hello[at + 1]]);
+        let len = usize::from(u16::from_be_bytes([hello[at + 2], hello[at + 3]]));
+        if kind == 0x0010 {
+            alpn = hello[at + 4..at + 4 + len].to_vec();
+        }
+        kinds.push(kind);
+        at += 4 + len;
+    }
+    assert_eq!(alpn, [&[0u8, 3, 2][..], b"h2"].concat());
+    for kind in [0x001b, 0x44cd, 0xfe0d] {
+        assert!(kinds.contains(&kind), "Chrome extension {kind:#06x}");
+    }
+}

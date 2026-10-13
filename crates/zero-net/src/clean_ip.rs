@@ -6,7 +6,6 @@
 //! response progress.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -196,7 +195,7 @@ async fn probe_one(
     );
 
     let response = if candidate.tls {
-        let connector = tokio_rustls::TlsConnector::from(probe_tls_config());
+        let connector = tokio_rustls::TlsConnector::from(crate::fetch::tls_config());
         let Ok(server_name) = rustls_pki_types::ServerName::try_from(candidate.host.clone()) else {
             return CleanIpResult::failed(candidate.address, started.elapsed());
         };
@@ -251,27 +250,6 @@ where
         .ok()?;
     response.truncate(count);
     Some(response)
-}
-
-/// A probe-only TLS client. Certificate verification stays on: an edge that
-/// cannot present a valid certificate for the fronted name is not an edge this
-/// client could use, so accepting one would rank an unusable address highly.
-fn probe_tls_config() -> Arc<rustls::ClientConfig> {
-    static CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
-    Arc::clone(CONFIG.get_or_init(|| {
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        Arc::new(
-            rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .expect("ring provider supports the default protocol versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-        )
-    }))
 }
 
 #[cfg(test)]

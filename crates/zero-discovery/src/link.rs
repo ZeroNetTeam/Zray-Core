@@ -195,6 +195,22 @@ fn public_v6(v6: Ipv6Addr) -> bool {
         || v6.is_unicast_link_local())
 }
 
+/// A feed link may not switch certificate checking off.
+///
+/// `allowInsecure=1` lets anyone on the path impersonate the server, and a
+/// feed is written by strangers, so a link that carries it would be probed,
+/// promoted and then used with nothing proving who answers. The link is
+/// refused here; the user's own pasted links go through [`parse_candidate`]
+/// and keep the flag, since they chose it.
+fn require_verified(candidate: &Candidate) -> Result<(), String> {
+    match &candidate.outbound.stream.security {
+        Security::Tls(tls) if tls.allow_insecure => {
+            Err("a feed link may not skip certificate checks".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn require_public(candidate: &Candidate) -> Result<(), String> {
     // A MasterDNS link has no endpoint; its resolvers are what gets dialled.
     if let OutboundProtocol::MasterDns(masterdns) = &candidate.outbound.protocol {
@@ -578,7 +594,8 @@ pub fn parse_candidates(text: &str, exclude: &HashSet<String>) -> (Vec<Candidate
 }
 
 /// [`parse_candidates`] for a downloaded feed: the same, but a link that
-/// points at the local machine or network is rejected (see [`public_host`]).
+/// points at the local machine or network is rejected (see [`public_host`]),
+/// and so is one that skips certificate checks (see [`require_verified`]).
 pub fn parse_feed_candidates(
     text: &str,
     exclude: &HashSet<String>,
@@ -603,6 +620,7 @@ fn parse_candidates_inner(
         let parsed = parse_candidate(&link).and_then(|candidate| {
             if public_only {
                 require_public(&candidate)?;
+                require_verified(&candidate)?;
             }
             Ok(candidate)
         });
@@ -672,6 +690,23 @@ pub(crate) mod tests {
         assert!(require_public(&candidate).is_err());
         let public = parse_candidate(MASTERDNS).unwrap();
         assert!(require_public(&public).is_ok());
+    }
+
+    #[test]
+    fn a_feed_link_may_not_skip_certificate_checks_but_a_pasted_one_may() {
+        let insecure = "trojan://pw@203.0.113.9:443?security=tls&sni=a.example&allowInsecure=1#x";
+        let strict = "trojan://pw@203.0.113.9:443?security=tls&sni=a.example#x";
+        let (feed, report) = parse_feed_candidates(insecure, &HashSet::new());
+        assert!(feed.is_empty());
+        assert_eq!(report.rejected, 1);
+        assert_eq!(parse_feed_candidates(strict, &HashSet::new()).0.len(), 1);
+        // The user's own link keeps the flag they asked for.
+        let (own, _) = parse_candidates(insecure, &HashSet::new());
+        assert_eq!(own.len(), 1);
+        assert!(matches!(
+            &own[0].outbound.stream.security,
+            Security::Tls(t) if t.allow_insecure
+        ));
     }
 
     #[test]

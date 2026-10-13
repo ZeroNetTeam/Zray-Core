@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 zero-core = { workspace = true }
+zero-security = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 socket2 = { workspace = true }
@@ -13,7 +14,6 @@ futures = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
-webpki-roots = { workspace = true }
 httparse = { workspace = true }
 url = { workspace = true }
 thiserror = { workspace = true }

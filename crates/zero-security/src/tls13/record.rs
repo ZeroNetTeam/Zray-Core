@@ -21,6 +21,12 @@ pub const CONTENT_HANDSHAKE: u8 = 0x16;
 pub const CONTENT_APPDATA: u8 = 0x17;
 pub const CONTENT_CCS: u8 = 0x14;
 
+/// The one-byte ChangeCipherSpec record every browser and TLS 1.3 server sends
+/// for middlebox compatibility (RFC 8446 §5): after the ServerHello from the
+/// server, before the Finished from the client. It carries no handshake bytes
+/// and is not hashed; leaving it out is a tell, because a real peer never does.
+pub const DUMMY_CCS: [u8; 6] = [CONTENT_CCS, 0x03, 0x03, 0x00, 0x01, 0x01];
+
 /// AEAD tag length shared by all three TLS 1.3 suites.
 const TAG_LEN: usize = 16;
 
@@ -51,10 +57,20 @@ pub fn record_header(content_type: u8, len: usize) -> [u8; 5] {
 }
 
 /// Parse one record header. Returns (content_type, body_len).
+///
+/// A peer that is not speaking TLS at all shows up here first, as the bytes
+/// of its own reply read as a header. The commonest case is a web server
+/// answering a hello with `HTTP/1.1 400`: those five bytes would parse as a
+/// record of 20527 bytes, so they are named instead of reported as a length.
 pub fn parse_header(header: &[u8]) -> Result<(u8, usize), super::Failure> {
     let h: [u8; 5] = header
         .try_into()
         .map_err(|_| super::truncated("record header"))?;
+    if &h == b"HTTP/" {
+        return Err(malformed(
+            "the server answered with plain HTTP, not TLS (wrong port, or TLS is off there)",
+        ));
+    }
     let len = u16::from_be_bytes([h[3], h[4]]) as usize;
     if len > MAX_CIPHERTEXT {
         return Err(malformed(format!(
@@ -479,6 +495,9 @@ mod tests {
     #[test]
     fn header_rejects_oversized_records() {
         assert!(parse_header(&[0x17, 0x03, 0x03, 0xff, 0xff]).is_err());
+        // "HTTP/" would read as a 20527-byte record; it is named instead.
+        let http = parse_header(b"HTTP/").unwrap_err().to_string();
+        assert!(http.contains("plain HTTP"), "{http}");
         let (t, len) = parse_header(&[0x17, 0x03, 0x03, 0x41, 0x00]).unwrap();
         assert_eq!((t, len), (CONTENT_APPDATA, 16640));
     }

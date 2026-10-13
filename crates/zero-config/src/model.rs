@@ -179,6 +179,12 @@ pub struct TlsConfig {
     /// not weaken anything: the chain is still verified and the name still has
     /// to match — the operator has simply named an extra issuer to trust.
     pub trusted_roots: Vec<Box<[u8]>>,
+    /// Xray's `pinnedPeerCertSha256` (`pcs=` in links): SHA-256 hashes of
+    /// certificates the server must present. A hash that matches the leaf is
+    /// accepted outright; one that matches a certificate further up the chain
+    /// still needs the chain and name to verify; no match at all is refused.
+    /// Empty means no pinning.
+    pub pinned_cert_sha256: Vec<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,6 +591,11 @@ impl FragmentConfig {
     /// segments of 40 bytes and plain record re-framing got 0 of 2. It costs
     /// five bytes and no delay. Cloudflare accepts the empty record; not
     /// every server does, so it is something to try, not to assume.
+    ///
+    /// The empty record says 0x0303 in its header, not the hello's 0x0301
+    /// (`zero_evasion::fragment`): measured 2026-10-13 on the same kind of
+    /// line, the 0x0301 form got nothing back from Cloudflare, Fastly or
+    /// Google and the 0x0303 form got through to all three.
     pub fn empty_record() -> Self {
         Self {
             packets: FragmentPackets::TlsHello,

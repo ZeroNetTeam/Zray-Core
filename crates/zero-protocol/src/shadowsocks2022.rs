@@ -1,6 +1,8 @@
 //! Shadowsocks 2022 TCP (`2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`).
 //!
-//! SIP022 wire format, single-PSK (no EIH multi-user). The session subkey is
+//! SIP022 wire format. The client also speaks the Extensible Identity Headers
+//! (`iPSK:uPSK` passwords: one 16-byte header per identity key, between the
+//! salt and the first chunk); the server side takes a single PSK. The session subkey is
 //! `BLAKE3::derive_key("shadowsocks 2022 session subkey", PSK || salt)` and
 //! every AEAD chunk uses a 12-byte little-endian counter nonce starting at 0,
 //! matching the reference implementations.
@@ -41,6 +43,7 @@ const MAX_PADDING: usize = 900;
 /// pool at a few MiB no matter how many handshakes arrive in a window.
 const SALT_POOL_GENERATION_LIMIT: usize = 64 * 1024;
 const SESSION_SUBKEY_CONTEXT: &str = "shadowsocks 2022 session subkey";
+const IDENTITY_SUBKEY_CONTEXT: &str = "shadowsocks 2022 identity subkey";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -113,6 +116,50 @@ pub fn decode_user_key(password: &str, method: Method) -> Result<Vec<u8>, Error>
         return Err(Error::Crypto);
     }
     Ok(bytes)
+}
+
+/// Split an `iPSK0:iPSK1:...:uPSK` password into its keys; the last one is the
+/// user's, the ones before it are identity keys of relays or the server.
+///
+/// A password that is a valid single key as a whole (a raw key may contain
+/// `:`) stays one key. Every key must have the method's length.
+fn decode_key_chain(password: &str, method: Method) -> Result<Vec<Vec<u8>>, Error> {
+    if let Ok(single) = decode_user_key(password, method) {
+        return Ok(vec![single]);
+    }
+    password
+        .split(':')
+        .map(|part| decode_user_key(part, method))
+        .collect()
+}
+
+/// The identity headers of a request: for each identity key, the first 16
+/// bytes of the next key's BLAKE3 hash, AES-encrypted under
+/// `derive_key("shadowsocks 2022 identity subkey", key || salt)`.
+/// They sit right after the salt; the session subkey uses the last key.
+fn identity_headers(chain: &[Vec<u8>], salt: &[u8]) -> Vec<u8> {
+    use aes::cipher::generic_array::GenericArray;
+    use aes::cipher::{BlockEncrypt, KeyInit as BlockKeyInit};
+    let mut out = Vec::with_capacity(16 * chain.len().saturating_sub(1));
+    for pair in chain.windows(2) {
+        let mut hasher = blake3::Hasher::new_derive_key(IDENTITY_SUBKEY_CONTEXT);
+        hasher.update(&pair[0]);
+        hasher.update(salt);
+        let mut subkey = vec![0u8; pair[0].len()];
+        hasher.finalize_xof().fill(&mut subkey);
+        let mut block = GenericArray::clone_from_slice(&blake3::hash(&pair[1]).as_bytes()[..16]);
+        if subkey.len() == 16 {
+            aes::Aes128::new_from_slice(&subkey)
+                .expect("16-byte key")
+                .encrypt_block(&mut block);
+        } else {
+            aes::Aes256::new_from_slice(&subkey)
+                .expect("32-byte key")
+                .encrypt_block(&mut block);
+        }
+        out.extend_from_slice(&block);
+    }
+    out
 }
 
 fn base64_decode(value: &str) -> Result<Vec<u8>, ()> {
@@ -392,7 +439,8 @@ where
         password: &str,
         destination: &Destination,
     ) -> Result<Stream<crate::first_flight::HeaderFirst<S>>, Error> {
-        let psk = decode_user_key(password, method)?;
+        let chain = decode_key_chain(password, method)?;
+        let psk = chain.last().cloned().ok_or(Error::Crypto)?;
         let salt = random_salt(method);
         let subkey = session_subkey(&psk, &salt, method.key_len());
         let mut send = ChunkState::new(method, &subkey);
@@ -411,8 +459,12 @@ where
         fixed.extend_from_slice(&now().to_be_bytes());
         fixed.extend_from_slice(&(variable.len() as u16).to_be_bytes());
 
-        let mut out = Vec::with_capacity(salt.len() + fixed.len() + variable.len() + 2 * TAG_LEN);
+        let identity = identity_headers(&chain, &salt);
+        let mut out = Vec::with_capacity(
+            salt.len() + identity.len() + fixed.len() + variable.len() + 2 * TAG_LEN,
+        );
         out.extend_from_slice(&salt);
+        out.extend_from_slice(&identity);
         send.seal_into(&fixed, &mut out)?;
         send.seal_into(&variable, &mut out)?;
 
@@ -790,6 +842,24 @@ mod tests {
         assert!(held.is_empty());
         assert_eq!(carrier.writes.len(), 1);
         assert!(carrier.writes[0].len() > 300);
+    }
+
+    #[test]
+    fn an_identity_password_adds_one_header_per_identity_key() {
+        use base64::Engine;
+        let b64 = |byte: u8| base64::engine::general_purpose::STANDARD.encode([byte; 32]);
+        let chain = decode_key_chain(&format!("{}:{}", b64(1), b64(2)), Method::Aes256Gcm).unwrap();
+        assert_eq!(chain.len(), 2);
+        let salt = [9u8; 32];
+        assert_eq!(identity_headers(&chain, &salt).len(), 16);
+        assert_ne!(
+            identity_headers(&chain, &salt),
+            identity_headers(&chain, &[8u8; 32]),
+            "the header depends on the salt"
+        );
+        // A single key has no identity header; a part of the wrong length fails.
+        assert!(identity_headers(&chain[1..], &salt).is_empty());
+        assert!(decode_key_chain("a:b", Method::Aes256Gcm).is_err());
     }
 
     #[test]

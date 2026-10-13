@@ -23,14 +23,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use zero_core::{Confidence, Failure, FailureKind, Stage};
 use zeroize::Zeroize;
 
-use super::hello::{build as build_hello, ClientKeypair, HelloParams};
+use super::hello::{
+    build as build_hello, offers_certificate_compression, ClientKeypair, HelloParams,
+};
 use super::kdf::{
     establish_application_secrets, establish_handshake_secrets, finished_verify_data,
     next_traffic_secret, Transcript,
 };
 use super::record::{
     parse_header, record_header, RecordCrypter, CONTENT_ALERT, CONTENT_APPDATA, CONTENT_CCS,
-    CONTENT_HANDSHAKE,
+    CONTENT_HANDSHAKE, DUMMY_CCS,
 };
 use super::{malformed, CipherSuite, MAX_PLAINTEXT};
 
@@ -43,6 +45,7 @@ mod msg {
     pub const CERTIFICATE_VERIFY: u8 = 15;
     pub const FINISHED: u8 = 20;
     pub const KEY_UPDATE: u8 = 24;
+    pub const COMPRESSED_CERTIFICATE: u8 = 25;
 }
 
 /// The HelloRetryRequest sentinel random (RFC 8446 §4.1.3). We do not follow
@@ -81,13 +84,21 @@ pub trait ServerAuth: Send + Sync {
 pub struct PendingHello {
     pub msg: Vec<u8>,
     keypair: ClientKeypair,
+    /// The hello offered `compress_certificate`, so a `CompressedCertificate`
+    /// from the server is legitimate (RFC 8879 §4: the server may send one
+    /// only when asked).
+    compression_offered: bool,
 }
 
 impl PendingHello {
     /// Build with `params`; `params.session_id` lands verbatim at msg[39..71].
     pub fn new(params: &HelloParams) -> Self {
         let (msg, keypair) = build_hello(params);
-        Self { msg, keypair }
+        Self {
+            msg,
+            keypair,
+            compression_offered: offers_certificate_compression(params.fingerprint),
+        }
     }
 
     /// The 32-byte session-id field as currently in the message.
@@ -224,6 +235,11 @@ where
                     let leaf = certificate_leaf_der(body)?;
                     leaf_key = Some(auth.verify_certificate_with_context(leaf, &hello.msg, &sh)?);
                 }
+                msg::COMPRESSED_CERTIFICATE if leaf_key.is_none() && hello.compression_offered => {
+                    let certificate = inflate_certificate(body)?;
+                    let leaf = certificate_leaf_der(&certificate)?;
+                    leaf_key = Some(auth.verify_certificate_with_context(leaf, &hello.msg, &sh)?);
+                }
                 msg::CERTIFICATE_VERIFY if !got_cv => {
                     let Some(key) = leaf_key.as_deref() else {
                         return Err(malformed("CertificateVerify before Certificate"));
@@ -269,7 +285,11 @@ where
 
     let mut write_hs = RecordCrypter::new(suite, &schedule.client_hs_traffic);
     let sealed = write_hs.seal(&finished_msg, CONTENT_HANDSHAKE)?;
-    io.write_all(&sealed.bytes)
+    // One write, as a browser sends them: the dummy CCS, then the Finished.
+    let mut flight = Vec::with_capacity(DUMMY_CCS.len() + sealed.bytes.len());
+    flight.extend_from_slice(&DUMMY_CCS);
+    flight.extend_from_slice(&sealed.bytes);
+    io.write_all(&flight)
         .await
         .map_err(|e| Failure::from_io(&e, stage))?;
     io.flush().await.map_err(|e| Failure::from_io(&e, stage))?;
@@ -604,6 +624,54 @@ fn certificate_leaf_der(body: &[u8]) -> Result<&[u8], Failure> {
     let cert_len = read_u24(body, at)?;
     at += 3;
     super::take(body, at, cert_len, "certificate DER")
+}
+
+/// The largest Certificate message a `CompressedCertificate` may inflate to.
+/// RFC 8879 §4 asks for a cap so a small message cannot claim a huge one;
+/// real chains are a few kilobytes.
+const MAX_INFLATED_CERTIFICATE: usize = 1 << 16;
+
+/// Inflate a `CompressedCertificate` body (RFC 8879 §4) into the body of the
+/// Certificate message it stands for.
+///
+/// Layout: algorithm (2), uncompressed length (3), compressed length (3),
+/// data. Only brotli is accepted because only brotli was offered. The output
+/// must be exactly the length the server declared: a bomb that expands past
+/// it, or a message that stops short, fails the handshake. The transcript
+/// still hashes the message as it came off the wire (the caller does that),
+/// not this inflated form.
+fn inflate_certificate(body: &[u8]) -> Result<Vec<u8>, Failure> {
+    use std::io::Read;
+    let algorithm = u16::from_be_bytes([
+        byte_at(body, 0, "algorithm")?,
+        byte_at(body, 1, "algorithm")?,
+    ]);
+    if algorithm != 0x0002 {
+        return Err(malformed(format!(
+            "CompressedCertificate uses algorithm {algorithm:#06x}, only brotli was offered"
+        )));
+    }
+    let declared = read_u24(body, 2)?;
+    let compressed = read_u24(body, 5)?;
+    let data = super::take(body, 8, compressed, "compressed certificate")?;
+    if 8 + compressed != body.len() {
+        return Err(malformed("CompressedCertificate has trailing bytes"));
+    }
+    if declared == 0 || declared > MAX_INFLATED_CERTIFICATE {
+        return Err(malformed("CompressedCertificate declares an unusable size"));
+    }
+    let mut out = vec![0u8; declared];
+    let mut reader = brotli_decompressor::Decompressor::new(data, 4096);
+    reader
+        .read_exact(&mut out)
+        .map_err(|_| malformed("CompressedCertificate is shorter than it declared"))?;
+    let mut extra = [0u8; 1];
+    match reader.read(&mut extra) {
+        Ok(0) => Ok(out),
+        _ => Err(malformed(
+            "CompressedCertificate is longer than it declared",
+        )),
+    }
 }
 
 fn byte_at(buf: &[u8], at: usize, what: &'static str) -> Result<u8, Failure> {
@@ -1113,6 +1181,79 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn brotli(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let params = brotli::enc::BrotliEncoderParams::default();
+        brotli::BrotliCompress(&mut &data[..], &mut out, &params).unwrap();
+        out
+    }
+
+    /// A CompressedCertificate body: algorithm, declared length, data.
+    fn compressed_body(algorithm: u16, declared: usize, data: &[u8]) -> Vec<u8> {
+        let mut body = algorithm.to_be_bytes().to_vec();
+        body.extend_from_slice(&(declared as u32).to_be_bytes()[1..]);
+        body.extend_from_slice(&(data.len() as u32).to_be_bytes()[1..]);
+        body.extend_from_slice(data);
+        body
+    }
+
+    /// The Certificate body a server would have sent: an empty request
+    /// context, then a one-entry list.
+    fn certificate_body() -> Vec<u8> {
+        let der = [0x30u8, 0x03, 0x02, 0x01, 0x07];
+        let mut entry = (der.len() as u32).to_be_bytes()[1..].to_vec();
+        entry.extend_from_slice(&der);
+        entry.extend_from_slice(&[0, 0]); // no extensions
+        let mut body = vec![0u8];
+        body.extend_from_slice(&(entry.len() as u32).to_be_bytes()[1..]);
+        body.extend_from_slice(&entry);
+        body
+    }
+
+    #[test]
+    fn a_brotli_certificate_inflates_to_the_message_it_stood_for() {
+        let original = certificate_body();
+        let body = compressed_body(2, original.len(), &brotli(&original));
+        let inflated = inflate_certificate(&body).unwrap();
+        assert_eq!(inflated, original);
+        assert_eq!(certificate_leaf_der(&inflated).unwrap(), [0x30, 3, 2, 1, 7]);
+    }
+
+    #[test]
+    fn a_compressed_certificate_that_lies_or_is_not_brotli_is_refused() {
+        let original = certificate_body();
+        let data = brotli(&original);
+        // Declares more than it holds, and less.
+        assert!(inflate_certificate(&compressed_body(2, original.len() + 1, &data)).is_err());
+        assert!(inflate_certificate(&compressed_body(2, original.len() - 1, &data)).is_err());
+        // zlib and zstd were never offered.
+        assert!(inflate_certificate(&compressed_body(1, original.len(), &data)).is_err());
+        assert!(inflate_certificate(&compressed_body(3, original.len(), &data)).is_err());
+        // A claim past the cap is refused before anything is allocated.
+        let huge = compressed_body(2, MAX_INFLATED_CERTIFICATE + 1, &data);
+        assert!(inflate_certificate(&huge).is_err());
+        // Trailing bytes after the data, garbage data, and a truncated head.
+        let mut trailing = compressed_body(2, original.len(), &data);
+        trailing.push(0);
+        assert!(inflate_certificate(&trailing).is_err());
+        assert!(inflate_certificate(&compressed_body(2, 40, &[0xff; 20])).is_err());
+        assert!(inflate_certificate(&[0, 2, 0]).is_err());
+    }
+
+    #[test]
+    fn only_the_chrome_hello_invites_a_compressed_certificate() {
+        use crate::FingerprintProfile;
+        for (fingerprint, offered) in [
+            (FingerprintProfile::Chrome, true),
+            (FingerprintProfile::Firefox, false),
+            (FingerprintProfile::Safari, false),
+        ] {
+            let mut params = HelloParams::new("example.com");
+            params.fingerprint = fingerprint;
+            assert_eq!(PendingHello::new(&params).compression_offered, offered);
+        }
+    }
 
     #[tokio::test]
     async fn unauthenticated_record_shaped_bytes_fail_closed() {

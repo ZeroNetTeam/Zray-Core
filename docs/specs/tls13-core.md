@@ -437,6 +437,19 @@ them change the handshake state machine above (psk_key_exchange_modes WILL make 
 REALITY server start sending session tickets, §1.3, so only add it together with
 post-handshake message tolerance).
 
+**Zray's own hello (`tls13/hello.rs`).** For `fp=chrome` it follows the list above: the
+same eighteen extensions as the uTLS Chrome 133 parrot (including `compress_certificate`
+with brotli only, ALPS under codepoint 0x44cd when `h2` is offered, and ECH GREASE with a
+body of 186, 218, 250 or 282 bytes), GREASE values drawn per connection (the key share's
+GREASE group equals the one in `supported_groups`, the two GREASE extensions differ), the
+middle extensions in a fresh random order with the GREASE pair pinned at the ends, and
+no padding once the hello is past 512 bytes. Because the hello invites it, the client
+inflates a brotli `CompressedCertificate` (RFC 8879) before the REALITY certificate
+check; the output must equal the declared length and is capped at 64 KiB. Other
+families (Firefox, Safari, iOS, Edge) keep the older fixed-order Chrome-like shape.
+`the_chrome_hello_has_the_extensions_of_the_chrome_133_profile` pins the extension set
+and body lengths to the corpus.
+
 ---
 
 ## 5. TRANSCRIPT HASH

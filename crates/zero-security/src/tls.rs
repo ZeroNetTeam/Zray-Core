@@ -8,8 +8,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use rustls::client::danger::ServerCertVerifier;
 use rustls::ClientConfig;
-use rustls_pki_types::ServerName;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
@@ -47,9 +48,46 @@ pub struct TlsParams {
     /// Accept any certificate: Xray's `allowInsecure`. Only ever set from a
     /// link or config that says so itself (see [`TlsParams::with_insecure`]).
     pub insecure: bool,
+    /// SHA-256 hashes the server's certificate chain must contain (see
+    /// [`TlsParams::with_pinned_certs`]). Empty means no pinning.
+    pub pinned: Vec<[u8; 32]>,
     /// What to write in the ClientHello's `legacy_version` field instead of
     /// 0x0303 (see [`TlsParams::with_hello_version`]).
     pub hello_version: Option<u16>,
+    /// A certificate verifier of the caller's own (see
+    /// [`TlsParams::with_verifier`]).
+    pub verifier: Option<Arc<dyn ServerCertVerifier>>,
+    /// A client certificate to present (see [`TlsParams::with_client_auth`]).
+    pub client_auth: Option<ClientAuth>,
+}
+
+/// A client certificate chain and its private key, for servers that ask the
+/// client to authenticate (the WARP MASQUE edge does).
+///
+/// The key is shared, not copied, and is left out of `Debug` output.
+#[derive(Clone)]
+pub struct ClientAuth {
+    chain: Vec<CertificateDer<'static>>,
+    key: Arc<PrivateKeyDer<'static>>,
+}
+
+impl ClientAuth {
+    pub fn new(chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Self {
+        Self {
+            chain,
+            key: Arc::new(key),
+        }
+    }
+}
+
+impl std::fmt::Debug for ClientAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ClientAuth({} certificate(s), key withheld)",
+            self.chain.len()
+        )
+    }
 }
 
 impl TlsParams {
@@ -63,8 +101,40 @@ impl TlsParams {
             ech_server_name: None,
             extra_roots: Vec::new(),
             insecure: false,
+            pinned: Vec::new(),
             hello_version: None,
+            verifier: None,
+            client_auth: None,
         }
+    }
+
+    /// Check the server's certificate with `verifier` instead of the public
+    /// roots, for a peer that is known by its key rather than by a CA (the
+    /// WARP MASQUE edge is pinned this way). It replaces every other check
+    /// (`insecure`, pins), so a verifier that accepts too much is the
+    /// caller's to answer for. Such a config is built fresh each time and is
+    /// never cached, because a verifier cannot be compared.
+    pub fn with_verifier(mut self, verifier: Arc<dyn ServerCertVerifier>) -> Self {
+        self.verifier = Some(verifier);
+        self
+    }
+
+    /// Present a client certificate when the server asks for one. Like
+    /// [`TlsParams::with_verifier`], it keeps the config out of the cache.
+    pub fn with_client_auth(mut self, auth: ClientAuth) -> Self {
+        self.client_auth = Some(auth);
+        self
+    }
+
+    /// Require the server to present a certificate with one of these SHA-256
+    /// hashes (Xray's `pinnedPeerCertSha256`). The leaf matching is enough on
+    /// its own, so a self-signed server can be reached without
+    /// `allowInsecure`; a match further up the chain keeps the ordinary chain
+    /// and name checks; no match fails the handshake. Pins win over
+    /// `insecure`.
+    pub fn with_pinned_certs(mut self, pins: Vec<[u8; 32]>) -> Self {
+        self.pinned = pins;
+        self
     }
 
     /// Do not check the server's certificate chain or name (Xray's
@@ -141,6 +211,8 @@ struct ConfigKey {
     /// Part of the key for the same reason as `extra_roots`: a config that
     /// accepts any certificate must never be handed to a verifying outbound.
     insecure: bool,
+    /// Part of the key: a pinned config must never serve an unpinned outbound.
+    pinned: Vec<[u8; 32]>,
     /// Part of the key: the field is written by the config's hello
     /// customizer, so configs that disagree about it are different configs.
     hello_version: Option<u16>,
@@ -247,12 +319,19 @@ pub fn try_client_config(params: &TlsParams) -> Result<Arc<ClientConfig>, Failur
         ech_config_list: params.ech_config_list.clone(),
         extra_roots: params.extra_roots.clone(),
         insecure: params.insecure,
+        pinned: params.pinned.clone(),
         hello_version: params.hello_version,
     };
 
-    if let Ok(mut cache) = config_cache().lock() {
-        if let Some(found) = cache.get(&key) {
-            return Ok(found);
+    // A verifier or a client key cannot be compared, so a config that holds
+    // one is neither looked up nor stored: handing it to another caller
+    // would hand over that caller's trust or identity.
+    let cacheable = params.verifier.is_none() && params.client_auth.is_none();
+    if cacheable {
+        if let Ok(mut cache) = config_cache().lock() {
+            if let Some(found) = cache.get(&key) {
+                return Ok(found);
+            }
         }
     }
 
@@ -262,13 +341,54 @@ pub fn try_client_config(params: &TlsParams) -> Result<Arc<ClientConfig>, Failur
             .with_detail(detail)
     })?);
 
+    if !cacheable {
+        return Ok(cfg);
+    }
     if let Ok(mut cache) = config_cache().lock() {
         return Ok(cache.insert(key, cfg));
     }
     Ok(cfg)
 }
 
+/// A browser-shaped config for plain HTTPS clients: feed and asset fetches,
+/// subscription downloads, the update check.
+///
+/// Those clients used to send rustls's own ClientHello — ring's suite order,
+/// rustls's extension order, often no ALPN — which no browser produces, and
+/// they are dialled to exactly the hosts a censor lists (GitHub, jsDelivr,
+/// the crowd endpoints). This one wears the Chrome profile like the proxy
+/// paths do and verifies against the bundled public roots.
+///
+/// `alpn` is what the caller can actually speak. A fetcher that only does
+/// HTTP/1.1 must say `["http/1.1"]`, or a server would pick `h2` and the
+/// exchange would break; that one field then differs from a browser that
+/// speaks both, which is the cost of not carrying an HTTP/2 client here.
+///
+/// If the shape cannot be built the stock config is returned instead: a feed
+/// that downloads with a plain hello beats one that does not download.
+pub fn https_client_config(alpn: &[&str]) -> Arc<ClientConfig> {
+    let params = TlsParams::new("")
+        .with_profile(FingerprintProfile::Chrome)
+        .with_alpn(alpn);
+    try_client_config(&params).unwrap_or_else(|failure| {
+        tracing::warn!(%failure, "browser-shaped HTTPS config unavailable, using the stock one");
+        let mut config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("ring supports the default protocol versions")
+                .with_root_certificates(rustls::RootCertStore {
+                    roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+                })
+                .with_no_client_auth();
+        config.alpn_protocols = params.alpn.clone();
+        Arc::new(config)
+    })
+}
+
 fn build_client_config(params: &TlsParams) -> Result<ClientConfig, String> {
+    if params.ech_config_list.is_some() && params.client_auth.is_some() {
+        return Err("a client certificate is not supported together with ECH".into());
+    }
     let mut roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
@@ -287,6 +407,7 @@ fn build_client_config(params: &TlsParams) -> Result<ClientConfig, String> {
         }
     }
 
+    let pin_roots = (!params.pinned.is_empty()).then(|| roots.clone());
     let mut cfg = if let Some(config_list) = &params.ech_config_list {
         let ech = rustls::client::EchConfig::new(
             rustls_pki_types::EchConfigListBytes::from(config_list.clone()),
@@ -299,10 +420,30 @@ fn build_client_config(params: &TlsParams) -> Result<ClientConfig, String> {
             .with_root_certificates(roots)
             .with_no_client_auth()
     } else {
-        params.profile.apply_to_builder(roots).with_no_client_auth()
+        let builder = params.profile.apply_to_builder(roots);
+        match &params.client_auth {
+            Some(auth) => builder
+                .with_client_auth_cert(auth.chain.clone(), auth.key.clone_key())
+                .map_err(|error| format!("client certificate: {error}"))?,
+            None => builder.with_no_client_auth(),
+        }
     };
 
-    if params.insecure {
+    if let Some(verifier) = &params.verifier {
+        cfg.dangerous()
+            .set_certificate_verifier(Arc::clone(verifier));
+    } else if let Some(roots) = pin_roots {
+        let provider = Arc::new(params.profile.aws_provider());
+        let inner =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(|error| format!("cannot build the certificate verifier: {error}"))?;
+        cfg.dangerous()
+            .set_certificate_verifier(Arc::new(PinnedCertificate {
+                pins: params.pinned.clone(),
+                inner,
+            }));
+    } else if params.insecure {
         let algorithms = params
             .profile
             .aws_provider()
@@ -334,6 +475,84 @@ fn build_client_config(params: &TlsParams) -> Result<ClientConfig, String> {
         )?;
     }
     Ok(cfg)
+}
+
+/// The verifier behind [`TlsParams::pinned`].
+///
+/// How it decides, in Xray's order: the leaf's SHA-256 is in the pin list,
+/// accept (no chain or name check, which is what lets a self-signed server
+/// work); else a certificate higher in the chain is pinned, so the usual
+/// chain and name verification must pass; else refuse. The one thing that
+/// differs from Xray is that a pinned CA is checked against the public roots,
+/// not treated as the only root.
+#[derive(Debug)]
+struct PinnedCertificate {
+    pins: Vec<[u8; 32]>,
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+}
+
+/// The reason shown when no certificate of the chain is pinned.
+#[derive(Debug)]
+struct PinMismatch;
+
+impl std::fmt::Display for PinMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the server's certificate is not the one pinned in the link (pcs)")
+    }
+}
+
+impl std::error::Error for PinMismatch {}
+
+impl PinnedCertificate {
+    fn pinned(&self, certificate: &rustls_pki_types::CertificateDer<'_>) -> bool {
+        use sha2::{Digest, Sha256};
+        let hash: [u8; 32] = Sha256::digest(certificate.as_ref()).into();
+        self.pins.contains(&hash)
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCertificate {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls_pki_types::CertificateDer<'_>,
+        intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if self.pinned(end_entity) {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+        if !intermediates.iter().any(|c| self.pinned(c)) {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Other(rustls::OtherError(Arc::new(PinMismatch))),
+            ));
+        }
+        self.inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
 }
 
 /// The verifier behind [`TlsParams::insecure`]: every certificate is
@@ -435,6 +654,16 @@ fn classify_handshake_error(e: &std::io::Error) -> Failure {
                 Failure::new(FailureKind::TlsAlert, Stage::TlsStarted)
                     .with_confidence(Confidence::Confirmed)
                     .with_detail(format!("alert {alert:?}"))
+            }
+            // The first record of the reply has a type TLS does not have: the
+            // peer is not speaking TLS (a web server answering `HTTP/1.1 400`
+            // is the usual case), so say that instead of "corrupt message".
+            rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType) => {
+                Failure::new(FailureKind::TlsHandshakeMalformed, Stage::TlsStarted)
+                    .with_confidence(Confidence::Likely)
+                    .with_detail(
+                        "the server did not answer in TLS (wrong port, or TLS is off there)",
+                    )
             }
             other => Failure::new(FailureKind::TlsHandshakeMalformed, Stage::TlsStarted)
                 .with_confidence(Confidence::Likely)
@@ -542,9 +771,84 @@ mod tests {
         assert_eq!(first_flight.first(), Some(&22), "TLS handshake record");
         assert_eq!(
             first_flight.len(),
-            1709,
+            1721,
             "Chrome 133 PQ/uTLS first-flight shape"
         );
+    }
+
+    /// The hello must carry the profile's own cipher-suite list, whole.
+    ///
+    /// This is the field a JA3 is built from, and the one a censor reads
+    /// without decrypting anything, so it is the shape that has to match a real
+    /// browser exactly — not the subset rustls can negotiate. The list is
+    /// written as shape only; a suite the provider cannot do is never selected
+    /// by the handshake.
+    #[test]
+    fn shaped_hello_carries_the_profile_cipher_suites_verbatim() {
+        use crate::utls_profiles::profile_for_fingerprint;
+
+        let profile = profile_for_fingerprint("chrome").expect("chrome profile");
+        let config = client_config(&TlsParams::new("example.com").with_fingerprint_name("chrome"));
+        let name = ServerName::try_from("example.com".to_owned()).unwrap();
+        let mut connection = rustls::ClientConnection::new(config, name).unwrap();
+        let mut first_flight = Vec::new();
+        connection.write_tls(&mut first_flight).unwrap();
+
+        let advertised = client_hello_cipher_suites(&first_flight);
+        let expected: Vec<u16> = profile
+            .cipher_suites
+            .iter()
+            .copied()
+            .filter(|suite| !is_grease(*suite))
+            .collect();
+        let got: Vec<u16> = advertised
+            .iter()
+            .copied()
+            .filter(|suite| !is_grease(*suite))
+            .collect();
+        assert_eq!(
+            got, expected,
+            "the hello must carry the profile's own suites, verbatim and in order"
+        );
+        assert!(
+            advertised.iter().any(|suite| is_grease(*suite)),
+            "the profile's GREASE suite is placed, not dropped"
+        );
+        assert_eq!(
+            advertised.first().copied(),
+            Some(0x0a0a),
+            "chrome leads its cipher list with GREASE"
+        );
+    }
+
+    /// The cipher-suite half of the first ClientHello in a TLS flight.
+    ///
+    /// Walks the record and handshake headers to the field rather than trusting
+    /// a fixed offset, so a change in the hello's layout surfaces as a test
+    /// failure here instead of silently reading the wrong bytes.
+    fn client_hello_cipher_suites(flight: &[u8]) -> Vec<u16> {
+        // Record header is 5 bytes, handshake header 4; then the ClientHello
+        // body starts with client_version(2), random(32), session_id(1 + len).
+        let body = flight
+            .get(5..)
+            .and_then(|record| record.get(4..))
+            .expect("first flight starts with a record holding a handshake message");
+        let session_id_len = usize::from(body[34]);
+        let mut at = 35 + session_id_len;
+        let suites_len = usize::from(u16::from_be_bytes([body[at], body[at + 1]]));
+        at += 2;
+        body[at..at + suites_len]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_be_bytes(*pair))
+            .collect()
+    }
+
+    /// RFC 8701: GREASE values are `0x?a?a` with both bytes equal.
+    fn is_grease(value: u16) -> bool {
+        let [high, low] = value.to_be_bytes();
+        high == low && high & 0x0f == 0x0a
     }
 
     #[test]
@@ -693,6 +997,7 @@ mod tests {
             ech_config_list: Some(index.to_be_bytes().to_vec()),
             extra_roots: Vec::new(),
             insecure: false,
+            pinned: Vec::new(),
             hello_version: None,
         };
         let mut cache = ConfigCache {
@@ -730,6 +1035,17 @@ mod tests {
         let f = classify_handshake_error(&e);
         assert_eq!(f.kind, FailureKind::TlsCertificateFailure);
         assert!(!f.kind.suggests_interference());
+    }
+
+    #[test]
+    fn a_reply_that_is_not_tls_is_named() {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType),
+        );
+        let f = classify_handshake_error(&e);
+        assert_eq!(f.kind, FailureKind::TlsHandshakeMalformed);
+        assert!(f.to_string().contains("did not answer in TLS"), "{f}");
     }
 
     #[test]
@@ -794,6 +1110,172 @@ mod tests {
         // the cache: asking again without it is still refused.
         assert!(dial(TlsParams::new("other.example")).await.is_err());
     }
+    #[tokio::test]
+    async fn a_pinned_leaf_is_accepted_without_allow_insecure_and_a_wrong_pin_is_refused() {
+        use rustls_pki_types::pem::PemObject;
+        use sha2::{Digest, Sha256};
+        let address = self_signed_server().await;
+        let leaf =
+            rustls_pki_types::CertificateDer::from_pem_slice(SELF_SIGNED_CERT.as_bytes()).unwrap();
+        let right: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
+        let dial = |params: TlsParams| async move {
+            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            connect(stream, &params).await.map(|_| ())
+        };
+        // The name does not match and no root vouches for the certificate;
+        // the pin alone makes it acceptable.
+        dial(TlsParams::new("other.example").with_pinned_certs(vec![[0u8; 32], right]))
+            .await
+            .expect("a pinned leaf completes the handshake");
+        // A pin that matches nothing refuses it, even with allowInsecure.
+        let refused = dial(
+            TlsParams::new("other.example")
+                .with_insecure(true)
+                .with_pinned_certs(vec![[7u8; 32]]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.kind, FailureKind::TlsCertificateFailure);
+        // The pinned config was not handed to a plain outbound.
+        assert!(dial(TlsParams::new("other.example")).await.is_err());
+    }
+
+    /// The extensions of the first ClientHello in a flight, as (type, body).
+    fn client_hello_extensions(flight: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let body = &flight[9..];
+        let mut at = 34;
+        at += 1 + usize::from(body[at]);
+        at += 2 + usize::from(u16::from_be_bytes([body[at], body[at + 1]]));
+        at += 1 + usize::from(body[at]);
+        let end = at + 2 + usize::from(u16::from_be_bytes([body[at], body[at + 1]]));
+        at += 2;
+        let mut found = Vec::new();
+        while at < end {
+            let kind = u16::from_be_bytes([body[at], body[at + 1]]);
+            let len = usize::from(u16::from_be_bytes([body[at + 2], body[at + 3]]));
+            found.push((kind, body[at + 4..at + 4 + len].to_vec()));
+            at += 4 + len;
+        }
+        found
+    }
+
+    fn first_flight(config: Arc<ClientConfig>) -> Vec<u8> {
+        let name = ServerName::try_from("example.com".to_owned()).unwrap();
+        let mut connection = rustls::ClientConnection::new(config, name).unwrap();
+        let mut flight = Vec::new();
+        connection.write_tls(&mut flight).unwrap();
+        flight
+    }
+
+    /// A plain HTTPS client must send the browser's hello, not rustls's own,
+    /// but only advertise the protocol it can speak: a server that picked `h2`
+    /// for an HTTP/1.1-only fetcher would break the exchange.
+    #[test]
+    fn the_https_helper_wears_chrome_and_offers_only_what_it_speaks() {
+        use crate::utls_profiles::profile_for_fingerprint;
+
+        let flight = first_flight(https_client_config(&["http/1.1"]));
+        let chrome = profile_for_fingerprint("chrome").unwrap();
+        let wanted: Vec<u16> = chrome
+            .cipher_suites
+            .iter()
+            .copied()
+            .filter(|suite| !is_grease(*suite))
+            .collect();
+        let got: Vec<u16> = client_hello_cipher_suites(&flight)
+            .into_iter()
+            .filter(|suite| !is_grease(*suite))
+            .collect();
+        assert_eq!(got, wanted, "the suite list is Chrome's");
+
+        let extensions = client_hello_extensions(&flight);
+        let alpn = extensions
+            .iter()
+            .find(|(kind, _)| *kind == 0x0010)
+            .expect("an ALPN extension is sent");
+        assert_eq!(alpn.1, [&[0u8, 9, 8][..], b"http/1.1"].concat());
+        for kind in [0x001b, 0x44cd, 0xfe0d] {
+            assert!(
+                extensions.iter().any(|(k, _)| *k == kind),
+                "the Chrome extension {kind:#06x} is present"
+            );
+        }
+    }
+
+    #[derive(Debug)]
+    struct Yes(rustls::crypto::WebPkiSupportedAlgorithms);
+    impl ServerCertVerifier for Yes {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: rustls_pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            m: &[u8],
+            c: &CertificateDer<'_>,
+            d: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(m, c, d, &self.0)
+        }
+        fn verify_tls13_signature(
+            &self,
+            m: &[u8],
+            c: &CertificateDer<'_>,
+            d: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(m, c, d, &self.0)
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.supported_schemes()
+        }
+    }
+
+    #[test]
+    fn a_config_with_a_verifier_or_a_client_key_is_never_shared() {
+        let algorithms = FingerprintProfile::Chrome
+            .aws_provider()
+            .signature_verification_algorithms;
+        let with_verifier = || {
+            TlsParams::new("x.example")
+                .with_profile(FingerprintProfile::Chrome)
+                .with_verifier(Arc::new(Yes(algorithms)))
+        };
+        let a = try_client_config(&with_verifier()).unwrap();
+        let b = try_client_config(&with_verifier()).unwrap();
+        assert!(!Arc::ptr_eq(&a, &b), "a verifier config is built each time");
+        let plain = TlsParams::new("x.example").with_profile(FingerprintProfile::Chrome);
+        assert!(Arc::ptr_eq(
+            &try_client_config(&plain).unwrap(),
+            &try_client_config(&plain).unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_caller_verifier_decides_instead_of_the_public_roots() {
+        let address = self_signed_server().await;
+        let algorithms = FingerprintProfile::Chrome
+            .aws_provider()
+            .signature_verification_algorithms;
+        let params = TlsParams::new("not-the-certificate-name.example")
+            .with_profile(FingerprintProfile::Chrome)
+            .with_verifier(Arc::new(Yes(algorithms)));
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        connect(stream, &params)
+            .await
+            .expect("the verifier's yes completes the handshake");
+        // The same dial without it is refused by the public roots.
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let plain = TlsParams::new("not-the-certificate-name.example")
+            .with_profile(FingerprintProfile::Chrome);
+        assert!(connect(stream, &plain).await.is_err());
+    }
+
     /// The hello's own `legacy_version` is what the params say, with and
     /// without a browser shape, and the handshake still completes (the
     /// field is part of the transcript the Finished messages sign).

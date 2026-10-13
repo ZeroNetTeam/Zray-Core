@@ -20,4 +20,7 @@ pub use reality_compat::{
     family_supports_reality, named_profile_supports_reality, RealityCompatibility,
     RealityGeneration, RealityIncompatibility, DEFAULT_MIN_CLIENT_VERSION, REPORTED_CLIENT_VERSION,
 };
-pub use tls::{client_config, connect, connect_with, try_client_config, TlsParams};
+pub use tls::{
+    client_config, connect, connect_with, https_client_config, try_client_config, ClientAuth,
+    TlsParams,
+};

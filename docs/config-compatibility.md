@@ -5,30 +5,6 @@ different from the pinned Xray oracle (`v26.7.28`, commit `5ca6f4b`). Each entry
 names the test that holds the divergence in place, because an undocumented
 divergence and an unnoticed regression look identical from the outside.
 
-## ClientHello cipher-suite list (ordinary TLS only)
-
-**What differs.** uTLS emits a browser's full cipher-suite list, including the
-TLS 1.2 ECDHE and RSA/CBC suites a TLS 1.3 connection never uses. Zray's
-ordinary-TLS path emits the same list, in the same order, filtered to the suites
-rustls implements — roughly half the length.
-
-**Why.** The pinned `shaped-rustls` revision validates the ClientHello plan
-against the configured crypto provider and refuses to advertise a suite it could
-not negotiate. There is no shape-only advertisement on that path.
-
-**Consequence.** The list length and tail are visible to a classifier comparing
-against a real browser. This is the cost PLAN-01 Decision 2 anticipated in
-depending on someone else's TLS state machine.
-
-**Not affected: REALITY.** REALITY runs on the TLS 1.3 stack this project owns
-(`zero-security/src/tls13/`), which emits the legacy tail verbatim as shape.
-That is the path where indistinguishability is load-bearing.
-
-**Pinned by.** `zero-runtime/tests/fingerprint_oracle.rs`, which asserts the
-exact relationship (uTLS's list, uTLS's order, filtered to rustls-implemented
-suites) rather than skipping the field. If the fork gains shape-only
-advertisement, the filter comes out and the assertion tightens to equality.
-
 ## Fingerprint profiles that cannot carry REALITY
 
 Profiles with no X25519 key share — the Android/okhttp shape, the 360 shapes,
@@ -41,6 +17,30 @@ time, since a REALITY failure is a *silent* relay to the decoy site.
 test `zero-runtime/tests/reality_compatibility.rs`, which compares the config
 compiler's independent copy of the rule against the wire corpus for every
 profile in it.
+
+## ClientHellos that are not browser-shaped
+
+The uTLS profile is applied to TCP TLS hellos only. Three kinds of hello leave
+as rustls writes them:
+
+- **QUIC** (Hysteria2, TUIC, Juicity, XHTTP over HTTP/3, the WARP MASQUE HTTP/3
+  leg, DoH3/DoQ). The shaping hook returns no plan when the connection is QUIC
+  (`BrowserClientHelloCustomizer`), because a browser's QUIC hello carries
+  `quic_transport_parameters` and a different extension set from its TCP one,
+  and the TCP profile data is not that.
+- **ECH.** With an ECH config list the shape is skipped (see
+  `build_client_config`), because the hook cannot tell the outer hello from the
+  inner one and reshaping broke Cloudflare ECH.
+- **DoT** (port 853), which has no browser equivalent to copy.
+
+Every other plain client (config and asset fetches, subscriptions, the update
+check, WARP registration, the clean-IP probe, DoH over HTTP/2, the WARP MASQUE
+HTTP/2 leg) uses the Chrome profile; the HTTP/1.1-only ones offer `http/1.1`
+as their only ALPN because that is all they speak.
+
+**Pinned by.** `zero-security` `the_https_helper_wears_chrome_and_offers_only_what_it_speaks`,
+`zero-transport` `the_http2_leg_wears_a_browser_hello_and_offers_h2`, and
+`zero-dns` `doh_is_browser_shaped_and_dot_is_not`.
 
 ## ECH GREASE payload length
 

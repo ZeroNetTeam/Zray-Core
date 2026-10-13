@@ -227,8 +227,11 @@ fn endpoint_failure(name: &str, system: SystemMiss, encrypted: EncryptedMiss) ->
     Failure::new(kind, Stage::Resolving).with_detail(detail)
 }
 
-/// How long the system resolver gets before it is given up on.
-const SYSTEM_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+/// How long the system resolver gets before it is given up on. A name that is
+/// not cached yet can take several seconds through a slow upstream, and the
+/// encrypted lookup runs beside it, so waiting longer costs nothing unless
+/// both are failing.
+const SYSTEM_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 /// How long the system resolver is on its own before encrypted DNS is asked
 /// beside it.
 const SYSTEM_HEAD_START: std::time::Duration = std::time::Duration::from_millis(400);
@@ -581,7 +584,8 @@ pub(crate) fn tls_params(stream: &StreamSettings, fallback_host: &str) -> Option
                 .unwrap_or_default();
             let mut p = TlsParams::new(sni)
                 .with_profile(profile)
-                .with_insecure(t.allow_insecure);
+                .with_insecure(t.allow_insecure)
+                .with_pinned_certs(t.pinned_cert_sha256.clone());
             p = p.with_fingerprint_name(t.fingerprint.name());
             if matches!(
                 stream.transport,
@@ -2799,7 +2803,7 @@ mod tests {
         stream.flush().await.unwrap();
         let (mut accepted, _) = listener.accept().await.unwrap();
         // Empty, ten bytes, one byte, and the fourth piece takes the rest.
-        let mut expected = vec![0x16, 3, 1, 0, 0];
+        let mut expected = vec![0x16, 3, 3, 0, 0];
         for piece in [&body[..10], &body[10..11], &body[11..]] {
             expected.extend_from_slice(&[0x16, 3, 1, 0, piece.len() as u8]);
             expected.extend_from_slice(piece);
@@ -2830,7 +2834,7 @@ mod tests {
         let (mut accepted, _) = listener.accept().await.unwrap();
         let mut seen = [0u8; 14];
         accepted.read_exact(&mut seen).await.unwrap();
-        assert_eq!(seen[..5], [0x16, 3, 1, 0, 0], "the empty record leads");
+        assert_eq!(seen[..5], [0x16, 3, 3, 0, 0], "the empty record leads");
         assert_eq!(seen[5..], hello[..]);
     }
 

@@ -16,25 +16,15 @@
 //! are normalised away; everything that constitutes the shape is compared
 //! exactly.
 //!
-//! ## The one divergence, stated plainly
+//! ## The cipher-suite list is compared exactly
 //!
-//! The cipher-suite list is *not* identical, and cannot be made so on this
-//! path. uTLS emits a browser's full list including the TLS 1.2 ECDHE and
-//! RSA/CBC suites that a TLS 1.3 connection never uses; the pinned
-//! `shaped-rustls` revision refuses to advertise a suite the configured
-//! provider could not negotiate, so those suites are dropped and Zray's list
-//! is about half the length. That is visible to a classifier.
-//!
-//! Rather than skip the field — which would let the divergence grow unnoticed
-//! — these tests assert the exact relationship that does hold: Zray's list is
-//! uTLS's list, in uTLS's order, filtered to the suites rustls implements. A
-//! reordering, an addition, or a drop of a suite rustls *does* implement all
-//! fail here. If the fork later gains shape-only advertisement, the assertion
-//! tightens to equality by deleting the filter.
-//!
-//! The REALITY path does not have this problem: it is built on the TLS 1.3
-//! stack this project owns and emits the legacy tail verbatim, which is the
-//! whole argument of PLAN-01 Decision 2.
+//! uTLS emits a browser's full suite list, including the TLS 1.2 ECDHE and
+//! RSA/CBC suites a TLS 1.3 connection never uses. The shaped hello carries
+//! that list verbatim — the fork writes it as shape without requiring the
+//! provider to implement every entry — so the comparison asserts equality on
+//! membership and order. A suite the provider cannot negotiate is only ever
+//! shape: if a server selects one, rustls fails the handshake rather than
+//! proceeding, and the planner moves on.
 //!
 //! ```bash
 //! cargo test -p zero-runtime --test fingerprint_oracle -- --ignored --test-threads=1
@@ -385,24 +375,10 @@ fn read_u16(body: &[u8], at: &mut usize) -> Result<u16, String> {
     Ok(u16::from_be_bytes([value[0], value[1]]))
 }
 
-/// Suites the rustls build actually implements, so the oracle's list can be
-/// reduced to what Zray is able to advertise.
-///
-/// Listed explicitly rather than read back from Zray's own output: deriving
-/// the expectation from the thing under test would make the comparison pass by
-/// construction.
-const RUSTLS_IMPLEMENTED_SUITES: &[u16] = &[
-    0x1301, // TLS13_AES_128_GCM_SHA256
-    0x1302, // TLS13_AES_256_GCM_SHA384
-    0x1303, // TLS13_CHACHA20_POLY1305_SHA256
-    0xc02b, // ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-    0xc02c, // ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-    0xc02f, // ECDHE_RSA_WITH_AES_128_GCM_SHA256
-    0xc030, // ECDHE_RSA_WITH_AES_256_GCM_SHA384
-    0xcca8, // ECDHE_RSA_WITH_CHACHA20_POLY1305
-    0xcca9, // ECDHE_ECDSA_WITH_CHACHA20_POLY1305
-];
-
+/// Suites the rustls build actually implements were once used here to reduce
+/// the oracle's list to what Zray could advertise. The shaped hello now
+/// carries the profile's list verbatim, so the comparison is exact and this
+/// filter is gone.
 /// Report the first difference in terms a reader can act on.
 fn compare(name: &str, oracle: &HelloShape, zray: &HelloShape, shuffles: bool) {
     if shuffles {
@@ -438,25 +414,13 @@ fn compare(name: &str, oracle: &HelloShape, zray: &HelloShape, shuffles: bool) {
         );
     }
 
-    // See the module documentation: equality is unreachable here, so assert
-    // the exact relationship that is.
-    let expected: Vec<u16> = oracle
-        .cipher_suites
-        .iter()
-        .copied()
-        .filter(|suite| *suite == GREASE || RUSTLS_IMPLEMENTED_SUITES.contains(suite))
-        .collect();
+    // Written verbatim as shape, so it must equal uTLS's list exactly —
+    // membership and order, including the TLS 1.2 and RSA/CBC suites rustls
+    // cannot negotiate but a real browser still advertises.
     assert_eq!(
-        expected, zray.cipher_suites,
-        "{name}: cipher suites diverge beyond the known rustls filter.\n  \
-         uTLS:     {:?}\n  expected: {expected:?}\n  Zray:     {:?}",
+        oracle.cipher_suites, zray.cipher_suites,
+        "{name}: cipher suites differ.\n  uTLS: {:?}\n  Zray: {:?}",
         oracle.cipher_suites, zray.cipher_suites
-    );
-    assert!(
-        zray.cipher_suites.len() < oracle.cipher_suites.len(),
-        "{name}: Zray now advertises as many suites as uTLS. If the fork \
-         gained shape-only advertisement, delete the filter above and assert \
-         equality — this divergence should not be retired quietly"
     );
     assert_eq!(
         oracle.legacy_version, zray.legacy_version,

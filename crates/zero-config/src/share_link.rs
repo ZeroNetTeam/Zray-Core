@@ -795,6 +795,7 @@ fn parse_hysteria2(rest: &str) -> Result<ShareLink, String> {
             allow_insecure: link_insecure(&p.query),
             ech: None,
             trusted_roots: Vec::new(),
+            pinned_cert_sha256: Vec::new(),
         });
     }
     let outbound = Outbound {
@@ -839,6 +840,7 @@ fn parse_tuic(rest: &str) -> Result<ShareLink, String> {
             allow_insecure: link_insecure(&p.query),
             ech: None,
             trusted_roots: Vec::new(),
+            pinned_cert_sha256: Vec::new(),
         });
     }
     let outbound = Outbound {
@@ -891,6 +893,7 @@ fn parse_juicity(rest: &str) -> Result<ShareLink, String> {
             allow_insecure: link_insecure(&p.query),
             ech: None,
             trusted_roots: Vec::new(),
+            pinned_cert_sha256: Vec::new(),
         });
     }
     let outbound = Outbound {
@@ -1024,6 +1027,7 @@ fn build_stream(q: &BTreeMap<String, String>, host: &str) -> Result<StreamSettin
     let security_name = get("security").to_ascii_lowercase();
     let fingerprint_name = get("fp").to_ascii_lowercase();
 
+    let transport_is_raw = matches!(network.as_str(), "" | "tcp" | "raw");
     let transport = match network.as_str() {
         "" | "tcp" | "raw" => Transport::Raw,
         "ws" => Transport::WebSocket(build_ws(q)),
@@ -1112,6 +1116,8 @@ fn build_stream(q: &BTreeMap<String, String>, host: &str) -> Result<StreamSettin
                 allow_insecure: link_insecure(q),
                 ech: link_ech(q),
                 trusted_roots: Vec::new(),
+                pinned_cert_sha256: crate::xray_json::parse_cert_pins(get("pcs"))
+                    .map_err(|error| format!("pcs: {error}"))?,
             })
         }
         "reality" => {
@@ -1171,7 +1177,43 @@ fn build_stream(q: &BTreeMap<String, String>, host: &str) -> Result<StreamSettin
         security,
         sockopt: Sockopt::default(),
         evasion,
-        raw_http_header: None,
+        raw_http_header: match transport_is_raw {
+            true => link_http_camouflage(q),
+            false => None,
+        },
+    })
+}
+
+/// TCP header camouflage from a URI-style link: `headerType=http` with the
+/// link's `host` (comma list, first wins) as the `Host` header and `path` as
+/// the request line, the way v2rayN and Xray's own share links write it.
+/// Any other `headerType` (`none`, empty, panel filler) means no header.
+fn link_http_camouflage(q: &BTreeMap<String, String>) -> Option<RawHttpHeader> {
+    if !q
+        .get("headertype")
+        .is_some_and(|t| t.eq_ignore_ascii_case("http"))
+    {
+        return None;
+    }
+    let first = |key: &str| {
+        q.get(key)?
+            .split(',')
+            .map(str::trim)
+            .find(|item| !item.is_empty())
+            .map(str::to_owned)
+    };
+    let mut headers = BTreeMap::new();
+    if let Some(host) = first("host") {
+        headers.insert(Box::from("Host"), Box::from(host.as_str()));
+    }
+    Some(RawHttpHeader {
+        request: RawHttpRequest {
+            version: Box::from("1.1"),
+            method: Box::from("GET"),
+            path: Box::from(first("path").as_deref().unwrap_or("/")),
+            headers,
+        },
+        response: None,
     })
 }
 
@@ -1732,6 +1774,52 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn pcs_becomes_certificate_pins_and_a_bad_one_fails_the_link() {
+        let hash = "cd6e838b9bfe31cab8b3d5c858b0d6223fe84ece236c1fdb281be93c302e1e6e";
+        let link = |pcs: &str| {
+            parse_link(&format!(
+                "vless://11111111-2222-3333-4444-555555555555@203.0.113.9:443?security=tls&sni=a.example&type=ws&pcs={pcs}#x"
+            ))
+        };
+        let o = link(&format!("{hash},{}", hash.to_uppercase()))
+            .unwrap()
+            .outbound;
+        let Security::Tls(tls) = o.stream.security else {
+            panic!("tls")
+        };
+        assert_eq!(tls.pinned_cert_sha256.len(), 2);
+        assert_eq!(tls.pinned_cert_sha256[0], tls.pinned_cert_sha256[1]);
+        assert_eq!(tls.pinned_cert_sha256[0][..2], [0xcd, 0x6e]);
+        assert!(link("abcd").is_err(), "a short pin must not be skipped");
+        assert!(link("zz").is_err());
+    }
+
+    #[test]
+    fn a_uri_link_with_header_type_http_gets_the_camouflage_header() {
+        let o = parse_link(
+            "vless://11111111-2222-3333-4444-555555555555@203.0.113.9:80?encryption=none&type=tcp&headerType=http&host=a.example,b.example&path=%2Fx#t",
+        )
+        .unwrap()
+        .outbound;
+        let header = o.stream.raw_http_header.expect("HTTP camouflage");
+        assert_eq!(&*header.request.path, "/x");
+        assert_eq!(
+            header.request.headers.get("Host").map(|v| &**v),
+            Some("a.example")
+        );
+        // `none` and a missing headerType leave the stream bare, and a
+        // WebSocket link ignores the key.
+        for tail in ["headerType=none", "type=tcp", "type=ws&headerType=http"] {
+            let o = parse_link(&format!(
+                "vless://11111111-2222-3333-4444-555555555555@203.0.113.9:80?encryption=none&{tail}#t"
+            ))
+            .unwrap()
+            .outbound;
+            assert!(o.stream.raw_http_header.is_none(), "{tail}");
+        }
     }
 
     #[test]

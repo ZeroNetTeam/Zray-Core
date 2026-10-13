@@ -19,9 +19,9 @@
 use rand::{rngs::OsRng, RngCore};
 use rustls::{
     client::{
-        ClientHelloAdvertisedSupportedGroups, ClientHelloAdvertisedSupportedVersions,
-        ClientHelloAlpnProtocols, ClientHelloCertificateCompressionAlgorithms,
-        ClientHelloCipherSuites, ClientHelloContext, ClientHelloExactExtension,
+        ClientHelloAdvertisedCipherSuites, ClientHelloAdvertisedSupportedGroups,
+        ClientHelloAdvertisedSupportedVersions, ClientHelloAlpnProtocols,
+        ClientHelloCertificateCompressionAlgorithms, ClientHelloExactExtension,
         ClientHelloExactExtensions, ClientHelloExtensionOrder, ClientHelloExtensionPlan,
         ClientHelloForcedExtensions, ClientHelloGreaseExtension, ClientHelloGreasePlan,
         ClientHelloKeySharePlan, ClientHelloPaddingPlan, ClientHelloPlan, ClientHelloRawExtension,
@@ -85,14 +85,12 @@ const STRUCTURED_OPTIONAL_EXTENSIONS: &[u16] = &[
 pub(crate) fn apply_utls_profile(
     mut plan: ClientHelloPlan,
     profile: &'static UtlsClientHelloProfile,
-    context: ClientHelloContext<'_>,
     managed_ech: bool,
     shuffle_extensions: bool,
 ) -> Result<ClientHelloPlan, RustlsError> {
     let supported_versions = supported_versions(profile)?;
-    let cipher_suites = cipher_suites(profile, context, supported_versions.as_slice())?;
     plan = plan
-        .with_cipher_suites(cipher_suites)
+        .with_advertised_cipher_suites(cipher_suites(profile)?)
         .with_supported_versions(supported_versions);
 
     if !profile.supported_versions.is_empty() {
@@ -130,7 +128,7 @@ pub(crate) fn apply_utls_profile(
     if let Some(raw_extensions) = raw_extensions {
         plan = plan.with_raw_extensions(raw_extensions);
     }
-    if let Some(grease) = grease_plan(profile, context, managed_ech)? {
+    if let Some(grease) = grease_plan(profile, managed_ech)? {
         plan = plan.with_grease(grease);
     }
     if profile.padding_length.is_some() {
@@ -159,65 +157,37 @@ pub(crate) fn profile_has_usable_cipher_suite(
     })
 }
 
-/// The advertised cipher-suite list.
+/// The advertised cipher-suite list, written verbatim as shape.
 ///
 /// A browser's list is mostly suites it will never use on a TLS 1.3
 /// connection: Chrome, Firefox, Safari and Edge all still trail their modern
 /// AEAD suites with the TLS 1.2 ECDHE and RSA/CBC suites of a decade ago.
-/// uTLS emits those verbatim, because to uTLS the hello is a byte string.
+/// uTLS emits those verbatim, because to uTLS the hello is a byte string, and
+/// this list is the single largest field of a JA3.
 ///
-/// Here it is not. The pinned `shaped-rustls` revision validates the plan
-/// against the configured crypto provider and rejects any suite it could not
-/// actually negotiate ("ClientHello cipher suite is not supported by this
-/// config"), so the legacy tail cannot be advertised as shape alone. What goes
-/// out is the profile's list in the profile's order, filtered to what rustls
-/// implements — correct in membership and ordering, and roughly half a real
-/// browser's length.
+/// `ClientHelloPlan::with_advertised_cipher_suites` writes the list to the
+/// wire without requiring the configured provider to implement every entry,
+/// so the whole browser list goes out, in the browser's order, unchanged.
+/// Negotiation is untouched: rustls still picks a suite it implements, and if
+/// a server selects one it cannot — an old peer reaching for the RSA/CBC tail
+/// — the handshake fails closed (`SelectedUnofferedCipherSuite`) instead of
+/// proceeding. That is one connection lost to a legacy peer, not a silent
+/// downgrade, and the planner already moves to the next server on failure.
 ///
-/// **That length difference is a real, measurable divergence from uTLS**, and
-/// it is the one thing about this path a classifier can see for free. It is
-/// pinned by the ClientHello parity oracle in `zero-runtime`, recorded in
-/// `docs/config-compatibility.md`, and it is exactly the cost PLAN-01
-/// Decision 2 anticipated in depending on someone else's TLS state machine —
-/// which is why REALITY, the path that has to be indistinguishable, is built
-/// on the TLS 1.3 stack this project owns, where the same legacy tail *is*
-/// emitted verbatim.
+/// GREASE is filtered here and re-inserted by position in `grease_plan`, so it
+/// is advertised once, where the profile put it.
 fn cipher_suites(
     profile: &UtlsClientHelloProfile,
-    context: ClientHelloContext<'_>,
-    supported_versions: &[ProtocolVersion],
-) -> Result<ClientHelloCipherSuites, RustlsError> {
-    ClientHelloCipherSuites::try_from(
+) -> Result<ClientHelloAdvertisedCipherSuites, RustlsError> {
+    ClientHelloAdvertisedCipherSuites::try_from(
         profile
             .cipher_suites
             .iter()
             .copied()
             .filter(|suite| !is_grease_value(*suite))
-            .filter(|suite| provider_supports_cipher_suite(*suite, context, supported_versions))
             .map(CipherSuite::from)
             .collect::<Vec<_>>(),
     )
-}
-
-fn provider_supports_cipher_suite(
-    suite: u16,
-    context: ClientHelloContext<'_>,
-    supported_versions: &[ProtocolVersion],
-) -> bool {
-    let suite = CipherSuite::from(suite);
-    context
-        .crypto_provider
-        .cipher_suites
-        .iter()
-        .any(|candidate| {
-            let version = candidate.version().version;
-            candidate.suite() == suite
-                && supported_versions.contains(&version)
-                && context
-                    .versions
-                    .iter()
-                    .any(|enabled| enabled.version == version)
-        })
 }
 
 /// Whether a handshake wearing this profile may negotiate TLS 1.3.
@@ -702,7 +672,9 @@ fn extension_payloads(
 /// One draw covers a HelloRetryRequest as well, because the plan this lands in
 /// is built once per connection and reused for the second flight -- the reuse
 /// rule uTLS states for the same fields.
-fn encrypted_client_hello_payload(grease: &UtlsEchGrease) -> Result<Vec<u8>, RustlsError> {
+pub(crate) fn encrypted_client_hello_payload(
+    grease: &UtlsEchGrease,
+) -> Result<Vec<u8>, RustlsError> {
     const OUTER_TYPE: u8 = 0;
     const HPKE_KDF_HKDF_SHA256: u16 = 0x0001;
 
@@ -780,7 +752,6 @@ fn draw_candidate<T: Copy>(candidates: &[T], what: &str) -> Result<T, RustlsErro
 
 fn grease_plan(
     profile: &UtlsClientHelloProfile,
-    context: ClientHelloContext<'_>,
     managed_ech: bool,
 ) -> Result<Option<ClientHelloGreasePlan>, RustlsError> {
     let grease_value = profile
@@ -805,12 +776,11 @@ fn grease_plan(
         .iter()
         .position(|suite| is_grease_value(*suite))
     {
-        let supported_versions = supported_versions(profile)?;
+        // Counted against the advertised list, which is now the profile's own
+        // non-GREASE suites, so GREASE lands exactly where the profile put it.
         let position = profile.cipher_suites[..grease_index]
             .iter()
-            .filter(|suite| {
-                provider_supports_cipher_suite(**suite, context, supported_versions.as_slice())
-            })
+            .filter(|suite| !is_grease_value(**suite))
             .count();
         grease = grease.with_cipher_suite_position(position);
     }

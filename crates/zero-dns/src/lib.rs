@@ -457,12 +457,27 @@ impl Resolver {
             }
             config
         };
-        let mut doh = config(Some(b"h2"));
-        doh.alpn_protocols.push(b"http/1.1".to_vec());
+        // DoH is HTTPS to a well-known name, which a browser does too, so it
+        // wears the browser's hello. A config that cannot be built shaped
+        // (an unusable trust anchor, say) falls back to the stock one: a
+        // resolver that works with a plain hello beats one that does not.
+        let browser = |alpn: &[&str]| {
+            let anchors = settings.trusted_roots.iter().map(|b| b.to_vec()).collect();
+            let params = zero_security::TlsParams::new("")
+                .with_profile(zero_security::FingerprintProfile::Chrome)
+                .with_alpn(alpn)
+                .with_extra_roots(anchors);
+            zero_security::try_client_config(&params).ok()
+        };
+        let doh = browser(&["h2", "http/1.1"]).unwrap_or_else(|| {
+            let mut doh = config(Some(b"h2"));
+            doh.alpn_protocols.push(b"http/1.1".to_vec());
+            Arc::new(doh)
+        });
         let tls = TlsConfigs {
             plain: Arc::new(config(None)),
-            doh: Arc::new(doh),
-            h2: Arc::new(config(Some(b"h2"))),
+            doh,
+            h2: browser(&["h2"]).unwrap_or_else(|| Arc::new(config(Some(b"h2")))),
             h3: Arc::new(config(Some(b"h3"))),
             doq: Arc::new(config(Some(b"doq"))),
         };
@@ -3618,6 +3633,23 @@ mod tests {
             let ips = resolver.lookup(name, QueryStrategy::UseIpv4).await.unwrap();
             assert_eq!(ips, vec!["10.0.0.1".parse::<IpAddr>().unwrap()]);
         }
+    }
+
+    /// DoH wears the browser's hello; DoT keeps its own (no ALPN, no browser
+    /// asks for port 853), and a custom trust anchor does not undo the shape.
+    #[test]
+    fn doh_is_browser_shaped_and_dot_is_not() {
+        let resolver = Resolver::new(DnsSettings {
+            trusted_roots: vec![TEST_CERT.as_bytes().into()],
+            ..DnsSettings::default()
+        });
+        assert!(resolver.tls.doh.client_hello_customizer.is_some());
+        assert!(resolver.tls.h2.client_hello_customizer.is_some());
+        assert!(resolver.tls.plain.client_hello_customizer.is_none());
+        assert_eq!(
+            resolver.tls.doh.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 
     /// A resolver whose first handshake is cut still answers: the plain

@@ -25,6 +25,7 @@ use super::kdf::{
 };
 use super::record::{
     parse_header, record_header, RecordCrypter, CONTENT_APPDATA, CONTENT_CCS, CONTENT_HANDSHAKE,
+    DUMMY_CCS,
 };
 use super::{CipherSuite, Tls13Stream};
 use zero_core::{Confidence, Failure, FailureKind, Stage};
@@ -294,7 +295,12 @@ where
         &certificate,
         &signing,
     )?;
-    io.write_all(&encrypted_flight)
+    // The dummy CCS a real server sends after its ServerHello, in the same
+    // write as the encrypted flight it precedes.
+    let mut flight = Vec::with_capacity(DUMMY_CCS.len() + encrypted_flight.len());
+    flight.extend_from_slice(&DUMMY_CCS);
+    flight.extend_from_slice(&encrypted_flight);
+    io.write_all(&flight)
         .await
         .map_err(|error| Failure::from_io(&error, Stage::TlsStarted))?;
     io.flush()
@@ -917,6 +923,69 @@ mod tests {
             client_short_id,
         );
         (server_params, client_params)
+    }
+
+    /// The record types of everything one side wrote, in order.
+    fn record_types(mut wire: &[u8]) -> Vec<u8> {
+        let mut types = Vec::new();
+        while wire.len() >= 5 {
+            let len = usize::from(u16::from_be_bytes([wire[3], wire[4]]));
+            types.push(wire[0]);
+            wire = &wire[(5 + len).min(wire.len())..];
+        }
+        types
+    }
+
+    /// Copy `from` to `to`, keeping a record of every byte that passed.
+    async fn tap(
+        mut from: impl AsyncRead + Unpin,
+        mut to: impl AsyncWrite + Unpin,
+        record: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        let mut chunk = [0u8; 4096];
+        while let Ok(n @ 1..) = from.read(&mut chunk).await {
+            record.lock().unwrap().extend_from_slice(&chunk[..n]);
+            if to.write_all(&chunk[..n]).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    /// A real server follows its ServerHello with a dummy ChangeCipherSpec and
+    /// a browser sends one before its Finished; both ends here do the same, or
+    /// the wire would carry a pattern no real peer produces.
+    #[tokio::test]
+    async fn both_ends_send_the_dummy_change_cipher_spec_a_real_peer_sends() {
+        use std::sync::{Arc, Mutex};
+        let (server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        // client <-> tap <-> server, recording what each side wrote.
+        let (client_io, tap_client) = tokio::io::duplex(64 * 1024);
+        let (tap_server, server_io) = tokio::io::duplex(64 * 1024);
+        let from_client = Arc::new(Mutex::new(Vec::new()));
+        let from_server = Arc::new(Mutex::new(Vec::new()));
+        let (cr, cw) = tokio::io::split(tap_client);
+        let (sr, sw) = tokio::io::split(tap_server);
+        tokio::spawn(tap(cr, sw, Arc::clone(&from_client)));
+        tokio::spawn(tap(sr, cw, Arc::clone(&from_server)));
+        let server = tokio::spawn(async move { handshake(server_io, &server_params).await });
+        let mut client = crate::reality::connect(client_io, &client_params)
+            .await
+            .unwrap();
+        client.write_all(b"x").await.unwrap();
+        client.flush().await.unwrap();
+        let _ = server.await;
+        let to_server = record_types(&from_client.lock().unwrap());
+        let to_client = record_types(&from_server.lock().unwrap());
+        // ClientHello, dummy CCS, encrypted Finished (then application data).
+        assert_eq!(
+            &to_server[..3],
+            &[CONTENT_HANDSHAKE, CONTENT_CCS, CONTENT_APPDATA]
+        );
+        // ServerHello, dummy CCS, then the encrypted flight.
+        assert_eq!(
+            &to_client[..3],
+            &[CONTENT_HANDSHAKE, CONTENT_CCS, CONTENT_APPDATA]
+        );
     }
 
     /// A client fragmenting its ClientHello into several TLS records (the

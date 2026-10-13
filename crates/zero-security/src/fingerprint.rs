@@ -315,13 +315,8 @@ impl rustls::client::ClientHelloCustomizer for BrowserClientHelloCustomizer {
         // order has to be redrawn on every connection or the "shuffle" is a
         // single fixed permutation, which is no better than none.
         let shuffle = profile_shuffles_extensions(&self.profile_name);
-        let mut plan = apply_utls_profile(
-            ClientHelloPlan::new(),
-            profile,
-            context,
-            self.managed_ech,
-            shuffle,
-        )?;
+        let mut plan =
+            apply_utls_profile(ClientHelloPlan::new(), profile, self.managed_ech, shuffle)?;
         // ECH is TLS 1.3-only in rustls. Keep the profile's browser shape when
         // both versions are enabled, but never ask the handshake planner to
         // advertise a version the selected config cannot negotiate.

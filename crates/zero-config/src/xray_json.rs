@@ -2460,8 +2460,23 @@ fn parse_stream(v: &Value, path: &str, _out: &mut ParseOutput) -> R<StreamSettin
                 .unwrap_or(false);
             let ech = parse_ech_config(t, path)?;
             let trusted_roots = parse_trusted_roots(t, path)?;
+            let pinned_cert_sha256 = match t.and_then(|t| t.get("pinnedPeerCertSha256")) {
+                Some(Value::String(text)) => parse_cert_pins(text),
+                Some(Value::Array(items)) => parse_cert_pins(
+                    &items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                _ => Ok(Vec::new()),
+            }
+            .map_err(|error| {
+                format!("{path}.streamSettings.tlsSettings.pinnedPeerCertSha256: {error}")
+            })?;
             Security::Tls(TlsConfig {
                 trusted_roots,
+                pinned_cert_sha256,
                 server_name: t
                     .and_then(|t| t.get("serverName"))
                     .and_then(Value::as_str)
@@ -2698,6 +2713,29 @@ pub(crate) fn host_from_server_name(transport: &mut Transport, security: &Securi
             config.host = Some(name.clone());
         }
     }
+}
+
+/// The SHA-256 certificate pins of `pinnedPeerCertSha256` or a link's `pcs=`:
+/// hex, comma or space separated, optionally with `:` between bytes. A value
+/// that is not a 32-byte hash is an error rather than skipped, because a pin
+/// dropped silently would leave the connection less protected than its author
+/// asked for.
+pub(crate) fn parse_cert_pins(text: &str) -> Result<Vec<[u8; 32]>, String> {
+    text.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            let digits: Vec<u8> = item.bytes().filter(|b| *b != b':').collect();
+            if digits.len() != 64 || !digits.iter().all(u8::is_ascii_hexdigit) {
+                return Err(format!("{item:?} is not a 32-byte SHA-256 hash in hex"));
+            }
+            let mut hash = [0u8; 32];
+            for (byte, pair) in hash.iter_mut().zip(digits.chunks(2)) {
+                *byte =
+                    u8::from_str_radix(std::str::from_utf8(pair).unwrap_or("0"), 16).unwrap_or(0);
+            }
+            Ok(hash)
+        })
+        .collect()
 }
 
 fn parse_raw_http_header(v: &Value, path: &str) -> R<Option<RawHttpHeader>> {

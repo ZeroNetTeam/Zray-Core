@@ -382,12 +382,21 @@ impl ServerCertVerifier for Pinned {
     }
 }
 
+/// The client certificate this account's tunnel presents, and its key.
+fn identity(spec: &Spec) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), String> {
+    let certificate = spec.key.certificate(SystemTime::now())?;
+    let key = PrivateKeyDer::try_from(spec.key.pkcs8().to_vec())
+        .map_err(|error| format!("MASQUE client key: {error}"))?;
+    Ok((CertificateDer::from(certificate), key))
+}
+
+/// Plain rustls with the pinned server key. This is what the QUIC leg uses:
+/// the browser shape is not applied to QUIC hellos, so there is nothing to
+/// gain there.
 fn tls_config(spec: &Spec, alpn: &[u8]) -> Result<rustls::ClientConfig, String> {
     let provider = Arc::new(ring_provider::default_provider());
     let algorithms = provider.signature_verification_algorithms;
-    let certificate = spec.key.certificate(SystemTime::now())?;
-    let private_key = PrivateKeyDer::try_from(spec.key.pkcs8().to_vec())
-        .map_err(|error| format!("MASQUE client key: {error}"))?;
+    let (certificate, private_key) = identity(spec)?;
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|error| format!("MASQUE TLS: {error}"))?
@@ -396,10 +405,36 @@ fn tls_config(spec: &Spec, alpn: &[u8]) -> Result<rustls::ClientConfig, String> 
             point: spec.server_point.to_vec(),
             algorithms,
         }))
-        .with_client_auth_cert(vec![CertificateDer::from(certificate)], private_key)
+        .with_client_auth_cert(vec![certificate], private_key)
         .map_err(|error| format!("MASQUE client certificate: {error}"))?;
     config.alpn_protocols = vec![alpn.to_vec()];
     Ok(config)
+}
+
+/// The TLS config of the HTTP/2 leg: the same pinned key and client
+/// certificate, but a Chrome-shaped ClientHello instead of rustls's own.
+///
+/// The leg is a long-lived TLS 1.3 stream to a Cloudflare edge address, so
+/// its hello is on the wire for as long as the tunnel is up. If the shaped
+/// config cannot be built the plain one is used: a tunnel that connects with
+/// a recognisable hello beats one that does not connect.
+fn h2_tls_config(spec: &Spec) -> Result<Arc<rustls::ClientConfig>, String> {
+    let (certificate, key) = identity(spec)?;
+    let params = zero_security::TlsParams::new("")
+        .with_profile(zero_security::FingerprintProfile::Chrome)
+        .with_alpn(&["h2"])
+        .with_verifier(Arc::new(Pinned {
+            point: spec.server_point.to_vec(),
+            algorithms: ring_provider::default_provider().signature_verification_algorithms,
+        }))
+        .with_client_auth(zero_security::ClientAuth::new(vec![certificate], key));
+    match zero_security::try_client_config(&params) {
+        Ok(config) => Ok(config),
+        Err(failure) => {
+            tracing::warn!(%failure, "MASQUE: browser-shaped TLS unavailable, using the plain one");
+            tls_config(spec, b"h2").map(Arc::new)
+        }
+    }
 }
 
 // ------------------------------------------------------------------- the API
@@ -712,7 +747,7 @@ impl H2Session {
         };
         let server_name = ServerName::try_from(endpoint.sni.to_string())
             .map_err(|error| format!("SNI {}: {error}", endpoint.sni))?;
-        let tls = tokio_rustls::TlsConnector::from(Arc::new(tls_config(spec, b"h2")?))
+        let tls = tokio_rustls::TlsConnector::from(h2_tls_config(spec)?)
             .connect(server_name, io)
             .await
             .map_err(|error| format!("TLS: {error}"))?;
