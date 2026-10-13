@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 15
     steps:
       # First: the relay's address comes from its wrangler.toml.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: find the relays
         id: relays
         env:
@@ -53,7 +53,9 @@ jobs:
           echo "list=$relays" >> "$GITHUB_OUTPUT"
           [ -n "$relays" ] || echo "No relay set up yet; nothing to do."
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
         if: steps.relays.outputs.list != ''
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: steps.relays.outputs.list != ''
