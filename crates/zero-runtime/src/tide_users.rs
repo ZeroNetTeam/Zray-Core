@@ -110,7 +110,7 @@ pub fn share_link(config: &TideInboundConfig, user: &UserId, name: &str) -> Opti
         host.to_string()
     };
     Some(format!(
-        "zerov1://{}@{}:{}?key={}&path={}&security=tls{}&fp=chrome#{}",
+        "zerov1://{}@{}:{}?key={}&path={}&security=tls{}&fp=chrome&dg=1#{}",
         encode_key(user),
         authority,
         config.public_port,

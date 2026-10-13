@@ -2626,6 +2626,15 @@ impl Server {
                 let peer = SocketAddr::from(([0, 0, 0, 0], 0));
                 while let Some((_user, destination, stream)) = streams.recv().await {
                     let (server, tag) = (Arc::clone(&server), tag.clone());
+                    if destination.network == Network::Udp {
+                        tokio::spawn(async move {
+                            let flow = zero_protocol::tide::UdpFlow::new(stream);
+                            if let Err(error) = server.handle_tide_udp(flow, id, tag).await {
+                                debug!(%error, "Tide UDP flow ended with an error");
+                            }
+                        });
+                        continue;
+                    }
                     tokio::spawn(async move {
                         if let Err(error) = server
                             .handle_hysteria2(boxed(stream), peer, id, tag, destination)
@@ -2641,6 +2650,53 @@ impl Server {
             .serve_connection(stream)
             .await
             .map_err(|error| format!("Tide connection: {error}"))
+    }
+
+    /// One UDP flow from a Tide client. Every datagram names its own
+    /// destination, so the flow is routed and answered like any UDP ingress:
+    /// the shared relay does the routing, the NAT sockets and the proxying,
+    /// and what it gets back goes into the flow.
+    async fn handle_tide_udp(
+        self: Arc<Self>,
+        flow: zero_protocol::tide::UdpFlow,
+        id: InboundId,
+        tag: Arc<str>,
+    ) -> Result<(), String> {
+        let flow = Arc::new(flow);
+        // A session spans connections, so a flow has no one peer address.
+        let peer = SocketAddr::from(([0, 0, 0, 0], 0));
+        let (mut udp, mut replies) =
+            UdpRelay::<()>::new(Arc::clone(&self), id, tag, 64, self.sniff_policy(id));
+        let writer = {
+            let (flow, stats) = (Arc::clone(&flow), Arc::clone(&self.stats));
+            tokio::spawn(async move {
+                while let Some(reply) = replies.recv().await {
+                    let length = reply.payload.len() as u64;
+                    if flow.send(&reply.source, &reply.payload).is_err() {
+                        return;
+                    }
+                    stats.downloaded.fetch_add(length, Ordering::Relaxed);
+                    stats.succeeded.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let _writer = AbortOnDrop(vec![writer]);
+        let mut seen = udp.activity();
+        loop {
+            match timeout(UDP_SESSION_IDLE, flow.recv()).await {
+                Ok(Ok((destination, payload))) => {
+                    udp.dispatch((), peer, destination, payload.to_vec()).await;
+                }
+                Ok(Err(_)) => return Ok(()),
+                Err(_) => {
+                    let now = udp.activity();
+                    if now == seen {
+                        return Ok(());
+                    }
+                    seen = now;
+                }
+            }
+        }
     }
 
     async fn handle_anytls(
@@ -5623,6 +5679,32 @@ impl Drop for NatFlow {
     }
 }
 
+/// One UDP flow carried through a Tide outbound. A task owns the datagram
+/// flow, opening it on first use (which may take a handshake, so the relay
+/// never waits on it) and carrying answers back; datagrams are handed to it
+/// through a bounded queue and dropped when it is full, as a UDP socket would.
+struct TideFlow {
+    outgoing: tokio::sync::mpsc::Sender<(Destination, Vec<u8>)>,
+    task: tokio::task::JoinHandle<()>,
+    last_active: Arc<AtomicU64>,
+    restored: Arc<std::sync::atomic::AtomicBool>,
+    /// When the flow was started. One that ended within [`TIDE_RETRY`] of it
+    /// (it could not be opened) is not made again until that has passed, or a
+    /// dead server would cost a handshake attempt per datagram.
+    started: tokio::time::Instant,
+}
+
+impl Drop for TideFlow {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// How long a Tide flow that failed is left alone before another try.
+const TIDE_RETRY: Duration = Duration::from_secs(3);
+/// Datagrams queued to a Tide flow that is still opening or busy.
+const TIDE_QUEUE: usize = 128;
+
 /// Idle limit for one direct UDP flow (Xray's UDP session default).
 const UDP_FLOW_IDLE: Duration = Duration::from_secs(60);
 /// Idle limit for a UDP session carried inside one client stream (Trojan,
@@ -5649,6 +5731,9 @@ struct UdpRelay<K> {
     tag: Arc<str>,
     replies: tokio::sync::mpsc::Sender<UdpReply<K>>,
     flows: HashMap<(K, bool), NatFlow>,
+    /// Flows carried by a Tide (ZeroV1) outbound, one per client flow and
+    /// outbound.
+    tide_flows: HashMap<(K, Arc<str>), TideFlow>,
     flow_limit: usize,
     inflight: Arc<tokio::sync::Semaphore>,
     exchanges: tokio::task::JoinSet<()>,
@@ -5678,6 +5763,7 @@ where
                 tag,
                 replies,
                 flows: HashMap::new(),
+                tide_flows: HashMap::new(),
                 flow_limit: flow_limit.max(1),
                 inflight: Arc::new(tokio::sync::Semaphore::new(UDP_INFLIGHT_LIMIT)),
                 exchanges: tokio::task::JoinSet::new(),
@@ -5756,6 +5842,10 @@ where
                     server.stats.blocked.fetch_add(1, Ordering::Relaxed);
                     return Dispatch::Rejected(payload);
                 }
+                if matches!(&outbound.protocol, OutboundProtocol::Tide(tide) if tide.datagrams) {
+                    self.send_tide(key, outbound, destination, payload, restored);
+                    return Dispatch::Sent;
+                }
                 if !matches!(outbound.protocol, OutboundProtocol::Freedom { .. }) {
                     self.spawn_exchange(key, outbound, destination, payload, restored);
                     return Dispatch::Sent;
@@ -5781,6 +5871,77 @@ where
                 debug!(%destination, %error, "direct UDP datagram failed");
                 Dispatch::Rejected(payload)
             }
+        }
+    }
+
+    /// Send a datagram through a Tide outbound's flow for `key`, starting the
+    /// flow if there is none. Never waits: a flow that is still connecting
+    /// queues the datagram, and one that is full or dead drops it.
+    fn send_tide(
+        &mut self,
+        key: K,
+        outbound: zero_config::Outbound,
+        destination: Destination,
+        payload: Vec<u8>,
+        restored: bool,
+    ) {
+        let slot = (key, outbound.tag.clone());
+        if let Some(flow) = self.tide_flows.get(&slot) {
+            if flow.task.is_finished() && flow.started.elapsed() < TIDE_RETRY {
+                return;
+            }
+            if flow.task.is_finished() {
+                self.tide_flows.remove(&slot);
+            }
+        }
+        if !self.tide_flows.contains_key(&slot) {
+            if self.tide_flows.len() >= self.flow_limit {
+                self.tide_flows.retain(|_, flow| !flow.task.is_finished());
+                if self.tide_flows.len() >= self.flow_limit {
+                    self.server.stats.failed.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+            let (outgoing, queue) = tokio::sync::mpsc::channel(TIDE_QUEUE);
+            let last_active = Arc::new(AtomicU64::new(millis_since(self.epoch)));
+            let restored_flag = Arc::new(std::sync::atomic::AtomicBool::new(restored));
+            let task = tokio::spawn(run_tide_flow(
+                Arc::clone(&self.server),
+                outbound,
+                destination.clone(),
+                key,
+                queue,
+                self.replies.clone(),
+                self.epoch,
+                Arc::clone(&last_active),
+                Arc::clone(&self.activity),
+                Arc::clone(&restored_flag),
+            ));
+            self.tide_flows.insert(
+                slot.clone(),
+                TideFlow {
+                    outgoing,
+                    task,
+                    last_active,
+                    restored: restored_flag,
+                    started: tokio::time::Instant::now(),
+                },
+            );
+        }
+        let Some(flow) = self.tide_flows.get(&slot) else {
+            return;
+        };
+        flow.restored.store(restored, Ordering::Relaxed);
+        flow.last_active
+            .store(millis_since(self.epoch), Ordering::Relaxed);
+        let length = payload.len() as u64;
+        if flow.outgoing.try_send((destination, payload)).is_ok() {
+            self.server
+                .stats
+                .uploaded
+                .fetch_add(length, Ordering::Relaxed);
+        } else {
+            self.server.stats.failed.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -5979,6 +6140,77 @@ where
 
 fn millis_since(epoch: tokio::time::Instant) -> u64 {
     epoch.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+/// The life of one Tide UDP flow: open it, send what the relay queues, carry
+/// answers back, and end when it has been idle for [`UDP_FLOW_IDLE`] or the
+/// session stops listening.
+#[allow(clippy::too_many_arguments)]
+async fn run_tide_flow<K: Copy + Send + 'static>(
+    server: Arc<Server>,
+    outbound: zero_config::Outbound,
+    first: Destination,
+    key: K,
+    mut queue: tokio::sync::mpsc::Receiver<(Destination, Vec<u8>)>,
+    replies: tokio::sync::mpsc::Sender<UdpReply<K>>,
+    epoch: tokio::time::Instant,
+    last_active: Arc<AtomicU64>,
+    activity: Arc<AtomicU64>,
+    restored: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let resolver = server.resolver();
+    let flow = match outbound::connect_tide_udp(&outbound, &first, &resolver).await {
+        Ok(flow) => Arc::new(flow),
+        Err(error) => {
+            server.stats.failed.fetch_add(1, Ordering::Relaxed);
+            debug!(%error, "Tide UDP flow could not be opened");
+            return;
+        }
+    };
+    let writer = {
+        let flow = Arc::clone(&flow);
+        async move {
+            while let Some((destination, payload)) = queue.recv().await {
+                if flow.send(&destination, &payload).is_err() {
+                    return;
+                }
+            }
+        }
+    };
+    let reader = async {
+        loop {
+            match timeout(UDP_FLOW_IDLE, flow.recv()).await {
+                Ok(Ok((source, payload))) => {
+                    last_active.store(millis_since(epoch), Ordering::Relaxed);
+                    activity.fetch_add(1, Ordering::Relaxed);
+                    let reply = UdpReply {
+                        key,
+                        source,
+                        payload: payload.to_vec(),
+                        restored: restored.load(Ordering::Relaxed),
+                    };
+                    if replies.send(reply).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(Err(error)) => {
+                    debug!(%error, "Tide UDP flow ended");
+                    return;
+                }
+                Err(_) => {
+                    let idle =
+                        millis_since(epoch).saturating_sub(last_active.load(Ordering::Relaxed));
+                    if idle >= UDP_FLOW_IDLE.as_millis() as u64 {
+                        return;
+                    }
+                }
+            }
+        }
+    };
+    tokio::select! {
+        () = writer => {}
+        () = reader => {}
+    }
 }
 
 /// Carry a direct flow's answers back until it has been idle for

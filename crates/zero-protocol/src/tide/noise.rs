@@ -117,6 +117,19 @@ impl Cipher {
     }
 }
 
+/// The key for one direction of a session's datagram lane, derived from the
+/// secret both sides share after the handshake. The lane gets keys of its own
+/// so that its counters and the byte stream's offsets can never meet in one
+/// nonce space. `client_to_server` picks the direction.
+pub fn lane_cipher(binding: &[u8; 32], client_to_server: bool) -> Cipher {
+    let label: &[u8] = if client_to_server {
+        b"zerov1 lane client-to-server"
+    } else {
+        b"zerov1 lane server-to-client"
+    };
+    Cipher::new(&hmac(binding, &[label]))
+}
+
 /// The running state both sides keep during the handshake (Noise's
 /// SymmetricState): a hash of everything said so far and a chaining key that
 /// every key exchange is mixed into.

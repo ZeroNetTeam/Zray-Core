@@ -30,13 +30,31 @@
 //!    observer learns which step a size fell in and nothing finer, and no two
 //!    connections show the same exact numbers. Later data is not padded.
 //!
+//!  * **Lane.** UDP does not want a reliable, ordered byte stream: a late
+//!    voice packet is worse than a lost one. When both sides ask for it, the
+//!    session also carries *datagrams*, built the way WireGuard builds its
+//!    transport packets. Each is sealed on its own with a counter nonce (under
+//!    a key of its own), carries no offset into the byte stream, is never
+//!    resent, and is checked against a sliding replay window, so records may
+//!    arrive in any order over any mix of pipes and a duplicate is dropped.
+//!    A datagram belongs to a stream (the stream is the UDP flow: it opens and
+//!    closes it, and its id names it), is padded in size classes, and is
+//!    dropped rather than queued for long when the pipe cannot keep up.
+//!    A lane record is told from a chunk by the top bit of its first field.
+//!
 //! The rules it keeps:
 //!  * a nonce (the offset) is used for exactly one chunk, which is why a
 //!    resent chunk is the stored bytes, never a re-cut of the stream;
 //!  * a receiver never holds more than it granted: a stream's window of data,
 //!    and a bounded amount of out-of-order chunks;
 //!  * acknowledgements and credit are never held back by the data limit, or
-//!    two full sides would wait on each other for ever.
+//!    two full sides would wait on each other for ever;
+//!  * a chunk never holds more than [`CHUNK_PLAIN_MAX`] plaintext bytes,
+//!    whatever frames were cut into it: the receiver closes the session over
+//!    a longer one;
+//!  * a lane counter is used once, and a lane record that fails to open ends
+//!    the session just as a bad chunk does, while a repeated or too old one is
+//!    quietly dropped.
 //!
 //! The surprise: nothing here does I/O or knows what a pipe is made of. A
 //! pipe writer asks [`Session::next_chunk`] for bytes to send; a pipe reader
@@ -56,7 +74,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Notify;
 use zero_core::{Address, Destination, Network};
 
-use super::noise::{Cipher, Keys, TAG_LEN};
+use super::noise::{self, Cipher, Keys, TAG_LEN};
 
 /// Bytes in front of a chunk's ciphertext: its offset and its length.
 pub const CHUNK_HEADER: usize = 10;
@@ -64,6 +82,15 @@ pub const CHUNK_HEADER: usize = 10;
 pub const CHUNK_PLAIN_MAX: usize = 16 * 1024;
 /// What a stream may send before the receiver has read any of it.
 const STREAM_WINDOW: usize = 256 * 1024;
+/// A stream that has received this much is a bulk transfer, and may be given
+/// the larger window below: a window caps a stream at window / round trip
+/// (256 KiB over 160 ms is 13 Mbit/s whatever the link can do).
+const BULK_AFTER: u64 = 1024 * 1024;
+const BULK_WINDOW: usize = 4 * 1024 * 1024;
+/// Most window, beyond the base one, that all of a session's bulk streams
+/// together may be given. This is what a peer could make the receiver hold
+/// if it stopped reading, so it bounds a session's memory, not just a stream's.
+const WINDOW_BUDGET: usize = 16 * 1024 * 1024;
 /// What an application may queue on a stream before its writes wait.
 const STREAM_SEND_BUFFER: usize = 64 * 1024;
 /// Sent but unacknowledged bytes above which no new data is cut. Control
@@ -91,6 +118,32 @@ const EARLY_BYTES: u64 = 4 * 1024;
 /// padding in `mux.rs` learned this from the shape benchmark).
 const PAD_STEP: usize = 640;
 const PAD_JITTER: usize = 128;
+
+/// Set in the first field of a record that belongs to the datagram lane. A
+/// chunk's first field is a stream offset, which never gets near this bit.
+const LANE_FLAG: u64 = 1 << 63;
+/// How far behind the newest counter a lane record may arrive and still be
+/// accepted, if not seen before. WireGuard's window is about twice this.
+const LANE_WINDOW: u64 = 4096;
+/// Most plaintext bytes of datagrams waiting to be sent. More than a pipe can
+/// drain in a moment is just delay, so the rest is dropped, like a full UDP
+/// socket buffer would.
+const LANE_QUEUE_BYTES: usize = 256 * 1024;
+/// A datagram that waited this long is dropped unsent: a game or call packet
+/// that late is worse than none.
+const LANE_MAX_AGE: Duration = Duration::from_millis(300);
+/// Datagrams a stream keeps for its reader.
+const LANE_INBOX: usize = 256;
+/// Most wire bytes of lane records added to one write.
+const LANE_BATCH: usize = 8 * 1024;
+/// Inside a lane record, before the body: the stream id and the padding length.
+const LANE_PLAIN_HEADER: usize = 6;
+/// The largest datagram body: a whole chunk less the lane's own header.
+pub const LANE_BODY_MAX: usize = CHUNK_PLAIN_MAX - LANE_PLAIN_HEADER;
+/// A flow's first datagrams are padded like a stream's early data.
+const LANE_EARLY: u32 = 8;
+/// Later datagrams are rounded up to a multiple of this, plus a little.
+const LANE_ROUND: usize = 32;
 
 const FRAME_OPEN: u8 = 1;
 const FRAME_DATA: u8 = 2;
@@ -142,6 +195,15 @@ struct StreamState {
     write_waker: Option<Waker>,
     /// The application dropped its handle; only queued output remains.
     orphan: bool,
+    /// Datagrams received for this stream and not yet read.
+    lane_inbox: VecDeque<Bytes>,
+    lane_waker: Option<Waker>,
+    /// Datagrams sent so far, to tell a flow's early ones.
+    lane_sent: u32,
+    /// What this side lets the peer send before it has read any (zero means
+    /// the base [`STREAM_WINDOW`]), and how much has been received in all.
+    window: usize,
+    receive_total: u64,
 }
 
 impl StreamState {
@@ -151,6 +213,17 @@ impl StreamState {
         }
         if let Some(waker) = self.write_waker.take() {
             waker.wake();
+        }
+        if let Some(waker) = self.lane_waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn window(&self) -> usize {
+        if self.window == 0 {
+            STREAM_WINDOW
+        } else {
+            self.window
         }
     }
 
@@ -169,6 +242,84 @@ struct Sent {
     /// The pipe it last went out on.
     pipe: u64,
     at: Instant,
+}
+
+/// A datagram waiting for a pipe.
+struct LaneOut {
+    stream: u32,
+    body: Vec<u8>,
+    at: Instant,
+}
+
+/// The sliding record of which lane counters have been seen: WireGuard's
+/// replay filter. `check` is asked before the (costly) decryption and
+/// `update` only after it succeeded, so forged records cannot move it.
+struct ReplayWindow {
+    /// One bit per counter, indexed by counter modulo the window.
+    bits: Vec<u64>,
+    /// The highest counter accepted; meaningful once `any` is set.
+    newest: u64,
+    any: bool,
+}
+
+impl ReplayWindow {
+    fn new() -> Self {
+        Self {
+            bits: vec![0; (LANE_WINDOW / 64) as usize],
+            newest: 0,
+            any: false,
+        }
+    }
+
+    fn slot(counter: u64) -> (usize, u64) {
+        let index = counter % LANE_WINDOW;
+        ((index / 64) as usize, 1 << (index % 64))
+    }
+
+    fn check(&self, counter: u64) -> bool {
+        if !self.any || counter > self.newest {
+            return true;
+        }
+        if self.newest - counter >= LANE_WINDOW {
+            return false;
+        }
+        let (word, bit) = Self::slot(counter);
+        self.bits[word] & bit == 0
+    }
+
+    fn update(&mut self, counter: u64) {
+        if !self.any || counter > self.newest {
+            // Counters between the old newest and this one have not been
+            // seen: clear the slots they reuse.
+            let behind = if self.any {
+                counter - self.newest
+            } else {
+                LANE_WINDOW
+            };
+            if behind >= LANE_WINDOW {
+                self.bits.iter_mut().for_each(|word| *word = 0);
+            } else {
+                for gap in self.newest + 1..=counter {
+                    let (word, bit) = Self::slot(gap);
+                    self.bits[word] &= !bit;
+                }
+            }
+            self.newest = counter;
+            self.any = true;
+        }
+        let (word, bit) = Self::slot(counter);
+        self.bits[word] |= bit;
+    }
+}
+
+/// The datagram lane's state: keys, counter, replay filter and send queue.
+struct Lane {
+    send: Cipher,
+    receive: Cipher,
+    next: u64,
+    window: ReplayWindow,
+    queue: VecDeque<LaneOut>,
+    queue_bytes: usize,
 }
 
 struct Core {
@@ -197,6 +348,32 @@ struct Core {
     incoming: VecDeque<(u32, Destination)>,
     closed: Option<io::ErrorKind>,
     last_activity: Instant,
+    /// `None` unless both sides agreed to carry datagrams.
+    lane: Option<Lane>,
+    /// Window granted to bulk streams beyond the base, in all.
+    window_extra: usize,
+}
+
+/// Bytes of the OPEN frame for `destination`.
+fn open_size(destination: &Destination) -> usize {
+    9 + match &destination.address {
+        Address::Ip(std::net::IpAddr::V4(_)) => 4,
+        Address::Ip(std::net::IpAddr::V6(_)) => 16,
+        Address::Domain(name) => 1 + name.len().min(255),
+    }
+}
+
+/// How many padding bytes a lane record of `plain_len` plaintext bytes gets.
+fn lane_padding(plain_len: usize, early: bool) -> usize {
+    let target = if early {
+        (plain_len / PAD_STEP + 1) * PAD_STEP + rand::random::<usize>() % PAD_JITTER
+    } else {
+        plain_len.next_multiple_of(LANE_ROUND) + rand::random::<usize>() % (LANE_ROUND / 2)
+    };
+    target
+        .saturating_sub(plain_len)
+        .min(CHUNK_PLAIN_MAX.saturating_sub(plain_len))
+        .min(u16::MAX as usize)
 }
 
 impl Core {
@@ -237,11 +414,19 @@ impl Core {
                 return early;
             };
             let stream = self.streams.get_mut(&id).expect("just found");
+            // The OPEN frame (and a FIN that may follow it) goes out whole or
+            // not at all in this chunk, so a chunk never outgrows `max`.
+            let reserve = if stream.fin_queued { 5 } else { 0 };
+            if let Some(destination) = &stream.open_pending {
+                if !out.is_empty() && out.len() + open_size(destination) + reserve > max {
+                    return early;
+                }
+            }
             early |= stream.sent < EARLY_BYTES;
             if let Some(destination) = stream.open_pending.take() {
                 encode_open(id, &destination, out);
             }
-            let room = max.saturating_sub(out.len() + DATA_HEADER);
+            let room = max.saturating_sub(out.len() + DATA_HEADER + reserve);
             let take = stream
                 .send_buffer
                 .len()
@@ -287,6 +472,13 @@ impl Core {
         plain.resize(plain.len() + filler, 0);
     }
 
+    /// Drop a stream's state, returning its extra window to the budget.
+    fn remove_stream(&mut self, id: u32) {
+        if let Some(stream) = self.streams.remove(&id) {
+            self.window_extra -= stream.window().saturating_sub(STREAM_WINDOW);
+        }
+    }
+
     /// Forget a stream whose handle is gone and whose output has all left.
     fn reap(&mut self, id: u32) {
         let Some(stream) = self.streams.get(&id) else {
@@ -295,7 +487,7 @@ impl Core {
         let drained = stream.send_buffer.is_empty() && (stream.fin_sent || stream.send_stopped);
         if stream.orphan && drained && stream.open_pending.is_none() {
             let finished = stream.receive_fin || stream.receive_reset;
-            self.streams.remove(&id);
+            self.remove_stream(id);
             if !finished {
                 // Nobody will read what the peer still sends: tell it to stop.
                 self.queue_control(Self::stream_frame(FRAME_STOP, id));
@@ -319,8 +511,12 @@ impl Core {
         }
         let mut plain = Vec::new();
         let early = self.build_plain(max_plain.min(CHUNK_PLAIN_MAX), &mut plain);
+        // Datagrams follow the chunk, so the OPEN frame of a flow that has
+        // just been cut into it reaches the far side before its datagrams.
+        let mut lane = Vec::new();
+        self.drain_lane(&mut lane, LANE_BATCH);
         if plain.is_empty() {
-            return None;
+            return (!lane.is_empty()).then(|| Bytes::from(lane));
         }
         if early {
             Self::pad(&mut plain);
@@ -345,7 +541,103 @@ impl Core {
             at: Instant::now(),
         });
         self.last_activity = Instant::now();
-        Some(wire)
+        if lane.is_empty() {
+            return Some(wire);
+        }
+        let mut both = BytesMut::with_capacity(wire.len() + lane.len());
+        both.extend_from_slice(&wire);
+        both.extend_from_slice(&lane);
+        Some(both.freeze())
+    }
+
+    /// Seal queued datagrams into `out`, up to `budget` wire bytes. Late ones
+    /// are dropped; one whose stream has not been opened on the wire yet
+    /// waits (its OPEN frame is cut into the chunk before this runs).
+    fn drain_lane(&mut self, out: &mut Vec<u8>, budget: usize) {
+        loop {
+            let Some(lane) = self.lane.as_mut() else {
+                return;
+            };
+            let Some(front) = lane.queue.front() else {
+                return;
+            };
+            let stale = front.at.elapsed() > LANE_MAX_AGE;
+            let stream = self.streams.get_mut(&front.stream);
+            let usable = stream
+                .as_ref()
+                .is_some_and(|stream| !stream.send_stopped && !stream.orphan);
+            if stale || !usable || lane.next >= LANE_FLAG - 1 {
+                let gone = lane.queue.pop_front().expect("peeked");
+                lane.queue_bytes -= gone.body.len();
+                continue;
+            }
+            let stream = stream.expect("usable");
+            if stream.open_pending.is_some() {
+                return;
+            }
+            let plain_len = LANE_PLAIN_HEADER + front.body.len();
+            let early = stream.lane_sent < LANE_EARLY;
+            let padding = lane_padding(plain_len, early);
+            let wire_len = CHUNK_HEADER + plain_len + padding + TAG_LEN;
+            if !out.is_empty() && out.len() + wire_len > budget {
+                return;
+            }
+            let item = lane.queue.pop_front().expect("peeked");
+            lane.queue_bytes -= item.body.len();
+            stream.lane_sent = stream.lane_sent.saturating_add(1);
+            let mut plain = Vec::with_capacity(plain_len + padding + TAG_LEN);
+            plain.extend_from_slice(&item.stream.to_be_bytes());
+            plain.extend_from_slice(&(padding as u16).to_be_bytes());
+            plain.extend_from_slice(&item.body);
+            plain.resize(plain_len + padding, 0);
+            let counter = lane.next;
+            lane.next += 1;
+            let mut header = [0u8; CHUNK_HEADER];
+            header[..8].copy_from_slice(&(LANE_FLAG | counter).to_be_bytes());
+            header[8..].copy_from_slice(&((plain.len() + TAG_LEN) as u16).to_be_bytes());
+            lane.send.seal(counter, &header, &mut plain);
+            out.extend_from_slice(&header);
+            out.extend_from_slice(&plain);
+            self.last_activity = Instant::now();
+        }
+    }
+
+    /// One lane record off a pipe: check the replay window, open it, and hand
+    /// the datagram to its stream.
+    fn on_lane(&mut self, header: &[u8; CHUNK_HEADER], mut body: Vec<u8>) -> io::Result<()> {
+        let Some(lane) = self.lane.as_mut() else {
+            return Err(invalid("tide datagram lane was not agreed"));
+        };
+        let counter = u64::from_be_bytes(header[..8].try_into().expect("8 bytes")) & !LANE_FLAG;
+        if !lane.window.check(counter) {
+            return Ok(());
+        }
+        lane.receive
+            .open(counter, header, &mut body)
+            .map_err(|_| invalid("tide datagram failed authentication"))?;
+        lane.window.update(counter);
+        if body.len() < LANE_PLAIN_HEADER {
+            return Err(invalid("tide datagram is too short"));
+        }
+        let flow = u32::from_be_bytes(body[..4].try_into().expect("4 bytes"));
+        let padding = u16::from_be_bytes([body[4], body[5]]) as usize;
+        if LANE_PLAIN_HEADER + padding > body.len() {
+            return Err(invalid("tide datagram padding is longer than it"));
+        }
+        let end = body.len() - padding;
+        // Stream 0 is never a stream: a record for it is cover traffic.
+        if let Some(stream) = self.streams.get_mut(&flow) {
+            if !stream.orphan && stream.lane_inbox.len() < LANE_INBOX {
+                stream
+                    .lane_inbox
+                    .push_back(Bytes::copy_from_slice(&body[LANE_PLAIN_HEADER..end]));
+                if let Some(waker) = stream.lane_waker.take() {
+                    waker.wake();
+                }
+            }
+        }
+        self.last_activity = Instant::now();
+        Ok(())
     }
 
     fn on_ack(&mut self, offset: u64) {
@@ -366,6 +658,9 @@ impl Core {
 
     /// One chunk off a pipe: `header` is its ten bytes, `body` the ciphertext.
     fn on_chunk(&mut self, header: &[u8; CHUNK_HEADER], body: Vec<u8>) -> io::Result<()> {
+        if header[0] & 0x80 != 0 {
+            return self.on_lane(header, body);
+        }
         let offset = u64::from_be_bytes(header[..8].try_into().expect("8 bytes"));
         if offset < self.expected || self.reorder.contains_key(&offset) {
             // Already have it. The sender is resending, so it does not know
@@ -462,7 +757,7 @@ impl Core {
                     let id = id_of(buffer);
                     if let Some(stream) = self.streams.get_mut(&id) {
                         let data = &buffer[DATA_HEADER..needed];
-                        if stream.receive_buffer.len() + data.len() > STREAM_WINDOW {
+                        if stream.receive_buffer.len() + data.len() > stream.window() {
                             return Err(invalid("tide peer sent past its credit"));
                         }
                         if !stream.orphan {
@@ -600,7 +895,15 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(role: Role, keys: Keys) -> Arc<Self> {
+    pub fn new(role: Role, keys: Keys, lane: bool) -> Arc<Self> {
+        let lane = lane.then(|| Lane {
+            send: noise::lane_cipher(&keys.binding, role == Role::Client),
+            receive: noise::lane_cipher(&keys.binding, role == Role::Server),
+            next: 0,
+            window: ReplayWindow::new(),
+            queue: VecDeque::new(),
+            queue_bytes: 0,
+        });
         Arc::new(Self {
             binding: keys.binding,
             core: Mutex::new(Core {
@@ -623,6 +926,8 @@ impl Session {
                 incoming: VecDeque::new(),
                 closed: None,
                 last_activity: Instant::now(),
+                lane,
+                window_extra: 0,
             }),
             sendable: Notify::new(),
             arrived: Notify::new(),
@@ -650,6 +955,12 @@ impl Session {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "tide session has too many streams",
+            ));
+        }
+        if destination.network == Network::Udp && core.lane.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this tide server does not carry UDP",
             ));
         }
         let id = core.next_stream;
@@ -804,6 +1115,10 @@ impl Session {
         let core = self.lock();
         !core.control.is_empty()
             || !core.resend.is_empty()
+            || core
+                .lane
+                .as_ref()
+                .is_some_and(|lane| !lane.queue.is_empty())
             || core.streams.values().any(StreamState::wants_to_send)
     }
 
@@ -857,6 +1172,72 @@ pub struct TideStream {
     id: u32,
 }
 
+impl TideStream {
+    /// Send one datagram on this stream. Like UDP it may be lost: it is
+    /// dropped, with `Ok`, when the queue is full, and unsent if it waits too
+    /// long for a pipe. An error means the stream or session is gone, or the
+    /// session carries no lane, or the datagram is larger than
+    /// [`LANE_BODY_MAX`].
+    pub fn send_datagram(&self, body: &[u8]) -> io::Result<()> {
+        let mut core = self.session.lock();
+        if core.closed.is_some() {
+            return Err(closed());
+        }
+        let alive = core
+            .streams
+            .get(&self.id)
+            .is_some_and(|stream| !stream.send_stopped && !stream.receive_reset);
+        if !alive {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let Some(lane) = core.lane.as_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this tide session has no datagram lane",
+            ));
+        };
+        if body.len() > LANE_BODY_MAX {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        if lane.queue_bytes + body.len() > LANE_QUEUE_BYTES {
+            return Ok(());
+        }
+        lane.queue_bytes += body.len();
+        lane.queue.push_back(LaneOut {
+            stream: self.id,
+            body: body.to_vec(),
+            at: Instant::now(),
+        });
+        drop(core);
+        self.session.sendable.notify_waiters();
+        Ok(())
+    }
+
+    /// Poll for the next datagram of this stream.
+    pub fn poll_recv_datagram(&self, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
+        let mut core = self.session.lock();
+        let Some(stream) = core.streams.get_mut(&self.id) else {
+            return Poll::Ready(Err(closed()));
+        };
+        if stream.receive_reset {
+            return Poll::Ready(Err(io::Error::other("the tide peer ended this stream")));
+        }
+        if let Some(datagram) = stream.lane_inbox.pop_front() {
+            return Poll::Ready(Ok(datagram));
+        }
+        if stream.receive_fin {
+            return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
+        }
+        stream.lane_waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    /// The next datagram of this stream; an error once the stream is over.
+    pub async fn recv_datagram(&self) -> io::Result<Bytes> {
+        std::future::poll_fn(|cx| self.poll_recv_datagram(cx)).await
+    }
+}
+
 impl AsyncRead for TideStream {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -885,11 +1266,32 @@ impl AsyncRead for TideStream {
         buf.put_slice(&stream.receive_buffer[..take]);
         stream.receive_buffer.advance(take);
         stream.unreported += take;
+        stream.receive_total += take as u64;
+        // A stream that proves to be a bulk transfer gets a bigger window if
+        // the session's budget has room; the difference is granted at once.
+        let mut widened = 0;
+        let Core {
+            streams,
+            window_extra,
+            ..
+        } = &mut *core;
+        let stream = streams.get_mut(&self.id).expect("read just above");
+        let more = BULK_WINDOW - STREAM_WINDOW;
+        if stream.window() == STREAM_WINDOW
+            && stream.receive_total >= BULK_AFTER
+            && !stream.receive_fin
+            && *window_extra + more <= WINDOW_BUDGET
+        {
+            stream.window = BULK_WINDOW;
+            *window_extra += more;
+            widened = more;
+        }
         // Credit goes back in quarter-window steps: often enough that the
         // sender never stalls, rarely enough to cost almost nothing.
-        if stream.unreported >= STREAM_WINDOW / 4 {
+        if stream.unreported >= stream.window() / 4 || widened > 0 {
             let mut frame = Core::stream_frame(FRAME_CREDIT, self.id);
-            frame.extend_from_slice(&(stream.unreported as u32).to_be_bytes());
+            let amount = stream.unreported + widened;
+            frame.extend_from_slice(&(amount as u32).to_be_bytes());
             stream.unreported = 0;
             core.queue_control(frame);
             drop(core);
@@ -950,7 +1352,7 @@ impl Drop for TideStream {
         if !stream.fin_queued {
             // Dropped without a clean finish: abandon both directions.
             let unopened = stream.open_pending.is_some();
-            core.streams.remove(&self.id);
+            core.remove_stream(self.id);
             if !unopened {
                 core.queue_control(Core::stream_frame(FRAME_RESET, self.id));
             }
@@ -989,8 +1391,8 @@ mod tests {
         let (reply, server_keys) = responder.reply([5u8; 32], b"").unwrap();
         let (_, client_keys) = initiator.finish(&reply).unwrap();
         (
-            Session::new(Role::Client, client_keys),
-            Session::new(Role::Server, server_keys),
+            Session::new(Role::Client, client_keys, true),
+            Session::new(Role::Server, server_keys, true),
         )
     }
 
@@ -1278,6 +1680,269 @@ mod tests {
         stream.write_all(&pattern(100, 3)).await.unwrap();
         let late = client.try_next_chunk(1, CHUNK_PLAIN_MAX).unwrap();
         assert_eq!(late.len() - CHUNK_HEADER - TAG_LEN, DATA_HEADER + 100);
+    }
+
+    fn udp_destination() -> Destination {
+        Destination::udp(Address::domain("example.com"), 3478)
+    }
+
+    /// Cut every chunk `session` has ready, as one pipe's writer would.
+    fn drain(session: &Session) -> Vec<Bytes> {
+        std::iter::from_fn(|| session.try_next_chunk(1, CHUNK_PLAIN_MAX)).collect()
+    }
+
+    fn parse(session: &Session, wire: &[u8]) -> io::Result<()> {
+        session.receive(&mut ChunkParser::default(), wire)
+    }
+
+    /// A chunk that is nearly full must not take an OPEN frame that does not
+    /// fit, nor a FIN after data that filled it exactly: the receiver closes
+    /// the whole session over a chunk longer than the limit.
+    #[tokio::test]
+    async fn a_chunk_never_outgrows_the_limit() {
+        let (client, server) = pair();
+        let mut first = client.open(destination()).unwrap();
+        // OPEN (21) + data header (7) + 16347 bytes = 16375 of 16384.
+        first
+            .write_all(&pattern(CHUNK_PLAIN_MAX - 37, 1))
+            .await
+            .unwrap();
+        let _second = client.open(destination()).unwrap();
+        for chunk in drain(&client) {
+            assert!(chunk.len() <= CHUNK_HEADER + CHUNK_PLAIN_MAX + TAG_LEN);
+            parse(&server, &chunk).expect("the receiver takes every chunk");
+        }
+
+        // Data that exactly fills a chunk, then a FIN.
+        let (client, server) = pair();
+        let mut stream = client.open(destination()).unwrap();
+        stream
+            .write_all(&pattern(CHUNK_PLAIN_MAX - 21 - DATA_HEADER, 2))
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        for chunk in drain(&client) {
+            assert!(chunk.len() <= CHUNK_HEADER + CHUNK_PLAIN_MAX + TAG_LEN);
+            parse(&server, &chunk).expect("the receiver takes every chunk");
+        }
+        assert!(!server.is_closed());
+    }
+
+    #[test]
+    fn the_replay_window_accepts_each_counter_once_and_forgets_the_old() {
+        let mut window = ReplayWindow::new();
+        assert!(window.check(0));
+        window.update(0);
+        assert!(!window.check(0), "a repeat");
+        // Out of order inside the window is fine, once.
+        window.update(10);
+        assert!(window.check(7));
+        window.update(7);
+        assert!(!window.check(7));
+        assert!(window.check(9));
+        // Far ahead: everything behind the window is refused, and slots the
+        // jump reused are clean.
+        window.update(10 + LANE_WINDOW * 3);
+        assert!(!window.check(10), "too old");
+        assert!(!window.check(10 + LANE_WINDOW * 3));
+        assert!(window.check(10 + LANE_WINDOW * 3 - 1));
+        // Just inside the edge.
+        let edge = 10 + LANE_WINDOW * 3 - (LANE_WINDOW - 1);
+        assert!(window.check(edge));
+        assert!(!window.check(edge - 1));
+    }
+
+    #[tokio::test]
+    async fn datagrams_cross_in_both_directions_and_are_padded() {
+        let (client, server) = pair();
+        let flow = client.open(udp_destination()).unwrap();
+        flow.send_datagram(b"hello").unwrap();
+        let wire = drain(&client);
+        for chunk in &wire {
+            parse(&server, chunk).unwrap();
+        }
+        let (destination, accepted) = server.accept().await.unwrap();
+        assert_eq!(destination, udp_destination());
+        assert_eq!(&accepted.recv_datagram().await.unwrap()[..], b"hello");
+
+        // The flow's early records show a size class, not their length.
+        let mut sizes = std::collections::HashSet::new();
+        for length in [1usize, 50, 200, 400] {
+            accepted.send_datagram(&pattern(length, 9)).unwrap();
+            let chunk = server.try_next_chunk(1, CHUNK_PLAIN_MAX).unwrap();
+            let plain = chunk.len() - CHUNK_HEADER - TAG_LEN;
+            assert!(
+                (PAD_STEP..2 * PAD_STEP + PAD_JITTER).contains(&plain),
+                "{length} -> {plain}"
+            );
+            sizes.insert(plain);
+            parse(&client, &chunk).unwrap();
+            assert_eq!(
+                flow.recv_datagram().await.unwrap()[..],
+                pattern(length, 9)[..]
+            );
+        }
+        assert!(sizes.len() > 1, "the random extra varies");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_or_reordered_record_is_dropped_or_taken_once() {
+        let (client, server) = pair();
+        let flow = client.open(udp_destination()).unwrap();
+        // The OPEN has to get there first.
+        flow.send_datagram(b"zero").unwrap();
+        for chunk in drain(&client) {
+            parse(&server, &chunk).unwrap();
+        }
+        let (_, accepted) = server.accept().await.unwrap();
+        assert_eq!(&accepted.recv_datagram().await.unwrap()[..], b"zero");
+
+        // Three records cut one after another, delivered 3, 1, 2, 1 again.
+        let mut records = Vec::new();
+        for body in [&b"one"[..], b"two", b"three"] {
+            flow.send_datagram(body).unwrap();
+            records.push(client.try_next_chunk(1, CHUNK_PLAIN_MAX).unwrap());
+        }
+        for index in [2usize, 0, 1, 0, 2] {
+            parse(&server, &records[index]).unwrap();
+        }
+        let mut got = Vec::new();
+        while let Ok(Ok(datagram)) =
+            tokio::time::timeout(Duration::from_millis(50), accepted.recv_datagram()).await
+        {
+            got.push(datagram);
+        }
+        assert_eq!(got, vec![&b"three"[..], b"one", b"two"], "once each");
+        assert!(!server.is_closed(), "repeats are not an error");
+    }
+
+    #[tokio::test]
+    async fn a_forged_lane_record_ends_the_session() {
+        let (client, server) = pair();
+        let flow = client.open(udp_destination()).unwrap();
+        flow.send_datagram(b"x").unwrap();
+        let chunks = drain(&client);
+        let mut lane = chunks.last().unwrap().to_vec();
+        let last = lane.len() - 1;
+        lane[last] ^= 1;
+        for chunk in &chunks[..chunks.len() - 1] {
+            parse(&server, chunk).unwrap();
+        }
+        assert!(parse(&server, &lane).is_err());
+        assert!(server.is_closed());
+    }
+
+    #[tokio::test]
+    async fn datagrams_follow_the_open_and_are_not_resent_when_a_pipe_dies() {
+        let (client, server) = pair();
+        let flow = client.open(udp_destination()).unwrap();
+        for index in 0..5u8 {
+            flow.send_datagram(&[index; 40]).unwrap();
+        }
+        // The first write holds the OPEN, then the datagrams, in that order.
+        let first = client.try_next_chunk(7, CHUNK_PLAIN_MAX).unwrap();
+        parse(&server, &first).unwrap();
+        let (_, accepted) = server.accept().await.unwrap();
+        for index in 0..5u8 {
+            assert_eq!(accepted.recv_datagram().await.unwrap()[..], [index; 40]);
+        }
+        // That pipe is lost with a datagram on it: nothing is queued again.
+        flow.send_datagram(b"lost").unwrap();
+        client.pipe_opened(8);
+        let _gone = client.try_next_chunk(8, CHUNK_PLAIN_MAX).unwrap();
+        client.pipe_closed(8, false);
+        assert!(client.try_next_chunk(9, CHUNK_PLAIN_MAX).is_none());
+    }
+
+    #[tokio::test]
+    async fn datagrams_that_wait_too_long_or_overfill_the_queue_are_dropped() {
+        let (client, _server) = pair();
+        let flow = client.open(udp_destination()).unwrap();
+        // The open goes out first; then only the queue's limit is in play.
+        let _ = drain(&client);
+        let big = vec![0u8; 8000];
+        let mut accepted = 0;
+        for _ in 0..100 {
+            flow.send_datagram(&big).unwrap();
+            accepted += 1;
+        }
+        assert!(accepted > 0);
+        assert!(client.has_output());
+        tokio::time::sleep(LANE_MAX_AGE + Duration::from_millis(50)).await;
+        assert!(
+            client.try_next_chunk(1, CHUNK_PLAIN_MAX).is_none(),
+            "late datagrams are not worth sending"
+        );
+        assert!(flow.send_datagram(&vec![0u8; LANE_BODY_MAX + 1]).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_session_without_the_lane_refuses_udp() {
+        let server_secret = [3u8; 32];
+        let (hello, initiator) =
+            noise::initiate(b"t", &noise::public_key(&server_secret), [4u8; 32], b"").unwrap();
+        let (_, responder) = noise::respond(b"t", &server_secret, &hello).unwrap();
+        let (reply, _) = responder.reply([5u8; 32], b"").unwrap();
+        let (_, keys) = initiator.finish(&reply).unwrap();
+        let client = Session::new(Role::Client, keys, false);
+        let error = client.open(udp_destination()).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(client.open(destination()).is_ok(), "TCP is unaffected");
+    }
+
+    /// Datagrams over two pipes at once, a stream's bytes over a third, the
+    /// way a bonded session runs: everything arrives.
+    #[tokio::test]
+    async fn the_lane_and_the_byte_stream_share_pipes() {
+        let (client, server) = pair();
+        pipe(client.clone(), server.clone(), 1, None);
+        pipe(server.clone(), client.clone(), 2, None);
+        tokio::spawn(client.clone().run_timers());
+        tokio::spawn(server.clone().run_timers());
+        let mut tcp = client.open(destination()).unwrap();
+        let udp = client.open(udp_destination()).unwrap();
+        let echo = tokio::spawn({
+            let server = server.clone();
+            async move {
+                while let Ok((destination, stream)) = server.accept().await {
+                    if destination.network == Network::Udp {
+                        tokio::spawn(async move {
+                            while let Ok(datagram) = stream.recv_datagram().await {
+                                stream.send_datagram(&datagram).unwrap();
+                            }
+                        });
+                    } else {
+                        tokio::spawn(async move {
+                            let mut stream = stream;
+                            let mut buffer = vec![0u8; 8192];
+                            while let Ok(n @ 1..) = stream.read(&mut buffer).await {
+                                stream.write_all(&buffer[..n]).await.unwrap();
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        let payload = pattern(100_000, 4);
+        let writer = {
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                tcp.write_all(&payload).await.unwrap();
+                let mut back = vec![0u8; payload.len()];
+                tcp.read_exact(&mut back).await.unwrap();
+                back
+            })
+        };
+        for round in 0..20u8 {
+            udp.send_datagram(&[round; 120]).unwrap();
+            let echoed = tokio::time::timeout(Duration::from_secs(5), udp.recv_datagram())
+                .await
+                .expect("an echo")
+                .unwrap();
+            assert_eq!(echoed[..], [round; 120]);
+        }
+        assert_eq!(writer.await.unwrap(), payload);
+        echo.abort();
     }
 
     #[test]

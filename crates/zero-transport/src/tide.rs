@@ -179,13 +179,22 @@ pub struct ClientConfig {
     /// ends it as soon as nothing is waiting, which is what a server that
     /// collects a whole request before passing it on needs.
     pub linger: Duration,
+    /// Ask the server to carry UDP too (the datagram lane). A server that
+    /// does not know it simply does not grant it, and UDP is then refused.
+    pub lane: bool,
 }
 
 /// One HTTP/2 connection that is redialled when it breaks.
+///
+/// Each connection has a generation number. A request that fails reports the
+/// generation it used, and only that generation is dropped: with several
+/// requests in flight on one connection, the later ones to fail must not
+/// throw away the fresh connection an earlier failure already made.
 struct Carrier {
     dial: Dialer,
     host: String,
-    current: tokio::sync::Mutex<Option<SendRequest<Bytes>>>,
+    current: tokio::sync::Mutex<Option<(SendRequest<Bytes>, u64)>>,
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl Carrier {
@@ -194,17 +203,22 @@ impl Carrier {
             dial,
             host,
             current: tokio::sync::Mutex::new(None),
+            generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     /// A handle for sending requests, connecting first if there is none. A
     /// new connection fetches the front page before anything else; the
     /// server's clock from that reply is returned with it.
-    async fn get(&self) -> io::Result<(SendRequest<Bytes>, Option<u64>)> {
+    async fn get(&self) -> io::Result<(SendRequest<Bytes>, Option<u64>, u64)> {
         let mut current = self.current.lock().await;
-        if let Some(sender) = current.as_ref() {
-            return Ok((sender.clone(), None));
+        if let Some((sender, generation)) = current.as_ref() {
+            return Ok((sender.clone(), None, *generation));
         }
+        let generation = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         let (io, uncork) = Cork::new((self.dial)().await?);
         let (sender, mut connection) = h2::client::Builder::new()
             .initial_window_size(H2_WINDOW)
@@ -221,12 +235,21 @@ impl Carrier {
         let pings = connection.ping_pong();
         tokio::spawn(drive(connection, pings, PING_EVERY, PING_DEADLINE));
         let time = front_page(page).await;
-        *current = Some(sender.clone());
-        Ok((sender, time))
+        *current = Some((sender.clone(), generation));
+        Ok((sender, time, generation))
     }
 
-    /// Forget the connection after a failure, so the next use redials.
-    async fn invalidate(&self) {
+    /// Forget connection `generation` after a failure, so the next use
+    /// redials. A newer connection is left alone.
+    async fn invalidate(&self, generation: u64) {
+        let mut current = self.current.lock().await;
+        if current.as_ref().is_some_and(|(_, g)| *g == generation) {
+            *current = None;
+        }
+    }
+
+    /// Forget whatever connection there is.
+    async fn close(&self) {
         *self.current.lock().await = None;
     }
 }
@@ -495,6 +518,12 @@ impl Client {
         session.open(destination)
     }
 
+    /// Open a UDP flow through the server. Its first datagram's destination
+    /// names the flow for routing; later datagrams may go anywhere.
+    pub async fn open_udp(self: &Arc<Self>, first: Destination) -> io::Result<tide::UdpFlow> {
+        self.open(first).await.map(tide::UdpFlow::new)
+    }
+
     /// Start connecting now if nothing is up, without opening a stream: for a
     /// caller that knows a stream is about to be wanted.
     pub fn prewarm(self: &Arc<Self>) {
@@ -510,20 +539,18 @@ impl Client {
     }
 
     async fn establish(self: &Arc<Self>) -> io::Result<Arc<Session>> {
-        let (sender, server_time) = match self.down.get().await {
+        let (sender, server_time, generation) = match self.down.get().await {
             Ok(connected) => connected,
-            Err(error) => {
-                self.down.invalidate().await;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let mut name = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut name);
         let base = format!("{}/{}", self.config.path, hex_name(&name));
-        let (hello, handshake) = tide::client_hello(
+        let (hello, handshake) = tide::client_hello_with(
             &self.config.server_public,
             &self.config.user,
             server_time.unwrap_or_else(now),
+            if self.config.lane { tide::FLAG_LANE } else { 0 },
         )?;
 
         let opened = async {
@@ -554,11 +581,11 @@ impl Client {
         let session = match tokio::time::timeout(Duration::from_secs(15), opened).await {
             Ok(Ok(session)) => session,
             Ok(Err(error)) => {
-                self.down.invalidate().await;
+                self.down.invalidate(generation).await;
                 return Err(error);
             }
             Err(_) => {
-                self.down.invalidate().await;
+                self.down.invalidate(generation).await;
                 return Err(io::ErrorKind::TimedOut.into());
             }
         };
@@ -601,8 +628,8 @@ async fn close_when_idle(session: Arc<Session>, down: Arc<Carrier>, up: Arc<Carr
         }
     }
     // Dropping the handles lets the HTTP/2 connections close.
-    down.invalidate().await;
-    up.invalidate().await;
+    down.close().await;
+    up.close().await;
 }
 
 /// Wait a little longer after each failure in a row.
@@ -611,27 +638,67 @@ async fn back_off(failures: u32) {
     tokio::time::sleep(Duration::from_millis(wait)).await;
 }
 
-/// Keep one download request open for as long as the session lives.
+/// Download requests kept open at once. The server ends each after 8 to 16
+/// MB, and a request opened only then leaves the session with no way to send
+/// to the client for a round trip. With two open, the one that is left
+/// carries on while its replacement is made. They also share the load: the
+/// server hands each chunk to whichever pipe is ready, and the receiver puts
+/// the chunks back in order.
+const DOWNLOAD_PIPES: usize = 2;
+
+/// Keep download requests open for as long as the session lives.
 async fn download(session: Arc<Session>, carrier: Arc<Carrier>, host: String, base: String) {
-    let mut number = 0u64;
-    let mut failures = 0;
+    let numbers = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let failures = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut slots = Vec::new();
+    for index in 0..DOWNLOAD_PIPES {
+        let (session, carrier, host, base) =
+            (session.clone(), carrier.clone(), host.clone(), base.clone());
+        let (numbers, failures) = (numbers.clone(), failures.clone());
+        slots.push(tokio::spawn(async move {
+            if index > 0 {
+                // Staggered, so the pipes do not all reach their end together.
+                let wait = rand::thread_rng().gen_range(300..1500);
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+            }
+            download_slot(session, carrier, host, base, numbers, failures).await;
+        }));
+    }
+    for slot in slots {
+        let _ = slot.await;
+    }
+    session.close();
+}
+
+/// One of the download requests: opens a request, reads it to its end, and
+/// opens the next.
+async fn download_slot(
+    session: Arc<Session>,
+    carrier: Arc<Carrier>,
+    host: String,
+    base: String,
+    numbers: Arc<std::sync::atomic::AtomicU64>,
+    failures: Arc<std::sync::atomic::AtomicU32>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
     while !session.is_closed() {
-        number += 1;
+        let number = numbers.fetch_add(1, Relaxed) + 1;
         let path = format!(
             "{base}/d/{number}?t={}",
             pipe_tag(session.binding(), b'd', number)
         );
-        match download_once(&session, &carrier, &host, &path).await {
-            Ok(()) => failures = 0,
+        let mut generation = 0;
+        match download_once(&session, &carrier, &host, &path, &mut generation).await {
+            Ok(()) => failures.store(0, Relaxed),
             Err(PipeError::Gone) => break,
             Err(PipeError::Failed(error)) => {
                 tracing::debug!(%error, "tide download pipe failed");
-                carrier.invalidate().await;
-                failures += 1;
-                if failures > MAX_FAILURES {
+                carrier.invalidate(generation).await;
+                let total = failures.fetch_add(1, Relaxed) + 1;
+                if total > MAX_FAILURES * DOWNLOAD_PIPES as u32 {
                     break;
                 }
-                back_off(failures).await;
+                back_off(total.div_ceil(DOWNLOAD_PIPES as u32)).await;
             }
         }
     }
@@ -643,8 +710,10 @@ async fn download_once(
     carrier: &Carrier,
     host: &str,
     path: &str,
+    generation: &mut u64,
 ) -> Result<(), PipeError> {
-    let (sender, _) = carrier.get().await?;
+    let (sender, _, used) = carrier.get().await?;
+    *generation = used;
     let mut sender = sender.ready().await.map_err(other)?;
     let (response, _) = sender
         .send_request(request(Method::GET, host, path), true)
@@ -663,12 +732,24 @@ async fn download_once(
     Ok(())
 }
 
-/// Send what the session has to send, one upload request after another.
+/// Upload requests that may wait for their answer at once. HTTP/2 lets the
+/// next request go out while the last one's reply is still on its way; waiting
+/// for it left the link idle for a round trip after every request.
+const UPLOADS_IN_FLIGHT: usize = 3;
+
+/// Send what the session has to send, in upload requests that overlap: the
+/// next starts as soon as the previous body is closed, and the answers are
+/// collected in the background. An answer that says the chunks did not get
+/// there (or never comes) hands them back to the session to send again.
 async fn upload(session: Arc<Session>, carrier: Arc<Carrier>, config: ClientConfig, base: String) {
     let mut number = 0u64;
-    let mut failures = 0;
+    let failures = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let slots = Arc::new(tokio::sync::Semaphore::new(UPLOADS_IN_FLIGHT));
     loop {
-        // Wait for something to send before making a request for it.
+        // Wait for room, then for something to send, before making a request.
+        let Ok(slot) = slots.clone().acquire_owned().await else {
+            break;
+        };
         let Ok(first) = session.next_chunk(number + 1, CHUNK_PLAIN_MAX).await else {
             break;
         };
@@ -678,10 +759,43 @@ async fn upload(session: Arc<Session>, carrier: Arc<Carrier>, config: ClientConf
             "{base}/u/{number}?t={}",
             pipe_tag(session.binding(), b'u', number)
         );
-        match upload_once(&session, &carrier, &config, &path, number, first).await {
-            Ok(()) => {
-                session.pipe_closed(number, true);
-                failures = 0;
+        let mut generation = 0;
+        match upload_send(
+            &session,
+            &carrier,
+            &config,
+            &path,
+            number,
+            first,
+            &mut generation,
+        )
+        .await
+        {
+            Ok(response) => {
+                let (session, carrier, failures) =
+                    (session.clone(), carrier.clone(), failures.clone());
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    match upload_answer(response).await {
+                        Ok(()) => {
+                            session.pipe_closed(number, true);
+                            failures.store(0, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(PipeError::Gone) => {
+                            session.pipe_closed(number, false);
+                            session.close();
+                        }
+                        Err(PipeError::Failed(error)) => {
+                            tracing::debug!(%error, "tide upload pipe failed");
+                            session.pipe_closed(number, false);
+                            carrier.invalidate(generation).await;
+                            let total = failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if total > MAX_FAILURES * UPLOADS_IN_FLIGHT as u32 {
+                                session.close();
+                            }
+                        }
+                    }
+                });
             }
             Err(PipeError::Gone) => {
                 session.pipe_closed(number, false);
@@ -690,27 +804,32 @@ async fn upload(session: Arc<Session>, carrier: Arc<Carrier>, config: ClientConf
             Err(PipeError::Failed(error)) => {
                 tracing::debug!(%error, "tide upload pipe failed");
                 session.pipe_closed(number, false);
-                carrier.invalidate().await;
-                failures += 1;
-                if failures > MAX_FAILURES {
+                carrier.invalidate(generation).await;
+                let total = failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if total > MAX_FAILURES {
                     break;
                 }
-                back_off(failures).await;
+                back_off(total).await;
             }
         }
     }
     session.close();
 }
 
-async fn upload_once(
+/// Open one upload request and write chunks into it until it has carried
+/// enough (a different amount each time, so no size repeats), or nothing more
+/// is waiting. Returns the pending answer without waiting for it.
+async fn upload_send(
     session: &Session,
     carrier: &Carrier,
     config: &ClientConfig,
     path: &str,
     number: u64,
     first: Bytes,
-) -> Result<(), PipeError> {
-    let (sender, _) = carrier.get().await?;
+    generation: &mut u64,
+) -> Result<h2::client::ResponseFuture, PipeError> {
+    let (sender, _, used) = carrier.get().await?;
+    *generation = used;
     let mut sender = sender.ready().await.map_err(other)?;
     let mut post = request(Method::POST, &config.host, path);
     post.headers_mut().insert(
@@ -720,7 +839,6 @@ async fn upload_once(
             .expect("a fixed header value"),
     );
     let (response, mut body) = sender.send_request(post, false).map_err(other)?;
-    // Each request carries a different amount, so no size repeats.
     let limit = rand::thread_rng().gen_range(256 * 1024..1024 * 1024);
     let mut sent = first.len();
     send_all(&mut body, first).await?;
@@ -740,6 +858,11 @@ async fn upload_once(
         send_all(&mut body, chunk).await?;
     }
     body.send_data(Bytes::new(), true).map_err(other)?;
+    Ok(response)
+}
+
+/// The server's answer to an upload request.
+async fn upload_answer(response: h2::client::ResponseFuture) -> Result<(), PipeError> {
     let response = response.await.map_err(other)?;
     match response.status() {
         StatusCode::OK => Ok(()),
@@ -1243,6 +1366,59 @@ mod tests {
     /// A server answering every stream as an echo, and a client wired to it
     /// through in-memory connections.
     fn bench(split: bool, linger: Duration, known_user: bool) -> Bench {
+        bench_with_delay(split, linger, known_user, Duration::ZERO)
+    }
+
+    /// Two connected ends with `one_way` of delay each way and no limit on
+    /// bandwidth, like a long fat path: a copy task per direction stamps each
+    /// read with the time it may be written, so delays overlap instead of
+    /// adding up.
+    fn delayed_pair(one_way: Duration) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        // No delay: no relay either, so that dropping one end is seen at once
+        // by the other, which the connection-cut tests rely on.
+        if one_way.is_zero() {
+            return tokio::io::duplex(256 * 1024);
+        }
+        let (client, relay_near) = tokio::io::duplex(1024 * 1024);
+        let (relay_far, server) = tokio::io::duplex(1024 * 1024);
+        fn carry(
+            mut from: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+            mut to: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            one_way: Duration,
+        ) {
+            let (send, mut receive) =
+                tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 64 * 1024];
+                while let Ok(n @ 1..) = from.read(&mut buffer).await {
+                    let due = tokio::time::Instant::now() + one_way;
+                    if send.send((due, buffer[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some((due, data)) = receive.recv().await {
+                    tokio::time::sleep_until(due).await;
+                    if to.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        let (near_read, near_write) = tokio::io::split(relay_near);
+        let (far_read, far_write) = tokio::io::split(relay_far);
+        carry(near_read, far_write, one_way);
+        carry(far_read, near_write, one_way);
+        (client, server)
+    }
+
+    fn bench_with_delay(
+        split: bool,
+        linger: Duration,
+        known_user: bool,
+        one_way: Duration,
+    ) -> Bench {
         let (secret, public) = tide::generate_keypair();
         let user = [9u8; 16];
         let users = Arc::new(RwLock::new(HashMap::new()));
@@ -1257,7 +1433,18 @@ mod tests {
             decoy: Decoy::default(),
         });
         tokio::spawn(async move {
-            while let Some((_, _, mut stream)) = streams.recv().await {
+            while let Some((_, destination, mut stream)) = streams.recv().await {
+                if destination.network == zero_core::Network::Udp {
+                    tokio::spawn(async move {
+                        let flow = tide::UdpFlow::new(stream);
+                        while let Ok((from, payload)) = flow.recv().await {
+                            if flow.send(&from, &payload).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    continue;
+                }
                 tokio::spawn(async move {
                     let mut buffer = vec![0u8; 16 * 1024];
                     loop {
@@ -1282,7 +1469,7 @@ mod tests {
                 let (server, dials, cut) = (server.clone(), dials.clone(), cut.clone());
                 Box::pin(async move {
                     dials.fetch_add(1, Ordering::SeqCst);
-                    let (near, far) = tokio::io::duplex(256 * 1024);
+                    let (near, far) = delayed_pair(one_way);
                     tokio::spawn(async move {
                         tokio::select! {
                             _ = server.serve_connection(boxed(far)) => {}
@@ -1301,6 +1488,7 @@ mod tests {
                 user,
                 split,
                 linger,
+                lane: true,
             },
             dial,
         );
@@ -1363,6 +1551,119 @@ mod tests {
         bench.cut.notify_waiters();
         round_trip(&mut stream, &pattern(300_000)).await;
         assert!(bench.dials.load(Ordering::SeqCst) > before, "it redialled");
+    }
+
+    /// UDP over the same HTTP/2 pipes as the streams: datagrams come back
+    /// from the server, a flow keeps working after both connections are cut
+    /// (what was in flight is lost, as UDP allows), and TCP streams carry on
+    /// beside it.
+    #[tokio::test]
+    async fn udp_flows_share_the_connections_and_survive_a_cut() {
+        let bench = bench(true, Duration::from_millis(200), true);
+        let peer = Destination::udp(Address::domain("stun.example.org"), 3478);
+        let flow = bench.client.open_udp(peer.clone()).await.unwrap();
+        let mut tcp = bench.client.open(target()).await.unwrap();
+        for round in 0..30u8 {
+            flow.send(&peer, &[round; 200]).unwrap();
+            let (from, got) = tokio::time::timeout(Duration::from_secs(5), flow.recv())
+                .await
+                .expect("an echo")
+                .unwrap();
+            assert_eq!(from, peer);
+            assert_eq!(got[..], [round; 200]);
+        }
+        round_trip(&mut tcp, &pattern(100_000)).await;
+        bench.cut.notify_waiters();
+        // Keep sending until one gets through the redialled connections.
+        let mut recovered = false;
+        for round in 0..40u8 {
+            flow.send(&peer, &[round; 64]).unwrap();
+            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(500), flow.recv()).await {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(recovered, "the flow never came back after the cut");
+        round_trip(&mut tcp, &pattern(100_000)).await;
+    }
+
+    /// On a path with a long round trip, an upload keeps the pipe full and a
+    /// datagram sent during it is not stuck behind it. Prints what it saw;
+    /// the bounds are loose so a loaded machine does not fail it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn uploads_and_datagrams_on_a_long_path() {
+        let one_way = Duration::from_millis(80);
+        let bench = bench_with_delay(true, Duration::from_millis(200), true, one_way);
+        let peer = Destination::udp(Address::domain("stun.example.org"), 3478);
+        let flow = bench.client.open_udp(peer.clone()).await.unwrap();
+        // Warm the session.
+        flow.send(&peer, b"warm").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), flow.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let tcp = bench.client.open(target()).await.unwrap();
+        let (mut reader, mut writer) = tokio::io::split(tcp);
+        let total = 6 * 1024 * 1024;
+        let started = std::time::Instant::now();
+        let upload = tokio::spawn(async move {
+            let block = pattern(64 * 1024);
+            for _ in 0..total / block.len() {
+                writer.write_all(&block).await.unwrap();
+            }
+            writer
+        });
+        let drain = tokio::spawn(async move {
+            let mut buffer = vec![0u8; 64 * 1024];
+            let mut got = 0;
+            while got < total {
+                got += reader.read(&mut buffer).await.unwrap();
+            }
+            started.elapsed()
+        });
+        let mut latencies = Vec::new();
+        for round in 0..40u8 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let at = std::time::Instant::now();
+            flow.send(&peer, &[round; 100]).unwrap();
+            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(2), flow.recv()).await {
+                latencies.push(at.elapsed());
+            }
+        }
+        let elapsed = drain.await.unwrap();
+        let _ = upload.await;
+        latencies.sort();
+        let median = latencies.get(latencies.len() / 2).copied();
+        eprintln!(
+            "6 MiB echoed in {elapsed:?} ({:.1} Mbit/s each way); {} of 40 datagrams came back, median {median:?}, worst {:?}",
+            total as f64 * 8.0 / elapsed.as_secs_f64() / 1e6,
+            latencies.len(),
+            latencies.last()
+        );
+        assert!(
+            latencies.len() >= 20,
+            "datagrams were lost during an upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_does_not_ask_for_the_lane_gets_no_udp() {
+        let mut bench = bench(true, Duration::from_millis(200), true);
+        let config = ClientConfig {
+            lane: false,
+            ..bench.client.config.clone()
+        };
+        let dial = bench.client.down.dial.clone();
+        bench.client = Client::new(config, dial);
+        let error = bench
+            .client
+            .open_udp(Destination::udp(Address::domain("a.b"), 1))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        let mut tcp = bench.client.open(target()).await.unwrap();
+        round_trip(&mut tcp, b"still fine").await;
     }
 
     #[tokio::test]

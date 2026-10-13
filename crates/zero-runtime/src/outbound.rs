@@ -1101,15 +1101,67 @@ async fn connect_tide(
 ) -> Result<BoxStream, Failure> {
     if destination.network != zero_core::Network::Tcp {
         return Err(Failure::new(FailureKind::LocalPolicy, Stage::RequestSent)
-            .with_detail("Tide carries TCP streams only for now"));
+            .with_detail("ZeroV1 carries UDP only when its link has dg=1 (a datagram flow, not a byte stream)"));
     }
+    tide_client(outbound, tide, address, addrs)
+        .open(destination.clone())
+        .await
+        .map(boxed)
+        .map_err(|error| {
+            Failure::from_io(&error, Stage::RequestSent).with_detail(format!("Tide: {error}"))
+        })
+}
+
+/// Open a UDP flow through a Tide server: the persistent counterpart of the
+/// per-datagram exchanges other protocols use here. The flow lives as long as
+/// its caller keeps it; the session under it is shared with the TCP streams.
+/// Fails with `Unsupported` when the link does not ask for datagrams or the
+/// server does not grant them.
+pub async fn connect_tide_udp(
+    outbound: &Outbound,
+    first: &Destination,
+    resolver: &zero_dns::Resolver,
+) -> Result<zero_protocol::tide::UdpFlow, String> {
+    let OutboundProtocol::Tide(tide) = &outbound.protocol else {
+        return Err("not a Tide outbound".into());
+    };
+    if !tide.datagrams {
+        return Err("this ZeroV1 link does not ask for UDP (no dg=1)".into());
+    }
+    let (address, port) = outbound
+        .endpoint()
+        .ok_or_else(|| "Tide outbound has no endpoint".to_string())?;
+    let addrs: Vec<SocketAddr> = resolver
+        .resolve_address(&address, resolver.settings().query_strategy)
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    if addrs.is_empty() {
+        return Err("Tide server has no address".into());
+    }
+    tide_client(outbound, tide, &address, addrs)
+        .open_udp(first.clone())
+        .await
+        .map_err(|error| format!("Tide: {error}"))
+}
+
+/// The client for one Tide server, made on first use and kept: it owns the
+/// session and the HTTP/2 connections under it.
+fn tide_client(
+    outbound: &Outbound,
+    tide: &zero_config::TideConfig,
+    address: &Address,
+    addrs: Vec<SocketAddr>,
+) -> Arc<zero_transport::tide::Client> {
     let key = mux_pool_key(outbound, address, &addrs);
     let existing = {
         let clients = TIDE_CLIENTS.get_or_init(Default::default);
         let clients = clients.lock().unwrap_or_else(|p| p.into_inner());
         clients.get(&key).cloned()
     };
-    let client = match existing {
+    match existing {
         Some(client) => client,
         None => {
             let host = address.host_string();
@@ -1155,6 +1207,7 @@ async fn connect_tide(
                     } else {
                         std::time::Duration::from_secs(2)
                     },
+                    lane: tide.datagrams,
                 },
                 dial,
             );
@@ -1166,14 +1219,7 @@ async fn connect_tide(
             }
             clients.entry(key).or_insert(client).clone()
         }
-    };
-    client
-        .open(destination.clone())
-        .await
-        .map(boxed)
-        .map_err(|error| {
-            Failure::from_io(&error, Stage::RequestSent).with_detail(format!("Tide: {error}"))
-        })
+    }
 }
 
 async fn connect_mux_pooled(
