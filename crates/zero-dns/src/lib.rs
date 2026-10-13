@@ -3467,6 +3467,35 @@ mod tests {
         }
     }
 
+    /// Opt-in: Google's DNS answers the browser-shaped hello by taking up ALPS,
+    /// after which it waits for the client's own settings and ends the
+    /// connection with `unexpected_message` if they never come. Run with
+    /// `cargo test -p zero-dns -- --ignored live_doh_to_a_server_that_takes_up_alps`.
+    #[tokio::test]
+    #[ignore = "requires outbound network access to dns.google"]
+    async fn live_doh_to_a_server_that_takes_up_alps() {
+        let mut hosts = std::collections::BTreeMap::new();
+        hosts.insert(
+            Box::<str>::from("dns.google"),
+            HostValue::Addresses(vec![Address::parse_host("8.8.8.8")]),
+        );
+        let resolver = Resolver::new(DnsSettings {
+            servers: vec![DnsServer {
+                endpoint: ResolverEndpoint::parse("https://dns.google/dns-query").unwrap(),
+                domains: Vec::new(),
+                expect_ips: Vec::new(),
+                skip_fallback: false,
+                tag: None,
+            }]
+            .into_boxed_slice(),
+            hosts,
+            disable_cache: true,
+            ..DnsSettings::default()
+        });
+        let answer = resolver.lookup("example.com", QueryStrategy::UseIpv4).await;
+        assert!(answer.is_ok(), "{answer:?}");
+    }
+
     /// A self-signed certificate for `dns.test` / 127.0.0.1, used as its own
     /// trust anchor by the local encrypted-resolver tests.
     const TEST_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIBlTCCATugAwIBAgIUGS+8Fs1U1nZuhCCERiq/cE2I/EwwCgYIKoZIzj0EAwIw\nEzERMA8GA1UEAwwIZG5zLnRlc3QwIBcNMjYwOTIzMDM0MjE0WhgPMjEyNjA4MzAw\nMzQyMTRaMBMxETAPBgNVBAMMCGRucy50ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0D\nAQcDQgAE4SqQn7qEa4DtfdAqi9OaEwN90Nw7fFYqJZpApbzJvAx1SEqxXCzJyCEB\na8NVtrWewNSLFBsFbk6lRLJoZU/NkKNrMGkwHQYDVR0OBBYEFJK+70IhxQ31fNnu\nfzTg7k6NSpO9MB8GA1UdIwQYMBaAFJK+70IhxQ31fNnufzTg7k6NSpO9MBkGA1Ud\nEQQSMBCCCGRucy50ZXN0hwR/AAABMAwGA1UdEwEB/wQCMAAwCgYIKoZIzj0EAwID\nSAAwRQIgNg84WOdtnUk+Q6MYOs83T0huf9SA6szJaAKPxRL6vf8CIQDqMr+gBsfi\n5i5jHcRxCnpNYCzjPGH0FgdOY12pKnFHpQ==\n-----END CERTIFICATE-----";

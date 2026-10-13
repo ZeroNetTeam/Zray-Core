@@ -1065,6 +1065,9 @@ impl std::error::Error for EarlyDataError {}
 pub struct ClientConnectionData {
     pub(super) early_data: EarlyData,
     pub(super) ech_status: EchStatus,
+    /// The ALPS extension type the server accepted, if it did: the client
+    /// then owes an `EncryptedExtensions` of its own before its Finished.
+    pub(super) alps_accepted: Option<u16>,
 }
 
 impl ClientConnectionData {
@@ -1072,6 +1075,7 @@ impl ClientConnectionData {
         Self {
             early_data: EarlyData::new(),
             ech_status: EchStatus::NotOffered,
+            alps_accepted: None,
         }
     }
 }

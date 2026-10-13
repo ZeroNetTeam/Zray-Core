@@ -718,6 +718,10 @@ pub(super) fn emit_fake_ccs(sent_tls13_fake_ccs: &mut bool, common: &mut CommonS
     common.send_msg(m, false);
 }
 
+/// The two code points ALPS has used: the draft's, and the one Chrome moved to
+/// in version 131.
+const ALPS_EXTENSIONS: [u16; 2] = [0x4469, 0x44cd];
+
 fn validate_encrypted_extensions(
     common: &mut CommonState,
     hello: &ClientHelloDetails,
@@ -769,6 +773,12 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
         self.transcript.add_message(&m);
 
         validate_encrypted_extensions(cx.common, &self.hello, exts)?;
+        // ALPS (draft-vvv-tls-alps): a server that took up the offer says so
+        // by echoing the extension, and then expects the client's settings in
+        // an EncryptedExtensions of its own (see `ExpectFinished`).
+        cx.data.alps_accepted = ALPS_EXTENSIONS
+            .into_iter()
+            .find(|ty| exts.unknown_extensions.contains(ty));
         hs::process_alpn_protocol(
             cx.common,
             &self.hello.alpn_protocols,
@@ -1631,6 +1641,17 @@ impl State<ClientConnectionData> for ExpectFinished {
         }
 
         let mut flight = HandshakeFlightTls13::new(&mut st.transcript);
+
+        // The ALPS reply goes first: BoringSSL-based servers that accepted
+        // the extension read it right after their own Finished and answer
+        // anything else with `unexpected_message`. It carries no settings.
+        if let Some(extension) = cx.data.alps_accepted.take() {
+            let [high, low] = extension.to_be_bytes();
+            flight.add(HandshakeMessagePayload(HandshakePayload::Unknown((
+                HandshakeType::EncryptedExtensions,
+                Payload::new(vec![0, 4, high, low, 0, 0]),
+            ))));
+        }
 
         /* Send our authentication/finished messages.  These are still encrypted
          * with our handshake keys. */
