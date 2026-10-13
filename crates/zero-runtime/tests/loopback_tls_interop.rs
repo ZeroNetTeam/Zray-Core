@@ -301,6 +301,7 @@ async fn tunnel_with(
                     "path": "/assets/app",
                     "serverKey": encode_key(&public),
                     "user": encode_key(&user),
+                    "datagrams": true,
                 }),
             )
         }
@@ -598,6 +599,79 @@ async fn udp_round_trip(tunnel: &Tunnel, body: &[u8]) {
 async fn hysteria2_carries_udp_datagrams() {
     let tunnel = tunnel("hysteria2", true, raw()).await;
     udp_round_trip(&tunnel, b"datagram over hysteria2").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tide_carries_udp_datagrams() {
+    let tunnel = tunnel("tide", false, raw()).await;
+    udp_round_trip(&tunnel, b"datagram over zerov1").await;
+    // Streams and datagrams share the session and do not disturb each other.
+    let mut stream = socks_connect(tunnel.socks, tunnel.echo).await.unwrap();
+    round_trip(&mut stream, &payload(11, 200 * 1024)).await;
+    udp_round_trip(&tunnel, b"and again").await;
+}
+
+/// Two client UDP sockets are two flows: each gets back its own datagrams,
+/// all of them, while a TCP transfer runs on the same session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tide_udp_keeps_flows_apart_and_loses_nothing_on_a_clean_path() {
+    let tunnel = tunnel("tide", false, raw()).await;
+    let transfer = {
+        let (socks, echo) = (tunnel.socks, tunnel.echo);
+        tokio::spawn(async move {
+            let mut stream = socks_connect(socks, echo).await.unwrap();
+            round_trip(&mut stream, &payload(21, 600 * 1024)).await;
+        })
+    };
+    let mut clients = Vec::new();
+    for flow in 0..2u8 {
+        let (socks, udp_echo) = (tunnel.socks, tunnel.udp_echo);
+        clients.push(tokio::spawn(async move {
+            let mut control = TcpStream::connect(socks).await.unwrap();
+            control.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut greeting = [0u8; 2];
+            control.read_exact(&mut greeting).await.unwrap();
+            control
+                .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            let mut reply = [0u8; 10];
+            control.read_exact(&mut reply).await.unwrap();
+            let relay = SocketAddr::new(
+                "127.0.0.1".parse().unwrap(),
+                u16::from_be_bytes([reply[8], reply[9]]),
+            );
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let std::net::IpAddr::V4(ip) = udp_echo.ip() else {
+                panic!("IPv4 only");
+            };
+            for index in 0..25u8 {
+                let mut datagram = vec![0, 0, 0, 1];
+                datagram.extend_from_slice(&ip.octets());
+                datagram.extend_from_slice(&udp_echo.port().to_be_bytes());
+                datagram.extend_from_slice(&[flow, index, 7, 7, 7]);
+                socket.send_to(&datagram, relay).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            let mut buffer = vec![0u8; 2048];
+            while seen.len() < 25 {
+                let (read, _) =
+                    tokio::time::timeout(Duration::from_secs(10), socket.recv_from(&mut buffer))
+                        .await
+                        .expect("a datagram never came back")
+                        .unwrap();
+                assert_eq!(buffer[10], flow, "another flow's datagram");
+                assert_eq!(&buffer[12..read], &[7, 7, 7]);
+                seen.insert(buffer[11]);
+            }
+            drop(control);
+        }));
+    }
+    for client in clients {
+        client.await.unwrap();
+    }
+    transfer.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

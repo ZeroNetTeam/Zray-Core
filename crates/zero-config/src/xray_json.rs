@@ -1280,6 +1280,10 @@ fn parse_tide(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
             .and_then(Value::as_bool)
             .unwrap_or(true),
         packet_upload: settings.get("upload").and_then(Value::as_str) == Some("packet"),
+        datagrams: settings
+            .get("datagrams")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }))
 }
 

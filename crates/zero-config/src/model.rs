@@ -1013,6 +1013,9 @@ pub struct TideConfig {
     /// End each upload request as soon as nothing is waiting, for a server
     /// behind a proxy that collects a whole request before passing it on.
     pub packet_upload: bool,
+    /// Carry UDP too, over the session's datagram lane. Off for a server
+    /// built before the lane existed, which would refuse the request for it.
+    pub datagrams: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1739,6 +1742,7 @@ impl std::fmt::Debug for TideConfig {
             .field("path", &self.path)
             .field("split", &self.split)
             .field("packet_upload", &self.packet_upload)
+            .field("datagrams", &self.datagrams)
             .field("identity", &format_args!("{mark:016x}"))
             .finish()
     }

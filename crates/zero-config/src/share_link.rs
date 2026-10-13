@@ -553,6 +553,7 @@ fn parse_tide(rest: &str) -> Result<ShareLink, String> {
             user,
             split: query.get("split").map(String::as_str) != Some("0"),
             packet_upload: query.get("upload").map(String::as_str) == Some("packet"),
+            datagrams: query.get("dg").map(String::as_str) == Some("1"),
         }),
         stream,
         mux: MuxConfig::default(),
@@ -1654,5 +1655,28 @@ mod tests {
         // Damage is reported, not guessed at.
         assert!(parse_link("warp://!!!").is_err());
         assert!(parse_link(&format!("warp://{}", "e30")).is_err());
+    }
+
+    #[test]
+    fn a_zerov1_link_asks_for_udp_only_when_it_says_so() {
+        let key = "A".repeat(43);
+        let user = "A".repeat(22);
+        let link = |extra: &str| {
+            format!("zerov1://{user}@example.org:443?key={key}&path=/static/ab{extra}#n")
+        };
+        let datagrams = |text: String| {
+            let parsed = parse_link(&text).unwrap();
+            let OutboundProtocol::Tide(tide) = &parsed.outbound.protocol else {
+                panic!("expected a ZeroV1 outbound")
+            };
+            tide.datagrams
+        };
+        // A link from a server that predates the lane must not ask for it:
+        // that server refuses the request instead of ignoring it.
+        assert!(!datagrams(link("")));
+        assert!(datagrams(link("&dg=1")));
+        assert!(!datagrams(link("&dg=0")));
+        // The old scheme name reads the same way.
+        assert!(datagrams(link("&dg=1").replace("zerov1://", "tide://")));
     }
 }
