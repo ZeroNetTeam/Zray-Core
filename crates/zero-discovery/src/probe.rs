@@ -293,6 +293,26 @@ fn alternate_target(target: &ProbeTarget) -> ProbeTarget {
     }
 }
 
+/// The outbound as the user's "Allow insecure" switch runs it: with the
+/// certificate check skipped when `allow` is set and the carrier has a
+/// certificate to check, and untouched otherwise. Searches and tests use it
+/// so they find the same servers the connection will then reach.
+pub fn loosened(
+    outbound: &zero_config::Outbound,
+    allow: bool,
+) -> std::borrow::Cow<'_, zero_config::Outbound> {
+    match &outbound.stream.security {
+        zero_config::Security::Tls(tls) if allow && !tls.allow_insecure => {
+            let mut copy = outbound.clone();
+            if let zero_config::Security::Tls(tls) = &mut copy.stream.security {
+                tls.allow_insecure = true;
+            }
+            std::borrow::Cow::Owned(copy)
+        }
+        _ => std::borrow::Cow::Borrowed(outbound),
+    }
+}
+
 /// The real test of one server, as the finder and the "test" buttons run it:
 /// the server as its link describes it, and when that dies in the handshake
 /// on a server that does answer, again with its name hidden from the filter

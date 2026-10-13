@@ -27,6 +27,10 @@
 //! The rules it keeps:
 //!  * a pipe that fails reports it ([`Session::pipe_closed`]), so what it
 //!    carried is sent again elsewhere; a session outlives its connections;
+//!  * a connection that is working is still replaced now and then (age and
+//!    volume limits, see [`Rotation`]): the new one is made first, new
+//!    requests move to it, and the old one closes when its last request is
+//!    done, so no connection grows old enough to be remembered;
 //!  * a body is written only as fast as HTTP/2 grants room, so nothing piles
 //!    up in memory behind a slow link;
 //!  * nothing is read from a request before its path proves it belongs to a
@@ -41,8 +45,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use h2::client::SendRequest;
@@ -53,7 +58,7 @@ use zero_protocol::tide::session::{pipe_tag, CHUNK_PLAIN_MAX};
 use zero_protocol::tide::{self, ChunkParser, ReplayGuard, Session, TideStream, UserId};
 
 /// HTTP/2 windows large enough that the transport, not HTTP/2, sets the pace.
-const H2_WINDOW: u32 = 4 * 1024 * 1024;
+pub(crate) const H2_WINDOW: u32 = 4 * 1024 * 1024;
 /// The most a handshake body may be; real ones are well under 100 bytes.
 const HANDSHAKE_MAX: usize = 1024;
 /// A download pipe with nothing to carry for this long is ended by the
@@ -68,18 +73,18 @@ const SESSION_FORGET: Duration = Duration::from_secs(300);
 const MAX_FAILURES: u32 = 6;
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 
-fn other(error: impl std::fmt::Display) -> io::Error {
+pub(crate) fn other(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Write `data` to a body, waiting for HTTP/2 to grant room for each part.
-async fn send_all(send: &mut h2::SendStream<Bytes>, mut data: Bytes) -> io::Result<()> {
+pub(crate) async fn send_all(send: &mut h2::SendStream<Bytes>, mut data: Bytes) -> io::Result<()> {
     while !data.is_empty() {
         send.reserve_capacity(data.len());
         let granted = std::future::poll_fn(|cx| send.poll_capacity(cx))
@@ -164,6 +169,48 @@ pub fn parse_http_date(text: &str) -> Option<u64> {
 pub type Dialer =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = io::Result<BoxStream>> + Send>> + Send + Sync>;
 
+/// When a connection is replaced by a fresh one while it still works.
+///
+/// A connection that lives for hours and moves gigabytes is what a censor's
+/// per-flow budget catches, and what no browser's connection looks like. So
+/// each connection is given its own age and volume limit, drawn at random
+/// from the upper half of the allowance here (so rotations keep no rhythm),
+/// and is replaced when it passes either. `min_age` is the floor under both
+/// draws: a connection is never churned faster than this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rotation {
+    pub min_age: Duration,
+    pub max_age: Duration,
+    pub max_bytes: u64,
+}
+
+impl Default for Rotation {
+    fn default() -> Self {
+        Self {
+            min_age: Duration::from_secs(120),
+            max_age: Duration::from_secs(600),
+            max_bytes: 2 << 30,
+        }
+    }
+}
+
+impl Rotation {
+    /// One connection's own limits: `(age, bytes)`, with the allowance
+    /// multiplied by `scale` (1.0 unless connections have been dying young).
+    /// The age never goes below `min_age` and the volume never below
+    /// [`MIN_BYTES`], so a hostile network can make rotation faster but not
+    /// frantic.
+    fn draw(&self, scale: f64) -> (Duration, u64) {
+        let mut rng = rand::thread_rng();
+        let age = self.max_age.mul_f64(rng.gen_range(0.5..=1.0) * scale);
+        let bytes = (self.max_bytes as f64 * rng.gen_range(0.5..=1.0) * scale) as u64;
+        (
+            age.max(self.min_age),
+            bytes.max(MIN_BYTES.min(self.max_bytes)),
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct ClientConfig {
     /// The site's name, for the `:authority` of every request.
@@ -179,32 +226,138 @@ pub struct ClientConfig {
     /// ends it as soon as nothing is waiting, which is what a server that
     /// collects a whole request before passing it on needs.
     pub linger: Duration,
+    /// When to replace a working connection; `None` keeps one until it breaks.
+    pub rotation: Option<Rotation>,
 }
 
-/// One HTTP/2 connection that is redialled when it breaks.
-struct Carrier {
-    dial: Dialer,
-    host: String,
-    current: tokio::sync::Mutex<Option<SendRequest<Bytes>>>,
+/// The smallest volume limit a connection is given, however hard the network
+/// has been on earlier ones.
+const MIN_BYTES: u64 = 64 << 20;
+/// A connection that fails before its limits multiplies the allowance by
+/// `SHRINK` for the connections after it, down to `FLOOR`; one that reaches
+/// its limit and is replaced on schedule multiplies it by `GROW`, up to 1.
+/// The reasoning: a censor's cut looks like a dead connection, not a labelled
+/// ban, so the only honest response to an early death is to be more careful
+/// with both limits, and to relax slowly while things go well.
+const SHRINK: f64 = 0.7;
+const GROW: f64 = 1.15;
+const FLOOR: f64 = 0.25;
+
+/// How long after a failed replacement the old connection is left alone
+/// before another replacement is tried. A broken network must not turn into
+/// a dial every request.
+const ROTATION_RETRY: Duration = Duration::from_secs(30);
+/// How often an open download looks at whether its connection is due, and
+/// how recently the session must have moved data for that to matter: an
+/// idle session is left alone (a rotation then costs battery and shows a
+/// connection opening with nothing to say).
+const ROTATION_CHECK: Duration = Duration::from_secs(1);
+const ROTATION_ACTIVE: Duration = Duration::from_secs(10);
+
+/// One HTTP/2 connection, with the limits it was given.
+struct Live {
+    sender: SendRequest<Bytes>,
+    born: Instant,
+    /// Bytes the pipes on this connection have moved, both ways.
+    moved: Arc<AtomicU64>,
+    /// `(age, bytes)` after which it is due for replacing.
+    limits: Option<(Duration, u64)>,
 }
 
-impl Carrier {
-    fn new(dial: Dialer, host: String) -> Arc<Self> {
-        Arc::new(Self {
-            dial,
-            host,
-            current: tokio::sync::Mutex::new(None),
+impl Live {
+    fn due(&self) -> bool {
+        self.limits.is_some_and(|(age, bytes)| {
+            self.born.elapsed() >= age || self.moved.load(Ordering::Relaxed) >= bytes
         })
     }
 
-    /// A handle for sending requests, connecting first if there is none. A
-    /// new connection fetches the front page before anything else; the
-    /// server's clock from that reply is returned with it.
-    async fn get(&self) -> io::Result<(SendRequest<Bytes>, Option<u64>)> {
-        let mut current = self.current.lock().await;
-        if let Some(sender) = current.as_ref() {
-            return Ok((sender.clone(), None));
+    fn lease(&self, epoch: u64, time: Option<u64>) -> Lease {
+        Lease {
+            sender: self.sender.clone(),
+            time,
+            moved: self.moved.clone(),
+            epoch,
         }
+    }
+}
+
+/// A connection lent to one request: send on it, and count what it carried
+/// against its volume limit.
+pub(crate) struct Lease {
+    pub(crate) sender: SendRequest<Bytes>,
+    /// The server's clock, from the front page; only a new connection has it.
+    time: Option<u64>,
+    moved: Arc<AtomicU64>,
+    /// Which connection of the carrier this is; see [`Carrier::changes`].
+    epoch: u64,
+}
+
+impl Lease {
+    fn count(&self, bytes: usize) {
+        self.moved.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+struct State {
+    live: Option<Live>,
+    /// A replacement is being dialled; everyone else keeps using the old one.
+    rotating: bool,
+    hold_until: Option<Instant>,
+    /// Counts connections put in `live`, so a replacement that lost a race
+    /// with another one is dropped, not stacked.
+    epoch: u64,
+    /// What the next connection's limits are multiplied by; see [`SHRINK`].
+    scale: f64,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            live: None,
+            rotating: false,
+            hold_until: None,
+            epoch: 0,
+            scale: 1.0,
+        }
+    }
+}
+
+/// One HTTP/2 connection that is redialled when it breaks, and replaced
+/// before it gets old (see [`Rotation`]).
+///
+/// The rule: a replacement is dialled *before* the old connection is let go
+/// (make before break). Requests keep using the old one until the new one
+/// has fetched the front page; requests already running on the old one
+/// finish there, and the connection closes by itself when the last ends. The
+/// session does not notice: the server knows it by name, not by connection.
+pub(crate) struct Carrier {
+    dial: Dialer,
+    host: String,
+    rotation: Option<Rotation>,
+    state: tokio::sync::Mutex<State>,
+    /// The epoch of the current connection, for requests that outlive their
+    /// connection's turn (a download) to see they should move.
+    epoch: tokio::sync::watch::Sender<u64>,
+}
+
+impl Carrier {
+    pub(crate) fn new(dial: Dialer, host: String, rotation: Option<Rotation>) -> Arc<Self> {
+        Arc::new(Self {
+            dial,
+            host,
+            rotation,
+            state: tokio::sync::Mutex::new(State::default()),
+            epoch: tokio::sync::watch::channel(0).0,
+        })
+    }
+
+    /// Changes whenever the carrier switches to a different connection.
+    fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.epoch.subscribe()
+    }
+
+    /// A new connection, with the front page fetched.
+    async fn connect(&self, scale: f64) -> io::Result<(Live, Option<u64>)> {
         let (io, uncork) = Cork::new((self.dial)().await?);
         let (sender, mut connection) = h2::client::Builder::new()
             .initial_window_size(H2_WINDOW)
@@ -217,17 +370,83 @@ impl Carrier {
         // request leave together in one write, as a browser's do, and not as
         // a 46-byte packet followed by the request.
         let page = front_page_request(sender.clone(), &self.host);
-        uncork.store(true, std::sync::atomic::Ordering::Release);
+        uncork.store(true, Ordering::Release);
         let pings = connection.ping_pong();
         tokio::spawn(drive(connection, pings, PING_EVERY, PING_DEADLINE));
         let time = front_page(page).await;
-        *current = Some(sender.clone());
-        Ok((sender, time))
+        let live = Live {
+            sender,
+            born: Instant::now(),
+            moved: Arc::default(),
+            limits: self.rotation.map(|rotation| rotation.draw(scale)),
+        };
+        Ok((live, time))
     }
 
-    /// Forget the connection after a failure, so the next use redials.
-    async fn invalidate(&self) {
-        *self.current.lock().await = None;
+    /// A connection for one request, dialling first if there is none. When
+    /// the current one is due, a replacement is dialled in the background
+    /// and this request still goes on the current one, so rotating never
+    /// delays anything; the replacement takes over once it is ready, and if
+    /// it cannot be made the current one stays. Idle sessions never get
+    /// here, so they are never rotated: only a connection about to be used
+    /// is replaced.
+    pub(crate) async fn get(self: &Arc<Self>) -> io::Result<Lease> {
+        let mut state = self.state.lock().await;
+        let Some(live) = &state.live else {
+            let (live, time) = self.connect(state.scale).await?;
+            state.epoch += 1;
+            let lease = live.lease(state.epoch, time);
+            state.live = Some(live);
+            self.epoch.send_replace(state.epoch);
+            return Ok(lease);
+        };
+        let lease = live.lease(state.epoch, None);
+        let held = state.hold_until.is_some_and(|until| Instant::now() < until);
+        if live.due() && !state.rotating && !held {
+            state.rotating = true;
+            let (carrier, epoch, scale) = (Arc::clone(self), state.epoch, state.scale);
+            tokio::spawn(async move {
+                let fresh = carrier.connect(scale).await;
+                let mut state = carrier.state.lock().await;
+                state.rotating = false;
+                match fresh {
+                    // Only if nothing else replaced the connection meanwhile.
+                    Ok((live, _)) if state.epoch == epoch => {
+                        tracing::debug!("tide connection replaced");
+                        state.live = Some(live);
+                        state.epoch += 1;
+                        state.hold_until = None;
+                        state.scale = (state.scale * GROW).min(1.0);
+                        carrier.epoch.send_replace(state.epoch);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::debug!(%error, "tide connection replacement failed");
+                        state.hold_until = Some(Instant::now() + ROTATION_RETRY);
+                    }
+                }
+            });
+        }
+        Ok(lease)
+    }
+
+    /// Forget the connection after a failure, so the next use redials. A
+    /// connection that fails before either of its limits shrinks the
+    /// allowance of the next ones (see [`SHRINK`]).
+    ///
+    /// A replacement being dialled in the background when this happens is
+    /// dropped too (the epoch moves on): it was started before the failure,
+    /// so by the time it is used again it may be as dead as the connection
+    /// that failed, and installing it would turn one failure into several.
+    pub(crate) async fn invalidate(&self) {
+        let mut state = self.state.lock().await;
+        if let Some(live) = state.live.take() {
+            if live.limits.is_some() && !live.due() {
+                state.scale = (state.scale * SHRINK).max(FLOOR);
+            }
+        }
+        state.epoch += 1;
+        self.epoch.send_replace(state.epoch);
     }
 }
 
@@ -386,7 +605,7 @@ impl tokio::io::AsyncWrite for Cork {
     }
 }
 
-fn request(method: Method, host: &str, path: &str) -> Request<()> {
+pub(crate) fn request(method: Method, host: &str, path: &str) -> Request<()> {
     Request::builder()
         .method(method)
         .uri(format!("https://{host}{path}"))
@@ -468,9 +687,9 @@ impl From<io::Error> for PipeError {
 
 impl Client {
     pub fn new(config: ClientConfig, dial: Dialer) -> Arc<Self> {
-        let down = Carrier::new(dial.clone(), config.host.clone());
+        let down = Carrier::new(dial.clone(), config.host.clone(), config.rotation);
         let up = if config.split {
-            Carrier::new(dial, config.host.clone())
+            Carrier::new(dial, config.host.clone(), config.rotation)
         } else {
             down.clone()
         };
@@ -511,7 +730,7 @@ impl Client {
 
     async fn establish(self: &Arc<Self>) -> io::Result<Arc<Session>> {
         let (sender, server_time) = match self.down.get().await {
-            Ok(connected) => connected,
+            Ok(lease) => (lease.sender, lease.time),
             Err(error) => {
                 self.down.invalidate().await;
                 return Err(error);
@@ -530,9 +749,25 @@ impl Client {
             let mut sender = sender.ready().await.map_err(other)?;
             let open = request(Method::POST, &self.config.host, &format!("{base}/open"));
             let (response, mut body) = sender.send_request(open, false).map_err(other)?;
-            send_all(&mut body, Bytes::from(hello)).await?;
-            body.send_data(Bytes::new(), true).map_err(other)?;
-            let response = response.await.map_err(other)?;
+            // A server or proxy that answers before it has read the whole
+            // request ends the stream under the writer; what it said is more
+            // useful than the broken pipe, so the answer is read either way.
+            let written = async {
+                send_all(&mut body, Bytes::from(hello)).await?;
+                body.send_data(Bytes::new(), true).map_err(other)
+            }
+            .await;
+            let response = match response.await {
+                Ok(response) => response,
+                Err(error) => return Err(written.err().unwrap_or_else(|| other(error))),
+            };
+            if response.status().is_server_error() {
+                // A proxy in front has no backend right now; not a refusal.
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "the server is not available right now",
+                ));
+            }
             if response.status() != StatusCode::OK {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -616,16 +851,14 @@ async fn download(session: Arc<Session>, carrier: Arc<Carrier>, host: String, ba
     let mut number = 0u64;
     let mut failures = 0;
     while !session.is_closed() {
-        number += 1;
-        let path = format!(
-            "{base}/d/{number}?t={}",
-            pipe_tag(session.binding(), b'd', number)
-        );
-        match download_once(&session, &carrier, &host, &path).await {
+        match download_once(&session, &carrier, &host, &base, &mut number, &mut failures).await {
             Ok(()) => failures = 0,
-            Err(PipeError::Gone) => break,
+            Err(PipeError::Gone) => {
+                tracing::debug!("tide download: the server no longer knows the session");
+                break;
+            }
             Err(PipeError::Failed(error)) => {
-                tracing::debug!(%error, "tide download pipe failed");
+                tracing::debug!(%error, failures, "tide download pipe failed");
                 carrier.invalidate().await;
                 failures += 1;
                 if failures > MAX_FAILURES {
@@ -638,29 +871,103 @@ async fn download(session: Arc<Session>, carrier: Arc<Carrier>, host: String, ba
     session.close();
 }
 
-async fn download_once(
+/// A download request that is open.
+struct Down {
+    body: h2::RecvStream,
+    parser: ChunkParser,
+    lease: Lease,
+}
+
+/// Start the next download request (numbered by bumping `number`).
+async fn open_download(
     session: &Session,
-    carrier: &Carrier,
+    carrier: &Arc<Carrier>,
     host: &str,
-    path: &str,
-) -> Result<(), PipeError> {
-    let (sender, _) = carrier.get().await?;
-    let mut sender = sender.ready().await.map_err(other)?;
+    base: &str,
+    number: &mut u64,
+) -> Result<Down, PipeError> {
+    *number += 1;
+    let path = format!(
+        "{base}/d/{number}?t={}",
+        pipe_tag(session.binding(), b'd', *number)
+    );
+    let lease = carrier.get().await?;
+    let mut sender = lease.sender.clone().ready().await.map_err(other)?;
     let (response, _) = sender
-        .send_request(request(Method::GET, host, path), true)
+        .send_request(request(Method::GET, host, &path), true)
         .map_err(other)?;
     let response = response.await.map_err(other)?;
-    if response.status() != StatusCode::OK {
-        return Err(PipeError::Gone);
+    match response.status() {
+        StatusCode::OK => {}
+        // The server does not know the session (or answers as the decoy
+        // does): it is gone. Any other status is a proxy in the way having
+        // a bad moment (a relay whose egress is down says 502), which a
+        // retry may get past.
+        StatusCode::NOT_FOUND => return Err(PipeError::Gone),
+        status => {
+            return Err(PipeError::Failed(other(format!(
+                "download answered {status}"
+            ))))
+        }
     }
-    let mut body = response.into_body();
-    let mut parser = ChunkParser::default();
-    while let Some(data) = body.data().await {
-        let data = data.map_err(other)?;
-        session.receive(&mut parser, &data)?;
-        let _ = body.flow_control().release_capacity(data.len());
+    Ok(Down {
+        body: response.into_body(),
+        parser: ChunkParser::default(),
+        lease,
+    })
+}
+
+/// Read one download request to its end.
+///
+/// The rule: when the carrier moves to a new connection, the next request
+/// is opened on it *before* this one is dropped. Dropping resets the old
+/// request, so what it was carrying and the peer had not yet acknowledged
+/// goes out again on the new one; the session never sees a gap. Without
+/// this, a download would sit on its old connection until the server ended
+/// it (up to 16 MiB or 45 quiet seconds later) and the rotation would not
+/// reach the direction that carries the bytes.
+async fn download_once(
+    session: &Session,
+    carrier: &Arc<Carrier>,
+    host: &str,
+    base: &str,
+    number: &mut u64,
+    failures: &mut u32,
+) -> Result<(), PipeError> {
+    let mut pipe = open_download(session, carrier, host, base, number).await?;
+    // The server answered for this session, so it is alive: only failures to
+    // get an answer count towards giving up. A download is cut and reopened
+    // many times in a long session, and without this every cut, however
+    // well recovered, would add up until the session was dropped.
+    *failures = 0;
+    let mut changes = carrier.changes();
+    let mut seen = pipe.lease.epoch;
+    let mut check = tokio::time::interval(ROTATION_CHECK);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            // Only a request being made starts a rotation, and this one is
+            // the longest-lived, so it asks.
+            _ = check.tick(), if carrier.rotation.is_some() && session.idle_for() < ROTATION_ACTIVE => {
+                carrier.get().await?;
+            }
+            data = pipe.body.data() => {
+                let Some(data) = data else { return Ok(()) };
+                let data = data.map_err(other)?;
+                session.receive(&mut pipe.parser, &data)?;
+                pipe.lease.count(data.len());
+                let _ = pipe.body.flow_control().release_capacity(data.len());
+            }
+            Ok(latest) = async { changes.wait_for(|epoch| *epoch != seen).await.map(|e| *e) } => {
+                seen = latest;
+                if let Ok(next) = open_download(session, carrier, host, base, number).await {
+                    seen = next.lease.epoch;
+                    pipe = next;
+                    *failures = 0;
+                }
+            }
+        }
     }
-    Ok(())
 }
 
 /// Send what the session has to send, one upload request after another.
@@ -684,11 +991,12 @@ async fn upload(session: Arc<Session>, carrier: Arc<Carrier>, config: ClientConf
                 failures = 0;
             }
             Err(PipeError::Gone) => {
+                tracing::debug!("tide upload: the server no longer knows the session");
                 session.pipe_closed(number, false);
                 break;
             }
             Err(PipeError::Failed(error)) => {
-                tracing::debug!(%error, "tide upload pipe failed");
+                tracing::debug!(%error, failures, "tide upload pipe failed");
                 session.pipe_closed(number, false);
                 carrier.invalidate().await;
                 failures += 1;
@@ -704,14 +1012,14 @@ async fn upload(session: Arc<Session>, carrier: Arc<Carrier>, config: ClientConf
 
 async fn upload_once(
     session: &Session,
-    carrier: &Carrier,
+    carrier: &Arc<Carrier>,
     config: &ClientConfig,
     path: &str,
     number: u64,
     first: Bytes,
 ) -> Result<(), PipeError> {
-    let (sender, _) = carrier.get().await?;
-    let mut sender = sender.ready().await.map_err(other)?;
+    let lease = carrier.get().await?;
+    let mut sender = lease.sender.clone().ready().await.map_err(other)?;
     let mut post = request(Method::POST, &config.host, path);
     post.headers_mut().insert(
         "content-type",
@@ -723,24 +1031,42 @@ async fn upload_once(
     // Each request carries a different amount, so no size repeats.
     let limit = rand::thread_rng().gen_range(256 * 1024..1024 * 1024);
     let mut sent = first.len();
-    send_all(&mut body, first).await?;
-    while sent < limit {
-        let next = if config.linger.is_zero() {
-            session.try_next_chunk(number, CHUNK_PLAIN_MAX)
-        } else {
-            match tokio::time::timeout(config.linger, session.next_chunk(number, CHUNK_PLAIN_MAX))
+    lease.count(sent);
+    // As in the handshake: if the far end answers before the body is done
+    // (a 404 for a session it has forgotten), that answer decides what
+    // happens next, not the broken pipe it caused.
+    let written = async {
+        send_all(&mut body, first).await?;
+        while sent < limit {
+            let next = if config.linger.is_zero() {
+                session.try_next_chunk(number, CHUNK_PLAIN_MAX)
+            } else {
+                match tokio::time::timeout(
+                    config.linger,
+                    session.next_chunk(number, CHUNK_PLAIN_MAX),
+                )
                 .await
-            {
-                Ok(Ok(chunk)) => Some(chunk),
-                Ok(Err(_)) | Err(_) => None,
-            }
-        };
-        let Some(chunk) = next else { break };
-        sent += chunk.len();
-        send_all(&mut body, chunk).await?;
+                {
+                    Ok(Ok(chunk)) => Some(chunk),
+                    Ok(Err(_)) | Err(_) => None,
+                }
+            };
+            let Some(chunk) = next else { break };
+            sent += chunk.len();
+            lease.count(chunk.len());
+            send_all(&mut body, chunk).await?;
+        }
+        body.send_data(Bytes::new(), true).map_err(other)
     }
-    body.send_data(Bytes::new(), true).map_err(other)?;
-    let response = response.await.map_err(other)?;
+    .await;
+    let response = match response.await {
+        Ok(response) => response,
+        Err(error) => return Err(written.err().unwrap_or_else(|| other(error)).into()),
+    };
+    if response.status() == StatusCode::NOT_FOUND {
+        return Err(PipeError::Gone);
+    }
+    written?;
     match response.status() {
         StatusCode::OK => Ok(()),
         StatusCode::NOT_FOUND => Err(PipeError::Gone),
@@ -830,6 +1156,9 @@ pub struct ServerConfig {
     /// a control panel can change it while the server runs.
     pub users: Arc<RwLock<HashMap<UserId, String>>>,
     pub decoy: Decoy,
+    /// How far the server pads its answers to an upload (see
+    /// [`tide::ShapeLevel`]).
+    pub shape: tide::ShapeLevel,
 }
 
 /// A stream a client opened: who it is, where it wants to go, and the stream.
@@ -872,8 +1201,22 @@ impl Server {
         counts
     }
 
-    /// Serve one connection (TLS already done, if any) until it closes.
-    pub async fn serve_connection(self: &Arc<Self>, io: BoxStream) -> io::Result<()> {
+    /// Serve one connection (TLS already done, if any) until it closes. A
+    /// connection starting with the HTTP/2 preface is served as HTTP/2;
+    /// anything else as HTTP/1.1, for a proxy that cannot speak HTTP/2 to
+    /// its origin (see [`crate::tide_http1`]).
+    pub async fn serve_connection(self: &Arc<Self>, mut io: BoxStream) -> io::Result<()> {
+        let mut first = [0u8; 4];
+        tokio::io::AsyncReadExt::read_exact(&mut io, &mut first).await?;
+        let io = crate::tide_http1::Prefixed::new(&first, io);
+        if &first == b"PRI " {
+            self.serve_h2(zero_core::boxed(io)).await
+        } else {
+            crate::tide_http1::serve(self, io).await
+        }
+    }
+
+    pub(crate) async fn serve_h2(self: &Arc<Self>, io: BoxStream) -> io::Result<()> {
         let mut connection = h2::server::Builder::new()
             .initial_window_size(H2_WINDOW)
             .initial_connection_window_size(H2_WINDOW)
@@ -1096,6 +1439,7 @@ impl Server {
             return None;
         }
         let (reply, session) = offer.accept().ok()?;
+        session.shape(self.config.shape);
         tokio::spawn(session.clone().run_timers());
         let accept = {
             let (session, incoming) = (session.clone(), self.incoming.clone());
@@ -1130,35 +1474,66 @@ impl Server {
         &self,
         method: &Method,
         path: &str,
-        mut respond: h2::server::SendResponse<Bytes>,
+        respond: h2::server::SendResponse<Bytes>,
     ) -> io::Result<()> {
-        let front = matches!(path, "/" | "/index.html")
-            && (method == Method::GET || method == Method::HEAD);
-        let page = if front {
-            self.config.decoy.page.clone()
-        } else {
-            Bytes::from_static(b"<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center></body></html>\n")
-        };
-        let response = Response::builder()
-            .status(if front {
-                StatusCode::OK
-            } else {
-                StatusCode::NOT_FOUND
-            })
-            .header("date", http_date(now()))
-            .header("content-type", "text/html; charset=utf-8")
-            .header("content-length", page.len().to_string())
-            .body(())
-            .expect("a fixed response");
-        if method == Method::HEAD {
-            respond.send_response(response, true).map_err(other)?;
-            return Ok(());
-        }
-        let mut body = respond.send_response(response, false).map_err(other)?;
-        send_all(&mut body, page).await?;
-        body.send_data(Bytes::new(), true).map_err(other)?;
-        Ok(())
+        answer_decoy(&self.config.decoy.page, method, path, respond).await
     }
+}
+
+/// Answer as the site would: `page` for `/`, not found for the rest. Shared
+/// by the server and the relay, so both look the same from outside.
+/// What an ordinary reverse proxy shows when its backend is down: a 502 with
+/// the usual short page. Tide clients retry on it; they give a session up
+/// only on the 404 an egress gives for a session it does not know.
+pub(crate) async fn answer_bad_gateway(
+    mut respond: h2::server::SendResponse<Bytes>,
+) -> io::Result<()> {
+    let page = Bytes::from_static(b"<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center></body></html>\n");
+    let response = Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header("date", http_date(now()))
+        .header("content-type", "text/html; charset=utf-8")
+        .header("content-length", page.len().to_string())
+        .body(())
+        .expect("a fixed response");
+    let mut body = respond.send_response(response, false).map_err(other)?;
+    send_all(&mut body, page).await?;
+    body.send_data(Bytes::new(), true).map_err(other)?;
+    Ok(())
+}
+
+pub(crate) async fn answer_decoy(
+    page: &Bytes,
+    method: &Method,
+    path: &str,
+    mut respond: h2::server::SendResponse<Bytes>,
+) -> io::Result<()> {
+    let front =
+        matches!(path, "/" | "/index.html") && (method == Method::GET || method == Method::HEAD);
+    let page = if front {
+        page.clone()
+    } else {
+        Bytes::from_static(b"<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center></body></html>\n")
+    };
+    let response = Response::builder()
+        .status(if front {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        })
+        .header("date", http_date(now()))
+        .header("content-type", "text/html; charset=utf-8")
+        .header("content-length", page.len().to_string())
+        .body(())
+        .expect("a fixed response");
+    if method == Method::HEAD {
+        respond.send_response(response, true).map_err(other)?;
+        return Ok(());
+    }
+    let mut body = respond.send_response(response, false).map_err(other)?;
+    send_all(&mut body, page).await?;
+    body.send_data(Bytes::new(), true).map_err(other)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1238,11 +1613,25 @@ mod tests {
         dials: Arc<AtomicUsize>,
         /// Cut every connection made so far.
         cut: Arc<tokio::sync::Notify>,
+        /// While set, new dials wait; while `refuse` is set they fail.
+        hold: Arc<std::sync::atomic::AtomicBool>,
+        refuse: Arc<std::sync::atomic::AtomicBool>,
+        /// Connections the server has seen end.
+        ended: Arc<AtomicUsize>,
     }
 
     /// A server answering every stream as an echo, and a client wired to it
     /// through in-memory connections.
     fn bench(split: bool, linger: Duration, known_user: bool) -> Bench {
+        bench_rotating(split, linger, known_user, None)
+    }
+
+    fn bench_rotating(
+        split: bool,
+        linger: Duration,
+        known_user: bool,
+        rotation: Option<Rotation>,
+    ) -> Bench {
         let (secret, public) = tide::generate_keypair();
         let user = [9u8; 16];
         let users = Arc::new(RwLock::new(HashMap::new()));
@@ -1255,6 +1644,7 @@ mod tests {
             secret,
             users,
             decoy: Decoy::default(),
+            shape: tide::ShapeLevel::default(),
         });
         tokio::spawn(async move {
             while let Some((_, _, mut stream)) = streams.recv().await {
@@ -1276,18 +1666,30 @@ mod tests {
         });
         let dials = Arc::new(AtomicUsize::new(0));
         let cut = Arc::new(tokio::sync::Notify::new());
+        let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended = Arc::new(AtomicUsize::new(0));
         let dial: Dialer = {
-            let (dials, cut) = (dials.clone(), cut.clone());
+            let (dials, cut, ended) = (dials.clone(), cut.clone(), ended.clone());
+            let (hold, refuse) = (hold.clone(), refuse.clone());
             Arc::new(move || {
                 let (server, dials, cut) = (server.clone(), dials.clone(), cut.clone());
+                let (hold, refuse, ended) = (hold.clone(), refuse.clone(), ended.clone());
                 Box::pin(async move {
                     dials.fetch_add(1, Ordering::SeqCst);
+                    while hold.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    if refuse.load(Ordering::SeqCst) {
+                        return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+                    }
                     let (near, far) = tokio::io::duplex(256 * 1024);
                     tokio::spawn(async move {
                         tokio::select! {
                             _ = server.serve_connection(boxed(far)) => {}
                             () = cut.notified() => {}
                         }
+                        ended.fetch_add(1, Ordering::SeqCst);
                     });
                     Ok(boxed(near))
                 })
@@ -1301,10 +1703,18 @@ mod tests {
                 user,
                 split,
                 linger,
+                rotation,
             },
             dial,
         );
-        Bench { client, dials, cut }
+        Bench {
+            client,
+            dials,
+            cut,
+            hold,
+            refuse,
+            ended,
+        }
     }
 
     fn target() -> Destination {
@@ -1365,6 +1775,227 @@ mod tests {
         assert!(bench.dials.load(Ordering::SeqCst) > before, "it redialled");
     }
 
+    async fn stop_by(limit: Duration, done: impl Fn() -> bool) {
+        let end = std::time::Instant::now() + limit;
+        while !done() {
+            assert!(std::time::Instant::now() < end, "it did not happen in time");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A rotation that fires after about this long and moves this many bytes.
+    fn quick_rotation(age: Duration, bytes: u64) -> Option<Rotation> {
+        Some(Rotation {
+            min_age: age,
+            max_age: age,
+            max_bytes: bytes,
+        })
+    }
+
+    /// Connections are replaced on their own as they age, in the middle of
+    /// a live stream, and nothing the stream carries is lost or reordered.
+    #[tokio::test]
+    async fn connections_are_replaced_by_age_without_disturbing_a_stream() {
+        let bench = bench_rotating(
+            true,
+            Duration::from_millis(100),
+            true,
+            quick_rotation(Duration::from_millis(400), u64::MAX),
+        );
+        let mut stream = bench.client.open(target()).await.unwrap();
+        let started = bench.dials.load(Ordering::SeqCst);
+        for round in 0..24u8 {
+            let payload: Vec<u8> = pattern(30_000).iter().map(|b| b ^ round).collect();
+            round_trip(&mut stream, &payload).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let dialled = bench.dials.load(Ordering::SeqCst) - started;
+        assert!(dialled >= 2, "only {dialled} replacements in 2.4 s");
+        // The replaced connections close by themselves once drained.
+        stop_by(Duration::from_secs(5), || {
+            bench.ended.load(Ordering::SeqCst) >= dialled
+        })
+        .await;
+    }
+
+    /// The volume limit alone is enough to replace a connection.
+    #[tokio::test]
+    async fn connections_are_replaced_by_volume() {
+        let bench = bench_rotating(
+            true,
+            Duration::from_millis(100),
+            true,
+            quick_rotation(Duration::from_secs(3600), 100_000),
+        );
+        let mut stream = bench.client.open(target()).await.unwrap();
+        let started = bench.dials.load(Ordering::SeqCst);
+        for _ in 0..8 {
+            round_trip(&mut stream, &pattern(120_000)).await;
+        }
+        assert!(bench.dials.load(Ordering::SeqCst) > started);
+        // One long transfer crossing many replacements arrives whole.
+        let before = bench.dials.load(Ordering::SeqCst);
+        round_trip(&mut stream, &pattern(3_000_000)).await;
+        assert!(bench.dials.load(Ordering::SeqCst) > before);
+    }
+
+    /// While the replacement is still being dialled the old connection keeps
+    /// carrying the stream: rotating costs no stall.
+    #[tokio::test]
+    async fn the_old_connection_carries_on_while_its_replacement_is_dialled() {
+        let bench = bench_rotating(
+            true,
+            Duration::from_millis(100),
+            true,
+            quick_rotation(Duration::from_millis(300), u64::MAX),
+        );
+        let mut stream = bench.client.open(target()).await.unwrap();
+        round_trip(&mut stream, &pattern(10_000)).await;
+        bench.hold.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            round_trip(&mut stream, &pattern(40_000)).await;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "traffic waited for the dial: {:?}",
+            started.elapsed()
+        );
+        bench.hold.store(false, Ordering::SeqCst);
+    }
+
+    /// A replacement that cannot be made leaves the old connection in use,
+    /// and is not retried on every request.
+    #[tokio::test]
+    async fn a_failed_replacement_keeps_the_old_connection_and_backs_off() {
+        let bench = bench_rotating(
+            true,
+            Duration::from_millis(100),
+            true,
+            quick_rotation(Duration::from_millis(200), u64::MAX),
+        );
+        let mut stream = bench.client.open(target()).await.unwrap();
+        round_trip(&mut stream, &pattern(10_000)).await;
+        bench.refuse.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = bench.dials.load(Ordering::SeqCst);
+        for _ in 0..10 {
+            round_trip(&mut stream, &pattern(20_000)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let tried = bench.dials.load(Ordering::SeqCst) - before;
+        assert!(
+            tried <= 2,
+            "{tried} replacement dials while the network was refusing"
+        );
+    }
+
+    /// A connection that dies young makes the next ones shorter-lived, down
+    /// to a floor; ones that reach their limits on schedule win it back.
+    #[tokio::test]
+    async fn connections_dying_young_shorten_the_next_ones() {
+        let bench = bench_rotating(
+            true,
+            Duration::from_millis(100),
+            true,
+            Some(Rotation::default()),
+        );
+        let mut stream = bench.client.open(target()).await.unwrap();
+        round_trip(&mut stream, &pattern(10_000)).await;
+        let scale = || async { bench.client.down.state.lock().await.scale };
+        assert_eq!(scale().await, 1.0);
+        for _ in 0..3 {
+            bench.cut.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            round_trip(&mut stream, &pattern(50_000)).await;
+        }
+        let shrunk = scale().await;
+        assert!((FLOOR..0.8).contains(&shrunk), "scale is {shrunk}");
+    }
+
+    #[test]
+    fn limits_follow_the_scale_but_keep_their_floors() {
+        let rotation = Rotation::default();
+        for _ in 0..100 {
+            let (age, bytes) = rotation.draw(FLOOR);
+            assert!(age >= rotation.min_age);
+            assert!(bytes >= MIN_BYTES);
+            assert!(bytes <= rotation.max_bytes / 3);
+        }
+    }
+
+    #[test]
+    fn rotation_limits_stay_inside_the_allowance_and_vary() {
+        let rotation = Rotation::default();
+        let draws: Vec<_> = (0..200).map(|_| rotation.draw(1.0)).collect();
+        for (age, bytes) in &draws {
+            assert!(*age >= rotation.min_age && *age <= rotation.max_age);
+            assert!(*bytes >= rotation.max_bytes / 2 && *bytes <= rotation.max_bytes);
+        }
+        let first = draws[0];
+        assert!(draws.iter().any(|draw| *draw != first), "no two differ");
+    }
+
+    /// Constant trouble: connections are cut at random while six streams move
+    /// data of every size, rotation is replacing connections on its own, and
+    /// the server pads uploads. Every byte of every stream must still arrive,
+    /// in order, and the session must still be the one it started as.
+    #[tokio::test]
+    async fn a_busy_session_survives_constant_trouble() {
+        let bench = bench_rotating(
+            true,
+            Duration::from_millis(50),
+            true,
+            quick_rotation(Duration::from_millis(400), 400_000),
+        );
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let chaos = tokio::spawn({
+            let (cut, stop) = (bench.cut.clone(), stop.clone());
+            async move {
+                while !stop.load(Ordering::SeqCst) {
+                    let wait = rand::thread_rng().gen_range(300..900);
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                    cut.notify_waiters();
+                }
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let mut flows = Vec::new();
+        for flow in 0..6u8 {
+            let client = bench.client.clone();
+            flows.push(tokio::spawn(async move {
+                let mut stream = client.open(target()).await.unwrap();
+                let mut rounds = 0u32;
+                while std::time::Instant::now() < deadline {
+                    let size = rand::thread_rng().gen_range(1_000..250_000);
+                    let payload: Vec<u8> = (0..size)
+                        .map(|i| ((i as u32).wrapping_mul(31) as u8) ^ flow ^ rounds as u8)
+                        .collect();
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        round_trip(&mut stream, &payload),
+                    )
+                    .await
+                    .expect("a round trip stalled for 30 s");
+                    rounds += 1;
+                }
+                rounds
+            }));
+        }
+        let mut total = 0;
+        for flow in flows {
+            total += flow.await.unwrap();
+        }
+        stop.store(true, Ordering::SeqCst);
+        chaos.await.unwrap();
+        assert!(total >= 12, "only {total} round trips in 8 s of trouble");
+        assert!(
+            bench.dials.load(Ordering::SeqCst) > 6,
+            "no reconnects happened, so nothing was tested"
+        );
+    }
+
     #[tokio::test]
     async fn an_unknown_user_is_shown_the_site_not_an_error_of_its_own() {
         let bench = bench(true, Duration::ZERO, false);
@@ -1383,6 +2014,7 @@ mod tests {
             secret,
             users: Arc::default(),
             decoy: Decoy::default(),
+            shape: tide::ShapeLevel::default(),
         });
         let (near, far) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move { server.serve_connection(boxed(far)).await });

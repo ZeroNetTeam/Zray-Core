@@ -20,6 +20,7 @@
 
 pub mod noise;
 pub mod session;
+pub mod shape;
 
 use std::collections::HashMap;
 use std::io;
@@ -28,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use rand::RngCore;
 
 pub use session::{ChunkParser, Role, Session, TideStream};
+pub use shape::ShapeLevel;
 
 /// Mixed into the handshake, so a Tide message is never valid as anything
 /// else and a later version cannot be confused with this one.

@@ -15,6 +15,12 @@
 //!
 //! # Does the seed in $CROWD_SIGNING_KEY belong to the key the app trusts?
 //! zeronet-sign check
+//!
+//! # Turn a file of carrier links (one per line) into the TXT records of a
+//! # descriptor (see `zero_discovery::rendezvous`): prints `name<TAB>text`
+//! # lines, `f0` to `f<count-1>`, for the zone. The epoch is hours since 1970
+//! # and must grow with every publish.
+//! zeronet-sign descriptor --epoch 493000 [--count 64] carriers.txt
 //! ```
 //!
 //! `keygen` prints the public key (paste it into `sign::PUBLIC_KEY_HEX`) and
@@ -23,7 +29,7 @@
 
 use std::path::Path;
 
-use zero_discovery::sign;
+use zero_discovery::{rendezvous, sign};
 
 fn main() {
     if let Err(e) = run() {
@@ -39,6 +45,7 @@ fn run() -> Result<(), String> {
         Some("sign") => sign_files(args.collect()),
         Some("verify") => verify_file(args.collect()),
         Some("check") => check_seed(),
+        Some("descriptor") => descriptor(args.collect()),
         Some(other) => Err(format!(
             "unknown command {other:?}; use keygen, sign, verify or check"
         )),
@@ -102,6 +109,46 @@ fn check_seed() -> Result<(), String> {
             sign::public_hex(&seed)
         ))
     }
+}
+
+/// Print the TXT records of a signed descriptor naming the links in a file.
+fn descriptor(args: Vec<String>) -> Result<(), String> {
+    let (mut epoch, mut count, mut file) = (None, None, None);
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--epoch" => epoch = it.next().and_then(|v| v.parse::<u64>().ok()),
+            "--count" => count = it.next().and_then(|v| v.parse::<u32>().ok()),
+            other => file = Some(other.to_string()),
+        }
+    }
+    let epoch = epoch.ok_or("--epoch <hours since 1970> is required")?;
+    let file = file.ok_or("a file of carrier links is required")?;
+    let text = std::fs::read_to_string(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let links: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    let blob = rendezvous::sign_blob(&seed_from_env()?, epoch, &links);
+    // Checked the way a client will check it, so a bad file fails here.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() / 3600);
+    let key = sign::public_hex(&seed_from_env()?);
+    rendezvous::verify(&blob, &key, 0, now)?;
+    // Three times the blocks needed leaves room for names being blocked.
+    let count = count.unwrap_or(3 * rendezvous::blocks_for(blob.len()) as u32 + 8);
+    for (name, text) in rendezvous::zone_records(&blob, count)? {
+        println!("{name}\t{text}");
+    }
+    eprintln!(
+        "{} carriers, epoch {epoch}, {} bytes, {count} records",
+        links.len(),
+        blob.len()
+    );
+    Ok(())
 }
 
 /// Sign each file, writing `<file>.sig` beside it.

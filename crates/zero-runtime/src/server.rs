@@ -297,6 +297,7 @@ struct InboundRuntime {
     transport: Option<zero_transport::ws::WsConfig>,
     raw_http_header: Option<zero_transport::tcp_header::HttpHeaderConfig>,
     tide: Option<Arc<TideInbound>>,
+    tide_relay: Option<Arc<zero_transport::tide_relay::Relay>>,
 }
 
 /// A Tide inbound's server. It outlives any one connection: a session's
@@ -319,6 +320,11 @@ impl TideInbound {
                 admin: crate::tide_users::admin(config, &users),
                 users,
                 decoy: Default::default(),
+                shape: match config.shape {
+                    zero_config::TideShape::Off => zero_protocol::tide::ShapeLevel::Off,
+                    zero_config::TideShape::Light => zero_protocol::tide::ShapeLevel::Light,
+                    zero_config::TideShape::Full => zero_protocol::tide::ShapeLevel::Full,
+                },
             });
         Arc::new(Self {
             server,
@@ -372,6 +378,26 @@ impl InboundRuntime {
             transport,
             tide: match &inbound.protocol {
                 InboundProtocol::Tide(config) => Some(TideInbound::new(config)),
+                _ => None,
+            },
+            tide_relay: match &inbound.protocol {
+                InboundProtocol::TideRelay(config) => match outbound::tide_relay_dialer(config) {
+                    Ok(dial) => Some(zero_transport::tide_relay::Relay::new(
+                        zero_transport::tide_relay::RelayConfig {
+                            path: config.path.to_string(),
+                            host: config.upstream_name.as_deref().map_or_else(
+                                || config.upstream_address.host_string(),
+                                str::to_string,
+                            ),
+                            decoy: Default::default(),
+                        },
+                        dial,
+                    )),
+                    Err(error) => {
+                        warn!(%error, "the Tide relay's upstream could not be set up");
+                        None
+                    }
+                },
                 _ => None,
             },
             raw_http_header: inbound
@@ -1691,6 +1717,18 @@ impl Server {
                     .and_then(|compiled| compiled.tide.clone())
                     .ok_or_else(|| "inbound Tide configuration is missing".to_string())?;
                 return self.handle_tide(stream, id, tag, tide).await;
+            }
+            InboundProtocol::TideRelay(_) => {
+                let relay = session
+                    .state
+                    .inbounds
+                    .get(id.0 as usize)
+                    .and_then(|compiled| compiled.tide_relay.clone())
+                    .ok_or_else(|| "inbound Tide relay configuration is missing".to_string())?;
+                return relay
+                    .serve_connection(stream)
+                    .await
+                    .map_err(|error| format!("Tide relay connection: {error}"));
             }
             InboundProtocol::Dokodemo {
                 target: Some(target),
