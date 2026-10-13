@@ -1208,6 +1208,7 @@ fn tide_client(
                         std::time::Duration::from_secs(2)
                     },
                     lane: tide.datagrams,
+                    rotation: tide.rotate.then(zero_transport::tide::Rotation::default),
                 },
                 dial,
             );
@@ -1220,6 +1221,57 @@ fn tide_client(
             clients.entry(key).or_insert(client).clone()
         }
     }
+}
+
+/// The dialer a Tide relay uses to reach its egress: an ordinary client
+/// connection (TCP, then certificate TLS negotiating `h2`, shaped like the
+/// client profile), made fresh on every call so a moved egress is followed.
+///
+/// The outbound it dials with is built from a throwaway Tide link whose keys
+/// are all zero. Only its TLS settings are used; the relay holds no key and
+/// never sends a handshake of its own, it passes the clients' through.
+pub(crate) fn tide_relay_dialer(
+    config: &zero_config::TideRelayConfig,
+) -> Result<zero_transport::tide::Dialer, String> {
+    let host = config.upstream_address.host_string();
+    let name = config.upstream_name.as_deref().unwrap_or(&host).to_string();
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
+    let link = format!(
+        "zerov1://{}@{}:{}?key={}&path=/x&security=tls&fp=chrome&sni={}",
+        "A".repeat(22),
+        authority,
+        config.upstream_port,
+        "A".repeat(43),
+        name
+    );
+    let mut outbound = zero_config::share_link::parse_link(&link)?.outbound;
+    if let Security::Tls(tls) = &mut outbound.stream.security {
+        tls.alpn = vec!["h2".into()];
+        tls.trusted_roots = config.upstream_roots.clone();
+    }
+    let (outbound, port) = (Arc::new(outbound), config.upstream_port);
+    Ok(Arc::new(move || {
+        let (outbound, host) = (outbound.clone(), host.clone());
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+                .await?
+                .collect();
+            let tcp = dial_tcp(
+                &addrs,
+                &race_policy(&outbound.stream),
+                &socket_options(&outbound.stream),
+            )
+            .await
+            .map_err(|failure| std::io::Error::other(failure.to_string()))?;
+            protect_socket(&outbound, tcp.stream, &host)
+                .await
+                .map_err(|failure| std::io::Error::other(failure.to_string()))
+        })
+    }))
 }
 
 async fn connect_mux_pooled(

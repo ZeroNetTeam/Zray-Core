@@ -16,6 +16,8 @@ pub mod salamander;
 pub mod shadowtls;
 pub mod tcp_header;
 pub mod tide;
+pub mod tide_http1;
+pub mod tide_relay;
 pub mod tuic;
 pub mod ws;
 pub mod xhttp;

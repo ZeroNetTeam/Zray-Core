@@ -74,3 +74,4 @@ CHANGELOG*
 **/*-ideas.md
 # The ignore file itself (root only, so nested ones keep working)
 /.gitignore
+.wrangler/

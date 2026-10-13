@@ -95,6 +95,13 @@ pub struct DiscoverRequest {
     /// probe of the user's own machine or network; like `confirm_tls`, tests
     /// against local servers turn it on.
     pub allow_private_hosts: bool,
+    /// The user's "Allow insecure" switch: test candidates with the
+    /// certificate check skipped (see [`crate::probe::loosened`]).
+    pub allow_insecure: bool,
+    /// A signed list of carriers published as DNS records, asked for over
+    /// DoH. Joins the first tier like the user's own configs; each carrier
+    /// is tested like any other candidate. Used only when `fetch` is on.
+    pub rendezvous: Option<crate::rendezvous::RendezvousRequest>,
 }
 
 impl Default for DiscoverRequest {
@@ -121,6 +128,8 @@ impl Default for DiscoverRequest {
             fetch: true,
             fetch_timeout_ms: 20_000,
             allow_private_hosts: false,
+            allow_insecure: false,
+            rendezvous: None,
         }
     }
 }
@@ -458,6 +467,24 @@ async fn run(shared: Arc<Shared>) {
         }
     }
 
+    if let Some(rendezvous) = request.rendezvous.as_ref().filter(|_| request.fetch) {
+        shared.stage("rendezvous");
+        let found = crate::rendezvous::fetch(rendezvous, request.cache_dir.as_deref()).await;
+        shared.sink.emit(json!({
+            "t": "source",
+            "id": "rendezvous",
+            "status": if found.is_some() { "ok" } else { "error" },
+            "count": found.as_ref().map_or(0, |d| d.carriers.len()),
+        }));
+        for link in found.iter().flat_map(|d| &d.carriers) {
+            if let Ok(candidate) = parse_candidate(link) {
+                if seen.insert(candidate.info.key.clone()) {
+                    own.push(candidate);
+                }
+            }
+        }
+    }
+
     let mut tiers: Vec<u32> = if request.fetch {
         request.sources.iter().map(|source| source.tier).collect()
     } else {
@@ -591,7 +618,7 @@ async fn real_stage_all(shared: &Arc<Shared>, candidates: Vec<Candidate>) {
 async fn real_one(shared: &Shared, candidate: &Candidate) {
     let timeout = Duration::from_millis(shared.request.real_timeout_ms);
     let result = real_test(
-        &candidate.outbound,
+        &crate::probe::loosened(&candidate.outbound, shared.request.allow_insecure),
         &shared.target,
         timeout,
         shared

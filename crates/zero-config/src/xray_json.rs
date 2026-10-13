@@ -171,6 +171,7 @@ fn parse_inbound(v: &Value, idx: usize, _out: &mut ParseOutput) -> R<Inbound> {
         "anytls" => InboundProtocol::AnyTls(parse_anytls_inbound(v.get("settings"), &path)?),
         // "tide" is the name the protocol was built under.
         "zerov1" | "tide" => InboundProtocol::Tide(parse_tide_inbound(v.get("settings"), &path)?),
+        "zerov1-relay" => InboundProtocol::TideRelay(parse_tide_relay(v.get("settings"), &path)?),
         "hysteria2" => {
             InboundProtocol::Hysteria2(parse_hysteria2_inbound(v.get("settings"), &path)?)
         }
@@ -247,7 +248,10 @@ fn parse_inbound(v: &Value, idx: usize, _out: &mut ParseOutput) -> R<Inbound> {
             ));
         }
     }
-    if matches!(protocol, InboundProtocol::Tide(_)) {
+    if matches!(
+        protocol,
+        InboundProtocol::Tide(_) | InboundProtocol::TideRelay(_)
+    ) {
         if !matches!(transport, Transport::Raw) {
             return Err(format!(
                 "{path}.streamSettings.network: Tide speaks HTTP/2 itself and needs the raw carrier"
@@ -914,6 +918,17 @@ fn parse_outbound(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Outbound> {
                 })
             });
         }
+        // The user's own switch to skip certificate checks ("Allow insecure"
+        // in the apps), layered over every link at once. Only `true` does
+        // anything: absent or `false` leaves the link as it was written, so
+        // a link that asked for it itself keeps asking. A carrier without
+        // certificate TLS (REALITY, plain, WARP) has no certificate to skip,
+        // so it is left alone rather than refused.
+        if v.get("allowInsecure").and_then(Value::as_bool) == Some(true) {
+            if let crate::model::Security::Tls(tls) = &mut outbound.stream.security {
+                tls.allow_insecure = true;
+            }
+        }
         // A different port on the same server, for a network that cuts one
         // port and not another (Cloudflare answers on 443, 2053, 8443 ...).
         if let Some(port) = v.get("port").and_then(Value::as_u64) {
@@ -1439,6 +1454,10 @@ fn parse_tide(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
             .get("datagrams")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        rotate: settings
+            .get("rotate")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
     }))
 }
 
@@ -1490,6 +1509,36 @@ fn parse_tide_inbound(settings: Option<&Value>, path: &str) -> R<TideInboundConf
             .filter(|port| *port > 0 && *port <= u16::MAX as u64)
             .unwrap_or(443) as u16,
         admin_path,
+        shape: match settings.get("shape").and_then(Value::as_str) {
+            None => TideShape::default(),
+            Some(text) => TideShape::parse(text)
+                .ok_or_else(|| format!("{path}.settings.shape must be off, light or full"))?,
+        },
+    })
+}
+
+fn parse_tide_relay(settings: Option<&Value>, path: &str) -> R<TideRelayConfig> {
+    let settings =
+        settings.ok_or_else(|| format!("{path}.settings is required for zerov1-relay"))?;
+    let upstream = settings
+        .get("upstream")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{path}.settings.upstream (host:port) is required"))?;
+    let (host, port) = upstream
+        .rsplit_once(':')
+        .and_then(|(host, port)| Some((host.trim_matches(['[', ']']), port.parse::<u16>().ok()?)))
+        .filter(|(host, port)| !host.is_empty() && *port > 0)
+        .ok_or_else(|| format!("{path}.settings.upstream must look like host:port"))?;
+    Ok(TideRelayConfig {
+        path: tide_path(settings.get("path"), &format!("{path}.settings.path"))?,
+        upstream_address: Address::parse_host(host),
+        upstream_port: port,
+        upstream_name: settings
+            .get("upstreamName")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(Box::from),
+        upstream_roots: parse_trusted_roots(settings.get("tlsSettings"), path)?,
     })
 }
 
@@ -5269,6 +5318,41 @@ mod tests {
             panic!("expected Hysteria2");
         };
         assert_eq!(hysteria.obfs_password, None);
+    }
+
+    #[test]
+    fn a_link_outbound_can_be_told_to_skip_certificate_checks_for_every_link() {
+        let tls = "vless://00000000-0000-0000-0000-000000000002@cdn.example.com:443\
+            ?security=tls&sni=cdn.example.com&type=ws&path=%2Fws&encryption=none";
+        let asked = format!("{tls}&allowInsecure=1");
+        let reality = "vless://00000000-0000-0000-0000-000000000001@203.0.113.10:443\
+            ?security=reality&sni=www.example.com&pbk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\
+            &fp=chrome&sid=ab&type=tcp&encryption=none";
+        let insecure_of = |entry: serde_json::Value| {
+            let value = serde_json::json!({"outbounds": [entry]});
+            let (config, _) = parse_config(&value).unwrap();
+            match &config.outbounds[0].stream.security {
+                Security::Tls(tls) => Some(tls.allow_insecure),
+                _ => None,
+            }
+        };
+        // Off by default, on only when asked.
+        assert_eq!(insecure_of(serde_json::json!({"link": tls})), Some(false));
+        assert_eq!(
+            insecure_of(serde_json::json!({"link": tls, "allowInsecure": true})),
+            Some(true)
+        );
+        // `false` or absent never takes away what the link itself asked for.
+        assert_eq!(insecure_of(serde_json::json!({"link": asked})), Some(true));
+        assert_eq!(
+            insecure_of(serde_json::json!({"link": asked, "allowInsecure": false})),
+            Some(true)
+        );
+        // A carrier with no certificate to skip is left alone, not refused.
+        assert_eq!(
+            insecure_of(serde_json::json!({"link": reality, "allowInsecure": true})),
+            None
+        );
     }
 
     #[test]

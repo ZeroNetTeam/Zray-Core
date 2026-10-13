@@ -160,6 +160,11 @@ struct BuildRequest {
     /// The rules of the user's routing profile, tried before the built-in
     /// ones (`zero_config::UserRule`).
     routing_rules: Vec<zero_config::UserRule>,
+    /// The user's "Allow insecure" switch: every link's certificate check is
+    /// skipped, not only those whose link asks for it. Reaches more servers
+    /// (self-signed, expired, wrong name) at the price of trusting whoever
+    /// answers. Off unless the user turned it on.
+    allow_insecure: bool,
 }
 
 /// The password the host app will use on its own requests through the local
@@ -212,6 +217,7 @@ impl Default for BuildRequest {
             warp_order: None,
             local_auth: LocalAuth::default(),
             routing_rules: Vec::new(),
+            allow_insecure: false,
         }
     }
 }
@@ -683,6 +689,15 @@ pub fn build_config_with_assets(
             }
             if let Some(reusing) = reusing {
                 outbounds.insert(first + 1, reusing);
+            }
+        }
+        // Last, so it reaches every variant above, the connection-reusing
+        // copy included. A carrier with no certificate TLS ignores it.
+        if request.allow_insecure {
+            for outbound in &mut outbounds[first..] {
+                if outbound.get("link").is_some() {
+                    outbound["allowInsecure"] = json!(true);
+                }
             }
         }
     }
@@ -2102,6 +2117,49 @@ mod tests {
         );
         assert_eq!(mode(Some("warp-first")), zero_config::HybridMode::WarpFirst);
         assert!(build_config(&json!({"links": [account], "warp_order": "sideways"})).is_err());
+    }
+
+    /// "Allow insecure" reaches every outbound the builder makes from a link
+    /// (the plain one and each evasion variant) and nothing else, and is off
+    /// unless asked for.
+    #[test]
+    fn allow_insecure_is_off_by_default_and_reaches_every_link_variant() {
+        let link = "trojan://secret@203.0.113.9:8443?security=tls&sni=t.example.com#x";
+        let proxies = |config: &Value| -> Vec<Value> {
+            config["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|o| o.get("link").is_some())
+                .cloned()
+                .collect()
+        };
+        let plain = build_config(&json!({"links": [link], "mode": "proxy"})).unwrap();
+        assert!(proxies(&plain).len() > 1, "auto evasion makes variants");
+        assert!(proxies(&plain)
+            .iter()
+            .all(|o| o.get("allowInsecure").is_none()));
+        let loose =
+            build_config(&json!({"links": [link], "mode": "proxy", "allow_insecure": true}))
+                .unwrap();
+        assert_eq!(proxies(&loose).len(), proxies(&plain).len());
+        assert!(proxies(&loose)
+            .iter()
+            .all(|o| o["allowInsecure"] == json!(true)));
+        // And it compiles into outbounds that really skip the check.
+        let (generation, _) =
+            zero_config::compile_config(&loose, zero_core::GenerationId(1)).unwrap();
+        for outbound in generation
+            .config
+            .outbounds
+            .iter()
+            .filter(|o| matches!(o.protocol, zero_config::OutboundProtocol::Trojan(_)))
+        {
+            let zero_config::Security::Tls(tls) = &outbound.stream.security else {
+                panic!("expected certificate TLS");
+            };
+            assert!(tls.allow_insecure);
+        }
     }
 
     /// A routing profile's rules come right after the DNS capture and ahead

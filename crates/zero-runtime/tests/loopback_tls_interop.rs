@@ -446,6 +446,181 @@ async fn tide_carries_payload_intact() {
     round_trip(&mut again, &payload(3, 64)).await;
 }
 
+/// A Tide relay in the middle: the client dials only the relay, the relay
+/// holds no key and forwards to the egress, and a stream still arrives
+/// intact. Three running cores, real TLS on both hops.
+/// One round trip through a SOCKS proxy that reports a failure as `false`
+/// instead of panicking, for tests that expect the tunnel to be refused.
+async fn works_through(socks: SocketAddr, target: SocketAddr) -> bool {
+    let attempt = async {
+        let mut stream = TcpStream::connect(socks).await.ok()?;
+        stream.write_all(&[0x05, 0x01, 0x00]).await.ok()?;
+        let mut greeting = [0u8; 2];
+        stream.read_exact(&mut greeting).await.ok()?;
+        let std::net::IpAddr::V4(ip) = target.ip() else {
+            return None;
+        };
+        let mut request = vec![0x05, 0x01, 0x00, 0x01];
+        request.extend_from_slice(&ip.octets());
+        request.extend_from_slice(&target.port().to_be_bytes());
+        stream.write_all(&request).await.ok()?;
+        let mut reply = [0u8; 10];
+        stream.read_exact(&mut reply).await.ok()?;
+        if reply[1] != 0 {
+            return None;
+        }
+        stream.write_all(b"ping").await.ok()?;
+        let mut echoed = [0u8; 4];
+        stream.read_exact(&mut echoed).await.ok()?;
+        (&echoed == b"ping").then_some(())
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_secs(10), attempt).await,
+        Ok(Some(()))
+    )
+}
+
+/// "Allow insecure": a server whose certificate the client does not trust
+/// (the fixture CA is not in any root store) is refused by default, and
+/// reached when the outbound is told to skip the check. Real TLS, two cores.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_insecure_reaches_a_server_with_an_untrusted_certificate() {
+    let echo = echo_service().await;
+    let relay_port = free_tcp_port();
+    let server = spawn(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "relay-in",
+            "listen": "127.0.0.1",
+            "port": relay_port,
+            "protocol": "vless",
+            "settings": {"clients": [{"id": UUID}]},
+            "streamSettings": inbound_tls(),
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }));
+    wait_until_listening(&server).await;
+    let link = format!(
+        "vless://{UUID}@{SERVER_NAME}:{relay_port}?security=tls&sni={SERVER_NAME}&type=tcp&encryption=none#t"
+    );
+    let client = |extra: Value| {
+        let socks_port = free_tcp_port();
+        let mut outbound = json!({"tag": "proxy", "link": link});
+        merge(&mut outbound, &extra);
+        let core = spawn(json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "port": socks_port,
+                "protocol": "socks",
+                "settings": {"udp": false},
+            }],
+            "outbounds": [outbound],
+            "dns": {"hosts": {SERVER_NAME: ["127.0.0.1"]}},
+        }));
+        (
+            core,
+            SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port),
+        )
+    };
+
+    let (strict, strict_socks) = client(json!({}));
+    wait_until_listening(&strict).await;
+    assert!(
+        !works_through(strict_socks, echo).await,
+        "an untrusted certificate was accepted without being asked to"
+    );
+
+    let (loose, loose_socks) = client(json!({"allowInsecure": true}));
+    wait_until_listening(&loose).await;
+    assert!(
+        works_through(loose_socks, echo).await,
+        "the tunnel did not open with the certificate check skipped"
+    );
+
+    // `false` is the same as not asking.
+    let (off, off_socks) = client(json!({"allowInsecure": false}));
+    wait_until_listening(&off).await;
+    assert!(!works_through(off_socks, echo).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tide_through_a_relay_carries_payload_intact() {
+    use zero_protocol::tide::{encode_key, generate_keypair};
+    let echo = echo_service().await;
+    let (egress_port, relay_port, socks_port) = (free_tcp_port(), free_tcp_port(), free_tcp_port());
+    let (secret, public) = generate_keypair();
+    let user = [7u8; 16];
+    let egress = spawn(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "egress-in",
+            "listen": "127.0.0.1",
+            "port": egress_port,
+            "protocol": "zerov1",
+            "settings": {
+                "path": "/assets/app",
+                "secretKey": encode_key(&secret),
+                "users": [{"id": encode_key(&user), "name": "test"}],
+            },
+            "streamSettings": inbound_tls(),
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }));
+    let relay = spawn(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "relay-in",
+            "listen": "127.0.0.1",
+            "port": relay_port,
+            "protocol": "zerov1-relay",
+            "settings": {
+                "path": "/assets/app",
+                "upstream": format!("127.0.0.1:{egress_port}"),
+                "upstreamName": SERVER_NAME,
+                "tlsSettings": {
+                    "certificates": [{"usage": "verify", "certificate": [CA_CERTIFICATE]}],
+                },
+            },
+            "streamSettings": inbound_tls(),
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }));
+    let client = spawn(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": socks_port,
+            "protocol": "socks",
+            "settings": {"udp": true},
+        }],
+        "outbounds": [{
+            "tag": "proxy",
+            "protocol": "zerov1",
+            "settings": {
+                "address": SERVER_NAME,
+                "port": relay_port,
+                "path": "/assets/app",
+                "serverKey": encode_key(&public),
+                "user": encode_key(&user),
+            },
+            "streamSettings": client_tls(),
+        }],
+        "dns": {"hosts": {SERVER_NAME: ["127.0.0.1"]}},
+    }));
+    wait_until_listening(&egress).await;
+    wait_until_listening(&relay).await;
+    wait_until_listening(&client).await;
+    let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    let mut stream = socks_connect(socks, echo).await.unwrap();
+    round_trip(&mut stream, &payload(1, 64)).await;
+    round_trip(&mut stream, &payload(2, 512 * 1024)).await;
+    let mut again = socks_connect(socks, echo).await.unwrap();
+    round_trip(&mut again, &payload(3, 64)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn tide_keeps_concurrent_flows_separate() {
     // Every flow shares one session and two connections; a mistake in stream

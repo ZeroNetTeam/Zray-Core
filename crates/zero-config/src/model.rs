@@ -1226,6 +1226,31 @@ pub struct TideConfig {
     /// Carry UDP too, over the session's datagram lane. Off for a server
     /// built before the lane existed, which would refuse the request for it.
     pub datagrams: bool,
+    /// Replace a working connection now and then, before it gets old enough
+    /// to be remembered. On unless the link says `rotate=0`.
+    pub rotate: bool,
+}
+
+/// How much a Tide server pads its answers to an upload, so the flow's
+/// up/down ratio looks like browsing. Costs at most the fraction of the
+/// upload named by the level; nothing when nothing is uploaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TideShape {
+    Off,
+    #[default]
+    Light,
+    Full,
+}
+
+impl TideShape {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "off" => Some(Self::Off),
+            "light" => Some(Self::Light),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2036,6 +2061,8 @@ pub enum InboundProtocol {
     AnyTls(AnyTlsInboundConfig),
     /// Tide server: HTTP/2, with certificate TLS here or in a proxy in front.
     Tide(TideInboundConfig),
+    /// Tide relay: shows a site, forwards Tide requests to one egress.
+    TideRelay(TideRelayConfig),
     /// Hysteria2 TCP-over-QUIC inbound.
     Hysteria2(Hysteria2InboundConfig),
     /// TUIC v5 authenticated QUIC inbound.
@@ -2064,6 +2091,7 @@ impl InboundProtocol {
             InboundProtocol::Shadowsocks(_) => "shadowsocks",
             InboundProtocol::AnyTls(_) => "anytls",
             InboundProtocol::Tide(_) => "zerov1",
+            InboundProtocol::TideRelay(_) => "zerov1-relay",
             InboundProtocol::Hysteria2(_) => "hysteria2",
             InboundProtocol::Tuic(_) => "tuic",
             InboundProtocol::Tun(_) => "tun",
@@ -2134,6 +2162,22 @@ pub struct TideInboundConfig {
     pub public_port: u16,
     /// The secret path the control panel is served under; none, no panel.
     pub admin_path: Option<Box<str>>,
+    pub shape: TideShape,
+}
+
+/// A Tide relay: it holds no key and no user, only where the egress is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TideRelayConfig {
+    /// The path prefix Tide requests are forwarded under; the egress's.
+    pub path: Box<str>,
+    pub upstream_address: Address,
+    pub upstream_port: u16,
+    /// The egress's site name, for TLS and for the requests passed on;
+    /// the upstream address when not given.
+    pub upstream_name: Option<Box<str>>,
+    /// Extra certificate authorities to trust for the egress (DER), for one
+    /// whose certificate a private CA issued. Ordinary roots still apply.
+    pub upstream_roots: Vec<Box<[u8]>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2161,6 +2205,7 @@ impl std::fmt::Debug for TideConfig {
             .field("split", &self.split)
             .field("packet_upload", &self.packet_upload)
             .field("datagrams", &self.datagrams)
+            .field("rotate", &self.rotate)
             .field("identity", &format_args!("{mark:016x}"))
             .finish()
     }

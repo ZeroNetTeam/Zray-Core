@@ -365,6 +365,7 @@ mod tests {
             public_host: Some("example.com".into()),
             public_port: 443,
             admin_path: Some("/secret-admin".into()),
+            shape: Default::default(),
         }
     }
 
@@ -381,6 +382,19 @@ mod tests {
         assert_eq!(&*tide.path, "/app");
         assert_eq!(tide.port, 443);
         assert_eq!(parsed.remark, "my phone");
+        // Rotation is on unless the link turns it off.
+        assert!(tide.rotate);
+    }
+
+    #[test]
+    fn a_link_can_turn_connection_rotation_off() {
+        let link = share_link(&config(None), &[9; 16], "x").unwrap();
+        let plain = link.replace("&fp=chrome", "&rotate=0&fp=chrome");
+        let parsed = zero_config::share_link::parse_link(&plain).unwrap();
+        let zero_config::OutboundProtocol::Tide(tide) = &parsed.outbound.protocol else {
+            panic!("not a Tide link");
+        };
+        assert!(!tide.rotate);
     }
 
     #[test]

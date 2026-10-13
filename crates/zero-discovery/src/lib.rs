@@ -38,6 +38,7 @@ pub mod modestats;
 pub mod order;
 pub mod panel;
 pub mod probe;
+pub mod rendezvous;
 pub mod scan;
 pub mod selftest;
 pub mod sign;

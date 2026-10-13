@@ -34,6 +34,8 @@ pub struct TestRequest {
     pub confirm_tls: bool,
     /// See `DiscoverRequest::confirm_timeout_ms`.
     pub confirm_timeout_ms: u64,
+    /// See `DiscoverRequest::allow_insecure`.
+    pub allow_insecure: bool,
 }
 
 impl Default for TestRequest {
@@ -46,6 +48,7 @@ impl Default for TestRequest {
             tcp_only: false,
             confirm_tls: true,
             confirm_timeout_ms: 6000,
+            allow_insecure: false,
         }
     }
 }
@@ -65,6 +68,7 @@ pub async fn test_links(
     let timeout = Duration::from_millis(request.timeout_ms.clamp(200, 60_000));
     let alive = Arc::new(AtomicUsize::new(0));
     let tested = Arc::new(AtomicUsize::new(0));
+    let allow_insecure = request.allow_insecure;
     let request_confirm = request
         .confirm_tls
         .then(|| Duration::from_millis(request.confirm_timeout_ms.clamp(200, 60_000)));
@@ -107,8 +111,16 @@ pub async fn test_links(
                             let key = candidate.info.key.clone();
                             let outcome = match &target {
                                 Some(target) => {
-                                    real_test(&candidate.outbound, target, timeout, request_confirm)
-                                        .await
+                                    real_test(
+                                        &crate::probe::loosened(
+                                            &candidate.outbound,
+                                            allow_insecure,
+                                        ),
+                                        target,
+                                        timeout,
+                                        request_confirm,
+                                    )
+                                    .await
                                 }
                                 None if candidate.skips_tcp_stage() => {
                                     Err("tcp: not applicable to a UDP-based or direct profile"

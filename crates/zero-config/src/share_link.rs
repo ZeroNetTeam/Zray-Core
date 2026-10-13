@@ -714,6 +714,7 @@ fn parse_tide(rest: &str) -> Result<ShareLink, String> {
             split: query.get("split").map(String::as_str) != Some("0"),
             packet_upload: query.get("upload").map(String::as_str) == Some("packet"),
             datagrams: query.get("dg").map(String::as_str) == Some("1"),
+            rotate: query.get("rotate").map(String::as_str) != Some("0"),
         }),
         stream,
         mux: MuxConfig::default(),

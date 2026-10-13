@@ -335,6 +335,7 @@ async fn tide_split() -> Vec<Vec<i64>> {
         secret,
         users,
         decoy: Decoy::default(),
+        shape: zero_protocol::tide::ShapeLevel::Off,
     });
     let origin = tokio::spawn(async move {
         let script = script();
@@ -365,6 +366,8 @@ async fn tide_split() -> Vec<Vec<i64>> {
             user,
             split: true,
             linger: Duration::from_millis(50),
+            lane: false,
+            rotation: None,
         },
         dial,
     );

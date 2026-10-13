@@ -75,6 +75,7 @@ use tokio::sync::Notify;
 use zero_core::{Address, Destination, Network};
 
 use super::noise::{self, Cipher, Keys, TAG_LEN};
+use super::shape::{ShapeLevel, Shaper};
 
 /// Bytes in front of a chunk's ciphertext: its offset and its length.
 pub const CHUNK_HEADER: usize = 10;
@@ -342,6 +343,10 @@ struct Core {
     reorder: BTreeMap<u64, Vec<u8>>,
     reorder_bytes: u64,
     acknowledged: u64,
+    /// Something other than an acknowledgement arrived since the last one
+    /// went out. Acknowledgements are not themselves acknowledged: if they
+    /// were, two idle sides would trade them for ever.
+    ack_due: bool,
     /// Decrypted bytes not yet a whole frame.
     partial: BytesMut,
     // ---- server side: streams opened by the client, not yet accepted
@@ -352,6 +357,9 @@ struct Core {
     lane: Option<Lane>,
     /// Window granted to bulk streams beyond the base, in all.
     window_extra: usize,
+    /// Keeps the up/down ratio browsing-like by padding the downstream; set
+    /// only on a server that asks for it (see [`Session::shape`]).
+    shaper: Option<Shaper>,
 }
 
 /// Bytes of the OPEN frame for `destination`.
@@ -506,7 +514,11 @@ impl Core {
                 let sent = &mut self.unacked[index];
                 sent.pipe = pipe;
                 sent.at = Instant::now();
-                return Some(sent.wire.clone());
+                let wire = sent.wire.clone();
+                if let Some(shaper) = &mut self.shaper {
+                    shaper.sent(wire.len(), sent.at);
+                }
+                return Some(wire);
             }
         }
         let mut plain = Vec::new();
@@ -515,11 +527,29 @@ impl Core {
         // just been cut into it reaches the far side before its datagrams.
         let mut lane = Vec::new();
         self.drain_lane(&mut lane, LANE_BATCH);
-        if plain.is_empty() {
-            return (!lane.is_empty()).then(|| Bytes::from(lane));
+        if let (Some(shaper), false) = (&mut self.shaper, lane.is_empty()) {
+            shaper.sent(lane.len(), Instant::now());
         }
         if early {
             Self::pad(&mut plain);
+        }
+        // Ratio padding rides on a chunk being cut, or stands alone when the
+        // peer is uploading and there is nothing to answer with.
+        if let Some(shaper) = &mut self.shaper {
+            let room = max_plain
+                .min(CHUNK_PLAIN_MAX)
+                .saturating_sub(plain.len() + 3);
+            if (!plain.is_empty() || self.unacked_bytes < UNACKED_LIMIT) && room > 0 {
+                let filler = shaper.pad_wanted(room, Instant::now());
+                if filler > 0 {
+                    plain.push(FRAME_PAD);
+                    plain.extend_from_slice(&(filler as u16).to_be_bytes());
+                    plain.resize(plain.len() + filler, 0);
+                }
+            }
+        }
+        if plain.is_empty() {
+            return (!lane.is_empty()).then(|| Bytes::from(lane));
         }
         let offset = self.next_offset;
         let end = offset + plain.len() as u64;
@@ -532,6 +562,9 @@ impl Core {
         wire.extend_from_slice(&plain);
         let wire = wire.freeze();
         self.next_offset = end;
+        if let Some(shaper) = &mut self.shaper {
+            shaper.sent(wire.len(), Instant::now());
+        }
         self.unacked_bytes += wire.len();
         self.unacked.push_back(Sent {
             offset,
@@ -662,6 +695,9 @@ impl Core {
             return self.on_lane(header, body);
         }
         let offset = u64::from_be_bytes(header[..8].try_into().expect("8 bytes"));
+        if let Some(shaper) = &mut self.shaper {
+            shaper.received(CHUNK_HEADER + body.len(), Instant::now());
+        }
         if offset < self.expected || self.reorder.contains_key(&offset) {
             // Already have it. The sender is resending, so it does not know
             // how far we got: tell it now rather than at the next timer, or
@@ -688,7 +724,7 @@ impl Core {
             self.partial.extend_from_slice(&body);
             self.parse_frames()?;
         }
-        if self.expected - self.acknowledged >= ACK_EVERY {
+        if self.ack_due && self.expected - self.acknowledged >= ACK_EVERY {
             self.queue_ack();
         }
         self.last_activity = Instant::now();
@@ -701,6 +737,7 @@ impl Core {
         frame.extend_from_slice(&self.expected.to_be_bytes());
         self.queue_control(frame);
         self.acknowledged = self.expected;
+        self.ack_due = false;
     }
 
     fn parse_frames(&mut self) -> io::Result<()> {
@@ -729,6 +766,7 @@ impl Core {
             if buffer.len() < needed {
                 return Ok(());
             }
+            self.ack_due |= kind != FRAME_ACK;
             match kind {
                 FRAME_OPEN => {
                     let id = id_of(buffer);
@@ -814,6 +852,7 @@ impl Core {
 
     fn close(&mut self, kind: io::ErrorKind) {
         if self.closed.is_none() {
+            tracing::debug!(?kind, streams = self.streams.len(), "tide session closing");
             self.closed = Some(kind);
         }
         for stream in self.streams.values_mut() {
@@ -922,16 +961,26 @@ impl Session {
                 reorder: BTreeMap::new(),
                 reorder_bytes: 0,
                 acknowledged: 0,
+                ack_due: false,
                 partial: BytesMut::new(),
                 incoming: VecDeque::new(),
                 closed: None,
                 last_activity: Instant::now(),
                 lane,
                 window_extra: 0,
+                shaper: None,
             }),
             sendable: Notify::new(),
             arrived: Notify::new(),
         })
+    }
+
+    /// Have this side pad its sending to keep the up/down ratio inside the
+    /// band set by `level`. Meant for a server: it is the side that can
+    /// answer an upload with more download. Takes effect from now on and
+    /// needs nothing from the peer, which skips padding frames anyway.
+    pub fn shape(&self, level: ShapeLevel) {
+        self.lock().shaper = Shaper::new(level, Instant::now());
     }
 
     fn lock(&self) -> MutexGuard<'_, Core> {
@@ -1077,6 +1126,8 @@ impl Session {
             Ok(())
         })();
         if let Err(error) = &result {
+            // The one reason a session ends that nothing else reports.
+            tracing::debug!(%error, "tide session closed by a bad chunk");
             core.close(error.kind());
         }
         let woke_accept = core.incoming.len() != before.1;
@@ -1133,7 +1184,7 @@ impl Session {
                 return;
             }
             let mut wake = false;
-            if core.expected > core.acknowledged {
+            if core.ack_due && core.expected > core.acknowledged {
                 core.queue_ack();
                 wake = true;
             }
@@ -1653,6 +1704,165 @@ mod tests {
 
     /// An early chunk's size says which step its content fell in
     /// and nothing finer; a stream past its first kilobytes is not padded.
+    /// A pipe like [`pipe`] that also adds what it carried to `count`.
+    fn counting_pipe(
+        from: Arc<Session>,
+        to: Arc<Session>,
+        id: u64,
+        delay: Duration,
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        tokio::spawn(async move {
+            from.pipe_opened(id);
+            let mut parser = ChunkParser::default();
+            while let Ok(chunk) = from.next_chunk(id, CHUNK_PLAIN_MAX).await {
+                tokio::time::sleep(delay).await;
+                count.fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+                to.receive(&mut parser, &chunk).unwrap();
+            }
+        });
+    }
+
+    /// Upload `size` bytes to a server that only reads, and return
+    /// `(up, down)` wire bytes, with the server shaping at `level`.
+    async fn upload_only(level: ShapeLevel, size: usize) -> (usize, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (client, server) = pair();
+        server.shape(level);
+        let (up, down) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        // The way down is faster than the way up, as on a real line, so
+        // the padding is not limited by the test's pipe.
+        counting_pipe(
+            client.clone(),
+            server.clone(),
+            1,
+            Duration::from_millis(2),
+            up.clone(),
+        );
+        counting_pipe(
+            server.clone(),
+            client.clone(),
+            2,
+            Duration::ZERO,
+            down.clone(),
+        );
+        tokio::spawn(client.clone().run_timers());
+        tokio::spawn(server.clone().run_timers());
+        let sink = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let (_, mut stream) = server.accept().await.unwrap();
+                let mut total = 0;
+                let mut buffer = vec![0u8; 16 * 1024];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break total,
+                        Ok(n) => total += n,
+                    }
+                }
+            }
+        });
+        let mut stream = client.open(destination()).unwrap();
+        stream.write_all(&pattern(size, 7)).await.unwrap();
+        stream.shutdown().await.unwrap();
+        assert_eq!(sink.await.unwrap(), size, "the upload arrived whole");
+        // Let the padding still owed go out: stop when nothing more moves.
+        loop {
+            let before = down.load(Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            if down.load(Ordering::SeqCst) == before {
+                break;
+            }
+        }
+        (up.load(Ordering::SeqCst), down.load(Ordering::SeqCst))
+    }
+
+    /// The server's answer to an upload is kept near the level's ratio, the
+    /// upload itself is untouched, and with shaping off it stays at the
+    /// acknowledgements alone.
+    #[tokio::test]
+    async fn an_upload_is_answered_with_padding_up_to_the_level() {
+        let (up, down) = upload_only(ShapeLevel::Off, 1_500_000).await;
+        assert!(down * 10 < up, "off: {down} down for {up} up");
+        let (up, down) = upload_only(ShapeLevel::Light, 1_500_000).await;
+        let ratio = down as f64 / up as f64;
+        assert!((0.3..0.7).contains(&ratio), "light: ratio {ratio:.2}");
+        let (up, down) = upload_only(ShapeLevel::Full, 1_500_000).await;
+        let ratio = down as f64 / up as f64;
+        assert!((1.2..2.3).contains(&ratio), "full: ratio {ratio:.2}");
+    }
+
+    /// A download-only session is not padded at all, whatever the level.
+    #[tokio::test]
+    async fn a_download_is_not_padded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (client, server) = pair();
+        server.shape(ShapeLevel::Full);
+        let down = Arc::new(AtomicUsize::new(0));
+        pipe(client.clone(), server.clone(), 1, None);
+        counting_pipe(
+            server.clone(),
+            client.clone(),
+            2,
+            Duration::ZERO,
+            down.clone(),
+        );
+        tokio::spawn(client.clone().run_timers());
+        tokio::spawn(server.clone().run_timers());
+        tokio::spawn(async move {
+            let (_, mut stream) = server.accept().await.unwrap();
+            stream.write_all(&pattern(800_000, 3)).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let mut stream = client.open(destination()).unwrap();
+        stream.write_all(b"GET").await.unwrap();
+        let mut got = Vec::new();
+        stream.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got.len(), 800_000);
+        assert!(down.load(Ordering::SeqCst) < 800_000 * 11 / 10);
+    }
+
+    /// Once everything has been delivered and acknowledged, neither side
+    /// keeps sending: an idle session is silent, not an endless exchange of
+    /// acknowledgements of acknowledgements.
+    #[tokio::test]
+    async fn an_idle_session_goes_quiet() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (client, server) = pair();
+        let (up, down) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        counting_pipe(
+            client.clone(),
+            server.clone(),
+            1,
+            Duration::from_millis(1),
+            up.clone(),
+        );
+        counting_pipe(
+            server.clone(),
+            client.clone(),
+            2,
+            Duration::from_millis(1),
+            down.clone(),
+        );
+        tokio::spawn(client.clone().run_timers());
+        tokio::spawn(server.clone().run_timers());
+        tokio::spawn(echo_server(server.clone()));
+        let mut stream = client.open(destination()).unwrap();
+        stream.write_all(&pattern(300_000, 5)).await.unwrap();
+        let mut got = vec![0u8; 300_000];
+        stream.read_exact(&mut got).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let before = up.load(Ordering::SeqCst) + down.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let after = up.load(Ordering::SeqCst) + down.load(Ordering::SeqCst);
+        assert_eq!(
+            before,
+            after,
+            "{} bytes moved on an idle session",
+            after - before
+        );
+    }
+
     #[tokio::test]
     async fn early_data_is_padded_to_a_step_and_later_data_is_not() {
         let (client, server) = pair();
