@@ -35,9 +35,21 @@ async fn web_server() -> (u16, Arc<Mutex<Vec<Vec<u8>>>>) {
         while let Ok((mut stream, _)) = listener.accept().await {
             let log = log.clone();
             tokio::spawn(async move {
+                // Read until the visitor goes quiet, as a real server would.
+                let mut got = Vec::new();
                 let mut buffer = vec![0u8; 4096];
-                let read = stream.read(&mut buffer).await.unwrap_or(0);
-                log.lock().unwrap().push(buffer[..read].to_vec());
+                while let Ok(Ok(read)) = tokio::time::timeout(
+                    std::time::Duration::from_millis(60),
+                    stream.read(&mut buffer),
+                )
+                .await
+                {
+                    if read == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buffer[..read]);
+                }
+                log.lock().unwrap().push(got);
                 let _ = stream.write_all(REPLY).await;
             });
         }
@@ -177,4 +189,60 @@ async fn a_fallback_chosen_by_path_or_name_is_not_used_for_everyone() {
         .await
         .is_empty());
     assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_rule_takes_its_requests_and_the_default_takes_the_rest() {
+    let (ws, ws_seen) = web_server().await;
+    let (site, site_seen) = web_server().await;
+    let port = inbound(
+        "vless",
+        json!([{"path": "/ws", "dest": ws}, {"dest": site}]),
+    )
+    .await;
+    // The specific rule wins for its path, query and all.
+    assert_eq!(
+        visit(
+            port,
+            b"GET /ws?ed=2048 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        )
+        .await,
+        REPLY
+    );
+    assert_eq!(ws_seen.lock().unwrap().len(), 1);
+    assert!(site_seen.lock().unwrap().is_empty());
+    // Any other path, and traffic that is not HTTP, goes to the default.
+    assert_eq!(
+        visit(
+            port,
+            b"GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        )
+        .await,
+        REPLY
+    );
+    assert_eq!(visit(port, b"\x16\x03\x01 not http").await, REPLY);
+    assert_eq!(site_seen.lock().unwrap().len(), 2);
+    assert_eq!(ws_seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xver_puts_a_proxy_header_in_front_of_what_the_web_server_gets() {
+    let (web, seen) = web_server().await;
+    let port = inbound("vless", json!([{"dest": web, "xver": 1}])).await;
+    let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    assert_eq!(visit(port, request).await, REPLY);
+    let first = seen.lock().unwrap()[0].clone();
+    match zero_protocol::proxy_protocol::parse(&first) {
+        zero_protocol::proxy_protocol::Parsed::Header(header, consumed) => {
+            assert!(header
+                .source
+                .is_some_and(|source| source.ip().is_loopback()));
+            assert_eq!(
+                &first[consumed..],
+                request,
+                "the request follows the header"
+            );
+        }
+        other => panic!("no PROXY header: {other:?} in {first:?}"),
+    }
 }

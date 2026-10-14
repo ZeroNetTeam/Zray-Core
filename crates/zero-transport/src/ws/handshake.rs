@@ -23,6 +23,12 @@ pub struct WsConfig {
     /// Whether the carrier runs over TLS or REALITY (XHTTP writes `https`
     /// URLs into its padding headers then).
     pub secure: bool,
+    /// gRPC only: the path of the `TunMulti` method, when it is not the one
+    /// in `path`. A server answers both; a client in `grpc_multi` mode uses it.
+    pub grpc_multi_path: Option<String>,
+    /// gRPC only: a client speaks `MultiHunk` messages (Xray's `multiMode`).
+    /// A server needs no such switch: the path of each request says which.
+    pub grpc_multi: bool,
 }
 
 impl WsConfig {
@@ -34,6 +40,8 @@ impl WsConfig {
             early_data_len: 0,
             xhttp: Default::default(),
             secure: false,
+            grpc_multi_path: None,
+            grpc_multi: false,
         }
     }
 }

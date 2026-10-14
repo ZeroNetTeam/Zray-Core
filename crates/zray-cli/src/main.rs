@@ -11,6 +11,7 @@ const VERSION: &str = match option_env!("ZRAY_APP_VERSION") {
 };
 
 mod tide;
+mod tools;
 
 fn main() -> Result<()> {
     zero_runtime::tune_allocator();
@@ -22,37 +23,7 @@ fn main() -> Result<()> {
     }
 
     match args[0].as_str() {
-        "check" | "test" | "-test" => {
-            let rest = &args[1..];
-            let mut config_path: Option<&str> = None;
-            let mut idx = 0;
-            while idx < rest.len() {
-                let arg = &rest[idx];
-                if arg == "-c" || arg == "--config" || arg == "-config" {
-                    if idx + 1 < rest.len() {
-                        config_path = Some(rest[idx + 1].as_str());
-                        idx += 2;
-                        continue;
-                    }
-                } else if let Some(stripped) = arg.strip_prefix("--config=") {
-                    config_path = Some(stripped);
-                    idx += 1;
-                    continue;
-                } else if let Some(stripped) = arg.strip_prefix("-config=") {
-                    config_path = Some(stripped);
-                    idx += 1;
-                    continue;
-                } else if !arg.starts_with('-') && config_path.is_none() {
-                    config_path = Some(arg.as_str());
-                }
-                idx += 1;
-            }
-            if let Some(path) = config_path {
-                cmd_check(&[path.to_string()])
-            } else {
-                cmd_check(rest)
-            }
-        }
+        "check" | "test" | "-test" => cmd_check(&config_files(&args[1..], &[])?),
         "run" => cmd_run(&args[1..]),
         "-config" | "--config" => {
             // Invocation directly with `-config <file>` without the `run` subcommand (standard V2Ray CLI)
@@ -71,7 +42,10 @@ fn main() -> Result<()> {
             print_usage();
             Ok(())
         }
-        other => bail!("unknown command {other:?}; try `zray help`"),
+        other => match tools::run(other, &args[1..]) {
+            Some(result) => result,
+            None => bail!("unknown command {other:?}; try `zray help`"),
+        },
     }
 }
 
@@ -92,10 +66,27 @@ fn print_usage() {
                               Download and validate the config\'s rule sets\n  \
          zray assets check <file>\n  \
                               Report cached rule-set health without fetching\n  \
-         zray zerov1 init --host <domain> (--cert F --key F | --behind-proxy PORT)\n  \
+         zray zerov1 init --host <domain> (--cert F --key F | --behind-proxy PORT | --reality SITE)\n  \
                               Set up a ZeroV1 server: config, first user, link and QR\n  \
+         zray zerov1 add <config> <name>\n  \
+                              Add a ZeroV1 user and print their link\n  \
          zray zerov1 links <file>\n  \
                               Print the links and QR codes of a ZeroV1 server\n  \
+         zray uuid [-i TEXT]   A random UUID, or the UUIDv5 of TEXT (at most 30 bytes)\n  \
+         zray x25519 [-i KEY] [--std-encoding]\n  \
+                              A key pair for REALITY and VLESS encryption\n  \
+         zray wg [-i KEY]      A key pair for WireGuard\n  \
+         zray mldsa65 [-i SEED]\n  \
+                              A post-quantum signature key pair for REALITY\n  \
+         zray mlkem768 [-i SEED]\n  \
+                              A post-quantum key pair for VLESS encryption\n  \
+         zray vlessenc         A decryption/encryption pair for VLESS encryption\n  \
+         zray tls ping [-ip IP] DOMAIN\n  \
+                              Handshake with a domain and show what it answers\n  \
+         zray tls hash --cert FILE\n  \
+                              The SHA-256 to pin for a certificate\n  \
+         zray tls cert [--ca] [--domain=D] [--expire=240h] [--file=F] [--json]\n  \
+                              Make a self-signed certificate and key\n  \
          zray version\n\n\
          PRESET OPTIONS:\n  \
          --remote-dns NAME     cloudflare (default), google, quad9, adguard\n  \
@@ -376,17 +367,90 @@ fn cmd_assets(args: &[String]) -> Result<()> {
     }
 }
 
-fn cmd_check(args: &[String]) -> Result<()> {
-    let path = PathBuf::from(args.first().context("check needs a file path")?);
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-
+fn cmd_check(files: &[PathBuf]) -> Result<()> {
+    let text = load_config_text(files)?;
     let trimmed = text.trim_start();
     if trimmed.starts_with('[') || trimmed.starts_with('{') {
         check_json(&text)
     } else {
         check_subscription(&text)
     }
+}
+
+/// The configuration files a command was given: every `-c FILE`, the `.json`
+/// files of every `-confdir DIR` in file-name order, or else the first
+/// bare argument. `value_flags` are the command's own flags that take a
+/// value, so that value is not mistaken for a file.
+fn config_files(args: &[String], value_flags: &[&str]) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut positional = None;
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        let bare = arg.trim_start_matches('-');
+        let (name, inline) = match bare.split_once('=') {
+            Some((name, value)) if arg.starts_with('-') => (name, Some(value.to_string())),
+            _ => (bare, None),
+        };
+        match name {
+            "c" | "config" | "confdir" if arg.starts_with('-') => {
+                let value = match inline {
+                    Some(value) => value,
+                    None => iter
+                        .next()
+                        .cloned()
+                        .with_context(|| format!("{arg} needs a value"))?,
+                };
+                if name == "confdir" {
+                    let mut dir_files: Vec<PathBuf> = std::fs::read_dir(&value)
+                        .with_context(|| format!("reading directory {value}"))?
+                        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                        .collect();
+                    dir_files.sort();
+                    files.extend(dir_files);
+                } else {
+                    files.push(PathBuf::from(value));
+                }
+            }
+            flag if arg.starts_with('-') && value_flags.contains(&arg.as_str()) => {
+                let _ = flag;
+                iter.next();
+            }
+            _ if !arg.starts_with('-') && positional.is_none() => {
+                positional = Some(PathBuf::from(arg))
+            }
+            _ => {}
+        }
+    }
+    if files.is_empty() {
+        files.extend(positional);
+    }
+    if files.is_empty() {
+        bail!("no configuration given (use `<file>`, `-c <file>` or `-confdir <dir>`)");
+    }
+    Ok(files)
+}
+
+/// The text of the configuration: one file as it is (it may be an array of
+/// configs or a subscription), several merged the way Xray merges them.
+fn load_config_text(files: &[PathBuf]) -> Result<String> {
+    let read = |path: &PathBuf| {
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+    };
+    if let [only] = files {
+        return read(only);
+    }
+    let mut documents = Vec::with_capacity(files.len());
+    for path in files {
+        let value: serde_json::Value = serde_json::from_str(&read(path)?)
+            .with_context(|| format!("{} is not valid JSON", path.display()))?;
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        documents.push((name, value));
+    }
+    let merged = zero_config::merge_documents(documents).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(serde_json::to_string(&merged)?)
 }
 
 fn check_json(text: &str) -> Result<()> {
@@ -482,32 +546,16 @@ fn init_tracing() {
 }
 
 fn cmd_run(args: &[String]) -> Result<()> {
-    let mut config_path: Option<PathBuf> = None;
-    let mut idx = 0;
-    while idx < args.len() {
-        let arg = &args[idx];
-        if arg == "-c" || arg == "--config" || arg == "-config" {
-            if idx + 1 < args.len() {
-                config_path = Some(PathBuf::from(&args[idx + 1]));
-                idx += 2;
-                continue;
-            }
-        } else if let Some(stripped) = arg.strip_prefix("--config=") {
-            config_path = Some(PathBuf::from(stripped));
-            idx += 1;
-            continue;
-        } else if let Some(stripped) = arg.strip_prefix("-config=") {
-            config_path = Some(PathBuf::from(stripped));
-            idx += 1;
-            continue;
-        } else if !arg.starts_with('-') && config_path.is_none() {
-            config_path = Some(PathBuf::from(arg));
-        }
-        idx += 1;
-    }
-
-    let path = config_path.context(
-        "run needs a config file path (use `zray run <file>` or `zray run --config=<file>`)",
+    let files = config_files(
+        args,
+        &[
+            "-i",
+            "--index",
+            "--management",
+            "--management-token-env",
+            "--management-token-file",
+            "--drain-timeout",
+        ],
     )?;
     let index: usize = args
         .iter()
@@ -550,8 +598,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
         .context("--drain-timeout must be a number of seconds")?
         .unwrap_or(10);
 
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let text = load_config_text(&files)?;
 
     let mut configs = zero_config::parse_config_array(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
     if index >= configs.len() {

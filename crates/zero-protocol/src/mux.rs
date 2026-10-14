@@ -291,7 +291,7 @@ pub fn encode_frame(frame: &Frame) -> io::Result<Vec<u8>> {
 
 /// Decode the metadata block (without its length prefix) into a frame whose
 /// payload is still empty.
-fn decode_metadata(metadata: &[u8]) -> io::Result<Frame> {
+fn decode_metadata(metadata: &[u8], reverse: bool) -> io::Result<Frame> {
     if metadata.len() < 4 {
         return Err(invalid("mux metadata is too short"));
     }
@@ -316,7 +316,15 @@ fn decode_metadata(metadata: &[u8]) -> io::Result<Frame> {
     if status == STATUS_NEW && target.is_none() {
         return Err(invalid("new mux frame has no target"));
     }
+    // A reverse proxy's portal adds, after the target of a new session, where
+    // the client came from and which address it reached (a network byte, an
+    // address and a port, twice). The bridge has no use for them, but they
+    // are not an error: Xray's own bridge reads and keeps them.
+    if reverse && status == STATUS_NEW {
+        offset = metadata.len();
+    }
     let global_id = if status == STATUS_NEW
+        && !reverse
         && target
             .as_ref()
             .is_some_and(|target| target.network == Network::Udp)
@@ -352,7 +360,7 @@ pub fn decode_frame(bytes: &[u8]) -> io::Result<(Frame, usize)> {
         return Err(invalid("invalid mux metadata length"));
     }
     let metadata_end = checked_end(2, metadata_len, bytes.len())?;
-    let mut frame = decode_metadata(&bytes[2..metadata_end])?;
+    let mut frame = decode_metadata(&bytes[2..metadata_end], false)?;
     let consumed = if frame.option & OPTION_DATA != 0 {
         let end = checked_end(metadata_end, 2, bytes.len())?;
         let payload_len =
@@ -371,13 +379,23 @@ pub fn decode_frame(bytes: &[u8]) -> io::Result<(Frame, usize)> {
 /// Each call issues a few small reads, so callers reading many frames from a
 /// raw transport should wrap it in a `BufReader` (the pools here do).
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Frame> {
+    read_frame_as(reader, false).await
+}
+
+/// [`read_frame`] on a reverse-proxy carrier, where a new session's metadata
+/// may carry its client's source and local address after the target.
+pub async fn read_reverse_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Frame> {
+    read_frame_as(reader, true).await
+}
+
+async fn read_frame_as<R: AsyncRead + Unpin>(reader: &mut R, reverse: bool) -> io::Result<Frame> {
     let metadata_len = reader.read_u16().await? as usize;
     if metadata_len == 0 || metadata_len > MAX_METADATA {
         return Err(invalid("invalid mux metadata length"));
     }
     let mut metadata = [0u8; MAX_METADATA];
     reader.read_exact(&mut metadata[..metadata_len]).await?;
-    let mut frame = decode_metadata(&metadata[..metadata_len])?;
+    let mut frame = decode_metadata(&metadata[..metadata_len], reverse)?;
     if frame.option & OPTION_DATA != 0 {
         let payload_len = reader.read_u16().await? as usize;
         // `vec![0u8; payload_len]` zeroes up to 64 KiB that the read then
@@ -690,6 +708,36 @@ impl ClientPool {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        Self::with_header(inner, max_concurrency, true)
+    }
+
+    /// A pool over a carrier that is bare Mux frames, with no VLESS response
+    /// header in front: the carrier a reverse-proxy bridge dials.
+    pub fn raw<S>(inner: S, max_concurrency: u16) -> Arc<Self>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::with_header(inner, max_concurrency, false)
+    }
+
+    /// Sessions open now.
+    pub fn active(&self) -> usize {
+        self.state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// Whether the carrier has ended; nothing can be opened on it again.
+    pub fn is_closed(&self) -> bool {
+        self.state.closed.load(Ordering::Acquire)
+    }
+
+    fn with_header<S>(inner: S, max_concurrency: u16, vless_header: bool) -> Arc<Self>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (frame_tx, mut frame_rx) = mpsc::channel(128);
         let (shutdown, _) = watch::channel(false);
         let state = Arc::new(ClientPoolState {
@@ -728,7 +776,7 @@ impl ClientPool {
         tokio::spawn(async move {
             let mut reader = BufReader::with_capacity(CARRIER_READ_BUFFER, reader);
             tokio::select! {
-                _ = run_client_reader(&mut reader, &reader_state) => {}
+                _ = run_client_reader(&mut reader, &reader_state, vless_header) => {}
                 _ = reader_shutdown.wait_for(|closing| *closing) => {}
             }
             close_client_sessions(&reader_state);
@@ -873,8 +921,11 @@ impl ClientPool {
 async fn run_client_reader<R: AsyncRead + Unpin>(
     reader: &mut R,
     state: &ClientPoolState,
+    vless_header: bool,
 ) -> io::Result<()> {
-    strip_vless_response(reader).await?;
+    if vless_header {
+        strip_vless_response(reader).await?;
+    }
     loop {
         let frame = read_frame(reader).await?;
         match frame.status {
@@ -1078,7 +1129,47 @@ where
     if first_target.network != Network::Tcp {
         return Err(invalid("mux pool currently accepts TCP sessions only"));
     }
+    serve_pool(outer, Some((first, first_remote)), route, None, false).await
+}
 
+/// What a mux server does with the one UDP session addressed to a name of
+/// its own: reverse proxying carries the portal's heartbeats there. Each
+/// payload that arrives on it is handed to the callback.
+pub struct ControlSession {
+    pub host: &'static str,
+    pub on_message: ControlHandler,
+}
+
+/// Called with each payload that arrives on the control session.
+pub type ControlHandler = Box<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Serve a carrier of bare Mux frames that nobody has read yet (the carrier
+/// a reverse-proxy bridge dialled out): TCP sessions are routed with
+/// `route`, the `control` session is answered by its callback, anything else
+/// is refused session by session. Returns when the carrier ends.
+pub async fn serve_carrier<F, Fut>(
+    carrier: BoxStream,
+    control: ControlSession,
+    route: F,
+) -> io::Result<()>
+where
+    F: Fn(Destination) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = io::Result<BoxStream>> + Send + 'static,
+{
+    serve_pool(carrier, None, route, Some(control), true).await
+}
+
+async fn serve_pool<F, Fut>(
+    outer: ChainedMuxStream,
+    first: Option<(Frame, BoxStream)>,
+    route: F,
+    control: Option<ControlSession>,
+    reverse: bool,
+) -> io::Result<()>
+where
+    F: Fn(Destination) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = io::Result<BoxStream>> + Send + 'static,
+{
     let (frame_tx, mut frame_rx) = mpsc::channel(128);
     let sessions: ServerSessions = Arc::new(Mutex::new(HashMap::new()));
     let (outer_read, mut outer_write) = tokio::io::split(outer);
@@ -1088,20 +1179,24 @@ where
     });
     let mut tasks = JoinSet::new();
 
-    start_server_session(
-        &mut tasks,
-        first.session_id,
-        async move { Ok(first_remote) },
-        first.payload,
-        frame_tx.clone(),
-        sessions.clone(),
-    )?;
+    if let Some((first, first_remote)) = first {
+        start_server_session(
+            &mut tasks,
+            first.session_id,
+            async move { Ok(first_remote) },
+            first.payload,
+            frame_tx.clone(),
+            sessions.clone(),
+        )?;
+    }
+    // The session id the control name was opened under, once it has been.
+    let mut control_id = None;
 
     let result = loop {
         // Reap finished session tasks so the set does not grow unbounded on
         // a long-lived carrier.
         while tasks.try_join_next().is_some() {}
-        let frame = match read_frame(&mut outer_read).await {
+        let frame = match read_frame_as(&mut outer_read, reverse).await {
             Ok(frame) => frame,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
             Err(error) => break Err(error),
@@ -1123,6 +1218,17 @@ where
                 let Some(target) = frame.target.clone() else {
                     break Err(invalid("mux NEW frame has no target"));
                 };
+                if let Some(control) = &control {
+                    if target.network == Network::Udp
+                        && matches!(&target.address, zero_core::Address::Domain(host) if &**host == control.host)
+                    {
+                        control_id = Some(frame.session_id);
+                        if !frame.payload.is_empty() {
+                            (control.on_message)(&frame.payload);
+                        }
+                        continue;
+                    }
+                }
                 let active = sessions
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1150,6 +1256,10 @@ where
                 if frame.option & OPTION_DATA == 0 {
                     continue;
                 }
+                if let (Some(control), true) = (&control, control_id == Some(frame.session_id)) {
+                    (control.on_message)(&frame.payload);
+                    continue;
+                }
                 let sender = sessions
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1167,6 +1277,9 @@ where
                 }
             }
             STATUS_END => {
+                if control_id == Some(frame.session_id) {
+                    control_id = None;
+                }
                 if let Some(sender) = remove_server_session(&sessions, frame.session_id) {
                     let _ = deliver(&sender, Uplink::End).await;
                 }
@@ -1305,6 +1418,28 @@ mod tests {
         let (decoded, consumed) = decode_frame(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn a_reverse_carrier_skips_the_source_and_local_trailer_of_a_new_session() {
+        // A new TCP session's metadata, then (as a reverse-proxy portal
+        // writes it) the client's source and local address after the target.
+        let frame = Frame::new(7, destination(), b"data".to_vec());
+        let mut bytes = encode_frame(&frame).unwrap();
+        let trailer: &[u8] = &[
+            1, 1, 127, 0, 0, 1, 0x30, 0x39, 1, 1, 10, 0, 0, 1, 0x1f, 0x90,
+        ];
+        let metadata_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+        let at = 2 + metadata_len;
+        bytes.splice(at..at, trailer.iter().copied());
+        bytes[..2].copy_from_slice(&((metadata_len + trailer.len()) as u16).to_be_bytes());
+        // An ordinary carrier refuses what it does not understand...
+        assert!(decode_frame(&bytes).is_err());
+        // ...a reverse one reads the same session, trailer set aside.
+        let metadata = &bytes[2..at + trailer.len()];
+        let decoded = decode_metadata(metadata, true).unwrap();
+        assert_eq!(decoded.target, frame.target);
+        assert_eq!(decoded.session_id, 7);
     }
 
     #[test]

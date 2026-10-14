@@ -59,6 +59,13 @@ pub struct TlsParams {
     pub verifier: Option<Arc<dyn ServerCertVerifier>>,
     /// A client certificate to present (see [`TlsParams::with_client_auth`]).
     pub client_auth: Option<ClientAuth>,
+    /// Names the server's certificate may be valid for instead of the server
+    /// name sent (Xray's `verifyPeerCertByName`); any one matching is enough.
+    /// Empty verifies for the name sent.
+    pub verify_names: Vec<String>,
+    /// A file to append the session secrets to, in the format Wireshark reads
+    /// (Xray's `masterKeyLog`).
+    pub key_log: Option<String>,
 }
 
 /// A client certificate chain and its private key, for servers that ask the
@@ -105,6 +112,8 @@ impl TlsParams {
             hello_version: None,
             verifier: None,
             client_auth: None,
+            verify_names: Vec::new(),
+            key_log: None,
         }
     }
 
@@ -157,6 +166,23 @@ impl TlsParams {
     /// name already and whose inner hello must not differ.
     pub fn with_hello_version(mut self, version: u16) -> Self {
         self.hello_version = Some(version);
+        self
+    }
+
+    /// Verify the server's certificate for one of `names` instead of the
+    /// server name that was sent (Xray's `verifyPeerCertByName`): the name in
+    /// the hello and the name the certificate must carry are told apart when
+    /// the hello's name is a stand-in (a front).
+    pub fn with_verify_names(mut self, names: Vec<String>) -> Self {
+        self.verify_names = names;
+        self
+    }
+
+    /// Append the session secrets to the file at `path` as they are made, in
+    /// the NSS key log format (Xray's `masterKeyLog`). Anyone who reads the
+    /// file can decrypt the traffic it belongs to.
+    pub fn with_key_log(mut self, path: impl Into<String>) -> Self {
+        self.key_log = Some(path.into());
         self
     }
 
@@ -213,6 +239,10 @@ struct ConfigKey {
     insecure: bool,
     /// Part of the key: a pinned config must never serve an unpinned outbound.
     pinned: Vec<[u8; 32]>,
+    /// Part of the key: the names a certificate may carry change who a
+    /// config trusts.
+    verify_names: Vec<String>,
+    key_log: Option<String>,
     /// Part of the key: the field is written by the config's hello
     /// customizer, so configs that disagree about it are different configs.
     hello_version: Option<u16>,
@@ -320,6 +350,8 @@ pub fn try_client_config(params: &TlsParams) -> Result<Arc<ClientConfig>, Failur
         extra_roots: params.extra_roots.clone(),
         insecure: params.insecure,
         pinned: params.pinned.clone(),
+        verify_names: params.verify_names.clone(),
+        key_log: params.key_log.clone(),
         hello_version: params.hello_version,
     };
 
@@ -407,7 +439,8 @@ fn build_client_config(params: &TlsParams) -> Result<ClientConfig, String> {
         }
     }
 
-    let pin_roots = (!params.pinned.is_empty()).then(|| roots.clone());
+    let verify_roots =
+        (!params.pinned.is_empty() || !params.verify_names.is_empty()).then(|| roots.clone());
     let mut cfg = if let Some(config_list) = &params.ech_config_list {
         let ech = rustls::client::EchConfig::new(
             rustls_pki_types::EchConfigListBytes::from(config_list.clone()),
@@ -432,17 +465,36 @@ fn build_client_config(params: &TlsParams) -> Result<ClientConfig, String> {
     if let Some(verifier) = &params.verifier {
         cfg.dangerous()
             .set_certificate_verifier(Arc::clone(verifier));
-    } else if let Some(roots) = pin_roots {
+    } else if let Some(roots) = verify_roots {
         let provider = Arc::new(params.profile.aws_provider());
         let inner =
             rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
                 .build()
                 .map_err(|error| format!("cannot build the certificate verifier: {error}"))?;
-        cfg.dangerous()
-            .set_certificate_verifier(Arc::new(PinnedCertificate {
+        let base: Arc<dyn ServerCertVerifier> = if params.pinned.is_empty() {
+            inner
+        } else {
+            Arc::new(PinnedCertificate {
                 pins: params.pinned.clone(),
                 inner,
-            }));
+            })
+        };
+        let verifier: Arc<dyn ServerCertVerifier> = if params.verify_names.is_empty() {
+            base
+        } else {
+            Arc::new(VerifyByName {
+                inner: base,
+                names: params
+                    .verify_names
+                    .iter()
+                    .map(|name| {
+                        ServerName::try_from(name.clone())
+                            .map_err(|_| format!("{name:?} is not a name a certificate can carry"))
+                    })
+                    .collect::<Result<_, _>>()?,
+            })
+        };
+        cfg.dangerous().set_certificate_verifier(verifier);
     } else if params.insecure {
         let algorithms = params
             .profile
@@ -452,6 +504,9 @@ fn build_client_config(params: &TlsParams) -> Result<ClientConfig, String> {
             .set_certificate_verifier(Arc::new(AcceptAnyCertificate(algorithms)));
     }
     cfg.alpn_protocols = params.alpn.clone();
+    if let Some(path) = &params.key_log {
+        cfg.key_log = Arc::new(FileKeyLog::open(path)?);
+    }
     params.profile.apply_to_config(&mut cfg);
     let profile_name = params
         .fingerprint_name
@@ -489,6 +544,99 @@ fn build_client_config(params: &TlsParams) -> Result<ClientConfig, String> {
 struct PinnedCertificate {
     pins: Vec<[u8; 32]>,
     inner: Arc<rustls::client::WebPkiServerVerifier>,
+}
+
+/// Checks the certificate for any one of a list of names instead of the name
+/// the hello carried (see [`TlsParams::with_verify_names`]). Everything else
+/// about the verification is the wrapped verifier's.
+#[derive(Debug)]
+struct VerifyByName {
+    inner: Arc<dyn ServerCertVerifier>,
+    names: Vec<ServerName<'static>>,
+}
+
+impl ServerCertVerifier for VerifyByName {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls_pki_types::CertificateDer<'_>,
+        intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let mut last = None;
+        for name in &self.names {
+            match self
+                .inner
+                .verify_server_cert(end_entity, intermediates, name, ocsp_response, now)
+            {
+                Ok(verified) => return Ok(verified),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or(rustls::Error::General(
+            "no name to verify the certificate for".into(),
+        )))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Appends TLS session secrets to a file in the NSS key log format, one line
+/// each: `LABEL client_random_hex secret_hex`.
+struct FileKeyLog(std::sync::Mutex<std::fs::File>);
+
+impl std::fmt::Debug for FileKeyLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FileKeyLog")
+    }
+}
+
+impl FileKeyLog {
+    fn open(path: &str) -> Result<Self, String> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(path)
+            .map(|file| Self(std::sync::Mutex::new(file)))
+            .map_err(|error| format!("masterKeyLog {path}: {error}"))
+    }
+}
+
+impl rustls::KeyLog for FileKeyLog {
+    fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
+        use std::io::Write;
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let line = format!("{label} {} {}\n", hex(client_random), hex(secret));
+        if let Ok(mut file) = self.0.lock() {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
 }
 
 /// The reason shown when no certificate of the chain is pinned.
@@ -998,6 +1146,8 @@ mod tests {
             extra_roots: Vec::new(),
             insecure: false,
             pinned: Vec::new(),
+            verify_names: Vec::new(),
+            key_log: None,
             hello_version: None,
         };
         let mut cache = ConfigCache {

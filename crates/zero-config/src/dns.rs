@@ -13,6 +13,9 @@ pub struct DnsServer {
     pub domains: Vec<crate::routing::DomainPattern>,
     /// Answers must fall in these ranges to be accepted.
     pub expect_ips: Vec<crate::routing::IpPattern>,
+    /// Answers in these ranges are thrown away (Xray's `unexpectedIPs`), for
+    /// the addresses a poisoned resolver is known to hand out.
+    pub unexpect_ips: Vec<crate::routing::IpPattern>,
     /// When set, a miss here does not fall through to later servers.
     pub skip_fallback: bool,
     /// Routing tag applied to this server's own traffic.

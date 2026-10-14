@@ -7,6 +7,7 @@
 //! (RESEARCH-01 §2).
 
 pub mod address;
+pub mod custom_sockopt;
 pub mod error;
 pub mod node_control;
 pub mod path_mss;
@@ -23,6 +24,6 @@ pub use platform::{
     set_socket_protector, SocketProtector,
 };
 pub use session::{
-    GenerationId, InboundId, OutboundId, RouteId, SessionContext, SessionId, Sniffed,
+    GenerationId, HttpAttrs, InboundId, OutboundId, RouteId, SessionContext, SessionId, Sniffed,
 };
 pub use stream::{boxed, BoxStream, Stream};

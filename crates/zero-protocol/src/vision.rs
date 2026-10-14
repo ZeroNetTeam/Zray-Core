@@ -40,9 +40,46 @@ use crate::first_flight::FIRST_PAYLOAD_WAIT;
 const COMMAND_CONTINUE: u8 = 0x00;
 const COMMAND_END: u8 = 0x01;
 const COMMAND_DIRECT: u8 = 0x02;
-const LONG_PADDING_MIN: usize = 900;
-const LONG_PADDING_RANDOM_MAX: usize = 500;
-const SHORT_PADDING_RANDOM_MAX: usize = 256;
+/// How much padding Vision adds (Xray's `testseed`, four numbers). While the
+/// traffic inside is a TLS handshake, a frame shorter than `threshold` is
+/// padded to `base` bytes plus a random amount below `long_random`; every
+/// other frame gets a random amount below `short_random`. The defaults are
+/// 900, 500, 900, 256. The padding is sized by the sender and read by
+/// length, so the two ends need not agree on the numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisionSeed {
+    pub threshold: u32,
+    pub long_random: u32,
+    pub base: u32,
+    pub short_random: u32,
+}
+
+impl Default for VisionSeed {
+    fn default() -> Self {
+        Self::new([900, 500, 900, 256])
+    }
+}
+
+impl VisionSeed {
+    pub fn new(values: [u32; 4]) -> Self {
+        Self {
+            threshold: values[0],
+            long_random: values[1],
+            base: values[2],
+            short_random: values[3],
+        }
+    }
+}
+
+/// A random number below `limit`; below zero is zero, so an unset limit adds
+/// nothing instead of failing.
+fn below(rng: &mut impl RngCore, limit: u32) -> usize {
+    if limit == 0 {
+        0
+    } else {
+        (rng.next_u32() % limit) as usize
+    }
+}
 const MAX_FRAME_PLAINTEXT: usize = 8171; // Xray buf.Size (8192) - UUID/header room
 const READ_CHUNK: usize = 8192;
 
@@ -58,6 +95,7 @@ enum ReadMode {
 pub struct VisionStream<S> {
     inner: S,
     uuid: [u8; 16],
+    seed: VisionSeed,
     read_mode: ReadMode,
     read_input: BytesMut,
     /// The frame or header split off `read_input`, and the part of it still to
@@ -95,6 +133,7 @@ impl<S> VisionStream<S> {
         Self {
             inner,
             uuid,
+            seed: VisionSeed::default(),
             read_mode: ReadMode::ResponseHeader,
             read_input: BytesMut::with_capacity(READ_CHUNK),
             read_pending: BytesMut::new(),
@@ -112,6 +151,12 @@ impl<S> VisionStream<S> {
         }
     }
 
+    /// Pad with these numbers instead of the defaults.
+    pub fn with_seed(mut self, seed: VisionSeed) -> Self {
+        self.seed = seed;
+        self
+    }
+
     /// Construct the server side. The VLESS response header is emitted by the
     /// server dispatcher before this wrapper is installed, so server reads
     /// begin at the UUID-prefixed Vision frame immediately.
@@ -119,6 +164,7 @@ impl<S> VisionStream<S> {
         Self {
             inner,
             uuid,
+            seed: VisionSeed::default(),
             read_mode: ReadMode::InitialUuid,
             read_input: BytesMut::with_capacity(READ_CHUNK),
             read_pending: BytesMut::new(),
@@ -161,7 +207,14 @@ impl<S> VisionStream<S> {
     /// keeps the header from being a short record of its own.
     fn release_header_alone(&mut self) {
         let mut framed = std::mem::take(&mut self.pending_write);
-        make_frame_into(&[], Some(&self.uuid), COMMAND_CONTINUE, true, &mut framed);
+        make_frame_into(
+            &[],
+            Some(&self.uuid),
+            COMMAND_CONTINUE,
+            true,
+            &self.seed,
+            &mut framed,
+        );
         self.pending_write = framed;
         self.write_first = false;
         self.header_held = false;
@@ -211,6 +264,7 @@ impl<S> VisionStream<S> {
                 prefix,
                 frame_command,
                 long_padding,
+                &self.seed,
                 out,
             );
             self.write_first = false;
@@ -490,7 +544,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
 #[cfg(test)]
 fn make_frame(content: &[u8], uuid: Option<&[u8; 16]>, command: u8, long_padding: bool) -> Vec<u8> {
     let mut out = BytesMut::with_capacity(uuid.map_or(0, |_| 16) + 5 + content.len() + 1024);
-    make_frame_into(content, uuid, command, long_padding, &mut out);
+    make_frame_into(
+        content,
+        uuid,
+        command,
+        long_padding,
+        &VisionSeed::default(),
+        &mut out,
+    );
     out.to_vec()
 }
 
@@ -502,6 +563,7 @@ fn make_frame_into(
     uuid: Option<&[u8; 16]>,
     command: u8,
     long_padding: bool,
+    seed: &VisionSeed,
     out: &mut BytesMut,
 ) {
     let max_padding = MAX_FRAME_PLAINTEXT.saturating_sub(content.len());
@@ -512,12 +574,12 @@ fn make_frame_into(
     // syscall on every padded frame of every connection. Xray draws this
     // length with `crypto/rand` by convention, not for a stronger guarantee.
     let mut rng = rand::thread_rng();
-    let padding = if long_padding && content.len() < LONG_PADDING_MIN {
-        LONG_PADDING_MIN
+    let padding = if long_padding && content.len() < seed.threshold as usize {
+        (seed.base as usize)
             .saturating_sub(content.len())
-            .saturating_add((rng.next_u32() as usize) % LONG_PADDING_RANDOM_MAX)
+            .saturating_add(below(&mut rng, seed.long_random))
     } else {
-        (rng.next_u32() as usize) % SHORT_PADDING_RANDOM_MAX
+        below(&mut rng, seed.short_random)
     }
     .min(max_padding);
 
@@ -669,7 +731,7 @@ mod tests {
         assert_eq!(&wire[6..22], &UUID);
         assert_eq!(wire[22], COMMAND_CONTINUE);
         assert_eq!(&wire[23..25], &[0, 0], "no content");
-        assert!(wire.len() >= 6 + 16 + 5 + LONG_PADDING_MIN);
+        assert!(wire.len() >= 6 + 16 + 5 + VisionSeed::default().base as usize);
 
         // The payload that follows is a later frame without the UUID.
         client.write_all(b"late").await.unwrap();
@@ -837,5 +899,47 @@ mod tests {
         assert_eq!(content_len, 7);
         assert_eq!(padded.len(), 16 + 5 + content_len + padding_len);
         assert_eq!(&padded[21..21 + content_len], b"payload");
+    }
+
+    #[test]
+    fn the_seed_sets_how_much_padding_a_handshake_frame_gets() {
+        let long_seed = VisionSeed::new([1000, 1, 1000, 1]);
+        let short_seed = VisionSeed::new([0, 0, 0, 0]);
+        let frame = |seed: &VisionSeed, long: bool| {
+            let mut out = BytesMut::new();
+            make_frame_into(&[7u8; 100], None, COMMAND_CONTINUE, long, seed, &mut out);
+            out
+        };
+        // The padding length is bytes 3..5 of the frame header.
+        let padding = |out: &BytesMut| usize::from(u16::from_be_bytes([out[3], out[4]]));
+        // Under the threshold, in a handshake: padded up to `base`, plus
+        // less than `long_random` (here at most 0).
+        assert_eq!(padding(&frame(&long_seed, true)), 900);
+        // Not in a handshake: a random amount below `short_random` (here 0).
+        assert_eq!(padding(&frame(&long_seed, false)), 0);
+        // All zeros means no padding at all, not a failure.
+        assert_eq!(padding(&frame(&short_seed, true)), 0);
+        // The defaults are Xray's.
+        let default = VisionSeed::default();
+        assert_eq!(
+            (
+                default.threshold,
+                default.long_random,
+                default.base,
+                default.short_random
+            ),
+            (900, 500, 900, 256)
+        );
+        // A frame longer than the threshold is not "long" padded.
+        let mut out = BytesMut::new();
+        make_frame_into(
+            &[7u8; 2000],
+            None,
+            COMMAND_CONTINUE,
+            true,
+            &long_seed,
+            &mut out,
+        );
+        assert_eq!(padding(&out), 0);
     }
 }

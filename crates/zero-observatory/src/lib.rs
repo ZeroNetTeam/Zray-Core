@@ -20,6 +20,10 @@ const HISTORY_LIMIT: usize = 64;
 /// server, while a real failure adds whole seconds to a ping score and does
 /// switch at once.
 const PING_HYSTERESIS_RATIO: f64 = 0.2;
+/// Consecutive failures after which a balancer member counts as down for the
+/// purposes of `fallbackTag`. Two failures happen on a bad moment; three in a
+/// row is a server that is not answering.
+const FAILING_RUN: u32 = 3;
 const PING_HYSTERESIS_FLOOR: f64 = 0.02;
 
 /// Bounded per-outbound health evidence used by balancer selection. This is
@@ -87,6 +91,18 @@ impl HealthTable {
         let sample = self.sample_mut(tag);
         sample.failures = sample.failures.saturating_add(1);
         sample.consecutive_failures = sample.consecutive_failures.saturating_add(1);
+    }
+
+    /// Whether every one of `tags` has failed `FAILING_RUN` connections in a
+    /// row with no success since. A member nobody has tried yet is not
+    /// failing, and a single success ends the run, so a recovering server is
+    /// back in use as soon as anything reaches it (a probe, or a client when
+    /// there is no fallback to send them to).
+    pub fn all_failing(&self, tags: &[Arc<str>]) -> bool {
+        !tags.is_empty()
+            && tags
+                .iter()
+                .all(|tag| self.sample(tag).consecutive_failures >= FAILING_RUN)
     }
 
     pub fn sample(&self, tag: &str) -> OutboundHealth {
@@ -651,6 +667,24 @@ fn is_class_fatal(kind: FailureKind) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_balancer_is_down_only_when_every_member_keeps_failing() {
+        let mut table = HealthTable::default();
+        let tags: Vec<Arc<str>> = vec![Arc::from("a"), Arc::from("b")];
+        assert!(!table.all_failing(&tags), "untried members are not failing");
+        for _ in 0..3 {
+            table.record_failure("a");
+        }
+        assert!(!table.all_failing(&tags), "one member is still untried");
+        for _ in 0..3 {
+            table.record_failure("b");
+        }
+        assert!(table.all_failing(&tags));
+        table.record_success("a", Duration::from_millis(40));
+        assert!(!table.all_failing(&tags), "one success ends the run");
+        assert!(!table.all_failing(&[]));
+    }
+
     use super::*;
 
     #[test]

@@ -455,6 +455,7 @@ async fn zray_resolves_through(server: &str) -> Vec<std::net::IpAddr> {
                 .unwrap_or_else(|| panic!("{server} should parse as a resolver endpoint")),
             domains: Vec::new(),
             expect_ips: Vec::new(),
+            unexpect_ips: Vec::new(),
             skip_fallback: false,
             tag: None,
         }]

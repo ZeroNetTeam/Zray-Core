@@ -11,39 +11,83 @@ use crate::Sniffed;
 
 const MAX_HOST: usize = 253;
 
-/// Inspect a bounded prefix for HTTP `Host` or TLS ClientHello SNI.
+/// Inspect a bounded prefix for a TLS ClientHello's SNI, an HTTP request's
+/// `Host`, or a BitTorrent handshake.
+///
+/// `allow_http` and `allow_tls` come from the inbound's `destOverride`; the
+/// BitTorrent check needs no switch, because it never supplies a name (it
+/// only labels the flow so a `protocol: ["bittorrent"]` rule can match).
 pub fn inspect(bytes: &[u8], allow_http: bool, allow_tls: bool) -> Sniffed {
     if allow_tls && bytes.first() == Some(&0x16) {
         if let Some(domain) = tls_server_name(bytes) {
             return Sniffed {
                 domain: Some(Arc::from(domain)),
                 protocol: Some("tls"),
+                http: None,
             };
         }
     }
     if allow_http {
-        if let Some(domain) = http_host(bytes) {
+        if let Some((domain, attrs)) = http_request(bytes) {
             return Sniffed {
                 domain: Some(Arc::from(domain)),
                 protocol: Some("http"),
+                http: Some(Arc::new(attrs)),
             };
         }
+    }
+    if is_bittorrent_handshake(bytes) {
+        return Sniffed {
+            protocol: Some("bittorrent"),
+            ..Sniffed::default()
+        };
     }
     Sniffed::default()
 }
 
-fn http_host(bytes: &[u8]) -> Option<String> {
+/// The BitTorrent peer handshake: one length byte (19) then the protocol
+/// name. Nothing else starts a TCP stream that way.
+pub fn is_bittorrent_handshake(bytes: &[u8]) -> bool {
+    bytes.len() >= 20 && bytes[0] == 19 && &bytes[1..20] == b"BitTorrent protocol"
+}
+
+/// The first datagram of a uTP connection (BitTorrent over UDP): a SYN
+/// packet, version 1, with a known extension and a header's worth of bytes.
+/// Only the SYN is matched, because later packets look like any binary data.
+pub fn is_utp_syn(bytes: &[u8]) -> bool {
+    bytes.len() >= 20 && bytes[0] == 0x41 && bytes[1] <= 2
+}
+
+/// The request's `Host` and the attributes routing rules can match on, if
+/// `bytes` begin with a complete HTTP/1 request head.
+fn http_request(bytes: &[u8]) -> Option<(String, crate::HttpAttrs)> {
     let head_end = bytes.windows(4).position(|window| window == b"\r\n\r\n")?;
     let head = std::str::from_utf8(&bytes[..head_end]).ok()?;
-    let request = head.lines().next()?.split_whitespace().next()?;
-    if request.is_empty() {
-        return None;
+    let mut lines = head.lines();
+    let mut first = lines.next()?.split_whitespace();
+    let method = first.next().filter(|method| !method.is_empty())?;
+    let path = first.next().unwrap_or("");
+    let mut host = None;
+    let mut headers = Vec::new();
+    for line in lines {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (key, value) = (key.trim().to_ascii_lowercase(), value.trim());
+        if key == "host" && host.is_none() {
+            host = Some(value);
+        }
+        headers.push((key, value.to_string()));
     }
-    let host = head.lines().skip(1).find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        key.eq_ignore_ascii_case("host").then_some(value.trim())
-    })?;
-    normalize_host(host)
+    let host = normalize_host(host?)?;
+    Some((
+        host,
+        crate::HttpAttrs {
+            method: method.to_string(),
+            path: path.to_string(),
+            headers,
+        },
+    ))
 }
 
 fn tls_server_name(bytes: &[u8]) -> Option<String> {
@@ -308,5 +352,43 @@ mod tests {
         // The record-shaped parser still refuses it, and vice versa.
         assert!(inspect(&message, false, true).domain.is_none());
         assert_eq!(client_hello_sni(&hello), None);
+    }
+
+    #[test]
+    fn a_bittorrent_handshake_is_labelled_without_a_name() {
+        let mut hello = vec![19];
+        hello.extend_from_slice(b"BitTorrent protocol");
+        hello.extend_from_slice(&[0; 48]);
+        let sniffed = inspect(&hello, true, true);
+        assert_eq!(sniffed.protocol, Some("bittorrent"));
+        assert!(sniffed.domain.is_none());
+        assert_eq!(
+            inspect(b"\x13BitTorrent protoco", true, true).protocol,
+            None
+        );
+    }
+
+    #[test]
+    fn a_utp_syn_is_told_from_other_datagrams() {
+        let mut syn = vec![0x41, 0];
+        syn.extend_from_slice(&[7; 18]);
+        assert!(is_utp_syn(&syn));
+        syn[0] = 0x01;
+        assert!(!is_utp_syn(&syn));
+        assert!(!is_utp_syn(&syn[..10]));
+    }
+
+    #[test]
+    fn a_sniffed_request_keeps_its_method_path_and_headers() {
+        let sniffed = inspect(
+            b"GET /a/b?c=1 HTTP/1.1\r\nHost: example.com\r\nUser-Agent: Mozilla\r\n\r\n",
+            true,
+            false,
+        );
+        let attrs = sniffed.http.unwrap();
+        assert_eq!(attrs.get(":method"), Some("GET"));
+        assert_eq!(attrs.get(":path"), Some("/a/b?c=1"));
+        assert_eq!(attrs.get("User-Agent"), Some("Mozilla"));
+        assert_eq!(attrs.get("x-missing"), None);
     }
 }

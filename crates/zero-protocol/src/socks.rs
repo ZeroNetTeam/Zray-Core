@@ -610,6 +610,65 @@ pub fn parse_authority(s: &str, default_port: u16) -> Option<Destination> {
 /// The response sent after a successful CONNECT.
 pub const CONNECT_OK: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
 
+/// Run the client side of an HTTP `CONNECT` over a stream that is already
+/// connected to the proxy: the other way an upstream proxy is spoken to.
+///
+/// The request names the destination as `host:port` (a name is sent as a
+/// name, so the proxy resolves it), with Basic credentials when there are
+/// any. The reply head is read one byte at a time up to its blank line, so no
+/// byte of the tunnelled stream is consumed with it and the stream is
+/// returned as it is. Any 2xx is success; the rest is reported with the
+/// proxy's own status line.
+pub async fn connect_http<S>(
+    mut stream: S,
+    credential: Option<&Credential>,
+    destination: &Destination,
+) -> Result<S, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use base64::Engine as _;
+    if destination.network != Network::Tcp {
+        return Err("an HTTP proxy carries TCP only".into());
+    }
+    let authority = match &destination.address {
+        Address::Ip(IpAddr::V6(ip)) => format!("[{ip}]:{}", destination.port),
+        Address::Domain(name) if name.bytes().any(|b| b <= b' ' || b == 0x7f) => {
+            return Err("destination name has characters that cannot be sent".into());
+        }
+        other => format!("{other}:{}", destination.port),
+    };
+    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+    if let Some(c) = credential {
+        let token = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", c.username, c.password));
+        request.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
+    }
+    request.push_str("Proxy-Connection: Keep-Alive\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.map_err(io_err)?;
+
+    let mut head = Vec::with_capacity(128);
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() >= 8192 {
+            return Err("HTTP proxy reply is too long".into());
+        }
+        head.push(stream.read_u8().await.map_err(io_err)?);
+    }
+    let text = String::from_utf8_lossy(&head);
+    let status_line = text.lines().next().unwrap_or("");
+    let mut parts = status_line.split_whitespace();
+    let version = parts.next().unwrap_or("");
+    let code: u16 = parts.next().and_then(|code| code.parse().ok()).unwrap_or(0);
+    if !version.starts_with("HTTP/1.") {
+        return Err("upstream is not an HTTP proxy".into());
+    }
+    match code {
+        200..=299 => Ok(stream),
+        407 => Err("HTTP proxy rejected the user name or password".into()),
+        _ => Err(format!("HTTP proxy refused the tunnel: {status_line}")),
+    }
+}
+
 /// Run the client side of a SOCKS5 CONNECT over a stream that is already
 /// connected to the proxy (RFC 1928, with RFC 1929 user/password).
 ///
@@ -1285,5 +1344,105 @@ Proxy-Authorization: Basic YWxpY2U6d3Jvbmc=\r\n\r\n",
         let mut b = [0u8; 10];
         client.read_exact(&mut b).await.unwrap();
         assert_eq!(&b[..4], &[0x05, 0x00, 0x00, 0x01]);
+    }
+
+    /// Reads from `stream` until the request head ends, then answers `reply`.
+    async fn fake_proxy(mut stream: tokio::io::DuplexStream, reply: &'static [u8]) -> Vec<u8> {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+        }
+        stream.write_all(reply).await.unwrap();
+        head
+    }
+
+    #[tokio::test]
+    async fn http_connect_names_the_destination_and_leaves_the_payload_untouched() {
+        let (client, server) = duplex(1024);
+        let proxy = tokio::spawn(fake_proxy(
+            server,
+            b"HTTP/1.1 200 Connection established\r\n\r\nhello",
+        ));
+        let credential = Credential {
+            username: "a".into(),
+            password: "b".into(),
+        };
+        let mut stream = connect_http(
+            client,
+            Some(&credential),
+            &Destination::tcp(Address::domain("example.com"), 443),
+        )
+        .await
+        .unwrap();
+        // The tunnelled bytes sent right behind the reply are still there.
+        let mut payload = [0u8; 5];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"hello");
+        let head = String::from_utf8(proxy.await.unwrap()).unwrap();
+        assert!(
+            head.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("Host: example.com:443\r\n"));
+        // base64("a:b")
+        assert!(head.contains("Proxy-Authorization: Basic YTpi\r\n"));
+    }
+
+    #[tokio::test]
+    async fn http_connect_brackets_an_ipv6_literal_and_sends_no_login_unasked() {
+        let (client, server) = duplex(1024);
+        let proxy = tokio::spawn(fake_proxy(server, b"HTTP/1.0 200 OK\r\n\r\n"));
+        connect_http(
+            client,
+            None,
+            &Destination::tcp(Address::parse_host("2001:db8::1"), 80),
+        )
+        .await
+        .unwrap();
+        let head = String::from_utf8(proxy.await.unwrap()).unwrap();
+        assert!(
+            head.starts_with("CONNECT [2001:db8::1]:80 HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(!head.contains("Proxy-Authorization"));
+    }
+
+    #[tokio::test]
+    async fn http_connect_reports_what_the_proxy_said() {
+        for (reply, wanted) in [
+            (
+                &b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"[..],
+                "user name or password",
+            ),
+            (&b"HTTP/1.1 502 Bad Gateway\r\n\r\n"[..], "502 Bad Gateway"),
+            (&b"SSH-2.0-OpenSSH\r\n\r\n"[..], "not an HTTP proxy"),
+        ] {
+            let (client, server) = duplex(1024);
+            let reply: &'static [u8] = Box::leak(reply.to_vec().into_boxed_slice());
+            tokio::spawn(fake_proxy(server, reply));
+            let error = connect_http(
+                client,
+                None,
+                &Destination::tcp(Address::domain("x.test"), 1),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains(wanted), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_connect_refuses_udp_and_names_that_would_break_the_request() {
+        let (client, _server) = duplex(64);
+        assert!(connect_http(
+            client,
+            None,
+            &Destination::udp(Address::domain("x.test"), 1)
+        )
+        .await
+        .is_err());
+        let (client, _server) = duplex(64);
+        let bad = Destination::tcp(Address::domain("x.test\r\nX-Evil: 1"), 80);
+        assert!(connect_http(client, None, &bad).await.is_err());
     }
 }

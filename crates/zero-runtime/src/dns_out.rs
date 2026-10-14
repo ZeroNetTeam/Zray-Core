@@ -27,6 +27,8 @@
 use std::net::IpAddr;
 
 use zero_config::dns::QueryStrategy;
+use zero_config::routing::DomainPattern;
+use zero_config::{DnsAction, DnsOutboundRule};
 use zero_dns::{ResolveError, Resolver};
 
 /// TTL written into synthesised answers.
@@ -147,12 +149,51 @@ pub(crate) fn build_response(query: &Query, rcode: u8, addresses: &[IpAddr]) -> 
     out
 }
 
-/// Answer one query packet through `resolver`. `None` means the packet was
-/// not a query this outbound answers and should be dropped.
-pub(crate) async fn answer(resolver: &Resolver, packet: &[u8]) -> Option<Vec<u8>> {
+/// Whether `name` is covered by `pattern`: `full:` is exact, a plain or
+/// `domain:` pattern is the name and its subdomains, `keyword:` anywhere.
+fn name_matches(pattern: &DomainPattern, name: &str) -> bool {
+    match pattern {
+        DomainPattern::Full(full) => name == &**full,
+        DomainPattern::Suffix(suffix) => {
+            name == &**suffix
+                || name
+                    .strip_suffix(&**suffix)
+                    .is_some_and(|head| head.ends_with('.'))
+        }
+        DomainPattern::Keyword(word) => name.contains(&**word),
+        // Refused when the configuration is read.
+        DomainPattern::Regex(_) | DomainPattern::Geosite(_) => false,
+    }
+}
+
+/// The first rule that covers `query`, if any.
+fn matching_rule<'a>(rules: &'a [DnsOutboundRule], query: &Query) -> Option<&'a DnsOutboundRule> {
+    rules.iter().find(|rule| {
+        (rule.qtypes.is_empty() || rule.qtypes.contains(&query.qtype))
+            && (rule.domains.is_empty()
+                || rule
+                    .domains
+                    .iter()
+                    .any(|pattern| name_matches(pattern, &query.name)))
+    })
+}
+
+/// Answer one query packet through `resolver`, as `rules` direct. `None`
+/// means no answer is given: the packet was not a query this outbound
+/// answers, or a rule says to drop it.
+pub(crate) async fn answer(
+    resolver: &Resolver,
+    packet: &[u8],
+    rules: &[DnsOutboundRule],
+) -> Option<Vec<u8>> {
     let query = parse_query(packet)?;
     if query.qclass != CLASS_IN {
         return Some(build_response(&query, RCODE_NOTIMP, &[]));
+    }
+    match matching_rule(rules, &query).map(|rule| rule.action) {
+        Some(DnsAction::Drop) => return None,
+        Some(DnsAction::Return(code)) => return Some(build_response(&query, code, &[])),
+        Some(DnsAction::Hijack) | None => {}
     }
     let strategy = match query.qtype {
         TYPE_A => QueryStrategy::UseIpv4,
@@ -245,23 +286,68 @@ mod tests {
         settings.query_strategy = QueryStrategy::UseIpv4;
         let resolver = Resolver::new(settings);
 
-        let https = answer(&resolver, &query("pinned.example", 65))
+        let https = answer(&resolver, &query("pinned.example", 65), &[])
             .await
             .unwrap();
         assert_eq!(https[3] & 0x0F, RCODE_NOERROR);
         assert_eq!(u16::from_be_bytes([https[6], https[7]]), 0);
 
-        let a = answer(&resolver, &query("pinned.example", TYPE_A))
+        let a = answer(&resolver, &query("pinned.example", TYPE_A), &[])
             .await
             .unwrap();
         assert_eq!(u16::from_be_bytes([a[6], a[7]]), 1);
         assert_eq!(&a[a.len() - 4..], &[192, 0, 2, 7]);
 
         // IPv4-only configuration: AAAA is answered empty, not resolved.
-        let aaaa = answer(&resolver, &query("pinned.example", TYPE_AAAA))
+        let aaaa = answer(&resolver, &query("pinned.example", TYPE_AAAA), &[])
             .await
             .unwrap();
         assert_eq!(aaaa[3] & 0x0F, RCODE_NOERROR);
         assert_eq!(u16::from_be_bytes([aaaa[6], aaaa[7]]), 0);
+    }
+
+    #[tokio::test]
+    async fn rules_drop_return_or_hijack_by_type_and_name() {
+        let resolver = Resolver::new(Default::default());
+        let rules = [
+            DnsOutboundRule {
+                action: DnsAction::Drop,
+                qtypes: Box::new([28]),
+                domains: Box::new([]),
+            },
+            DnsOutboundRule {
+                action: DnsAction::Return(5),
+                qtypes: Box::new([]),
+                domains: Box::new([DomainPattern::Full("blocked.example".into())]),
+            },
+            DnsOutboundRule {
+                action: DnsAction::Hijack,
+                qtypes: Box::new([65]),
+                domains: Box::new([DomainPattern::Suffix("example".into())]),
+            },
+        ];
+        // AAAA is dropped for every name: no answer at all.
+        assert!(answer(&resolver, &query("a.example", TYPE_AAAA), &rules)
+            .await
+            .is_none());
+        // The named domain is refused (rcode 5) whatever the type.
+        let refused = answer(&resolver, &query("blocked.example", TYPE_A), &rules)
+            .await
+            .unwrap();
+        assert_eq!(refused[3] & 0x0f, 5);
+        // A name only a suffix rule covers is answered as usual (empty for HTTPS).
+        let https = answer(&resolver, &query("sub.example", 65), &rules)
+            .await
+            .unwrap();
+        assert_eq!(https[3] & 0x0f, RCODE_NOERROR);
+        // And a suffix never matches in the middle of a label.
+        assert!(name_matches(
+            &DomainPattern::Suffix("example".into()),
+            "a.example"
+        ));
+        assert!(!name_matches(
+            &DomainPattern::Suffix("example".into()),
+            "notexample"
+        ));
     }
 }

@@ -180,7 +180,15 @@ pub struct ServerConfig {
 /// header. Matches Xray's default `handshake` policy. Without it a client that
 /// connects and then says nothing -- a slow-loris, or a censor's half-open
 /// probe -- pins a task and a descriptor for as long as it cares to.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+static HANDSHAKE_MS: AtomicU64 = AtomicU64::new(DEFAULT_HANDSHAKE_TIMEOUT.as_millis() as u64);
+
+/// The handshake limit in force: the default, or the configured
+/// `policy.levels.0.handshake`.
+fn handshake_timeout() -> Duration {
+    Duration::from_millis(HANDSHAKE_MS.load(Ordering::Relaxed))
+}
 
 /// A connection to `chain[0]`'s server, carried through every later hop of
 /// `chain` (innermost dialled directly). `chain` has at least two entries.
@@ -188,35 +196,66 @@ async fn carry_to_exit(
     chain: &[zero_config::Outbound],
     resolver: &zero_dns::Resolver,
 ) -> Result<zero_core::BoxStream, zero_core::Failure> {
-    let server = |hop: &zero_config::Outbound| {
-        hop.endpoint()
-            .map(|(address, port)| Destination::tcp(address, port))
-            .ok_or_else(|| {
-                zero_core::Failure::new(
-                    zero_core::FailureKind::LocalPolicy,
-                    zero_core::Stage::SocketConnected,
-                )
-                .with_detail(format!("outbound {} has no endpoint", hop.tag))
-            })
-    };
-    let innermost = chain.len() - 1;
-    let carried = Box::pin(outbound::connect_with_resolver(
-        &chain[innermost],
-        &server(&chain[innermost - 1])?,
-        resolver,
-    ))
-    .await?;
-    let mut carried = outbound::strip_response(&chain[innermost], carried);
-    for index in (1..innermost).rev() {
-        let stream = Box::pin(outbound::connect_over(
-            &chain[index],
-            carried,
-            &server(&chain[index - 1])?,
-        ))
-        .await?;
-        carried = outbound::strip_response(&chain[index], stream);
-    }
-    Ok(carried)
+    carry_through(Arc::from(chain), 1, resolver.clone()).await
+}
+
+/// The server of `hop`, as a destination to connect to.
+fn hop_server(hop: &zero_config::Outbound) -> Result<Destination, zero_core::Failure> {
+    hop.endpoint()
+        .map(|(address, port)| Destination::tcp(address, port))
+        .ok_or_else(|| {
+            zero_core::Failure::new(
+                zero_core::FailureKind::LocalPolicy,
+                zero_core::Stage::SocketConnected,
+            )
+            .with_detail(format!("outbound {} has no endpoint", hop.tag))
+        })
+}
+
+/// A connection to the server of `chain[at - 1]`, opened through `chain[at]`
+/// and the hops after it, with the response header of each hop taken off.
+///
+/// The last hop dials directly. A hop before it runs over a connection to its
+/// own server that the hops after it carry. A Tide hop cannot run over one
+/// connection (it keeps several and replaces them), so it is given a way to
+/// open a new one whenever it wants one.
+fn carry_through(
+    chain: Arc<[zero_config::Outbound]>,
+    at: usize,
+    resolver: zero_dns::Resolver,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<zero_core::BoxStream, zero_core::Failure>> + Send>,
+> {
+    Box::pin(async move {
+        let hop = &chain[at];
+        let destination = hop_server(&chain[at - 1])?;
+        if at + 1 == chain.len() {
+            let stream = outbound::connect_with_resolver(hop, &destination, &resolver).await?;
+            return Ok(outbound::strip_response(hop, stream));
+        }
+        if matches!(hop.protocol, OutboundProtocol::Tide(_)) {
+            let (route, carrier) = tide_carrier(&chain, at, &resolver);
+            return outbound::connect_tide_via(hop, &destination, &route, carrier).await;
+        }
+        let carried = carry_through(chain.clone(), at + 1, resolver.clone()).await?;
+        let stream = outbound::connect_over(hop, carried, &destination).await?;
+        Ok(outbound::strip_response(hop, stream))
+    })
+}
+
+/// What a Tide client at `chain[at]` needs to reach its server: a name for
+/// the route (the hops behind it) and a way to open one more connection to
+/// the server through them.
+fn tide_carrier(
+    chain: &Arc<[zero_config::Outbound]>,
+    at: usize,
+    resolver: &zero_dns::Resolver,
+) -> (String, outbound::TideCarrier) {
+    let route = format!("{:?}", &chain[at + 1..]);
+    let (chain, resolver) = (chain.clone(), resolver.clone());
+    let carrier: outbound::TideCarrier =
+        Arc::new(move || carry_through(chain.clone(), at + 1, resolver.clone()));
+    (route, carrier)
 }
 
 /// Give `dialed` the TCP fragmentation of the direct outbound `dialer`, unless
@@ -259,10 +298,10 @@ const UDP_INFLIGHT_LIMIT: usize = 512;
 const UDP_EXCHANGE_DEADLINE: Duration = Duration::from_secs(15);
 
 async fn within_handshake<F: std::future::Future>(future: F) -> Result<F::Output, String> {
-    timeout(HANDSHAKE_TIMEOUT, future).await.map_err(|_| {
+    timeout(handshake_timeout(), future).await.map_err(|_| {
         format!(
             "client handshake timed out after {}s",
-            HANDSHAKE_TIMEOUT.as_secs()
+            handshake_timeout().as_secs()
         )
     })
 }
@@ -298,6 +337,10 @@ struct InboundRuntime {
     raw_http_header: Option<zero_transport::tcp_header::HttpHeaderConfig>,
     tide: Option<Arc<TideInbound>>,
     tide_relay: Option<Arc<zero_transport::tide_relay::Relay>>,
+    /// The VLESS Encryption server of a VLESS inbound with `decryption` set,
+    /// or why its setting is unusable. Made once per inbound, because its
+    /// 0-RTT tickets must outlive any one connection.
+    vless_encryption: Option<Result<Arc<zero_protocol::vless_encryption::Server>, String>>,
 }
 
 /// A Tide inbound's server. It outlives any one connection: a session's
@@ -336,11 +379,30 @@ impl TideInbound {
 impl InboundRuntime {
     fn compile(inbound: &zero_config::Inbound) -> Self {
         let tls = match &inbound.security {
-            zero_config::InboundSecurity::Tls(tls) => Some(zero_security::server::server_config(
-                &tls.certificate,
-                &tls.private_key,
-                &tls.alpn,
-            )),
+            zero_config::InboundSecurity::Tls(tls)
+                if tls.extra_identities.is_empty() && !tls.reject_unknown_sni =>
+            {
+                Some(zero_security::server::server_config(
+                    &tls.certificate,
+                    &tls.private_key,
+                    &tls.alpn,
+                ))
+            }
+            zero_config::InboundSecurity::Tls(tls) => {
+                let identities: Vec<(&[u8], &[u8])> =
+                    std::iter::once((&*tls.certificate, &*tls.private_key))
+                        .chain(
+                            tls.extra_identities
+                                .iter()
+                                .map(|(cert, key)| (&**cert, &**key)),
+                        )
+                        .collect();
+                Some(zero_security::server::server_config_multi(
+                    &identities,
+                    &tls.alpn,
+                    tls.reject_unknown_sni,
+                ))
+            }
             _ => None,
         };
         let reality = match &inbound.security {
@@ -349,6 +411,10 @@ impl InboundRuntime {
                     private_key: reality.private_key,
                     server_names: reality.server_names.clone(),
                     short_ids: reality.short_ids.clone(),
+                    mldsa65_seed: reality.mldsa65_seed.as_ref().map(|seed| seed.0),
+                    max_time_diff: Duration::from_millis(reality.max_time_diff_ms),
+                    min_client_ver: reality.min_client_ver,
+                    max_client_ver: reality.max_client_ver,
                     post_handshake: Default::default(),
                 })
             }
@@ -370,12 +436,22 @@ impl InboundRuntime {
                 early_data_len: 0,
                 xhttp: Default::default(),
                 secure: false,
+                grpc_multi_path: w.grpc_multi_path.as_deref().map(str::to_string),
+                grpc_multi: false,
             }),
+        };
+        let vless_encryption = match &inbound.protocol {
+            InboundProtocol::Vless(config) => config.decryption.as_deref().map(|setting| {
+                zero_protocol::vless_encryption::ServerConfig::parse(setting)
+                    .map(zero_protocol::vless_encryption::Server::new)
+            }),
+            _ => None,
         };
         Self {
             tls,
             reality,
             transport,
+            vless_encryption,
             tide: match &inbound.protocol {
                 InboundProtocol::Tide(config) => Some(TideInbound::new(config)),
                 _ => None,
@@ -408,12 +484,145 @@ impl InboundRuntime {
     }
 }
 
+/// A Hysteria2 inbound's masquerade, in the form the transport serves.
+fn hysteria_masquerade(
+    masquerade: &zero_config::Hysteria2Masquerade,
+) -> zero_transport::masquerade::Masquerade {
+    use zero_config::Hysteria2Masquerade as Config;
+    use zero_transport::masquerade::Masquerade;
+    match masquerade {
+        Config::Text {
+            status,
+            headers,
+            content,
+        } => Masquerade::Text {
+            status: *status,
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            content: content.as_bytes().to_vec(),
+        },
+        Config::Files { dir } => Masquerade::Files {
+            dir: std::path::PathBuf::from(&**dir),
+        },
+        Config::Proxy { url } => {
+            let base: Arc<str> = Arc::from(url.trim_end_matches('/'));
+            Masquerade::Proxy(Arc::new(move |path: String, head: bool| {
+                let url = format!("{base}{path}");
+                Box::pin(async move { fetch_page(&url, head).await })
+            }))
+        }
+    }
+}
+
+/// One page of the site a masquerade proxies. Only a 200 comes back with its
+/// body (the fetch client keeps nothing else); any other status is passed on
+/// as itself with no body, and a failure to reach the site is a 502.
+async fn fetch_page(url: &str, head: bool) -> zero_transport::masquerade::Page {
+    let limits = zero_net::fetch::FetchLimits {
+        max_bytes: 16 * 1024 * 1024,
+        timeout: Duration::from_secs(10),
+        max_redirects: 3,
+    };
+    match zero_net::fetch::fetch(url, &limits, &Default::default()).await {
+        Ok(zero_net::fetch::Fetched::Body { body, .. }) => {
+            let kind = match url
+                .split(['?', '#'])
+                .next()
+                .unwrap_or("")
+                .rsplit('.')
+                .next()
+            {
+                Some("css") => "text/css; charset=utf-8",
+                Some("js") => "text/javascript; charset=utf-8",
+                Some("json") => "application/json",
+                Some("png") => "image/png",
+                Some("jpg" | "jpeg") => "image/jpeg",
+                Some("svg") => "image/svg+xml",
+                Some("ico") => "image/x-icon",
+                _ => "text/html; charset=utf-8",
+            };
+            let body = if head { Vec::new() } else { body };
+            (
+                200,
+                vec![("content-type".to_string(), kind.to_string())],
+                body,
+            )
+        }
+        Ok(zero_net::fetch::Fetched::NotModified) => (304, Vec::new(), Vec::new()),
+        Err(zero_net::fetch::FetchError::Status(status)) => (status, Vec::new(), Vec::new()),
+        Err(_) => (502, Vec::new(), Vec::new()),
+    }
+}
+
 /// An accepted TCP connection as the inbound security layer reads it.
 type InboundTcp = zero_evasion::ReadPastMark<tokio::net::TcpStream>;
 
+/// How a dokodemo inbound learns the real destination of what it accepts:
+/// the `sockopt.tproxy` it names, or `followRedirect` alone, which means the
+/// REDIRECT lookup (what most setups with that flag use). `Off` means only
+/// the fixed `address`/`port`.
+fn dokodemo_follow(inbound: &zero_config::Inbound) -> zero_config::Tproxy {
+    match (&inbound.protocol, inbound.sockopt.tproxy) {
+        (
+            InboundProtocol::Dokodemo {
+                follow_redirect: true,
+                ..
+            },
+            zero_config::Tproxy::Off,
+        ) => zero_config::Tproxy::Redirect,
+        (InboundProtocol::Dokodemo { .. }, mode) => mode,
+        _ => zero_config::Tproxy::Off,
+    }
+}
+
+/// Read the PROXY protocol header at the start of `stream` and consume
+/// exactly its bytes, leaving the rest of the connection untouched. A
+/// connection that does not start with one is refused: with the option on, a
+/// plain client would be reading its own address from nowhere.
+async fn read_proxy_header(
+    stream: &tokio::net::TcpStream,
+) -> Result<zero_protocol::proxy_protocol::Header, String> {
+    use zero_protocol::proxy_protocol::{parse, Parsed};
+    let mut buffer = [0u8; 536];
+    let mut last = 0;
+    loop {
+        let seen = stream.peek(&mut buffer).await.map_err(|e| e.to_string())?;
+        if seen == 0 {
+            return Err("the connection closed before a PROXY header".into());
+        }
+        match parse(&buffer[..seen]) {
+            Parsed::Header(header, consumed) => {
+                let mut taken = vec![0u8; consumed];
+                let mut read = 0;
+                while read < consumed {
+                    stream.readable().await.map_err(|e| e.to_string())?;
+                    match stream.try_read(&mut taken[read..]) {
+                        Ok(0) => return Err("the connection closed inside the header".into()),
+                        Ok(n) => read += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(e.to_string()),
+                    }
+                }
+                return Ok(header);
+            }
+            Parsed::NotProxy => return Err("not a PROXY protocol header".into()),
+            Parsed::Incomplete => {
+                // Peek returns what has arrived without waiting for more;
+                // wait for new bytes before looking again.
+                if seen == last {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                last = seen;
+            }
+        }
+    }
+}
+
 /// What terminating an inbound's security layer produced.
 enum Secured {
-    Stream(zero_core::BoxStream),
+    Stream(zero_core::BoxStream, ConnInfo),
     /// An unauthenticated REALITY client, to be handed to the camouflage
     /// target with the ClientHello it already sent.
     Fallback {
@@ -482,6 +691,10 @@ pub struct Server {
     announced: StdMutex<HashSet<String>>,
     /// Connections prepared ahead of need ([`crate::warm`]).
     warm: Arc<crate::warm::WarmPool>,
+    /// The bridges that have dialled in to each reverse-proxy portal, by the
+    /// portal's outbound tag. Kept here, outside the configuration, so a
+    /// reload does not disconnect them.
+    portals: StdMutex<HashMap<Arc<str>, Arc<crate::reverse::Portal>>>,
     /// Lock-free mirror of the shortest time-triggered reset the planner has
     /// measured, in milliseconds; `0` means no such evidence exists.
     ///
@@ -506,6 +719,23 @@ type AcceptedTransport = (
 /// credentials and sniffing rules for every connection.
 struct InboundSession {
     state: Arc<ServerState>,
+    /// What the connection's TLS layer learned, for fallbacks that choose by
+    /// server name or ALPN.
+    conn: ConnInfo,
+}
+
+/// The server name and ALPN protocol a TLS client asked for and got.
+#[derive(Debug, Clone, Default)]
+struct ConnInfo {
+    server_name: Option<Arc<str>>,
+    alpn: Option<Arc<[u8]>>,
+    /// Where a transparently proxied connection was really going.
+    original: Option<SocketAddr>,
+    /// The inbound's own address, the destination of a PROXY header.
+    local: Option<SocketAddr>,
+    /// Set by Vision when a client goes direct under VLESS Encryption, so the
+    /// encryption layer, which Vision cannot reach by type, stops decrypting.
+    direct: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 struct Hysteria2UdpSession {
@@ -554,6 +784,7 @@ impl Server {
             sanction: StdMutex::new(None),
             announced: StdMutex::new(HashSet::new()),
             warm: Arc::default(),
+            portals: StdMutex::new(HashMap::new()),
             planner_flow_lifetime_ms: AtomicU64::new(0),
             stats: Arc::new(Stats::default()),
         }
@@ -646,6 +877,13 @@ impl Server {
         generation: GenerationId,
         geodata: &zero_router::GeoData,
     ) -> ServerState {
+        // The policy is process-wide, so the generation just built decides
+        // for every connection from here on.
+        HANDSHAKE_MS.store(
+            config.policy.handshake.as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        crate::relay::set_policy(config.policy.conn_idle, config.policy.half_close);
         let router = Self::build_router(&config, geodata);
         let client_resolver = Arc::new(zero_dns::Resolver::new(config.dns.clone()));
         let resolver = Arc::new(client_resolver.without_fake());
@@ -793,6 +1031,54 @@ impl Server {
         background.0.push(tokio::spawn(async move {
             me.run_sanction_watch().await;
         }));
+        // One supervisor per reverse-proxy bridge, from the configuration
+        // this run started with.
+        for bridge in initial.config.bridges.iter() {
+            let (me, tag, domain) = (Arc::clone(&self), bridge.tag.clone(), bridge.domain.clone());
+            let via = bridge.via.clone();
+            background.0.push(tokio::spawn(async move {
+                let (dialer, router) = (Arc::clone(&me), Arc::clone(&me));
+                let (dial_tag, route_tag) = (tag.clone(), tag);
+                crate::reverse::run_bridge(
+                    move || {
+                        let (me, tag, domain) =
+                            (Arc::clone(&dialer), dial_tag.clone(), domain.clone());
+                        let via = via.clone();
+                        async move {
+                            let destination = Destination::tcp(Address::domain(&domain), 0);
+                            match via {
+                                // A VLESS account's reverse: dial the portal
+                                // straight through that outbound.
+                                Some(outbound) => me.bridge_dial_via(&outbound, &destination).await,
+                                None => me.bridge_connect(tag, destination).await,
+                            }
+                        }
+                    },
+                    move |destination| {
+                        let (me, tag) = (Arc::clone(&router), route_tag.clone());
+                        async move {
+                            let result = me.bridge_connect(tag.clone(), destination.clone()).await;
+                            if let Err(error) = &result {
+                                debug!(bridge = %tag, %destination, %error, "reverse bridge session refused");
+                            }
+                            result
+                        }
+                    },
+                )
+                .await;
+            }));
+        }
+        // A VLESS Encryption setting that cannot be used (a key of the wrong
+        // size, a typo in the mode) must stop the server at start, not make
+        // every client's connection fail one by one.
+        for (inbound, compiled) in initial.config.inbounds.iter().zip(initial.inbounds.iter()) {
+            if let Some(Err(error)) = &compiled.vless_encryption {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("inbound {:?}: VLESS decryption: {error}", inbound.tag),
+                ));
+            }
+        }
         for (idx, inbound) in initial.config.inbounds.iter().enumerate() {
             let addr = SocketAddr::new(
                 inbound
@@ -801,6 +1087,18 @@ impl Server {
                     .unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
                 inbound.port,
             );
+
+            if let InboundProtocol::WireGuard(wireguard) = &inbound.protocol {
+                let socket = UdpSocket::bind(addr).await?;
+                info!(tag = %inbound.tag, %addr, protocol = inbound.protocol.kind(), "listening");
+                let me = Arc::clone(&self);
+                let id = InboundId(idx as u32);
+                let (tag, wireguard) = (inbound.tag.clone(), wireguard.clone());
+                handles_vec.push(tokio::spawn(async move {
+                    me.serve_wireguard(socket, id, tag, wireguard).await;
+                }));
+                continue;
+            }
 
             if let InboundProtocol::Tun(tun) = &inbound.protocol {
                 let me = Arc::clone(&self);
@@ -813,17 +1111,18 @@ impl Server {
                 continue;
             }
 
-            if let InboundProtocol::Hysteria2(_) = &inbound.protocol {
+            if let InboundProtocol::Hysteria2(hysteria) = &inbound.protocol {
                 let zero_config::InboundSecurity::Tls(tls) = &inbound.security else {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "Hysteria2 inbound requires certificate TLS",
                     ));
                 };
-                let endpoint = zero_transport::xhttp::h3_server_endpoint(
+                let endpoint = zero_transport::xhttp::h3_server_endpoint_obfuscated(
                     addr,
                     &tls.certificate,
                     &tls.private_key,
+                    hysteria.obfs_password.as_deref(),
                 )
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
                 info!(tag = %inbound.tag, %addr, protocol = inbound.protocol.kind(), "listening");
@@ -883,31 +1182,52 @@ impl Server {
                 }
             }
 
-            if let InboundProtocol::Dokodemo {
-                target: Some(target),
-                network: Network::Udp,
-            } = &inbound.protocol
-            {
-                let socket = UdpSocket::bind(addr).await?;
-                info!(tag = %inbound.tag, %addr, protocol = inbound.protocol.kind(), "listening");
-                let me = Arc::clone(&self);
-                let tag = inbound.tag.clone();
-                let target = target.clone();
+            let mut transparent = false;
+            if let InboundProtocol::Dokodemo { tcp, udp, .. } = &inbound.protocol {
+                // What it can send a connection to when nothing was redirected.
+                let target = inbound.dokodemo_destination(None);
+                let follow = dokodemo_follow(inbound);
+                transparent = follow == zero_config::Tproxy::Tproxy;
                 let id = InboundId(idx as u32);
-                handles_vec.push(tokio::spawn(async move {
-                    me.serve_dokodemo_udp(socket, id, tag, target).await;
-                }));
-                continue;
-            }
-            if matches!(
-                inbound.protocol,
-                InboundProtocol::Dokodemo { target: None, .. }
-            ) {
-                debug!(tag = %inbound.tag, "dokodemo-door TCP inbound needs a fixed target; skipping");
-                continue;
+                if *udp {
+                    let tag = inbound.tag.clone();
+                    if transparent {
+                        let socket = zero_net::transparent::TransparentUdp::bind(addr)?;
+                        info!(tag = %inbound.tag, %addr, protocol = "dokodemo (tproxy udp)", "listening");
+                        let me = Arc::clone(&self);
+                        handles_vec.push(tokio::spawn(async move {
+                            me.serve_tproxy_udp(socket, id, tag).await;
+                        }));
+                    } else if let Some(target) = target.clone() {
+                        let socket = UdpSocket::bind(addr).await?;
+                        info!(tag = %inbound.tag, %addr, protocol = inbound.protocol.kind(), "listening");
+                        let me = Arc::clone(&self);
+                        handles_vec.push(tokio::spawn(async move {
+                            me.serve_dokodemo_udp(socket, id, tag, target).await;
+                        }));
+                    } else {
+                        debug!(tag = %inbound.tag, "dokodemo-door UDP inbound needs a fixed target or tproxy; skipping");
+                    }
+                }
+                if !*tcp {
+                    continue;
+                }
+                if target.is_none() && follow == zero_config::Tproxy::Off {
+                    debug!(tag = %inbound.tag, "dokodemo-door TCP inbound needs a fixed target or followRedirect; skipping");
+                    continue;
+                }
             }
 
-            let listener = zero_net::prepare_listener(addr)?;
+            let listener = zero_net::prepare_listener_with(
+                addr,
+                &zero_net::ListenOptions {
+                    v6_only: inbound.sockopt.v6_only,
+                    mptcp: inbound.sockopt.mptcp,
+                    mark: inbound.sockopt.mark,
+                    transparent,
+                    custom: inbound.sockopt.custom.clone(),
+                },
+            )?;
             info!(tag = %inbound.tag, %addr, protocol = inbound.protocol.kind(), "listening");
 
             let me = Arc::clone(&self);
@@ -917,7 +1237,7 @@ impl Server {
             }));
         }
 
-        if handles_vec.is_empty() {
+        if handles_vec.is_empty() && initial.config.bridges.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "no supported inbound to listen on",
@@ -935,6 +1255,11 @@ impl Server {
 
         for handle in handles_vec.iter_mut() {
             let _ = handle.await;
+        }
+        // A server that is only a reverse-proxy bridge listens on nothing; it
+        // runs as long as its supervisors do.
+        if handles_vec.is_empty() {
+            std::future::pending::<()>().await;
         }
         drop(background);
         Ok(())
@@ -984,11 +1309,27 @@ impl Server {
 
     async fn accept_loop(self: Arc<Self>, listener: TcpListener, id: InboundId) {
         let mut backoff_ms = 10u64;
+        // What this inbound's `sockopt` asks of every connection it accepts.
+        let accepted = self
+            .state
+            .load()
+            .config
+            .inbounds
+            .get(id.0 as usize)
+            .map(|inbound| zero_net::AcceptedOptions {
+                keepalive: inbound.sockopt.keepalive,
+                user_timeout_ms: inbound.sockopt.user_timeout_ms,
+                window_clamp: inbound.sockopt.window_clamp,
+            })
+            .unwrap_or_default();
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
                     backoff_ms = 10;
                     let _ = stream.set_nodelay(true);
+                    if !accepted.is_default() {
+                        zero_net::apply_accepted(&stream, &accepted);
+                    }
                     #[cfg(target_os = "linux")]
                     {
                         let _ = socket2::SockRef::from(&stream).set_quickack(true);
@@ -1040,24 +1381,74 @@ impl Server {
             return;
         };
 
+        // A transparent inbound learns where the client was really going
+        // before the stream is wrapped: it is a question for the socket.
+        let original = match (&inbound.protocol, dokodemo_follow(inbound)) {
+            (InboundProtocol::Dokodemo { .. }, zero_config::Tproxy::Tproxy) => {
+                stream.local_addr().ok()
+            }
+            (InboundProtocol::Dokodemo { .. }, zero_config::Tproxy::Redirect) => {
+                zero_net::transparent::original_destination(&stream, peer)
+                    .ok()
+                    // A client that connected to the port itself was not
+                    // redirected; the "original" is then this very listener.
+                    .filter(|found| Some(*found) != stream.local_addr().ok())
+            }
+            _ => None,
+        };
+
+        // Behind a load balancer the connection's own peer is the balancer;
+        // the client's address is in the PROXY header it sent first.
+        let peer = if inbound.accept_proxy_protocol {
+            match timeout(handshake_timeout(), read_proxy_header(&stream)).await {
+                Ok(Ok(header)) => header.source.unwrap_or(peer),
+                Ok(Err(error)) => {
+                    stats.failed.fetch_add(1, Ordering::Relaxed);
+                    debug!(%peer, %error, "inbound PROXY protocol header refused");
+                    return;
+                }
+                Err(_) => {
+                    stats.failed.fetch_add(1, Ordering::Relaxed);
+                    debug!(%peer, "inbound PROXY protocol header timed out");
+                    return;
+                }
+            }
+        } else {
+            peer
+        };
+
+        let local = {
+            let ip = inbound
+                .listen
+                .as_ip()
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            Some(SocketAddr::new(ip, inbound.port))
+        };
         // A client may hide its server name with an urgent byte
         // (`zero_evasion::urgent`); reading on past the mark keeps such a
         // hello from stalling here.
         let stream = zero_evasion::ReadPastMark::new(stream);
-        let secured = match timeout(
-            HANDSHAKE_TIMEOUT,
+        let (secured, mut conn) = match timeout(
+            handshake_timeout(),
             Self::secure_inbound(stream, &inbound.security, compiled),
         )
         .await
         {
-            Ok(Ok(Secured::Stream(stream))) => stream,
+            Ok(Ok(Secured::Stream(stream, conn))) => (stream, conn),
             Ok(Ok(Secured::Fallback {
                 stream,
                 client_hello,
                 failure,
             })) => {
-                self.relay_reality_fallback(stream, client_hello, failure, peer, &inbound.security)
-                    .await;
+                self.relay_reality_fallback(
+                    stream,
+                    client_hello,
+                    failure,
+                    peer,
+                    local,
+                    &inbound.security,
+                )
+                .await;
                 return;
             }
             Ok(Err(error)) => {
@@ -1071,6 +1462,8 @@ impl Server {
                 return;
             }
         };
+        conn.local = local;
+        conn.original = original;
         let secured: zero_core::BoxStream = match &compiled.raw_http_header {
             Some(config) => boxed(zero_transport::tcp_header::HttpHeaderStream::server(
                 secured, config,
@@ -1080,7 +1473,13 @@ impl Server {
         let stream = match self.accept_transport(secured, inbound, compiled).await {
             Ok(Some((stream, more))) => {
                 if let Some(more) = more {
-                    Arc::clone(&self).serve_additional_streams(more, peer, id, Arc::clone(&state));
+                    Arc::clone(&self).serve_additional_streams(
+                        more,
+                        peer,
+                        id,
+                        Arc::clone(&state),
+                        conn.clone(),
+                    );
                 }
                 stream
             }
@@ -1093,7 +1492,7 @@ impl Server {
             }
         };
         if let Err(e) = self
-            .handle(stream, peer, id, InboundSession { state })
+            .handle(stream, peer, id, InboundSession { state, conn })
             .await
         {
             stats.failed.fetch_add(1, Ordering::Relaxed);
@@ -1109,17 +1508,19 @@ impl Server {
         peer: SocketAddr,
         id: InboundId,
         state: Arc<ServerState>,
+        conn: ConnInfo,
     ) {
         tokio::spawn(async move {
             while let Some(stream) = more.recv().await {
                 let this = Arc::clone(&self);
                 let state = Arc::clone(&state);
+                let conn = conn.clone();
                 tokio::spawn(async move {
                     let stats = Arc::clone(&this.stats);
                     stats.accepted.fetch_add(1, Ordering::Relaxed);
                     let _active = ActiveGuard::new(Arc::clone(&stats));
                     if let Err(e) = this
-                        .handle(stream, peer, id, InboundSession { state })
+                        .handle(stream, peer, id, InboundSession { state, conn })
                         .await
                     {
                         stats.failed.fetch_add(1, Ordering::Relaxed);
@@ -1137,7 +1538,9 @@ impl Server {
         compiled: &InboundRuntime,
     ) -> Result<Secured, String> {
         match security {
-            zero_config::InboundSecurity::None => Ok(Secured::Stream(boxed(stream))),
+            zero_config::InboundSecurity::None => {
+                Ok(Secured::Stream(boxed(stream), ConnInfo::default()))
+            }
             zero_config::InboundSecurity::Tls(_) => {
                 let config = match &compiled.tls {
                     Some(Ok(config)) => Arc::clone(config),
@@ -1148,7 +1551,17 @@ impl Server {
                 };
                 zero_security::server::accept(stream, config)
                     .await
-                    .map(|stream| Secured::Stream(boxed(stream)))
+                    .map(|stream| {
+                        let session = stream.get_ref().1;
+                        let conn = ConnInfo {
+                            server_name: session.server_name().map(Arc::from),
+                            alpn: session.alpn_protocol().map(Arc::from),
+                            original: None,
+                            local: None,
+                            direct: None,
+                        };
+                        Secured::Stream(boxed(stream), conn)
+                    })
                     .map_err(|error| format!("inbound TLS handshake failed: {error}"))
             }
             zero_config::InboundSecurity::Reality(_) => {
@@ -1158,7 +1571,7 @@ impl Server {
                     .ok_or_else(|| "inbound REALITY configuration is missing".to_string())?;
                 match zero_security::tls13::server::handshake_or_fallback(stream, params).await {
                     zero_security::tls13::server::HandshakeOutcome::Accepted(stream) => {
-                        Ok(Secured::Stream(boxed(stream)))
+                        Ok(Secured::Stream(boxed(stream), ConnInfo::default()))
                     }
                     zero_security::tls13::server::HandshakeOutcome::Fallback {
                         stream,
@@ -1186,6 +1599,7 @@ impl Server {
         client_hello: Vec<u8>,
         failure: String,
         peer: SocketAddr,
+        local: Option<SocketAddr>,
         security: &zero_config::InboundSecurity,
     ) {
         let zero_config::InboundSecurity::Reality(reality) = security else {
@@ -1216,6 +1630,16 @@ impl Server {
                 return;
             }
         };
+        // The target learns who is really connecting, if it asked to.
+        if reality.fallback_xver != 0 {
+            let header =
+                zero_protocol::proxy_protocol::encode(reality.fallback_xver, Some(peer), local);
+            if let Err(error) = remote.write_all(&header).await {
+                self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                debug!(%peer, error = %error, "REALITY fallback PROXY header failed");
+                return;
+            }
+        }
         if let Err(error) = remote.write_all(&client_hello).await {
             self.stats.failed.fetch_add(1, Ordering::Relaxed);
             debug!(%peer, error = %error, "REALITY fallback ClientHello replay failed");
@@ -1226,7 +1650,23 @@ impl Server {
             debug!(%peer, error = %error, "REALITY fallback flush failed");
             return;
         }
-        let outcome = relay(boxed(stream), remote).await;
+        // An unauthenticated visitor is held to the configured rates, so a
+        // probe cannot pull a large file through us from the target or push
+        // traffic at it.
+        let limit = |limit: zero_config::FallbackLimit| crate::throttle::Limit {
+            after_bytes: limit.after_bytes,
+            bytes_per_sec: limit.bytes_per_sec,
+            burst: limit.burst_bytes_per_sec,
+        };
+        let client = boxed(crate::throttle::Throttle::new(
+            stream,
+            limit(reality.fallback_limit_up),
+        ));
+        let remote = boxed(crate::throttle::Throttle::new(
+            remote,
+            limit(reality.fallback_limit_down),
+        ));
+        let outcome = relay(client, remote).await;
         self.stats
             .uploaded
             .fetch_add(outcome.transferred.uploaded, Ordering::Relaxed);
@@ -1346,7 +1786,7 @@ impl Server {
             // every other connection waiting behind it in the accept queue.
             let me = Arc::clone(&self);
             tokio::spawn(async move {
-                let connection = match timeout(HANDSHAKE_TIMEOUT, incoming).await {
+                let connection = match timeout(handshake_timeout(), incoming).await {
                     Ok(Ok(connection)) => connection,
                     Ok(Err(error)) => {
                         debug!(%error, "HTTP/3 connection failed");
@@ -1359,7 +1799,7 @@ impl Server {
                 };
                 let peer = connection.remote_address();
                 let mut h3_connection = match timeout(
-                    HANDSHAKE_TIMEOUT,
+                    handshake_timeout(),
                     h3::server::Connection::new(h3_quinn::Connection::new(connection)),
                 )
                 .await
@@ -1436,6 +1876,7 @@ impl Server {
                     let stats = Arc::clone(&me.stats);
                     let session = InboundSession {
                         state: Arc::clone(&state),
+                        conn: ConnInfo::default(),
                     };
                     tokio::spawn(async move {
                         let _active = ActiveGuard::new(Arc::clone(&stats));
@@ -1455,6 +1896,20 @@ impl Server {
         id: InboundId,
     ) {
         let mut acceptor = zero_transport::hysteria2::Acceptor::new(endpoint);
+        // The website a visitor without credentials sees, from the
+        // configuration this inbound started with.
+        if let Some(InboundProtocol::Hysteria2(config)) = self
+            .state
+            .load()
+            .config
+            .inbounds
+            .get(id.0 as usize)
+            .map(|inbound| &inbound.protocol)
+        {
+            if let Some(masquerade) = config.masquerade.as_ref().map(hysteria_masquerade) {
+                acceptor = acceptor.with_masquerade(masquerade);
+            }
+        }
         loop {
             let state = self.state.load_full();
             let Some(inbound) = state.config.inbounds.get(id.0 as usize) else {
@@ -1630,6 +2085,136 @@ impl Server {
             .unwrap_or_default()
     }
 
+    /// A session for a connection `peer` made to inbound `id`.
+    ///
+    /// `local` is the inbound's own address as configured (a wildcard bind
+    /// has no single address, so only the port is known then); it is what
+    /// `localIP` and `localPort` routing rules are matched against.
+    fn new_context(
+        &self,
+        id: InboundId,
+        tag: Arc<str>,
+        destination: Destination,
+        peer: SocketAddr,
+    ) -> SessionContext {
+        let state = self.state.load();
+        let mut ctx = SessionContext::new(state.generation, id, tag, destination).with_source(peer);
+        ctx.local = state.config.inbounds.get(id.0 as usize).map(|inbound| {
+            let ip = inbound
+                .listen
+                .as_ip()
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            SocketAddr::new(ip, inbound.port)
+        });
+        ctx
+    }
+
+    /// What inbound `id` of the running generation asks to sniff.
+    fn sniffing_of(&self, id: InboundId) -> Sniffing {
+        self.state
+            .load()
+            .config
+            .inbounds
+            .get(id.0 as usize)
+            .map(|inbound| inbound.sniffing.clone())
+            .unwrap_or_default()
+    }
+
+    /// Where `decision` sends a session, and the connection there. `None`
+    /// when the session is blocked (a block rule, or a black-hole outbound).
+    /// The tag of the outbound that carried it comes back too, so the caller
+    /// can report how it went; a direct-via-resolver connection has none.
+    ///
+    /// This is the one place server-side inbounds (VLESS, Trojan, VMess,
+    /// Shadowsocks, AnyTLS, Hysteria 2) turn a verdict into a connection, so
+    /// they share failover between a balancer's members with the proxy
+    /// inbounds.
+    async fn connect_decided(
+        &self,
+        decision: Decision,
+        destination: &Destination,
+        client: Option<SocketAddr>,
+    ) -> Result<Option<(Option<Arc<str>>, zero_core::BoxStream)>, String> {
+        let connect = self.connect_decided_for(decision, destination);
+        match client {
+            Some(client) => outbound::with_client_addr(client, connect).await,
+            None => connect.await,
+        }
+    }
+
+    async fn connect_decided_for(
+        &self,
+        decision: Decision,
+        destination: &Destination,
+    ) -> Result<Option<(Option<Arc<str>>, zero_core::BoxStream)>, String> {
+        match decision {
+            Decision::Block => {
+                self.stats.blocked.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            }
+            Decision::DirectVia { resolver } => {
+                let resolver = self.resolver().for_tag(&resolver);
+                outbound::connect_direct_with_resolver(
+                    destination,
+                    &zero_config::StreamSettings::default(),
+                    &resolver,
+                )
+                .await
+                .map(|stream| Some((None, stream)))
+                .map_err(|error| error.to_string())
+            }
+            Decision::Outbound(tag) | Decision::Balancer(tag) => {
+                match self.connect_balanced(&tag, destination).await? {
+                    Some((outbound, stream)) => Ok(Some((Some(outbound.tag), stream))),
+                    None => {
+                        self.stats.blocked.fetch_add(1, Ordering::Relaxed);
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read the first bytes the client sends, when its inbound sniffs, and
+    /// let them inform `ctx` (and rewrite `destination` to the sniffed name,
+    /// unless the inbound is `routeOnly` or the name is excluded). The bytes
+    /// are put back in front of the stream, so the destination sees them.
+    ///
+    /// Nothing is read when sniffing is off, so a server-speaks-first
+    /// protocol pays no wait. BitTorrent is recognised from the first bytes
+    /// on any destination; names are only taken for a bare address, because
+    /// a destination the client already named needs no help.
+    async fn sniff_client(
+        &self,
+        ctx: &mut SessionContext,
+        destination: &mut Destination,
+        client: zero_core::BoxStream,
+        sniffing: &Sniffing,
+    ) -> zero_core::BoxStream {
+        if !sniffing.enabled {
+            return client;
+        }
+        let mut client = client;
+        let probe = sniff_probe(&mut client).await;
+        let mut sniffed = sniffing.inspect(&probe);
+        if let Some(domain) = sniffed.domain.as_deref() {
+            if sniffing.excludes(domain) {
+                // An excluded name keeps its protocol label but never
+                // steers the connection.
+                sniffed.domain = None;
+            }
+        }
+        if sniffed.domain.is_some() || sniffed.protocol.is_some() {
+            ctx.apply_sniff(sniffed, !sniffing.route_only);
+            *destination = ctx.destination.clone();
+        }
+        if probe.is_empty() {
+            client
+        } else {
+            boxed(ChainedStream::new(probe, client))
+        }
+    }
+
     fn router(&self) -> Arc<Router> {
         Arc::clone(&self.state.load_full().router)
     }
@@ -1695,10 +2280,35 @@ impl Server {
         let sniffing = &inbound.sniffing;
         match &inbound.protocol {
             InboundProtocol::Vless(config) => {
-                return self.handle_vless(stream, peer, id, tag, config).await;
+                // VLESS Encryption wraps the whole VLESS exchange, request
+                // header included, so it is undone first.
+                let mut direct = None;
+                let stream = match session
+                    .state
+                    .inbounds
+                    .get(id.0 as usize)
+                    .and_then(|compiled| compiled.vless_encryption.as_ref())
+                {
+                    None => stream,
+                    Some(Err(error)) => return Err(error.clone()),
+                    Some(Ok(server)) => {
+                        let encrypted = within_handshake(server.handshake(stream))
+                            .await?
+                            .map_err(|error| format!("VLESS Encryption handshake: {error}"))?;
+                        direct = Some(encrypted.direct_flag());
+                        boxed(encrypted)
+                    }
+                };
+                let mut conn = session.conn.clone();
+                conn.direct = direct;
+                return self
+                    .handle_vless(stream, peer, id, tag, config, &conn)
+                    .await;
             }
             InboundProtocol::Trojan(config) => {
-                return self.handle_trojan(stream, peer, id, tag, config).await;
+                return self
+                    .handle_trojan(stream, peer, id, tag, config, &session.conn)
+                    .await;
             }
             InboundProtocol::Vmess(config) => {
                 return self.handle_vmess(stream, peer, id, tag, config).await;
@@ -1716,6 +2326,14 @@ impl Server {
                     .get(id.0 as usize)
                     .and_then(|compiled| compiled.tide.clone())
                     .ok_or_else(|| "inbound Tide configuration is missing".to_string())?;
+                // The streams of a Tide session have no one peer, so the
+                // usage figures count its connection. Behind REALITY that
+                // connection is already a proven client; behind a plain
+                // certificate any prober reaches this point, so it is not
+                // counted there.
+                if matches!(inbound.security, zero_config::InboundSecurity::Reality(_)) {
+                    crate::usage::confirm_current();
+                }
                 return self.handle_tide(stream, id, tag, tide).await;
             }
             InboundProtocol::TideRelay(_) => {
@@ -1730,12 +2348,12 @@ impl Server {
                     .await
                     .map_err(|error| format!("Tide relay connection: {error}"));
             }
-            InboundProtocol::Dokodemo {
-                target: Some(target),
-                network: Network::Tcp,
-            } => {
+            InboundProtocol::Dokodemo { tcp: true, .. } => {
+                let Some(destination) = inbound.dokodemo_destination(session.conn.original) else {
+                    return Err("no destination: the connection was not redirected".into());
+                };
                 return self
-                    .handle_dokodemo_tcp(stream, peer, id, tag, target.clone())
+                    .handle_dokodemo_tcp(stream, peer, id, tag, destination)
                     .await;
             }
             _ => {}
@@ -1840,11 +2458,9 @@ impl Server {
             }
         }
 
-        let mut ctx = SessionContext::new(self.generation(), id, tag, accepted.destination.clone())
-            .with_source(peer);
+        let mut ctx = self.new_context(id, tag, accepted.destination.clone(), peer);
         if sniffing.enabled {
-            let sniffed =
-                zero_core::sniff::inspect(&probe, sniffing.sniff_http, sniffing.sniff_tls);
+            let sniffed = sniffing.inspect(&probe);
             if sniffed.domain.is_some() || sniffed.protocol.is_some() {
                 ctx.apply_sniff(sniffed, !sniffing.route_only);
                 accepted.destination = ctx.destination.clone();
@@ -1863,8 +2479,20 @@ impl Server {
             }
             Decision::Outbound(tag) | Decision::Balancer(tag) => {
                 ctx.outbound = None;
-                let Some((ob, remote)) = self.connect_balanced(&tag, &accepted.destination).await?
-                else {
+                let connected = outbound::with_client_addr(
+                    peer,
+                    self.connect_balanced(&tag, &accepted.destination),
+                )
+                .await;
+                let connected = match connected {
+                    Ok(connected) => connected,
+                    Err(error) => {
+                        self.finish_unreachable(&mut stream, &accepted, replied)
+                            .await;
+                        return Err(error);
+                    }
+                };
+                let Some((ob, remote)) = connected else {
                     self.stats.blocked.fetch_add(1, Ordering::Relaxed);
                     self.finish_handshake(&mut stream, &accepted, false, replied)
                         .await;
@@ -1918,13 +2546,20 @@ impl Server {
             }
             Decision::DirectVia { resolver } => {
                 let resolver = self.resolver().for_tag(&resolver);
-                let remote = outbound::connect_direct_with_resolver(
+                let remote = match outbound::connect_direct_with_resolver(
                     &accepted.destination,
                     &zero_config::StreamSettings::default(),
                     &resolver,
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        self.finish_unreachable(&mut stream, &accepted, replied)
+                            .await;
+                        return Err(error.to_string());
+                    }
+                };
                 self.finish_handshake(&mut stream, &accepted, true, replied)
                     .await;
                 let mut remote = remote;
@@ -2092,12 +2727,10 @@ impl Server {
             .unwrap_or_default();
         let mut stream = stream;
         let mut prefetched = Vec::new();
-        let mut ctx =
-            SessionContext::new(self.generation(), id, tag, destination.clone()).with_source(peer);
+        let mut ctx = self.new_context(id, tag, destination.clone(), peer);
         if sniffing.enabled && destination.address.is_ip() {
             prefetched = sniff_probe(&mut stream).await;
-            let sniffed =
-                zero_core::sniff::inspect(&prefetched, sniffing.sniff_http, sniffing.sniff_tls);
+            let sniffed = sniffing.inspect(&prefetched);
             if sniffed.domain.is_some() || sniffed.protocol.is_some() {
                 // The name is for routing only. A flow to a bare IP belongs to
                 // an application that chose that address itself (its own DNS,
@@ -2144,44 +2777,20 @@ impl Server {
                 .map_err(|error| error.to_string())?
             }
             Decision::Outbound(outbound_tag) | Decision::Balancer(outbound_tag) => {
-                let outbound = self
-                    .pick_outbound(&outbound_tag)
-                    .ok_or_else(|| format!("no usable outbound for {outbound_tag:?}"))?;
+                // The same failover the proxy inbounds have: a member that
+                // cannot be reached is noted and the next one tried, so a
+                // VPN's sessions do not all go to the one that is broken.
+                let Some((outbound, stream)) = outbound::with_client_addr(
+                    peer,
+                    self.connect_balanced(&outbound_tag, &destination),
+                )
+                .await?
+                else {
+                    self.stats.blocked.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                };
                 health_tag = Some(outbound.tag.clone());
-                match &outbound.protocol {
-                    OutboundProtocol::Freedom { .. } => outbound::connect_direct_with_resolver(
-                        &destination,
-                        &outbound.stream,
-                        &self.resolver(),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?,
-                    OutboundProtocol::Vless(_)
-                    | OutboundProtocol::Trojan(_)
-                    | OutboundProtocol::Shadowsocks(_)
-                    | OutboundProtocol::Vmess(_)
-                    | OutboundProtocol::AnyTls(_)
-                    | OutboundProtocol::Socks(_)
-                    | OutboundProtocol::Tor(_)
-                    | OutboundProtocol::MasterDns(_)
-                    | OutboundProtocol::Tide(_)
-                    | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_)
-                    | OutboundProtocol::Juicity(_)
-                    | OutboundProtocol::AmneziaWireguard(_) => {
-                        let stream = self
-                            .open_outbound(&outbound, &destination)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        outbound::strip_response(&outbound, stream)
-                    }
-                    other => {
-                        return Err(format!(
-                            "{} cannot carry a dokodemo TCP session",
-                            other.name()
-                        ))
-                    }
-                }
+                stream
             }
         };
         let outcome = relay(stream, remote).await;
@@ -2359,22 +2968,34 @@ impl Server {
         if let Some(udp) = parts.udp {
             let me = Arc::clone(&self);
             let udp_tag = tag.clone();
-            let udp_device = Arc::clone(&device);
+            let udp_device: Arc<dyn PacketOut> = device.clone();
             tokio::spawn(async move {
                 me.serve_tun_udp(udp, id, udp_tag, udp_device).await;
             });
         }
-        let Some(mut tcp) = parts.tcp else {
+        let Some(tcp) = parts.tcp else {
             // A UDP-only TUN remains useful for DNS and datagram transports.
             std::future::pending::<()>().await;
             return;
         };
         info!(%tag, device = %config.name, "TUN userspace stack started");
-        // `local` is the address the application connected *from* and `remote`
-        // is the one it was trying to reach — the netstack names them from its
-        // own point of view, which is the opposite of a listening socket's.
-        // Proxying to the wrong one sends every session back to the machine it
-        // came from, and does so without any error to notice.
+        self.serve_netstack_tcp(tcp, id, tag).await;
+    }
+
+    /// Route the TCP connections a userspace stack terminates (TUN or
+    /// WireGuard), each as a session of inbound `id`.
+    ///
+    /// `local` is the address the application connected *from* and `remote`
+    /// is the one it was trying to reach — the netstack names them from its
+    /// own point of view, which is the opposite of a listening socket's.
+    /// Proxying to the wrong one sends every session back to the machine it
+    /// came from, and does so without any error to notice.
+    async fn serve_netstack_tcp(
+        self: Arc<Self>,
+        mut tcp: zero_tun::TcpListener,
+        id: InboundId,
+        tag: Arc<str>,
+    ) {
         while let Some((stream, source, destination)) = tcp.next().await {
             let me = Arc::clone(&self);
             let session_tag = tag.clone();
@@ -2389,10 +3010,93 @@ impl Server {
                     )
                     .await
                 {
-                    debug!(%error, "TUN TCP session failed");
+                    debug!(%error, "userspace stack TCP session failed");
                 }
             });
         }
+    }
+
+    /// Serve a WireGuard inbound: the peers' packets, decrypted, go into a
+    /// userspace stack that terminates their TCP and UDP exactly as a TUN
+    /// device's would be, and what the stack answers goes back out to the
+    /// peer that owns the destination address.
+    async fn serve_wireguard(
+        self: Arc<Self>,
+        socket: UdpSocket,
+        id: InboundId,
+        tag: Arc<str>,
+        config: zero_config::WireGuardInboundConfig,
+    ) {
+        let parts = match zero_tun::build_netstack(zero_tun::NetstackConfig {
+            mtu: config.mtu,
+            enable_tcp: true,
+            enable_udp: true,
+            enable_icmp: true,
+        }) {
+            Ok(parts) => parts,
+            Err(error) => {
+                self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                error!(%error, %tag, "WireGuard userspace stack failed to build");
+                return;
+            }
+        };
+        let peers = config
+            .peers
+            .iter()
+            .map(|peer| zero_protocol::wg_server::PeerSpec {
+                public_key: peer.public_key,
+                preshared_key: peer.preshared_key,
+                allowed: peer
+                    .allowed_ips
+                    .iter()
+                    .map(|cidr| (cidr.addr, cidr.prefix))
+                    .collect(),
+                keepalive: peer.keepalive,
+            })
+            .collect();
+        let mut link = zero_protocol::wg_server::serve(Arc::new(socket), config.secret_key, peers);
+        let (mut sink, mut stream) = parts.stack.split();
+        if let Some(runner) = parts.runner {
+            tokio::spawn(async move {
+                if let Err(error) = runner.await {
+                    debug!(%error, "WireGuard userspace stack stopped");
+                }
+            });
+        }
+        // Peers to stack.
+        tokio::spawn(async move {
+            while let Some(packet) = link.from_peers.recv().await {
+                match sink.send(packet).await {
+                    Ok(()) => {}
+                    // A packet the stack cannot parse is dropped; only a
+                    // closed stack ends the loop.
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+                    Err(_) => return,
+                }
+            }
+        });
+        // Stack to peers.
+        let to_peers = link.to_peers.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(packet)) = stream.next().await {
+                if to_peers.send(packet).await.is_err() {
+                    return;
+                }
+            }
+        });
+        if let Some(udp) = parts.udp {
+            let me = Arc::clone(&self);
+            let udp_tag = tag.clone();
+            let out: Arc<dyn PacketOut> = Arc::new(link.to_peers.clone());
+            tokio::spawn(async move {
+                me.serve_tun_udp(udp, id, udp_tag, out).await;
+            });
+        }
+        if let Some(tcp) = parts.tcp {
+            info!(%tag, peers = config.peers.len(), "WireGuard userspace stack started");
+            self.serve_netstack_tcp(tcp, id, tag).await;
+        }
+        link.task.abort();
     }
 
     async fn serve_tun_udp(
@@ -2400,7 +3104,7 @@ impl Server {
         udp: zero_tun::UdpSocket,
         id: InboundId,
         tag: Arc<str>,
-        device: Arc<zero_tun::TunDevice>,
+        device: Arc<dyn PacketOut>,
     ) {
         let sniff = self.sniff_policy(id);
         let (mut reader, mut writer) = udp.split();
@@ -2419,7 +3123,7 @@ impl Server {
                     if let Dispatch::Rejected(payload) =
                         relay.dispatch((source, target), source, destination, payload).await
                     {
-                        reject_udp(&device, source, target, &payload).await;
+                        reject_udp(&*device, source, target, &payload).await;
                     }
                 }
                 Some(reply) = replies.recv() => {
@@ -2492,6 +3196,76 @@ impl Server {
         }
     }
 
+    /// The UDP side of a TPROXY dokodemo inbound. Each datagram says where
+    /// its client was really sending it, so a flow is the pair (client,
+    /// destination), and the answer is sent from a socket bound to that
+    /// destination or the client would not accept it.
+    async fn serve_tproxy_udp(
+        self: Arc<Self>,
+        socket: zero_net::transparent::TransparentUdp,
+        id: InboundId,
+        tag: Arc<str>,
+    ) {
+        type Flow = (SocketAddr, SocketAddr);
+        let (mut relay, mut replies) =
+            UdpRelay::<Flow>::new(Arc::clone(&self), id, tag, 4096, self.sniff_policy(id));
+        let mut senders: HashMap<SocketAddr, UdpSocket> = HashMap::new();
+        let mut buffer = vec![0u8; 65_535];
+        loop {
+            tokio::select! {
+                received = socket.recv(&mut buffer) => {
+                    let (len, client, original) = match received {
+                        Ok(value) => value,
+                        Err(error) if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+                        ) => continue,
+                        Err(error) => {
+                            error!(%error, "tproxy UDP receive failed");
+                            return;
+                        }
+                    };
+                    let destination = Destination::udp(Address::Ip(original.ip()), original.port());
+                    relay
+                        .dispatch((client, original), client, destination, buffer[..len].to_vec())
+                        .await;
+                }
+                Some(reply) = replies.recv() => {
+                    let (client, original) = reply.key;
+                    if !senders.contains_key(&original) {
+                        // One socket per destination; a client scanning a
+                        // range must not grow this without bound.
+                        if senders.len() >= 256 {
+                            senders.clear();
+                        }
+                        match zero_net::transparent::reply_socket(original) {
+                            Ok(sender) => {
+                                senders.insert(original, sender);
+                            }
+                            Err(error) => {
+                                self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                                debug!(%original, %error, "tproxy UDP reply socket failed");
+                                continue;
+                            }
+                        }
+                    }
+                    match senders[&original].send_to(&reply.payload, client).await {
+                        Ok(_) => {
+                            self.stats
+                                .downloaded
+                                .fetch_add(reply.payload.len() as u64, Ordering::Relaxed);
+                            self.stats.succeeded.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(error) => {
+                            self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                            debug!(%client, %error, "tproxy UDP reply failed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn handle_vmess(
         self: Arc<Self>,
         stream: zero_core::BoxStream,
@@ -2516,66 +3290,32 @@ impl Server {
                 .handle_vmess_udp(accepted.stream, peer, id, tag, accepted.destination)
                 .await;
         }
-        let destination = self.restore_fake_destination(&accepted.destination).await;
-        let ctx =
-            SessionContext::new(self.generation(), id, tag, destination.clone()).with_source(peer);
-        let remote = match self.route(&ctx).await {
-            Decision::Block => {
-                self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
-            Decision::DirectVia { resolver } => {
-                let resolver = self.resolver().for_tag(&resolver);
-                outbound::connect_direct_with_resolver(
-                    &destination,
-                    &zero_config::StreamSettings::default(),
-                    &resolver,
-                )
-                .await
-                .map_err(|error| error.to_string())?
-            }
-            Decision::Outbound(outbound_tag) | Decision::Balancer(outbound_tag) => {
-                let outbound = self
-                    .pick_outbound(&outbound_tag)
-                    .ok_or_else(|| format!("no usable outbound for {outbound_tag:?}"))?;
-                match &outbound.protocol {
-                    OutboundProtocol::Freedom { .. } => outbound::connect_direct_with_resolver(
-                        &destination,
-                        &outbound.stream,
-                        &self.resolver(),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?,
-                    OutboundProtocol::Vless(_)
-                    | OutboundProtocol::Trojan(_)
-                    | OutboundProtocol::Shadowsocks(_)
-                    | OutboundProtocol::Vmess(_)
-                    | OutboundProtocol::AnyTls(_)
-                    | OutboundProtocol::Socks(_)
-                    | OutboundProtocol::Tor(_)
-                    | OutboundProtocol::MasterDns(_)
-                    | OutboundProtocol::Tide(_)
-                    | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_)
-                    | OutboundProtocol::Juicity(_)
-                    | OutboundProtocol::AmneziaWireguard(_) => {
-                        let stream = self
-                            .open_outbound(&outbound, &destination)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        outbound::strip_response(&outbound, stream)
-                    }
-                    OutboundProtocol::Blackhole => {
-                        self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                        return Ok(());
-                    }
-                    other => {
-                        return Err(format!("{} cannot carry a VMess TCP session", other.name()))
-                    }
-                }
-            }
+        let mut destination = self.restore_fake_destination(&accepted.destination).await;
+        let mut ctx = self.new_context(id, tag, destination.clone(), peer);
+        ctx.user = config
+            .users
+            .get(accepted.user)
+            .and_then(|user| user.email.clone());
+        let sniffing = self.sniffing_of(id);
+        let client = self
+            .sniff_client(
+                &mut ctx,
+                &mut destination,
+                boxed(accepted.stream),
+                &sniffing,
+            )
+            .await;
+        let decision = self.route(&ctx).await;
+        let Some((health, remote)) = self
+            .connect_decided(decision, &destination, Some(peer))
+            .await?
+        else {
+            return Ok(());
         };
-        let outcome = relay(boxed(accepted.stream), remote).await;
+        let outcome = relay(client, remote).await;
+        if let Some(tag) = &health {
+            self.record_outbound_observation(tag, &outcome);
+        }
         self.record_observation(&outcome).await;
         self.stats
             .record_tag_traffic(&ctx.inbound_tag, None, &outcome.transferred);
@@ -2612,15 +3352,22 @@ impl Server {
     /// is an ordinary connection to a website, and those last.
     async fn fall_back(
         &self,
-        fallback: Option<&(Address, u16)>,
+        fallbacks: &[zero_config::FallbackRule],
+        conn: &ConnInfo,
         stream: zero_core::BoxStream,
         seen: Vec<u8>,
         peer: SocketAddr,
         reason: String,
     ) -> Result<(), String> {
-        let Some((address, port)) = fallback else {
+        let probe = zero_config::FallbackProbe {
+            server_name: conn.server_name.as_deref(),
+            alpn: conn.alpn.as_deref(),
+            first_bytes: &seen,
+        };
+        let Some(rule) = zero_config::select_fallback(fallbacks, &probe) else {
             return Err(reason);
         };
+        let (address, port) = &rule.dest;
         self.stats.failed.fetch_add(1, Ordering::Relaxed);
         let destination = Destination::tcp(address.clone(), *port);
         let mut remote = outbound::connect_direct_with_resolver(
@@ -2632,8 +3379,16 @@ impl Server {
         .map_err(|error| {
             format!("{reason}; and the fallback {destination} is unreachable: {error}")
         })?;
+        // The web server behind learns who is really asking, if it wants to;
+        // the header and the first bytes go out together, as one segment.
+        let mut first = if rule.xver != 0 {
+            zero_protocol::proxy_protocol::encode(rule.xver, Some(peer), conn.local)
+        } else {
+            Vec::new()
+        };
+        first.extend_from_slice(&seen);
         remote
-            .write_all(&seen)
+            .write_all(&first)
             .await
             .map_err(|error| format!("{reason}; and writing to the fallback failed: {error}"))?;
         debug!(%peer, %reason, to = %destination, "unauthenticated connection handed to the fallback");
@@ -2759,69 +3514,23 @@ impl Server {
             within_handshake(zero_protocol::anytls::server_handshake(stream, &passwords))
                 .await?
                 .map_err(|error| format!("AnyTLS handshake: {error}"))?;
-        let destination = self.restore_fake_destination(&announced).await;
-        let ctx =
-            SessionContext::new(self.generation(), id, tag, destination.clone()).with_source(peer);
-        let remote = match self.route(&ctx).await {
-            Decision::Block => {
-                self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
-            Decision::DirectVia { resolver } => {
-                let resolver = self.resolver().for_tag(&resolver);
-                outbound::connect_direct_with_resolver(
-                    &destination,
-                    &zero_config::StreamSettings::default(),
-                    &resolver,
-                )
-                .await
-                .map_err(|error| error.to_string())?
-            }
-            Decision::Outbound(outbound_tag) | Decision::Balancer(outbound_tag) => {
-                let outbound = self
-                    .pick_outbound(&outbound_tag)
-                    .ok_or_else(|| format!("no usable outbound for {outbound_tag:?}"))?;
-                match &outbound.protocol {
-                    OutboundProtocol::Freedom { .. } => outbound::connect_direct_with_resolver(
-                        &destination,
-                        &outbound.stream,
-                        &self.resolver(),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?,
-                    OutboundProtocol::Vless(_)
-                    | OutboundProtocol::Trojan(_)
-                    | OutboundProtocol::Shadowsocks(_)
-                    | OutboundProtocol::Vmess(_)
-                    | OutboundProtocol::AnyTls(_)
-                    | OutboundProtocol::Socks(_)
-                    | OutboundProtocol::Tor(_)
-                    | OutboundProtocol::MasterDns(_)
-                    | OutboundProtocol::Tide(_)
-                    | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_)
-                    | OutboundProtocol::Juicity(_)
-                    | OutboundProtocol::AmneziaWireguard(_) => {
-                        let stream = self
-                            .open_outbound(&outbound, &destination)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        outbound::strip_response(&outbound, stream)
-                    }
-                    OutboundProtocol::Blackhole => {
-                        self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                        return Ok(());
-                    }
-                    other => {
-                        return Err(format!(
-                            "{} cannot carry an AnyTLS TCP session",
-                            other.name()
-                        ))
-                    }
-                }
-            }
+        let mut destination = self.restore_fake_destination(&announced).await;
+        let mut ctx = self.new_context(id, tag, destination.clone(), peer);
+        let sniffing = self.sniffing_of(id);
+        let client = self
+            .sniff_client(&mut ctx, &mut destination, boxed(stream), &sniffing)
+            .await;
+        let decision = self.route(&ctx).await;
+        let Some((health, remote)) = self
+            .connect_decided(decision, &destination, Some(peer))
+            .await?
+        else {
+            return Ok(());
         };
-        let outcome = relay(boxed(stream), remote).await;
+        let outcome = relay(client, remote).await;
+        if let Some(tag) = &health {
+            self.record_outbound_observation(tag, &outcome);
+        }
         self.record_observation(&outcome).await;
         self.stats
             .uploaded
@@ -2853,69 +3562,23 @@ impl Server {
         tag: Arc<str>,
         destination: Destination,
     ) -> Result<(), String> {
-        let destination = self.restore_fake_destination(&destination).await;
-        let ctx =
-            SessionContext::new(self.generation(), id, tag, destination.clone()).with_source(peer);
-        let remote = match self.route(&ctx).await {
-            Decision::Block => {
-                self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
-            Decision::DirectVia { resolver } => {
-                let resolver = self.resolver().for_tag(&resolver);
-                outbound::connect_direct_with_resolver(
-                    &destination,
-                    &zero_config::StreamSettings::default(),
-                    &resolver,
-                )
-                .await
-                .map_err(|error| error.to_string())?
-            }
-            Decision::Outbound(outbound_tag) | Decision::Balancer(outbound_tag) => {
-                let outbound = self
-                    .pick_outbound(&outbound_tag)
-                    .ok_or_else(|| format!("no usable outbound for {outbound_tag:?}"))?;
-                match &outbound.protocol {
-                    OutboundProtocol::Freedom { .. } => outbound::connect_direct_with_resolver(
-                        &destination,
-                        &outbound.stream,
-                        &self.resolver(),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?,
-                    OutboundProtocol::Vless(_)
-                    | OutboundProtocol::Trojan(_)
-                    | OutboundProtocol::Shadowsocks(_)
-                    | OutboundProtocol::Vmess(_)
-                    | OutboundProtocol::AnyTls(_)
-                    | OutboundProtocol::Socks(_)
-                    | OutboundProtocol::Tor(_)
-                    | OutboundProtocol::MasterDns(_)
-                    | OutboundProtocol::Tide(_)
-                    | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_)
-                    | OutboundProtocol::Juicity(_)
-                    | OutboundProtocol::AmneziaWireguard(_) => {
-                        let stream = self
-                            .open_outbound(&outbound, &destination)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        outbound::strip_response(&outbound, stream)
-                    }
-                    OutboundProtocol::Blackhole => {
-                        self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                        return Ok(());
-                    }
-                    other => {
-                        return Err(format!(
-                            "{} cannot carry a Hysteria2 TCP session",
-                            other.name()
-                        ))
-                    }
-                }
-            }
+        let mut destination = self.restore_fake_destination(&destination).await;
+        let mut ctx = self.new_context(id, tag, destination.clone(), peer);
+        let sniffing = self.sniffing_of(id);
+        let client = self
+            .sniff_client(&mut ctx, &mut destination, boxed(stream), &sniffing)
+            .await;
+        let decision = self.route(&ctx).await;
+        let Some((health, remote)) = self
+            .connect_decided(decision, &destination, Some(peer))
+            .await?
+        else {
+            return Ok(());
         };
-        let outcome = relay(boxed(stream), remote).await;
+        let outcome = relay(client, remote).await;
+        if let Some(tag) = &health {
+            self.record_outbound_observation(tag, &outcome);
+        }
         self.record_observation(&outcome).await;
         self.stats
             .uploaded
@@ -2958,8 +3621,7 @@ impl Server {
             destination: destination.clone(),
             payload,
         };
-        let ctx =
-            SessionContext::new(self.generation(), id, tag, destination.clone()).with_source(peer);
+        let ctx = self.new_context(id, tag, destination.clone(), peer);
         let decision = self.route(&ctx).await;
         let resolver = match &decision {
             Decision::DirectVia { resolver } => Arc::new(self.resolver().for_tag(resolver)),
@@ -2979,13 +3641,13 @@ impl Server {
         };
         let (response_destination, response) = if let Some(outbound) = proxy {
             if matches!(outbound.protocol, OutboundProtocol::Freedom { .. }) {
-                self.direct_udp(&resolver, &datagram, &outbound.stream.evasion.udp_noise)
+                self.direct_udp(&resolver, &datagram, Some(&outbound.stream))
                     .await?
             } else {
                 self.proxy_udp(&outbound, &datagram).await?
             }
         } else {
-            self.direct_udp(&resolver, &datagram, &[]).await?
+            self.direct_udp(&resolver, &datagram, None).await?
         };
         let frame = zero_transport::hysteria2::encode_udp_datagram(
             session_id,
@@ -3023,8 +3685,7 @@ impl Server {
             destination: destination.clone(),
             payload,
         };
-        let ctx =
-            SessionContext::new(self.generation(), id, tag, destination.clone()).with_source(peer);
+        let ctx = self.new_context(id, tag, destination.clone(), peer);
         let decision = self.route(&ctx).await;
         let resolver = match &decision {
             Decision::DirectVia { resolver } => Arc::new(self.resolver().for_tag(resolver)),
@@ -3043,13 +3704,13 @@ impl Server {
         };
         let (response_destination, response) = if let Some(outbound) = proxy {
             if matches!(outbound.protocol, OutboundProtocol::Freedom { .. }) {
-                self.direct_udp(&resolver, &datagram, &outbound.stream.evasion.udp_noise)
+                self.direct_udp(&resolver, &datagram, Some(&outbound.stream))
                     .await?
             } else {
                 self.proxy_udp(&outbound, &datagram).await?
             }
         } else {
-            self.direct_udp(&resolver, &datagram, &[]).await?
+            self.direct_udp(&resolver, &datagram, None).await?
         };
         let max_datagram = connection
             .max_datagram_size()
@@ -3093,8 +3754,7 @@ impl Server {
         destination: Destination,
     ) -> Result<(), String> {
         let destination = self.restore_fake_destination(&destination).await;
-        let ctx =
-            SessionContext::new(self.generation(), id, tag, destination.clone()).with_source(peer);
+        let ctx = self.new_context(id, tag, destination.clone(), peer);
         let decision = self.route(&ctx).await;
         let outbound = match decision {
             Decision::Block => {
@@ -3168,7 +3828,7 @@ impl Server {
                 .ok_or_else(|| "resolver returned no VMess UDP destinations".to_string())?,
             destination.port,
         );
-        let socket = bind_outbound_udp(target.is_ipv4())
+        let socket = bind_outbound_udp(target.is_ipv4(), None)
             .await
             .map_err(|error| format!("binding VMess UDP socket: {error}"))?;
         socket
@@ -3222,19 +3882,22 @@ impl Server {
         id: InboundId,
         tag: Arc<str>,
         config: &VlessInboundConfig,
+        conn: &ConnInfo,
     ) -> Result<(), String> {
-        let fallback = config.fallback.as_ref();
-        let read = within_handshake(read_vless_request(&mut stream, fallback.is_some())).await?;
+        let fallbacks = &config.fallbacks;
+        let read = within_handshake(read_vless_request(&mut stream, !fallbacks.is_empty())).await?;
         let (mut request, consumed, buffered) = match read {
             Ok(read) => read,
             Err((reason, seen)) => {
-                return self.fall_back(fallback, stream, seen, peer, reason).await
+                return self
+                    .fall_back(fallbacks, conn, stream, seen, peer, reason)
+                    .await
             }
         };
         let Some(user) = config.users.iter().find(|user| user.uuid == request.uuid) else {
             let reason = "VLESS UUID is not authorised".to_string();
             return self
-                .fall_back(fallback, stream, buffered, peer, reason)
+                .fall_back(fallbacks, conn, stream, buffered, peer, reason)
                 .await;
         };
         let request_is_vision = request.flow.is_some();
@@ -3263,6 +3926,33 @@ impl Server {
                 .await;
         }
 
+        // A reverse-proxy account may only dial in as a bridge, and a plain
+        // account may not: what each end is allowed to be is fixed by the
+        // account, not by what the client asks for.
+        if request.reverse {
+            let Some(tag) = user.reverse.clone() else {
+                return Err("this VLESS account is not allowed to create a reverse proxy".into());
+            };
+            let stream = with_vless_response(stream);
+            let client = ChainedStream::new(buffered[consumed..].to_vec(), stream);
+            let client: zero_core::BoxStream = if user_is_vision {
+                boxed(zero_protocol::vision::VisionStream::new_server(
+                    client,
+                    request.uuid,
+                ))
+            } else {
+                boxed(client)
+            };
+            let domain: Arc<str> = Arc::from(zero_protocol::vless::REVERSE_HOST);
+            return self
+                .portal(&tag, &domain)
+                .adopt(client)
+                .map_err(|error| format!("reverse proxy: {error}"));
+        }
+        if user.reverse.is_some() {
+            return Err("for safety, a reverse-proxy account may not use the forward proxy".into());
+        }
+
         request.destination = self.restore_fake_destination(&request.destination).await;
 
         if request.destination.network == Network::Udp {
@@ -3281,78 +3971,46 @@ impl Server {
                 .await;
         }
 
-        let ctx = SessionContext::new(self.generation(), id, tag, request.destination.clone())
-            .with_source(peer);
-        let decision = self.route(&ctx).await;
-        let remote = match decision {
-            Decision::Block => {
-                self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
-            Decision::Outbound(outbound_tag) | Decision::Balancer(outbound_tag) => {
-                let outbound = self
-                    .pick_outbound(&outbound_tag)
-                    .ok_or_else(|| format!("no usable outbound for {outbound_tag:?}"))?;
-                match &outbound.protocol {
-                    OutboundProtocol::Freedom { .. } => outbound::connect_direct_with_resolver(
-                        &request.destination,
-                        &outbound.stream,
-                        &self.resolver(),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?,
-                    OutboundProtocol::Vless(_)
-                    | OutboundProtocol::Trojan(_)
-                    | OutboundProtocol::Shadowsocks(_)
-                    | OutboundProtocol::Vmess(_)
-                    | OutboundProtocol::AnyTls(_)
-                    | OutboundProtocol::Socks(_)
-                    | OutboundProtocol::Tor(_)
-                    | OutboundProtocol::MasterDns(_)
-                    | OutboundProtocol::Tide(_)
-                    | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_)
-                    | OutboundProtocol::Juicity(_)
-                    | OutboundProtocol::AmneziaWireguard(_) => {
-                        let stream = self
-                            .open_outbound(&outbound, &request.destination)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        outbound::strip_response(&outbound, stream)
-                    }
-                    OutboundProtocol::Blackhole => {
-                        self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                        return Ok(());
-                    }
-                    other => {
-                        return Err(format!("{} cannot carry a VLESS TCP session", other.name()))
-                    }
-                }
-            }
-            Decision::DirectVia { resolver } => {
-                let resolver = self.resolver().for_tag(&resolver);
-                outbound::connect_direct_with_resolver(
-                    &request.destination,
-                    &zero_config::StreamSettings::default(),
-                    &resolver,
-                )
-                .await
-                .map_err(|error| error.to_string())?
-            }
-        };
-
-        debug!(%peer, vision = user_is_vision, "VLESS route connected; starting relay");
+        let mut destination = request.destination.clone();
+        let mut ctx = self.new_context(id, tag, destination.clone(), peer);
+        ctx.user = user.email.clone();
+        ctx.vless_route = Some(u16::from_be_bytes([request.uuid[6], request.uuid[7]]));
         let stream = with_vless_response(stream);
         let client = ChainedStream::new(buffered[consumed..].to_vec(), stream);
         let client: zero_core::BoxStream = if user_is_vision {
-            boxed(zero_protocol::vision::VisionStream::new_server(
-                client,
-                request.uuid,
-            ))
+            let mut vision = zero_protocol::vision::VisionStream::new_server(client, request.uuid)
+                .with_seed(
+                    user.vision_seed
+                        .map_or_else(Default::default, zero_protocol::vision::VisionSeed::new),
+                );
+            // A client that goes direct (writes its raw inner stream below
+            // the encryption layer) says so with a Vision frame; the layer
+            // under this one must then stop decrypting.
+            if let Some(flag) = conn.direct.clone() {
+                vision = vision.with_direct_read_switch(move |_| {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                });
+            }
+            boxed(vision)
         } else {
             boxed(client)
         };
+        let sniffing = self.sniffing_of(id);
+        let client = self
+            .sniff_client(&mut ctx, &mut destination, client, &sniffing)
+            .await;
+        let decision = self.route(&ctx).await;
+        let Some((health, remote)) = self
+            .connect_decided(decision, &destination, Some(peer))
+            .await?
+        else {
+            return Ok(());
+        };
+        debug!(%peer, vision = user_is_vision, "VLESS route connected; starting relay");
         let outcome = relay(client, remote).await;
+        if let Some(tag) = &health {
+            self.record_outbound_observation(tag, &outcome);
+        }
         self.record_observation(&outcome).await;
         self.stats
             .record_tag_traffic(&ctx.inbound_tag, None, &outcome.transferred);
@@ -3369,7 +4027,7 @@ impl Server {
         }
         debug!(
             %peer,
-            dest = %request.destination,
+            dest = %destination,
             up = outcome.transferred.uploaded,
             down = outcome.transferred.downloaded,
             stage = ?outcome.stage,
@@ -3446,13 +4104,7 @@ impl Server {
                     }
 
                     let destination = self.restore_fake_destination(&destination).await;
-                    let ctx = SessionContext::new(
-                        self.generation(),
-                        id,
-                        tag.clone(),
-                        destination.clone(),
-                    )
-                    .with_source(peer);
+                    let ctx = self.new_context(id, tag.clone(), destination.clone(), peer);
                     let decision = self.route(&ctx).await;
                     let session_id = frame.session_id;
                     let resolver = match &decision {
@@ -3473,7 +4125,7 @@ impl Server {
                                     destination: destination.clone(),
                                     payload: frame.payload,
                                 },
-                                &[],
+                                None,
                             )
                             .await
                         }
@@ -3486,12 +4138,8 @@ impl Server {
                                 payload: frame.payload,
                             };
                             if matches!(outbound.protocol, OutboundProtocol::Freedom { .. }) {
-                                self.direct_udp(
-                                    &resolver,
-                                    &datagram,
-                                    &outbound.stream.evasion.udp_noise,
-                                )
-                                .await
+                                self.direct_udp(&resolver, &datagram, Some(&outbound.stream))
+                                    .await
                             } else {
                                 self.proxy_udp(&outbound, &datagram).await
                             }
@@ -3582,8 +4230,7 @@ impl Server {
         tag: Arc<str>,
     ) -> Result<(Destination, zero_core::BoxStream), String> {
         let destination = self.restore_fake_destination(requested).await;
-        let ctx =
-            SessionContext::new(self.generation(), id, tag, destination.clone()).with_source(peer);
+        let ctx = self.new_context(id, tag, destination.clone(), peer);
         let remote = match self.route(&ctx).await {
             Decision::Block => {
                 self.stats.blocked.fetch_add(1, Ordering::Relaxed);
@@ -3649,95 +4296,54 @@ impl Server {
         id: InboundId,
         tag: Arc<str>,
         config: &zero_config::TrojanInboundConfig,
+        conn: &ConnInfo,
     ) -> Result<(), String> {
-        let fallback = config.fallback.as_ref();
-        let read = within_handshake(read_trojan_request(&mut stream, fallback.is_some())).await?;
+        let fallbacks = &config.fallbacks;
+        let read =
+            within_handshake(read_trojan_request(&mut stream, !fallbacks.is_empty())).await?;
         let (mut request, consumed, buffered) = match read {
             Ok(read) => read,
             Err((reason, seen)) => {
-                return self.fall_back(fallback, stream, seen, peer, reason).await
+                return self
+                    .fall_back(fallbacks, conn, stream, seen, peer, reason)
+                    .await
             }
         };
-        if !config
+        let Some(account) = config
             .password_hashes
             .iter()
-            .any(|candidate| candidate == &request.password_hash)
-        {
+            .position(|candidate| candidate == &request.password_hash)
+        else {
             let reason = "Trojan password is not authorised".to_string();
             return self
-                .fall_back(fallback, stream, buffered, peer, reason)
+                .fall_back(fallbacks, conn, stream, buffered, peer, reason)
                 .await;
-        }
+        };
         request.destination = self.restore_fake_destination(&request.destination).await;
         if request.destination.network == Network::Udp {
             return self
                 .handle_trojan_udp(stream, peer, id, tag, buffered[consumed..].to_vec())
                 .await;
         }
-        let ctx = SessionContext::new(self.generation(), id, tag, request.destination.clone())
-            .with_source(peer);
+        let mut destination = request.destination.clone();
+        let mut ctx = self.new_context(id, tag, destination.clone(), peer);
+        ctx.user = config.emails.get(account).cloned().flatten();
+        let client = boxed(ChainedStream::new(buffered[consumed..].to_vec(), stream));
+        let sniffing = self.sniffing_of(id);
+        let client = self
+            .sniff_client(&mut ctx, &mut destination, client, &sniffing)
+            .await;
         let decision = self.route(&ctx).await;
-        let remote = match decision {
-            Decision::Block => {
-                self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
-            Decision::Outbound(outbound_tag) | Decision::Balancer(outbound_tag) => {
-                let outbound = self
-                    .pick_outbound(&outbound_tag)
-                    .ok_or_else(|| format!("no usable outbound for {outbound_tag:?}"))?;
-                match &outbound.protocol {
-                    OutboundProtocol::Freedom { .. } => outbound::connect_direct_with_resolver(
-                        &request.destination,
-                        &outbound.stream,
-                        &self.resolver(),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?,
-                    OutboundProtocol::Vless(_)
-                    | OutboundProtocol::Trojan(_)
-                    | OutboundProtocol::Shadowsocks(_)
-                    | OutboundProtocol::Vmess(_)
-                    | OutboundProtocol::AnyTls(_)
-                    | OutboundProtocol::Socks(_)
-                    | OutboundProtocol::Tor(_)
-                    | OutboundProtocol::MasterDns(_)
-                    | OutboundProtocol::Tide(_)
-                    | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_)
-                    | OutboundProtocol::Juicity(_)
-                    | OutboundProtocol::AmneziaWireguard(_) => {
-                        let stream = self
-                            .open_outbound(&outbound, &request.destination)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        outbound::strip_response(&outbound, stream)
-                    }
-                    OutboundProtocol::Blackhole => {
-                        self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                        return Ok(());
-                    }
-                    other => {
-                        return Err(format!(
-                            "{} cannot carry a Trojan TCP session",
-                            other.name()
-                        ))
-                    }
-                }
-            }
-            Decision::DirectVia { resolver } => {
-                let resolver = self.resolver().for_tag(&resolver);
-                outbound::connect_direct_with_resolver(
-                    &request.destination,
-                    &zero_config::StreamSettings::default(),
-                    &resolver,
-                )
-                .await
-                .map_err(|error| error.to_string())?
-            }
+        let Some((health, remote)) = self
+            .connect_decided(decision, &destination, Some(peer))
+            .await?
+        else {
+            return Ok(());
         };
-        let client = ChainedStream::new(buffered[consumed..].to_vec(), stream);
-        let outcome = relay(boxed(client), remote).await;
+        let outcome = relay(client, remote).await;
+        if let Some(tag) = &health {
+            self.record_outbound_observation(tag, &outcome);
+        }
         self.record_observation(&outcome).await;
         self.stats
             .record_tag_traffic(&ctx.inbound_tag, None, &outcome.transferred);
@@ -3796,70 +4402,23 @@ impl Server {
         id: InboundId,
         tag: Arc<str>,
     ) -> Result<(), String> {
-        let destination = self.restore_fake_destination(&destination).await;
-        let ctx =
-            SessionContext::new(self.generation(), id, tag, destination.clone()).with_source(peer);
+        let mut destination = self.restore_fake_destination(&destination).await;
+        let mut ctx = self.new_context(id, tag, destination.clone(), peer);
+        let sniffing = self.sniffing_of(id);
+        let client = self
+            .sniff_client(&mut ctx, &mut destination, boxed(stream), &sniffing)
+            .await;
         let decision = self.route(&ctx).await;
-        let remote = match decision {
-            Decision::Block => {
-                self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
-            Decision::DirectVia { resolver } => {
-                let resolver = self.resolver().for_tag(&resolver);
-                outbound::connect_direct_with_resolver(
-                    &destination,
-                    &zero_config::StreamSettings::default(),
-                    &resolver,
-                )
-                .await
-                .map_err(|error| error.to_string())?
-            }
-            Decision::Outbound(outbound_tag) | Decision::Balancer(outbound_tag) => {
-                let outbound = self
-                    .pick_outbound(&outbound_tag)
-                    .ok_or_else(|| format!("no usable outbound for {outbound_tag:?}"))?;
-                match &outbound.protocol {
-                    OutboundProtocol::Freedom { .. } => outbound::connect_direct_with_resolver(
-                        &destination,
-                        &outbound.stream,
-                        &self.resolver(),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?,
-                    OutboundProtocol::Vless(_)
-                    | OutboundProtocol::Trojan(_)
-                    | OutboundProtocol::Shadowsocks(_)
-                    | OutboundProtocol::Vmess(_)
-                    | OutboundProtocol::AnyTls(_)
-                    | OutboundProtocol::Socks(_)
-                    | OutboundProtocol::Tor(_)
-                    | OutboundProtocol::MasterDns(_)
-                    | OutboundProtocol::Tide(_)
-                    | OutboundProtocol::Hysteria2(_)
-                    | OutboundProtocol::Tuic(_)
-                    | OutboundProtocol::Juicity(_)
-                    | OutboundProtocol::AmneziaWireguard(_) => {
-                        let stream = self
-                            .open_outbound(&outbound, &destination)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        outbound::strip_response(&outbound, stream)
-                    }
-                    OutboundProtocol::Blackhole => {
-                        self.stats.blocked.fetch_add(1, Ordering::Relaxed);
-                        return Ok(());
-                    }
-                    other => {
-                        return Err(format!(
-                            "{} cannot carry a Shadowsocks TCP session",
-                            other.name()
-                        ))
-                    }
-                }
-            }
+        let Some((health, remote)) = self
+            .connect_decided(decision, &destination, Some(peer))
+            .await?
+        else {
+            return Ok(());
         };
-        let outcome = relay(boxed(stream), remote).await;
+        let outcome = relay(client, remote).await;
+        if let Some(tag) = &health {
+            self.record_outbound_observation(tag, &outcome);
+        }
         self.record_observation(&outcome).await;
         self.stats
             .uploaded
@@ -3985,24 +4544,32 @@ impl Server {
         &self,
         resolver: &zero_dns::Resolver,
         datagram: &socks::UdpDatagram,
-        noise: &[NoiseConfig],
+        stream: Option<&zero_config::StreamSettings>,
     ) -> Result<(Destination, Vec<u8>), String> {
+        let noise = stream.map_or(&[][..], |stream| stream.evasion.udp_noise.as_slice());
+        let policy = stream.and_then(|stream| stream.direct.as_deref());
+        let destination = outbound::redirected(&datagram.destination, policy);
         let addrs = resolver
-            .resolve_address(
-                &datagram.destination.address,
-                resolver.settings().query_strategy,
-            )
+            .resolve_address(&destination.address, resolver.settings().query_strategy)
             .await
             .map_err(|error| error.to_string())?;
-        let remote_socket = bind_outbound_udp(addrs.first().map(|ip| ip.is_ipv4()).unwrap_or(true))
-            .await
-            .map_err(|e| format!("binding direct UDP socket: {e}"))?;
+        let remote_socket = bind_outbound_udp(
+            addrs.first().map(|ip| ip.is_ipv4()).unwrap_or(true),
+            stream.map(|stream| &stream.sockopt),
+        )
+        .await
+        .map_err(|e| format!("binding direct UDP socket: {e}"))?;
         let target = SocketAddr::new(
             *addrs
                 .first()
                 .ok_or_else(|| "resolver returned no UDP destinations".to_string())?,
-            datagram.destination.port,
+            destination.port,
         );
+        if let Some(policy) = policy {
+            outbound::allowed_by_final_rules(policy, destination.network, vec![target])
+                .await
+                .map_err(|failure| failure.to_string())?;
+        }
         // The first payload is sent after the decoys. This preserves the
         // configured wire order; sending the real datagram first would make
         // the noise visible only to a receiver that already knows the flow.
@@ -4082,7 +4649,13 @@ impl Server {
                 outbound.tag
             ));
         }
-        if outbound.mux.enabled {
+        // QUIC over a mux (`xudpProxyUDP443`): refused by default, so the
+        // application falls back to TCP; `skip` sends it as plain UDP below.
+        let quic = datagram.destination.port == 443;
+        if outbound.mux.enabled && quic && outbound.mux.udp443 == zero_config::Udp443::Reject {
+            return Err("UDP port 443 is refused on a mux outbound (xudpProxyUDP443)".into());
+        }
+        if outbound.mux.enabled && !(quic && outbound.mux.udp443 == zero_config::Udp443::Skip) {
             let carrier = outbound::connect_mux_carrier_with_resolver(outbound, &self.resolver())
                 .await
                 .map_err(|error| error.to_string())?;
@@ -4200,11 +4773,12 @@ impl Server {
                 .collect::<Vec<_>>();
             let tls = outbound::tls_params(&outbound.stream, &address.host_string())
                 .ok_or_else(|| "Hysteria2 requires ordinary certificate TLS".to_string())?;
+            let shape = outbound::hysteria2_shape(outbound, hysteria)?;
             return zero_transport::hysteria2::exchange_udp(
                 &addrs,
                 &tls,
                 &hysteria.password,
-                hysteria.obfs_password.as_deref(),
+                &shape,
                 &datagram.destination,
                 &datagram.payload,
             )
@@ -4536,6 +5110,12 @@ impl Server {
         if chain.len() == 1 {
             return outbound::connect_with_resolver(&chain[0], destination, &resolver).await;
         }
+        // A Tide exit asks for its connections itself, as many as it needs.
+        if matches!(chain[0].protocol, OutboundProtocol::Tide(_)) {
+            let chain: Arc<[zero_config::Outbound]> = Arc::from(chain);
+            let (route, carrier) = tide_carrier(&chain, 0, &resolver);
+            return outbound::connect_tide_via(&chain[0], destination, &route, carrier).await;
+        }
         Box::pin(outbound::within_setup_deadline(async {
             let carried = Box::pin(carry_to_exit(&chain, &resolver)).await?;
             Box::pin(outbound::connect_over(&chain[0], carried, destination)).await
@@ -4627,6 +5207,127 @@ impl Server {
         });
     }
 
+    /// The portal behind outbound `tag`, made the first time it is asked for.
+    fn portal(&self, tag: &Arc<str>, domain: &Arc<str>) -> Arc<crate::reverse::Portal> {
+        let mut portals = self
+            .portals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match portals.get(tag) {
+            Some(portal) if portal.domain() == &**domain => Arc::clone(portal),
+            _ => {
+                let portal = crate::reverse::Portal::new(Arc::clone(domain));
+                portals.insert(Arc::clone(tag), Arc::clone(&portal));
+                portal
+            }
+        }
+    }
+
+    /// The dial-in of a VLESS reverse bridge: a connection to the portal
+    /// through outbound `via`, which sends it as the reverse command.
+    async fn bridge_dial_via(
+        &self,
+        via: &str,
+        destination: &Destination,
+    ) -> std::io::Result<zero_core::BoxStream> {
+        match self
+            .connect_balanced(via, destination)
+            .await
+            .map_err(std::io::Error::other)?
+        {
+            Some((_, stream)) => Ok(stream),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the bridge's outbound refused the dial-in",
+            )),
+        }
+    }
+
+    /// One connection of a reverse-proxy bridge `tag`, to `destination`,
+    /// routed as if it had arrived on an inbound of that name: the dial-in to
+    /// the portal, or what one of the portal's sessions asks for.
+    async fn bridge_connect(
+        &self,
+        tag: Arc<str>,
+        destination: Destination,
+    ) -> std::io::Result<zero_core::BoxStream> {
+        let other = |error: String| std::io::Error::other(error);
+        let unspecified = SocketAddr::from(([0, 0, 0, 0], 0));
+        let ctx = self.new_context(InboundId(u32::MAX), tag, destination.clone(), unspecified);
+        let decision = self.route(&ctx).await;
+        match self
+            .connect_decided(decision, &destination, None)
+            .await
+            .map_err(other)?
+        {
+            Some((_, stream)) => Ok(stream),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "routing refused the bridge connection",
+            )),
+        }
+    }
+
+    /// [`Self::connect_balanced_once`], after following any `loopback`
+    /// outbounds: a loopback is not a connection but a second look at the
+    /// routing, as if the session had arrived on another inbound, so it is
+    /// followed in a loop here and the connection is made once, by whatever
+    /// the last look chose. Following it in a loop (and not by calling back
+    /// into the connector) keeps the stack flat however it is configured.
+    ///
+    /// The rule it keeps: a chain of loopbacks ends. After
+    /// [`MAX_LOOPBACK_DEPTH`] hops the session is refused, so rules that send
+    /// a flow round in a circle fail it instead of spinning.
+    ///
+    /// Only an outbound named by its own tag is followed; a loopback that is
+    /// a member of a balancer is refused when it is picked.
+    async fn connect_balanced(
+        &self,
+        tag: &str,
+        destination: &Destination,
+    ) -> Result<Option<(zero_config::Outbound, zero_core::BoxStream)>, String> {
+        let mut tag = std::borrow::Cow::Borrowed(tag);
+        for _ in 0..=MAX_LOOPBACK_DEPTH {
+            let config = self.config();
+            let Some(OutboundProtocol::Loopback { inbound_tag }) =
+                config.outbound_by_tag(&tag).map(|o| &o.protocol)
+            else {
+                return self.connect_balanced_once(&tag, destination).await;
+            };
+            let index = config
+                .inbounds
+                .iter()
+                .position(|inbound| inbound.tag == *inbound_tag)
+                .ok_or_else(|| format!("loopback names an unknown inbound {inbound_tag:?}"))?;
+            let ctx = SessionContext::new(
+                self.generation(),
+                InboundId(index as u32),
+                Arc::clone(inbound_tag),
+                destination.clone(),
+            );
+            match self.route(&ctx).await {
+                Decision::Outbound(next) | Decision::Balancer(next) => {
+                    tag = std::borrow::Cow::Owned(next.to_string());
+                }
+                Decision::Block => return Ok(None),
+                Decision::DirectVia { resolver } => {
+                    let resolver = self.resolver().for_tag(&resolver);
+                    let stream = outbound::connect_direct_with_resolver(
+                        destination,
+                        &zero_config::StreamSettings::default(),
+                        &resolver,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    return Ok(Some((loopback_direct(), stream)));
+                }
+            }
+        }
+        Err(format!(
+            "loopback went round more than {MAX_LOOPBACK_DEPTH} times"
+        ))
+    }
+
     /// Open a connection to `destination` through `tag`, an outbound or a
     /// balancer, and return the outbound that carried it. `Ok(None)` is a
     /// black hole: the session is refused, not failed.
@@ -4642,7 +5343,7 @@ impl Server {
     ///
     /// Trade-off: a server that is merely slow to set up (a cold Worker) gets
     /// a second, wasted connection attempt now and then.
-    async fn connect_balanced(
+    async fn connect_balanced_once(
         &self,
         tag: &str,
         destination: &Destination,
@@ -4732,7 +5433,42 @@ impl Server {
                     .map(Some)
                     .map_err(|e| e.to_string())
             }
-            OutboundProtocol::Blackhole => Ok(None),
+            OutboundProtocol::Blackhole { response: None } => Ok(None),
+            // A canned answer: the client reads it, then the connection ends.
+            OutboundProtocol::Blackhole {
+                response: Some(response),
+            } => {
+                let (near, mut far) = tokio::io::duplex(64 * 1024);
+                let response = Arc::clone(response);
+                tokio::spawn(async move {
+                    let _ = far.write_all(&response).await;
+                    let _ = far.shutdown().await;
+                });
+                Ok(Some(zero_core::boxed(near)))
+            }
+            OutboundProtocol::Loopback { .. } => {
+                Err("a loopback outbound is followed by name, not as a member of a balancer".into())
+            }
+            OutboundProtocol::Portal { domain } => {
+                let portal = self.portal(&ob.tag, domain);
+                if portal.is_bridge(destination) {
+                    // A bridge announcing itself: this connection is not
+                    // forwarded, it becomes the carrier the portal runs its
+                    // mux client on. The relay pumps bytes between the two.
+                    let (near, far) = tokio::io::duplex(64 * 1024);
+                    portal
+                        .adopt(zero_core::boxed(far))
+                        .map_err(|error| error.to_string())?;
+                    return Ok(Some(zero_core::boxed(near)));
+                }
+                if destination.network != Network::Tcp {
+                    return Err("a reverse-proxy portal carries TCP only".into());
+                }
+                portal
+                    .open(destination)
+                    .map(Some)
+                    .map_err(|error| error.to_string())
+            }
             OutboundProtocol::Vless(_)
             | OutboundProtocol::Trojan(_)
             | OutboundProtocol::Shadowsocks(_)
@@ -4796,6 +5532,29 @@ impl Server {
             return None;
         }
 
+        // Every member failing and a fallback named: the fallback carries the
+        // traffic, and the members are tried again when a probe reaches one.
+        if let Some(fallback) = b
+            .fallback
+            .as_deref()
+            .and_then(|tag| config.outbound_by_tag(tag))
+        {
+            let tags: Vec<_> = members
+                .iter()
+                .map(|id| config.outbounds[id.0 as usize].tag.clone())
+                .collect();
+            let down = self
+                .health
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .all_failing(&tags);
+            if down {
+                let mut outbound = fallback.clone();
+                self.apply_planner_strategy(&mut outbound);
+                crate::cdn_check::apply(cdn, &mut outbound);
+                return Some(outbound);
+            }
+        }
         let ticket = self.selection_counter.fetch_add(1, Ordering::Relaxed);
         let index = match b.strategy {
             zero_config::routing::BalancerStrategy::LeastPing => {
@@ -5544,7 +6303,7 @@ impl Server {
             )
             .await
             .map_err(|error| error.to_string())?,
-            OutboundProtocol::Blackhole | OutboundProtocol::Dns => {
+            OutboundProtocol::Blackhole { .. } | OutboundProtocol::Dns { .. } => {
                 return Err("outbound cannot be probed".into())
             }
             _ => self
@@ -5575,6 +6334,31 @@ impl Server {
             http_probe_status(&mut stream, &host, &target.path).await?;
         }
         Ok(started.elapsed())
+    }
+
+    /// Tell a client its destination could not be reached, unless it was
+    /// already told the connection was open. A SOCKS client gets "host
+    /// unreachable" and an HTTP client a 502, so the failure reaches it as an
+    /// answer it can show, not as a connection that simply vanishes.
+    async fn finish_unreachable(
+        &self,
+        stream: &mut zero_core::BoxStream,
+        accepted: &Accepted,
+        replied: bool,
+    ) {
+        if replied {
+            return;
+        }
+        match accepted.kind {
+            InboundKind::Socks5 => {
+                let _ = socks::reply(stream, socks::REP_HOST_UNREACHABLE, None).await;
+            }
+            InboundKind::HttpConnect | InboundKind::HttpForward => {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        }
     }
 
     async fn finish_handshake(
@@ -5643,14 +6427,32 @@ struct UdpReply<K> {
     restored: bool,
 }
 
-/// What an inbound's `sniffing` block asks for, reduced to the three flags
-/// the UDP relay needs. Held by value so a relay never keeps a configuration
-/// generation alive.
-#[derive(Debug, Clone, Copy, Default)]
+/// The outbound recorded for a connection a loopback's second routing sent
+/// direct through a resolver rule: it has no outbound of its own.
+fn loopback_direct() -> zero_config::Outbound {
+    zero_config::Outbound {
+        tag: Arc::from("loopback-direct"),
+        protocol: OutboundProtocol::Freedom {
+            domain_strategy: zero_config::DomainStrategy::AsIs,
+        },
+        stream: zero_config::StreamSettings::default(),
+        mux: zero_config::MuxConfig::default(),
+    }
+}
+
+/// How many times a flow may be sent back through routing by `loopback`
+/// outbounds before the connection is refused.
+const MAX_LOOPBACK_DEPTH: u32 = 8;
+
+/// What an inbound's `sniffing` block asks for, kept by value so a UDP relay
+/// never keeps a configuration generation alive.
+#[derive(Debug, Clone, Default)]
 struct SniffPolicy {
     enabled: bool,
     quic: bool,
     route_only: bool,
+    /// Names that never steer a flow (`domainsExcluded`).
+    sniffing: Sniffing,
 }
 
 impl From<&Sniffing> for SniffPolicy {
@@ -5659,6 +6461,7 @@ impl From<&Sniffing> for SniffPolicy {
             enabled: sniffing.enabled,
             quic: sniffing.sniff_quic,
             route_only: sniffing.route_only,
+            sniffing: sniffing.clone(),
         }
     }
 }
@@ -5682,18 +6485,47 @@ enum Dispatch {
 /// kernel is the one that has to see it, exactly as it would see one from a
 /// host with nothing listening on the port.
 async fn reject_udp(
-    device: &zero_tun::TunDevice,
+    device: &dyn PacketOut,
     source: SocketAddr,
     target: SocketAddr,
     payload: &[u8],
 ) {
     match zero_tun::build_icmp_unreachable(source, target, payload) {
-        Ok(packet) => {
-            if let Err(error) = device.send(&packet).await {
+        Ok(packet) => device.send(&packet).await,
+        Err(error) => debug!(%error, "could not build a port-unreachable notice"),
+    }
+}
+
+/// Where the packets a userspace stack's owner writes itself (ICMP notices)
+/// go: the TUN device, or a WireGuard server's link to its peers.
+trait PacketOut: Send + Sync {
+    fn send<'a>(
+        &'a self,
+        packet: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+}
+
+impl PacketOut for zero_tun::TunDevice {
+    fn send<'a>(
+        &'a self,
+        packet: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if let Err(error) = zero_tun::TunDevice::send(self, packet).await {
                 debug!(%error, "could not send a port-unreachable notice");
             }
-        }
-        Err(error) => debug!(%error, "could not build a port-unreachable notice"),
+        })
+    }
+}
+
+impl PacketOut for tokio::sync::mpsc::Sender<Vec<u8>> {
+    fn send<'a>(
+        &'a self,
+        packet: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = tokio::sync::mpsc::Sender::send(self, packet.to_vec()).await;
+        })
     }
 }
 
@@ -5845,9 +6677,24 @@ where
         // everything that is not an Initial packet, so this costs one byte
         // test on every other datagram of the flow.
         if self.sniff.enabled && self.sniff.quic && before_sniff.address.is_ip() {
-            if let Some(sniffed) = crate::quic_sniff::inspect(&payload) {
+            if let Some(mut sniffed) = crate::quic_sniff::inspect(&payload) {
+                if sniffed
+                    .domain
+                    .as_deref()
+                    .is_some_and(|d| self.sniff.sniffing.excludes(d))
+                {
+                    sniffed.domain = None;
+                }
                 ctx.apply_sniff(sniffed, !self.sniff.route_only);
             }
+        }
+        // uTP, BitTorrent's UDP transport, opens with a recognisable SYN.
+        // It supplies no name, only the label a `bittorrent` rule matches.
+        if self.sniff.enabled
+            && ctx.sniffed.protocol.is_none()
+            && zero_core::sniff::is_utp_syn(&payload)
+        {
+            ctx.sniffed.protocol = Some("bittorrent");
         }
         let destination = ctx.destination.clone();
         // The name now decides where this flow goes while the client still
@@ -5868,15 +6715,15 @@ where
                     debug!(outbound = %tag, "no outbound for UDP route");
                     return Dispatch::Rejected(payload);
                 };
-                if matches!(outbound.protocol, OutboundProtocol::Dns) {
-                    self.spawn_dns_answer(key, destination, payload, restored);
+                if let OutboundProtocol::Dns { rules } = &outbound.protocol {
+                    self.spawn_dns_answer(key, destination, payload, restored, rules.clone());
                     return Dispatch::Sent;
                 }
                 // A blackhole outbound is how a config says "drop this", not a
                 // server to connect to; the TCP path already treats it as a
                 // refusal, and a UDP flow has to as well or the datagram is
                 // handed to a proxy that is not a proxy.
-                if matches!(outbound.protocol, OutboundProtocol::Blackhole) {
+                if matches!(outbound.protocol, OutboundProtocol::Blackhole { .. }) {
                     server.stats.blocked.fetch_add(1, Ordering::Relaxed);
                     return Dispatch::Rejected(payload);
                 }
@@ -5891,13 +6738,10 @@ where
                 (server.resolver(), Some(outbound))
             }
         };
-        let noise = outbound
-            .as_ref()
-            .map(|outbound| outbound.stream.evasion.udp_noise.as_slice())
-            .unwrap_or(&[]);
+        let stream = outbound.as_ref().map(|outbound| &outbound.stream);
         let length = payload.len() as u64;
         match self
-            .send_direct(key, &resolver, &destination, &payload, noise, restored)
+            .send_direct(key, &resolver, &destination, &payload, stream, restored)
             .await
         {
             Ok(()) => {
@@ -5992,6 +6836,7 @@ where
         destination: Destination,
         payload: Vec<u8>,
         restored: bool,
+        rules: Box<[zero_config::DnsOutboundRule]>,
     ) {
         let Ok(permit) = Arc::clone(&self.inflight).try_acquire_owned() else {
             self.server.stats.failed.fetch_add(1, Ordering::Relaxed);
@@ -6008,9 +6853,9 @@ where
                 .uploaded
                 .fetch_add(payload.len() as u64, Ordering::Relaxed);
             let resolver = server.client_resolver();
-            let Some(response) = crate::dns_out::answer(&resolver, &payload).await else {
+            let Some(response) = crate::dns_out::answer(&resolver, &payload, &rules).await else {
                 server.stats.failed.fetch_add(1, Ordering::Relaxed);
-                debug!(%destination, "dropping a datagram that is not a DNS query");
+                debug!(%destination, "dropping a datagram that is not a DNS query, or one a rule drops");
                 return;
             };
             activity.fetch_add(1, Ordering::Relaxed);
@@ -6077,9 +6922,12 @@ where
         resolver: &zero_dns::Resolver,
         destination: &Destination,
         payload: &[u8],
-        noise: &[NoiseConfig],
+        stream: Option<&zero_config::StreamSettings>,
         restored: bool,
     ) -> Result<(), String> {
+        let noise = stream.map_or(&[][..], |stream| stream.evasion.udp_noise.as_slice());
+        let policy = stream.and_then(|stream| stream.direct.as_deref());
+        let destination = &outbound::redirected(destination, policy);
         let target = match &destination.address {
             Address::Ip(ip) => SocketAddr::new(*ip, destination.port),
             Address::Domain(_) => {
@@ -6093,8 +6941,15 @@ where
                 SocketAddr::new(*ip, destination.port)
             }
         };
+        if let Some(policy) = policy {
+            outbound::allowed_by_final_rules(policy, destination.network, vec![target])
+                .await
+                .map_err(|failure| failure.to_string())?;
+        }
         let epoch = self.epoch;
-        let flow = self.flow(key, target.is_ipv4()).await?;
+        let flow = self
+            .flow(key, target.is_ipv4(), stream.map(|stream| &stream.sockopt))
+            .await?;
         flow.restored.store(restored, Ordering::Relaxed);
         if !noise.is_empty() && !flow.noised.contains(&target) {
             if flow.noised.len() >= UDP_NOISE_TARGET_LIMIT {
@@ -6127,7 +6982,12 @@ where
     }
 
     /// The live flow for `key` and address family, opening one if needed.
-    async fn flow(&mut self, key: K, ipv4: bool) -> Result<&mut NatFlow, String> {
+    async fn flow(
+        &mut self,
+        key: K,
+        ipv4: bool,
+        sockopt: Option<&zero_config::Sockopt>,
+    ) -> Result<&mut NatFlow, String> {
         let slot = (key, ipv4);
         if self
             .flows
@@ -6144,7 +7004,7 @@ where
                 }
             }
             let socket = Arc::new(
-                bind_outbound_udp(ipv4)
+                bind_outbound_udp(ipv4, sockopt)
                     .await
                     .map_err(|error| format!("binding direct UDP socket: {error}"))?,
             );
@@ -6197,7 +7057,19 @@ async fn run_tide_flow<K: Copy + Send + 'static>(
     restored: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let resolver = server.resolver();
-    let flow = match outbound::connect_tide_udp(&outbound, &first, &resolver).await {
+    let opened = match server.resolve_chain(&outbound) {
+        // Dialled directly (a direct dialer's fragmentation is on `chain[0]`).
+        Ok(chain) if chain.len() == 1 => {
+            outbound::connect_tide_udp(&chain[0], &first, &resolver).await
+        }
+        Ok(chain) => {
+            let chain: Arc<[zero_config::Outbound]> = Arc::from(chain);
+            let (route, carrier) = tide_carrier(&chain, 0, &resolver);
+            outbound::connect_tide_udp_via(&chain[0], &first, &route, carrier).await
+        }
+        Err(failure) => Err(failure.to_string()),
+    };
+    let flow = match opened {
         Ok(flow) => Arc::new(flow),
         Err(error) => {
             server.stats.failed.fetch_add(1, Ordering::Relaxed);
@@ -6406,8 +7278,10 @@ fn replace_outbound_endpoint(outbound: &mut zero_config::Outbound, address: Addr
         | OutboundProtocol::Tor(_)
         | OutboundProtocol::MasterDns(_)
         | OutboundProtocol::Freedom { .. }
-        | OutboundProtocol::Blackhole
-        | OutboundProtocol::Dns => {}
+        | OutboundProtocol::Blackhole { .. }
+        | OutboundProtocol::Loopback { .. }
+        | OutboundProtocol::Portal { .. }
+        | OutboundProtocol::Dns { .. } => {}
     }
 }
 
@@ -6958,14 +7832,41 @@ fn with_vless_response(stream: zero_core::BoxStream) -> zero_core::BoxStream {
     ))
 }
 
-async fn bind_outbound_udp(ipv4: bool) -> Result<UdpSocket, String> {
-    let bind: SocketAddr = if ipv4 {
-        "0.0.0.0:0".parse().expect("a literal bind address")
-    } else {
-        "[::]:0".parse().expect("a literal bind address")
+/// A UDP socket for one outbound flow, carrying what its `sockopt` asks of a
+/// direct connection: the routing mark, the interface, and the address to
+/// leave from (`sendThrough`, used when it is of the destination's family).
+/// Without the mark, a gateway's own traffic is caught again by the very
+/// rule that sent the client's here.
+async fn bind_outbound_udp(
+    ipv4: bool,
+    sockopt: Option<&zero_config::Sockopt>,
+) -> Result<UdpSocket, String> {
+    let source = sockopt
+        .and_then(|sockopt| sockopt.bind_address)
+        .filter(|ip| ip.is_ipv4() == ipv4);
+    let bind: SocketAddr = match (source, ipv4) {
+        (Some(ip), _) => SocketAddr::new(ip, 0),
+        (None, true) => "0.0.0.0:0".parse().expect("a literal bind address"),
+        (None, false) => "[::]:0".parse().expect("a literal bind address"),
     };
     let socket =
         zero_core::platform::bind_protected_udp(bind).map_err(|error| error.to_string())?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(sockopt) = sockopt {
+        if !sockopt.custom.is_empty() {
+            use std::os::fd::AsRawFd;
+            let network = if ipv4 { "udp4" } else { "udp6" };
+            zero_core::custom_sockopt::apply(socket.as_raw_fd(), network, &sockopt.custom)
+                .map_err(|error| error.to_string())?;
+        }
+        let socket = socket2::SockRef::from(&socket);
+        if let Some(mark) = sockopt.mark {
+            let _ = socket.set_mark(mark);
+        }
+        if let Some(interface) = &sockopt.bind_interface {
+            let _ = socket.bind_device(Some(interface.as_bytes()));
+        }
+    }
     socket
         .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
@@ -7036,6 +7937,7 @@ mod tests {
             .unwrap();
         let session = super::InboundSession {
             state: server.state.load_full(),
+            conn: super::ConnInfo::default(),
         };
         let started = tokio::time::Instant::now();
         let result = Arc::clone(&server)
@@ -7048,7 +7950,7 @@ mod tests {
             .await;
         let error = result.expect_err("a stalled handshake must fail");
         assert!(error.contains("timed out"), "{error}");
-        assert!(started.elapsed() >= super::HANDSHAKE_TIMEOUT);
+        assert!(started.elapsed() >= super::handshake_timeout());
         drop(peer);
     }
 
@@ -7699,6 +8601,7 @@ mod tests {
                 uuid: [0; 16],
                 flow: zero_config::Flow::None,
                 encryption: "none".into(),
+                vision_seed: None,
             }),
             stream: zero_config::StreamSettings {
                 transport: zero_config::Transport::WebSocket(

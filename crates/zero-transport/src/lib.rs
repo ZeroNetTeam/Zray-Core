@@ -5,12 +5,16 @@
 //! know which carrier they are on.
 
 pub mod grpc;
+pub mod hop;
 pub mod httpupgrade;
 mod huffman;
 pub mod hysteria2;
 pub mod juicity;
 pub mod masque;
+pub mod masquerade;
+pub mod quic_cc;
 pub mod quic_pool;
+pub mod quic_shape;
 mod relay;
 pub mod salamander;
 pub mod shadowtls;

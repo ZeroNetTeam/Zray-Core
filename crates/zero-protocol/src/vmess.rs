@@ -94,6 +94,9 @@ pub struct User {
 pub struct Accepted<S> {
     pub destination: Destination,
     pub stream: Stream<S>,
+    /// Which of the offered users authenticated, as an index into the slice
+    /// given to [`server_handshake`].
+    pub user: usize,
 }
 
 /// The per-direction data AEAD. The cipher object (with its expanded key
@@ -1056,14 +1059,15 @@ where
     // Derived once per candidate, and the matching one carried forward.
     let user = users
         .iter()
-        .find_map(|user| {
+        .enumerate()
+        .find_map(|(index, user)| {
             let instruction = instruction_key(&user.uuid);
             valid_auth_id(&instruction, &auth_id)
                 .unwrap_or(false)
-                .then_some((user, instruction))
+                .then_some((index, user, instruction))
         })
         .ok_or_else(|| invalid("VMess authentication id is invalid or expired"))?;
-    let (user, instruction) = user;
+    let (user_index, user, instruction) = user;
     // Xray keeps every accepted auth ID for its 120-second validity window
     // and rejects repeats; without that, a captured request replays verbatim.
     if !AUTH_IDS.check_and_insert(&auth_id) {
@@ -1138,6 +1142,7 @@ where
     let prefix = response_prefix(&response_key, &response_iv, response_auth)?;
     Ok(Accepted {
         destination,
+        user: user_index,
         stream: Stream::new_server(
             inner,
             cipher,

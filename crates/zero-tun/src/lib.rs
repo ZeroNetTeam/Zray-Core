@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
 use netcmd::NetCommand;
-pub use netstack_smoltcp::UdpSocket;
+pub use netstack_smoltcp::{TcpListener, UdpSocket};
 use thiserror::Error;
 #[cfg(unix)]
 use tokio::io::unix::AsyncFd;

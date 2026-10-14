@@ -239,16 +239,91 @@ const SYSTEM_HEAD_START: std::time::Duration = std::time::Duration::from_millis(
 /// An answer no public proxy server has: Iran's filtering block page
 /// (10.10.34.34–36), the unspecified address and loopback, which filtering
 /// resolvers return for names they refuse to answer.
+///
+/// The same resolvers answer the AAAA query too, with the block page written
+/// into an IPv6 address: `2001:4188:2:600:10:10:34:34` is `10.10.34.34` with
+/// each number taken as hexadecimal. Dialling it is "network is unreachable"
+/// on any phone without IPv6, and it must not count as an answer, or the
+/// encrypted-DNS fallback is never asked and a name that resolves fine is
+/// reported as unreachable. An IPv4 address carried in an IPv6 one
+/// (`::ffff:10.10.34.34`) is judged by the IPv4 it carries.
 pub fn is_hijacked_answer(ip: IpAddr) -> bool {
+    is_block_page(ip)
+        || match ip {
+            IpAddr::V4(v4) => v4.is_unspecified() || v4.is_loopback() || v4.is_broadcast(),
+            IpAddr::V6(v6) => v6.is_unspecified() || v6.is_loopback(),
+        }
+}
+
+/// The ISP's block page itself, in its IPv4 form and its IPv6 form, and an
+/// IPv4 one carried in an IPv6 address. Narrower than [`is_hijacked_answer`]:
+/// loopback and the unspecified address are forgeries from a resolver that
+/// refuses a name, but a profile that maps a name to `127.0.0.1` on purpose
+/// means it.
+pub fn is_block_page(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
-            (o[0] == 10 && o[1] == 10 && o[2] == 34)
-                || v4.is_unspecified()
-                || v4.is_loopback()
-                || v4.is_broadcast()
+            o[0] == 10 && o[1] == 10 && o[2] == 34
         }
-        IpAddr::V6(v6) => v6.is_unspecified() || v6.is_loopback(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_block_page(IpAddr::V4(v4));
+            }
+            let s = v6.segments();
+            s[4] == 0x10 && s[5] == 0x10 && s[6] == 0x34 && (0x34..=0x36).contains(&s[7])
+        }
+    }
+}
+
+/// A server's own name, resolved through the engine's resolver.
+///
+/// The engine's DNS setting is whatever the profile asked for, and on a
+/// filtered network a plain-UDP choice is answered by the filter with the
+/// block page (`10.10.34.34`, or its IPv6 form), which the server's name must
+/// never resolve to: dialling it is "refused" or "unreachable" for a server
+/// that is fine. So those answers are thrown away, and when nothing else is
+/// left the name is asked of the encrypted resolvers, which cannot be forged
+/// on the way (see [`resolve_domain`], which does the same for the system
+/// resolver).
+pub trait ResolveServer {
+    fn resolve_server(
+        &self,
+        address: &Address,
+    ) -> impl std::future::Future<Output = Result<Vec<IpAddr>, zero_dns::ResolveError>> + Send;
+}
+
+impl ResolveServer for zero_dns::Resolver {
+    async fn resolve_server(
+        &self,
+        address: &Address,
+    ) -> Result<Vec<IpAddr>, zero_dns::ResolveError> {
+        let answers = self
+            .resolve_address(address, self.settings().query_strategy)
+            .await?;
+        let Address::Domain(name) = address else {
+            return Ok(answers);
+        };
+        let usable: Vec<IpAddr> = answers
+            .iter()
+            .copied()
+            .filter(|ip| !is_block_page(*ip))
+            .collect();
+        if !usable.is_empty() || answers.is_empty() {
+            return Ok(if answers.is_empty() { answers } else { usable });
+        }
+        // Everything the resolver said was a block page.
+        let clean: Vec<IpAddr> = fallback_resolver()
+            .lookup(name, zero_config::dns::QueryStrategy::UseIp)
+            .await?
+            .into_iter()
+            .filter(|ip| !is_block_page(*ip))
+            .collect();
+        if clean.is_empty() {
+            Err(zero_dns::ResolveError::Blocked)
+        } else {
+            Ok(clean)
+        }
     }
 }
 
@@ -268,6 +343,7 @@ fn fallback_resolver() -> &'static zero_dns::Resolver {
             endpoint,
             domains: Vec::new(),
             expect_ips: Vec::new(),
+            unexpect_ips: Vec::new(),
             skip_fallback: false,
             tag: None,
         })
@@ -346,6 +422,8 @@ fn socket_options(stream: &StreamSettings) -> SocketOptions {
         fast_open_if: fast_open_rule(stream),
         tcp_fast_open: stream.sockopt.tcp_fast_open,
         mark: stream.sockopt.mark,
+        bind_address: stream.sockopt.bind_address,
+        custom: stream.sockopt.custom.clone(),
         bind_interface: stream
             .sockopt
             .bind_interface
@@ -356,6 +434,11 @@ fn socket_options(stream: &StreamSettings) -> SocketOptions {
             .tcp_congestion
             .as_ref()
             .map(|s| s.to_string()),
+        keepalive: stream.sockopt.keepalive,
+        user_timeout_ms: stream.sockopt.user_timeout_ms,
+        window_clamp: stream.sockopt.window_clamp,
+        max_seg: stream.sockopt.max_seg,
+        mptcp: stream.sockopt.mptcp,
         ..Default::default()
     }
 }
@@ -585,7 +668,11 @@ pub(crate) fn tls_params(stream: &StreamSettings, fallback_host: &str) -> Option
             let mut p = TlsParams::new(sni)
                 .with_profile(profile)
                 .with_insecure(t.allow_insecure)
-                .with_pinned_certs(t.pinned_cert_sha256.clone());
+                .with_pinned_certs(t.pinned_cert_sha256.clone())
+                .with_verify_names(t.verify_names.iter().map(|name| name.to_string()).collect());
+            if let Some(path) = &t.key_log_file {
+                p = p.with_key_log(path.to_string());
+            }
             p = p.with_fingerprint_name(t.fingerprint.name());
             if matches!(
                 stream.transport,
@@ -746,7 +833,7 @@ pub async fn connect_with_resolver(
     let outbound = materialize_ech(outbound, resolver, &address.host_string()).await?;
     let t0 = std::time::Instant::now();
     let addrs = resolver
-        .resolve_address(&address, resolver.settings().query_strategy)
+        .resolve_server(&address)
         .await
         .map_err(|error| {
             Failure::new(FailureKind::DnsNoData, Stage::Resolving).with_detail(error.to_string())
@@ -895,11 +982,14 @@ async fn connect_resolved(
             Failure::new(FailureKind::LocalPolicy, Stage::TlsStarted)
                 .with_detail("Hysteria2 requires ordinary certificate TLS")
         })?;
+        let shape = hysteria2_shape(outbound, hysteria).map_err(|error| {
+            Failure::new(FailureKind::LocalPolicy, Stage::TlsStarted).with_detail(error)
+        })?;
         return zero_transport::hysteria2::connect(
             &addrs,
             &tls,
             &hysteria.password,
-            hysteria.obfs_password.as_deref(),
+            &shape,
             destination,
         )
         .await
@@ -1132,7 +1222,7 @@ pub async fn connect_tide_udp(
         .endpoint()
         .ok_or_else(|| "Tide outbound has no endpoint".to_string())?;
     let addrs: Vec<SocketAddr> = resolver
-        .resolve_address(&address, resolver.settings().query_strategy)
+        .resolve_server(&address)
         .await
         .map_err(|error| error.to_string())?
         .into_iter()
@@ -1156,71 +1246,300 @@ fn tide_client(
     addrs: Vec<SocketAddr>,
 ) -> Arc<zero_transport::tide::Client> {
     let key = mux_pool_key(outbound, address, &addrs);
+    let host = address.host_string();
+    // Tide is HTTP/2 whatever the profile says about ALPN.
+    let shaped = Arc::new(tide_shaped(outbound));
+    let dial: zero_transport::tide::Dialer = {
+        let host = host.clone();
+        Arc::new(move || {
+            let (outbound, addrs, host) = (shaped.clone(), addrs.clone(), host.clone());
+            Box::pin(async move {
+                let tcp = dial_tcp(
+                    &addrs,
+                    &race_policy(&outbound.stream),
+                    &socket_options(&outbound.stream),
+                )
+                .await
+                .map_err(|failure| std::io::Error::other(failure.to_string()))?;
+                protect_socket(&outbound, tcp.stream, &host)
+                    .await
+                    .map_err(|failure| std::io::Error::other(failure.to_string()))
+            })
+        })
+    };
+    tide_client_with(outbound, tide, key, &host, dial)
+}
+
+/// `outbound` with HTTP/2 as its only ALPN: what every Tide server speaks.
+fn tide_shaped(outbound: &Outbound) -> Outbound {
+    let mut shaped = outbound.clone();
+    if let Security::Tls(tls) = &mut shaped.stream.security {
+        tls.alpn = vec!["h2".into()];
+    }
+    shaped
+}
+
+/// The Tide client kept under `key`, or a new one that connects with `dial`.
+/// `host` is the server's address, used as the HTTP authority when the link
+/// names no TLS server name.
+fn tide_client_with(
+    outbound: &Outbound,
+    tide: &zero_config::TideConfig,
+    key: String,
+    host: &str,
+    dial: zero_transport::tide::Dialer,
+) -> Arc<zero_transport::tide::Client> {
     let existing = {
         let clients = TIDE_CLIENTS.get_or_init(Default::default);
         let clients = clients.lock().unwrap_or_else(|p| p.into_inner());
         clients.get(&key).cloned()
     };
-    match existing {
-        Some(client) => client,
-        None => {
-            let host = address.host_string();
-            // Tide is HTTP/2 whatever the profile says about ALPN.
-            let mut shaped = outbound.clone();
-            if let Security::Tls(tls) = &mut shaped.stream.security {
-                tls.alpn = vec!["h2".into()];
-            }
-            let shaped = Arc::new(shaped);
-            let dial: zero_transport::tide::Dialer = {
-                let host = host.clone();
-                Arc::new(move || {
-                    let (outbound, addrs, host) = (shaped.clone(), addrs.clone(), host.clone());
-                    Box::pin(async move {
-                        let tcp = dial_tcp(
-                            &addrs,
-                            &race_policy(&outbound.stream),
-                            &socket_options(&outbound.stream),
-                        )
-                        .await
-                        .map_err(|failure| std::io::Error::other(failure.to_string()))?;
-                        protect_socket(&outbound, tcp.stream, &host)
-                            .await
-                            .map_err(|failure| std::io::Error::other(failure.to_string()))
-                    })
-                })
-            };
-            let client = zero_transport::tide::Client::new(
-                zero_transport::tide::ClientConfig {
-                    host: match &outbound.stream.security {
-                        Security::Tls(tls) => tls
-                            .server_name
-                            .as_deref()
-                            .map_or_else(|| host.clone(), str::to_string),
-                        _ => host.clone(),
-                    },
-                    path: tide.path.to_string(),
-                    server_public: tide.server_key,
-                    user: tide.user,
-                    split: tide.split,
-                    linger: if tide.packet_upload {
-                        std::time::Duration::ZERO
-                    } else {
-                        std::time::Duration::from_secs(2)
-                    },
-                    lane: tide.datagrams,
-                    rotation: tide.rotate.then(zero_transport::tide::Rotation::default),
-                },
-                dial,
-            );
-            let clients = TIDE_CLIENTS.get_or_init(Default::default);
-            let mut clients = clients.lock().unwrap_or_else(|p| p.into_inner());
-            // Profiles come and go; keep the map from growing with them.
-            if clients.len() >= 64 {
-                clients.clear();
-            }
-            clients.entry(key).or_insert(client).clone()
-        }
+    if let Some(client) = existing {
+        return client;
     }
+    let client = zero_transport::tide::Client::new(tide_client_config(outbound, tide, host), dial);
+    let clients = TIDE_CLIENTS.get_or_init(Default::default);
+    let mut clients = clients.lock().unwrap_or_else(|p| p.into_inner());
+    // Profiles come and go; keep the map from growing with them.
+    if clients.len() >= 64 {
+        clients.clear();
+    }
+    clients.entry(key).or_insert(client).clone()
+}
+
+/// How a Hysteria 2 outbound's QUIC carrier is shaped: its Salamander
+/// password, its port-hopping plan and the QUIC parameters of its
+/// `finalmask`. The result is the same for the same outbound, so the pooled
+/// connection it makes is shared.
+pub(crate) fn hysteria2_shape(
+    outbound: &Outbound,
+    hysteria: &zero_config::Hysteria2Config,
+) -> Result<zero_transport::quic_shape::QuicShape, String> {
+    use std::time::Duration;
+    use zero_transport::quic_shape::{Congestion, QuicParams, QuicShape};
+    let evasion = &outbound.stream.evasion;
+    let salamander = hysteria
+        .obfs_password
+        .as_deref()
+        .map(zero_transport::salamander::Salamander::new)
+        .transpose()?;
+    let hop = evasion
+        .udp_hop
+        .as_ref()
+        .map(|hop| zero_transport::hop::Hop {
+            ports: hop.all_ports(),
+            interval: (
+                Duration::from_secs(hop.interval_secs.0.into()),
+                Duration::from_secs(hop.interval_secs.1.into()),
+            ),
+        });
+    let params = evasion
+        .quic
+        .as_ref()
+        .map_or_else(QuicParams::default, |quic| {
+            let secs = |value: Option<u32>| value.map(|s| Duration::from_secs(s.into()));
+            QuicParams {
+                congestion: match quic.congestion {
+                    zero_config::QuicCongestion::Default => Congestion::Default,
+                    zero_config::QuicCongestion::Reno => Congestion::Reno,
+                    zero_config::QuicCongestion::Bbr => Congestion::Bbr,
+                    zero_config::QuicCongestion::Brutal => Congestion::Brutal,
+                    zero_config::QuicCongestion::ForceBrutal => Congestion::ForceBrutal,
+                },
+                up_bytes_per_sec: quic.up_bytes_per_sec,
+                down_bytes_per_sec: quic.down_bytes_per_sec,
+                init_stream_window: quic.init_stream_window,
+                max_stream_window: quic.max_stream_window,
+                init_connection_window: quic.init_connection_window,
+                max_connection_window: quic.max_connection_window,
+                max_idle: secs(quic.max_idle_secs),
+                keep_alive: secs(quic.keep_alive_secs),
+                disable_mtu_discovery: quic.disable_mtu_discovery,
+                max_incoming_streams: quic.max_incoming_streams,
+            }
+        });
+    Ok(QuicShape {
+        salamander,
+        hop,
+        params,
+    })
+}
+
+/// The transport settings a Tide link stands for: the link's own choices where
+/// it makes them, Tide's defaults everywhere else.
+///
+/// The HTTP authority is, in order of preference, the link's `authority`, the
+/// TLS server name, then the server's address; a CDN front sets the first two
+/// apart (`sni=front.example`, `authority=real.example`).
+fn tide_client_config(
+    outbound: &Outbound,
+    tide: &zero_config::TideConfig,
+    host: &str,
+) -> zero_transport::tide::ClientConfig {
+    use std::time::Duration;
+    use zero_transport::tide::{Look, Rotation, Tuning};
+    let t = &tide.tuning;
+    let host = t
+        .authority
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| match &outbound.stream.security {
+            Security::Tls(tls) => tls
+                .server_name
+                .as_deref()
+                .map_or_else(|| host.to_string(), str::to_string),
+            _ => host.to_string(),
+        });
+    let defaults = Tuning::default();
+    let look = Look {
+        user_agent: t
+            .user_agent
+            .as_deref()
+            .map_or(defaults.look.user_agent, str::to_string),
+        language: t
+            .language
+            .as_deref()
+            .map_or(defaults.look.language, str::to_string),
+        headers: t
+            .headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect(),
+    };
+    let rotation = tide.rotate.then(|| {
+        let base = Rotation::default();
+        let (min_age, max_age) = t
+            .age_secs
+            .map_or((base.min_age, base.max_age), |(low, high)| {
+                (
+                    Duration::from_secs(low.into()),
+                    Duration::from_secs(high.into()),
+                )
+            });
+        Rotation {
+            min_age,
+            max_age,
+            max_bytes: t.volume_mb.map_or(base.max_bytes, |mb| u64::from(mb) << 20),
+        }
+    });
+    zero_transport::tide::ClientConfig {
+        host,
+        path: tide.path.to_string(),
+        server_public: tide.server_key,
+        user: tide.user,
+        split: tide.split,
+        linger: match (t.linger_ms, tide.packet_upload) {
+            (Some(ms), _) => Duration::from_millis(ms.into()),
+            (None, true) => Duration::ZERO,
+            (None, false) => Duration::from_secs(2),
+        },
+        lane: tide.datagrams,
+        rotation,
+        tuning: Tuning {
+            look,
+            down_pipes: t.down_pipes.map_or(defaults.down_pipes, usize::from),
+            up_pipes: t.up_pipes.map_or(defaults.up_pipes, usize::from),
+            ping: t
+                .ping_secs
+                .map_or(defaults.ping, |s| Duration::from_secs(s.into())),
+            idle: t
+                .idle_secs
+                .map_or(defaults.idle, |s| Duration::from_secs(s.into())),
+        },
+    }
+}
+
+/// How a Tide client reaches its server through other hops: each call opens
+/// a new connection to the Tide server's address, carried by the hops before
+/// it, and returns it as it left the last of them (no TLS yet).
+pub type TideCarrier = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<BoxStream, Failure>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+/// Open a stream through a Tide server that is itself reached through other
+/// outbounds (`dialerProxy`).
+///
+/// Tide keeps several HTTP/2 connections and replaces them as it rotates
+/// them, so it cannot run over the one carried stream [`connect_over`] gets.
+/// `carrier` is called for every connection the client wants; each answer is
+/// a fresh stream to the Tide server's address, which gets TLS (HTTP/2) here.
+/// `route` names the hops the carrier goes through, so two chains to the same
+/// server never share a client.
+pub async fn connect_tide_via(
+    outbound: &Outbound,
+    destination: &Destination,
+    route: &str,
+    carrier: TideCarrier,
+) -> Result<BoxStream, Failure> {
+    if destination.network != zero_core::Network::Tcp {
+        return Err(Failure::new(FailureKind::LocalPolicy, Stage::RequestSent)
+            .with_detail("ZeroV1 carries UDP only when its link has dg=1 (a datagram flow, not a byte stream)"));
+    }
+    tide_client_via(outbound, route, carrier)?
+        .open(destination.clone())
+        .await
+        .map(boxed)
+        .map_err(|error| {
+            Failure::from_io(&error, Stage::RequestSent).with_detail(format!("Tide: {error}"))
+        })
+}
+
+/// [`connect_tide_udp`] for a Tide server reached through other outbounds:
+/// the same client as [`connect_tide_via`] makes, so streams and datagrams
+/// share one session.
+pub async fn connect_tide_udp_via(
+    outbound: &Outbound,
+    first: &Destination,
+    route: &str,
+    carrier: TideCarrier,
+) -> Result<zero_protocol::tide::UdpFlow, String> {
+    let OutboundProtocol::Tide(tide) = &outbound.protocol else {
+        return Err("not a Tide outbound".into());
+    };
+    if !tide.datagrams {
+        return Err("this ZeroV1 link does not ask for UDP (no dg=1)".into());
+    }
+    tide_client_via(outbound, route, carrier)
+        .map_err(|failure| failure.to_string())?
+        .open_udp(first.clone())
+        .await
+        .map_err(|error| format!("Tide: {error}"))
+}
+
+/// The client for a Tide server whose connections come from `carrier`.
+fn tide_client_via(
+    outbound: &Outbound,
+    route: &str,
+    carrier: TideCarrier,
+) -> Result<Arc<zero_transport::tide::Client>, Failure> {
+    let OutboundProtocol::Tide(tide) = &outbound.protocol else {
+        return Err(
+            Failure::new(FailureKind::LocalPolicy, Stage::SocketConnected)
+                .with_detail(format!("outbound {} is not a Tide outbound", outbound.tag)),
+        );
+    };
+    let host = outbound
+        .endpoint()
+        .map(|(address, _)| address.host_string())
+        .unwrap_or_default();
+    let key = mux_pool_key_of(&format!("{outbound:?}|via|{route}"));
+    let shaped = Arc::new(tide_shaped(outbound));
+    let dial: zero_transport::tide::Dialer = Arc::new(move || {
+        let (shaped, carrier) = (shaped.clone(), carrier.clone());
+        Box::pin(async move {
+            let carried = carrier()
+                .await
+                .map_err(|failure| std::io::Error::other(failure.to_string()))?;
+            secure_over(&shaped, carried)
+                .await
+                .map(|(stream, _)| stream)
+                .map_err(|failure| std::io::Error::other(failure.to_string()))
+        })
+    });
+    Ok(tide_client_with(outbound, tide, key, &host, dial))
 }
 
 /// The dialer a Tide relay uses to reach its egress: an ordinary client
@@ -1342,7 +1661,7 @@ pub async fn connect_mux_carrier_with_resolver(
     })?;
     let outbound = materialize_ech(outbound, resolver, &address.host_string()).await?;
     let addrs = resolver
-        .resolve_address(&address, resolver.settings().query_strategy)
+        .resolve_server(&address)
         .await
         .map_err(|error| {
             Failure::new(FailureKind::DnsNoData, Stage::Resolving).with_detail(error.to_string())
@@ -1393,13 +1712,15 @@ async fn connect_mux_carrier_resolved(
 }
 
 fn mux_pool_key(outbound: &Outbound, address: &Address, addrs: &[SocketAddr]) -> String {
-    // Hash the complete compiled outbound rather than storing credentials in
-    // the process-wide pool key. The debug representation is only transient
-    // input to the digest and is never retained.
+    mux_pool_key_of(&format!("{outbound:?}|{address:?}|{addrs:?}"))
+}
+
+/// Hash the complete compiled outbound rather than storing credentials in
+/// the process-wide pool key. The debug representation is only transient
+/// input to the digest and is never retained.
+fn mux_pool_key_of(material: &str) -> String {
     use sha2::{Digest, Sha256};
-    let material = format!("{outbound:?}|{address:?}|{addrs:?}");
-    let digest = Sha256::digest(material.as_bytes());
-    hex::encode(digest)
+    hex::encode(Sha256::digest(material.as_bytes()))
 }
 
 async fn protect_socket(
@@ -1585,7 +1906,7 @@ async fn connect_xhttp_split(
     } else {
         match resolver {
             Some(resolver) => resolver
-                .resolve_address(&download_address, resolver.settings().query_strategy)
+                .resolve_server(&download_address)
                 .await
                 .map_err(|error| {
                     Failure::new(FailureKind::DnsNoData, Stage::Resolving)
@@ -1873,6 +2194,8 @@ fn xhttp_ws_config(
         early_data_len: 0,
         xhttp: Arc::new(xhttp_options(&config.xhttp)),
         secure: !matches!(security, Security::None),
+        grpc_multi_path: None,
+        grpc_multi: false,
     }
 }
 
@@ -2031,7 +2354,7 @@ pub(crate) async fn open_secured(
     let fallback_host = address.host_string();
     let outbound = materialize_ech(outbound, resolver, &fallback_host).await?;
     let addrs = resolver
-        .resolve_address(&address, resolver.settings().query_strategy)
+        .resolve_server(&address)
         .await
         .map_err(|error| {
             Failure::new(FailureKind::DnsNoData, Stage::Resolving).with_detail(error.to_string())
@@ -2081,6 +2404,8 @@ pub(crate) async fn open_carrier(
         early_data_len,
         xhttp: Default::default(),
         secure: false,
+        grpc_multi_path: None,
+        grpc_multi: false,
     };
     match &outbound.stream.transport {
         Transport::WebSocket(w) => {
@@ -2159,13 +2484,22 @@ async fn finish_stack(
                 username: a.username.clone(),
                 password: a.password.clone(),
             });
-        let stream = Box::pin(zero_protocol::socks::connect_socks5(
-            secured,
-            credential.as_ref(),
-            destination,
-        ))
-        .await
-        .map_err(|error| {
+        let tunnel = if socks.http {
+            Box::pin(zero_protocol::socks::connect_http(
+                secured,
+                credential.as_ref(),
+                destination,
+            ))
+            .await
+        } else {
+            Box::pin(zero_protocol::socks::connect_socks5(
+                secured,
+                credential.as_ref(),
+                destination,
+            ))
+            .await
+        };
+        let stream = tunnel.map_err(|error| {
             Failure::new(FailureKind::ProtocolRejected, Stage::RequestSent).with_detail(error)
         })?;
         return Ok(boxed(stream));
@@ -2224,6 +2558,8 @@ async fn finish_stack(
                 early_data_len: w.early_data_len,
                 xhttp: Default::default(),
                 secure: false,
+                grpc_multi_path: None,
+                grpc_multi: false,
             };
 
             // The protocol header goes in the upgrade request when it fits,
@@ -2282,6 +2618,8 @@ async fn finish_stack(
                 early_data_len: 0,
                 xhttp: Default::default(),
                 secure: false,
+                grpc_multi_path: None,
+                grpc_multi: false,
             };
             let s = httpupgrade::connect(secured, &cfg).await.map_err(|error| {
                 Failure::new(FailureKind::WebsocketRejected, Stage::RequestSent).with_detail(error)
@@ -2303,7 +2641,11 @@ async fn finish_stack(
         }
         Transport::Grpc(w) => {
             let cfg = WsConfig {
-                path: w.path.to_string(),
+                // multiMode calls the multi method, if it has a name of its own.
+                path: match (&w.grpc_multi_path, w.grpc_multi) {
+                    (Some(multi), true) => multi.to_string(),
+                    _ => w.path.to_string(),
+                },
                 host: w.host.as_deref().unwrap_or(fallback_host).to_string(),
                 headers: w
                     .headers
@@ -2313,6 +2655,8 @@ async fn finish_stack(
                 early_data_len: 0,
                 xhttp: Default::default(),
                 secure: false,
+                grpc_multi_path: None,
+                grpc_multi: w.grpc_multi,
             };
             let carrier = grpc::connect(secured, &cfg).await.map_err(|error| {
                 Failure::new(FailureKind::HttpMalformed, Stage::RequestSent).with_detail(error)
@@ -2429,6 +2773,10 @@ async fn send_vless(
                 .with_detail("Vision TCP flow cannot carry UDP without XUDP"));
         }
         let vision = zero_protocol::vision::VisionStream::new_client(s, v.uuid)
+            .with_seed(
+                v.vision_seed
+                    .map_or_else(Default::default, zero_protocol::vision::VisionSeed::new),
+            )
             .with_request_header(header)
             .with_direct_read_switch(|carrier| {
                 let carrier = carrier.as_mut().get_mut().as_any_mut();
@@ -2485,6 +2833,16 @@ fn reality_fingerprint(f: &zero_config::Fingerprint) -> FingerprintProfile {
 fn protocol_header(outbound: &Outbound, destination: &Destination) -> Result<Vec<u8>, Failure> {
     match &outbound.protocol {
         OutboundProtocol::Vless(v) => {
+            // Dialling a portal as a reverse-proxy bridge: the destination is
+            // the reverse name, and the request is the reverse command.
+            if destination.port == 0
+                && matches!(&destination.address, zero_core::Address::Domain(host)
+                    if &**host == zero_protocol::vless::REVERSE_HOST)
+            {
+                return Ok(
+                    zero_protocol::vless::encode_reverse_request(&v.uuid, v.flow.as_str()).to_vec(),
+                );
+            }
             if outbound.mux.enabled {
                 Ok(zero_protocol::vless::encode_mux_request(&v.uuid, v.flow.as_str()).to_vec())
             } else {
@@ -2608,6 +2966,7 @@ pub async fn connect_direct(
     destination: &Destination,
     stream: &StreamSettings,
 ) -> Result<BoxStream, Failure> {
+    let destination = &redirected(destination, stream.direct.as_deref());
     let addrs = match &destination.address {
         Address::Ip(ip) => vec![SocketAddr::new(*ip, destination.port)],
         Address::Domain(_) => filter_direct_addresses(
@@ -2619,9 +2978,45 @@ pub async fn connect_direct(
     if let Some(proxy) = env_proxy_for(&destination.address.host_string()) {
         return dial_via_env_proxy(proxy, destination, stream).await;
     }
+    dial_direct(addrs, destination, stream).await
+}
+
+/// The last steps of a direct connection, once the destination's addresses
+/// are known: drop the ones Freedom's `finalRules` forbid, dial what is left,
+/// and send the PROXY protocol header when the outbound asks for one.
+async fn dial_direct(
+    addrs: Vec<SocketAddr>,
+    destination: &Destination,
+    stream: &StreamSettings,
+) -> Result<BoxStream, Failure> {
+    let policy = stream.direct.as_deref();
+    let addrs = match policy {
+        Some(policy) => allowed_by_final_rules(policy, destination.network, addrs).await?,
+        None => addrs,
+    };
     let addrs = google_fronts_first(addrs, destination, stream).await;
     let dialed = dial_tcp(&addrs, &race_policy(stream), &socket_options(stream)).await?;
-    Ok(shaped(dialed.stream, stream, false))
+    let local = dialed.stream.local_addr().ok();
+    let mut connection = shaped(dialed.stream, stream, false);
+    if let Some(version) = policy
+        .map(|policy| policy.proxy_protocol)
+        .filter(|version| *version != 0)
+    {
+        // Who the backend should believe connected: the client, when the
+        // caller said who it is, and this machine's own address otherwise.
+        let client = CLIENT_ADDR.try_with(|addr| *addr).ok();
+        let target = addrs.first().copied().or_else(|| {
+            destination
+                .address
+                .as_ip()
+                .map(|ip| SocketAddr::new(ip, destination.port))
+        });
+        let header = zero_protocol::proxy_protocol::encode(version, client.or(local), target);
+        connection.write_all(&header).await.map_err(|error| {
+            Failure::new(FailureKind::TcpReset, Stage::RequestSent).with_detail(error.to_string())
+        })?;
+    }
+    Ok(connection)
 }
 
 /// For a direct connection that hides its name and goes to a Google-hosted
@@ -2656,12 +3051,84 @@ async fn google_fronts_first(
     ordered
 }
 
+tokio::task_local! {
+    /// The client whose connection is being made, for the PROXY protocol
+    /// header a Freedom outbound can send.
+    static CLIENT_ADDR: SocketAddr;
+}
+
+/// Run `connect` knowing which client it is for.
+pub async fn with_client_addr<F: std::future::Future>(client: SocketAddr, connect: F) -> F::Output {
+    CLIENT_ADDR.scope(client, connect).await
+}
+
+/// `destination` after the Freedom policy's `redirect`: its address and/or
+/// port replaced.
+pub fn redirected(
+    destination: &Destination,
+    policy: Option<&zero_config::DirectPolicy>,
+) -> Destination {
+    match policy.and_then(|policy| policy.redirect.as_ref()) {
+        Some(redirect) => Destination {
+            address: redirect
+                .address
+                .clone()
+                .unwrap_or_else(|| destination.address.clone()),
+            port: redirect.port.unwrap_or(destination.port),
+            network: destination.network,
+        },
+        None => destination.clone(),
+    }
+}
+
+/// The addresses of `addrs` the policy's `finalRules` let through. A
+/// connection with none left is held for the rule's block delay and then
+/// refused; the delay is random in its range so the time says nothing about
+/// which rule fired.
+pub async fn allowed_by_final_rules(
+    policy: &zero_config::DirectPolicy,
+    network: zero_core::Network,
+    addrs: Vec<SocketAddr>,
+) -> Result<Vec<SocketAddr>, Failure> {
+    if policy.final_rules.is_empty() {
+        return Ok(addrs);
+    }
+    let mut blocked_by = None;
+    let allowed: Vec<SocketAddr> = addrs
+        .into_iter()
+        .filter(
+            |addr| match policy.decide(network, addr.ip(), addr.port()) {
+                Some(rule) if !rule.allow => {
+                    blocked_by.get_or_insert(rule.block_delay_secs);
+                    false
+                }
+                _ => true,
+            },
+        )
+        .collect();
+    if !allowed.is_empty() {
+        return Ok(allowed);
+    }
+    if let Some((low, high)) = blocked_by {
+        let secs = if high > low {
+            rand::Rng::gen_range(&mut rand::thread_rng(), low..=high)
+        } else {
+            low
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(secs.into())).await;
+    }
+    Err(Failure::new(FailureKind::LocalPolicy, Stage::Resolving)
+        .with_detail("the destination is blocked by the freedom finalRules"))
+}
+
 /// Direct connection using the compiled, leak-aware DNS resolver.
 pub async fn connect_direct_with_resolver(
     destination: &Destination,
     stream: &StreamSettings,
     resolver: &zero_dns::Resolver,
 ) -> Result<BoxStream, Failure> {
+    let policy = stream.direct.as_deref();
+    let destination = &redirected(destination, policy);
     let ips = resolver
         .resolve_address(&destination.address, resolver.settings().query_strategy)
         .await
@@ -2683,9 +3150,7 @@ pub async fn connect_direct_with_resolver(
     if let Some(proxy) = env_proxy_for(&destination.address.host_string()) {
         return dial_via_env_proxy(proxy, destination, stream).await;
     }
-    let addrs = google_fronts_first(addrs, destination, stream).await;
-    let dialed = dial_tcp(&addrs, &race_policy(stream), &socket_options(stream)).await?;
-    Ok(shaped(dialed.stream, stream, false))
+    dial_direct(addrs, destination, stream).await
 }
 
 async fn dial_via_env_proxy(
@@ -2803,12 +3268,55 @@ mod tests {
             "127.0.0.1",
             "::",
             "::1",
+            // The same block page, as the AAAA answer and in mapped form.
+            "2001:4188:2:600:10:10:34:34",
+            "2001:4188:2:600:10:10:34:36",
+            "::ffff:10.10.34.34",
         ] {
             assert!(is_hijacked_answer(forged.parse().unwrap()), "{forged}");
         }
-        for real in ["104.16.1.1", "192.168.1.10", "10.0.0.5", "2606:4700::1111"] {
+        for real in [
+            "104.16.1.1",
+            "192.168.1.10",
+            "10.0.0.5",
+            "2606:4700::1111",
+            "2001:4188:2:600:10:10:34:37",
+            "::ffff:104.16.1.1",
+        ] {
             assert!(!is_hijacked_answer(real.parse().unwrap()), "{real}");
         }
+    }
+
+    /// The server's own name, resolved by the engine's resolver, never comes
+    /// back as the filter's block page when anything real is beside it, and an
+    /// address given as an IP is never second-guessed.
+    #[tokio::test]
+    async fn a_servers_name_drops_the_block_page_from_its_answers() {
+        use zero_config::dns::{DnsSettings, HostValue};
+        let mut hosts = std::collections::BTreeMap::new();
+        hosts.insert(
+            Box::from("mixed.example"),
+            HostValue::Addresses(vec![
+                Address::parse_host("10.10.34.34"),
+                Address::parse_host("2001:4188:2:600:10:10:34:34"),
+                Address::parse_host("203.0.113.9"),
+            ]),
+        );
+        let resolver = zero_dns::Resolver::new(DnsSettings {
+            hosts,
+            ..DnsSettings::default()
+        });
+        let found = resolver
+            .resolve_server(&Address::parse_host("mixed.example"))
+            .await
+            .unwrap();
+        assert_eq!(found, vec!["203.0.113.9".parse::<IpAddr>().unwrap()]);
+        let literal = Address::parse_host("10.10.34.34");
+        assert_eq!(
+            resolver.resolve_server(&literal).await.unwrap(),
+            vec!["10.10.34.34".parse::<IpAddr>().unwrap()],
+            "an address the user wrote is theirs to dial"
+        );
     }
 
     #[tokio::test]
@@ -3041,5 +3549,57 @@ mod tests {
     #[test]
     fn plain_security_produces_no_tls_layer() {
         assert!(tls_params(&StreamSettings::default(), "h").is_none());
+    }
+
+    #[test]
+    fn a_zerov1_link_becomes_the_transport_settings_it_names() {
+        use std::time::Duration;
+        let key = "A".repeat(43);
+        let user = "A".repeat(22);
+        let config = |extra: &str| {
+            let link = format!(
+                "zerov1://{user}@203.0.113.9:443?key={key}&path=/static/ab&sni=front.test{extra}"
+            );
+            let outbound = zero_config::share_link::parse_link(&link).unwrap().outbound;
+            let OutboundProtocol::Tide(tide) = &outbound.protocol else {
+                panic!("expected a ZeroV1 outbound")
+            };
+            tide_client_config(&outbound, tide, "203.0.113.9")
+        };
+        // A plain link keeps every default, and the TLS name is the authority.
+        let plain = config("");
+        assert_eq!(plain.host, "front.test");
+        assert_eq!(plain.tuning, zero_transport::tide::Tuning::default());
+        assert_eq!(plain.linger, Duration::from_secs(2));
+        assert_eq!(
+            plain.rotation,
+            Some(zero_transport::tide::Rotation::default())
+        );
+
+        let tuned = config(
+            "&authority=Real.Example&pipes=1&uploads=2&ping=30&idle=200&linger=250\
+             &age=60-90&volume=128&ua=safari&headers=referer:https://x.test/",
+        );
+        assert_eq!(tuned.host, "real.example");
+        assert_eq!(tuned.tuning.down_pipes, 1);
+        assert_eq!(tuned.tuning.up_pipes, 2);
+        assert_eq!(tuned.tuning.ping, Duration::from_secs(30));
+        assert_eq!(tuned.tuning.idle, Duration::from_secs(200));
+        assert_eq!(tuned.linger, Duration::from_millis(250));
+        assert!(tuned.tuning.look.user_agent.contains("Safari/"));
+        assert_eq!(tuned.tuning.look.headers.len(), 1);
+        let rotation = tuned.rotation.unwrap();
+        assert_eq!(
+            (rotation.min_age, rotation.max_age, rotation.max_bytes),
+            (Duration::from_secs(60), Duration::from_secs(90), 128 << 20)
+        );
+        // `rotate=0` still wins over the age and volume.
+        assert!(config("&rotate=0&age=60-90").rotation.is_none());
+        // Packet upload is zero linger unless the link says otherwise.
+        assert_eq!(config("&upload=packet").linger, Duration::ZERO);
+        assert_eq!(
+            config("&upload=packet&linger=300").linger,
+            Duration::from_millis(300)
+        );
     }
 }

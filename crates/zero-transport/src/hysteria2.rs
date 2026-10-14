@@ -12,6 +12,8 @@ use tokio::io::duplex;
 use tokio::time::{timeout, Duration};
 use zero_core::{boxed, BoxStream, Destination};
 
+use crate::quic_shape::QuicShape;
+
 const TCP_REQUEST: u64 = 0x401;
 const UDP_SESSION_HEADER: usize = 8;
 const AUTH_URI: &str = "https://hysteria/auth";
@@ -145,21 +147,17 @@ async fn pooled(
     addrs: &[SocketAddr],
     tls: &zero_security::TlsParams,
     password: &str,
-    obfs: Option<&str>,
+    shape: &QuicShape,
 ) -> Result<(String, std::sync::Arc<crate::quic_pool::Pooled>), String> {
-    // A wrong or missing obfuscation password is a different server as far
-    // as a connection goes, so it is part of the key.
+    // A wrong or missing obfuscation password, another hop plan or other QUIC
+    // limits make a different connection as far as the pool goes, so the
+    // shape is part of the key.
     let mut secret = password.as_bytes().to_vec();
-    if let Some(obfs) = obfs {
-        secret.extend_from_slice(b"\0salamander\0");
-        secret.extend_from_slice(obfs.as_bytes());
-    }
-    let salamander = obfs.map(crate::salamander::Salamander::new).transpose()?;
+    secret.extend_from_slice(b"\0");
+    secret.extend_from_slice(shape.key_text().as_bytes());
     let key = crate::quic_pool::key("hysteria2", addrs, tls, &secret);
-    let pooled = crate::quic_pool::get(&key, || {
-        connect_resumed(addrs, tls, password, salamander.as_ref())
-    })
-    .await?;
+    let pooled =
+        crate::quic_pool::get(&key, || connect_resumed(addrs, tls, password, shape)).await?;
     Ok((key, pooled))
 }
 
@@ -172,23 +170,23 @@ async fn connect_resumed(
     addrs: &[SocketAddr],
     tls: &zero_security::TlsParams,
     password: &str,
-    obfs: Option<&crate::salamander::Salamander>,
+    shape: &QuicShape,
 ) -> Result<
     (
         h3_quinn::quinn::Endpoint,
         h3_quinn::quinn::Connection,
-        Option<crate::salamander::Salamander>,
+        Option<Arc<QuicShape>>,
     ),
     String,
 > {
-    let dialed = match connect_authenticated_with(addrs, tls, password, obfs, true).await {
+    let dialed = match connect_authenticated_with(addrs, tls, password, shape, true).await {
         Err(error) if error.contains(ZERO_RTT_REJECTED) => {
             tracing::debug!(%error, "Hysteria2 0-RTT rejected; reconnecting in 1-RTT");
-            connect_authenticated_with(addrs, tls, password, obfs, false).await
+            connect_authenticated_with(addrs, tls, password, shape, false).await
         }
         other => other,
     }?;
-    Ok((dialed.0, dialed.1, obfs.cloned()))
+    Ok((dialed.0, dialed.1, Some(Arc::new(shape.clone()))))
 }
 
 /// Marker in the error of an attempt whose early data the server refused.
@@ -206,7 +204,7 @@ async fn connect_authenticated_with(
     addrs: &[SocketAddr],
     tls: &zero_security::TlsParams,
     password: &str,
-    obfs: Option<&crate::salamander::Salamander>,
+    shape: &QuicShape,
     early: bool,
 ) -> Result<(h3_quinn::quinn::Endpoint, h3_quinn::quinn::Connection), String> {
     if addrs.is_empty() {
@@ -223,18 +221,26 @@ async fn connect_authenticated_with(
     let crypto = h3_quinn::quinn::crypto::rustls::QuicClientConfig::try_from(rustls)
         .map_err(|error| format!("Hysteria2 TLS configuration: {error}"))?;
     let mut client_config = h3_quinn::quinn::ClientConfig::new(Arc::new(crypto));
-    client_config.transport_config(Arc::new(crate::relay::quic_transport(
-        CLIENT_IDLE_TIMEOUT,
-        Some(CLIENT_KEEP_ALIVE),
-    )));
+    let (transport, congestion) = shape.transport(CLIENT_IDLE_TIMEOUT, Some(CLIENT_KEEP_ALIVE));
+    client_config.transport_config(Arc::new(transport));
     let bind: SocketAddr = if addrs.first().is_some_and(SocketAddr::is_ipv6) {
         (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
     } else {
         (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
     };
-    let mut endpoint = match obfs {
-        Some(obfs) => crate::relay::protected_obfuscated_client_endpoint(bind, obfs),
-        None => crate::relay::protected_client_endpoint(bind),
+    let mut endpoint = if shape.salamander.is_some() || shape.hop.is_some() {
+        // The first address is the one the connection is named for, so it is
+        // the one a hop plan moves the port of.
+        shape.open_socket(addrs[0]).and_then(|socket| {
+            h3_quinn::quinn::Endpoint::new_with_abstract_socket(
+                h3_quinn::quinn::EndpointConfig::default(),
+                None,
+                socket,
+                Arc::new(h3_quinn::quinn::TokioRuntime),
+            )
+        })
+    } else {
+        crate::relay::protected_client_endpoint(bind)
     }
     .map_err(|error| format!("Hysteria2 endpoint: {error}"))?;
     endpoint.set_default_client_config(client_config);
@@ -275,7 +281,7 @@ async fn connect_authenticated_with(
             last_error.unwrap_or_else(|| "no candidate succeeded".into())
         )
     })?;
-    let result = authenticate_client(&connection, password).await;
+    let result = authenticate_client(&connection, password, shape).await;
     if let Some(accepted) = zero_rtt {
         // The authentication went out as early data; it only counts if the
         // server took it. Rejected, the streams it used are gone.
@@ -285,7 +291,14 @@ async fn connect_authenticated_with(
         }
         ZERO_RTT_ACCEPTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    result?;
+    let peer_receive = result?;
+    // Both ends have said what they can take: send at the smaller of the
+    // rates, or stay with the carrier's own controller.
+    if let Some(handle) = congestion {
+        let rate = shape.brutal_rate(peer_receive);
+        tracing::debug!(rate, "Hysteria2 sending rate");
+        handle.set_rate(rate);
+    }
     Ok((endpoint, connection))
 }
 
@@ -293,7 +306,8 @@ async fn connect_authenticated_with(
 async fn authenticate_client(
     connection: &h3_quinn::quinn::Connection,
     password: &str,
-) -> Result<(), String> {
+    shape: &QuicShape,
+) -> Result<Option<u64>, String> {
     let (mut driver, mut requests) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
         .await
         .map_err(|error| format!("Hysteria2 HTTP/3 setup: {error}"))?;
@@ -311,6 +325,13 @@ async fn authenticate_client(
         .method("POST")
         .uri(AUTH_URI)
         .header("hysteria-auth", password)
+        // The rate this end wants to receive at (0: no preference), and
+        // padding, so the request is not the same size every time.
+        .header(
+            "hysteria-cc-rx",
+            shape.params.down_bytes_per_sec.to_string(),
+        )
+        .header("hysteria-padding", padding_text())
         .body(())
         .map_err(|error| format!("Hysteria2 auth request: {error}"))?;
     let mut request_stream = requests
@@ -331,6 +352,13 @@ async fn authenticate_client(
             response.status()
         ));
     }
+    // The rate the server wants to receive at: a number, or "auto" when it
+    // leaves the choice to the sender.
+    let peer_receive = response
+        .headers()
+        .get("hysteria-cc-rx")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.trim().parse::<u64>().ok());
     while request_stream
         .recv_data()
         .await
@@ -347,7 +375,18 @@ async fn authenticate_client(
         let _requests = requests;
         held.closed().await;
     });
-    Ok(())
+    Ok(peer_receive)
+}
+
+/// Random printable text of 64 to 512 bytes, for the `Hysteria-Padding`
+/// header.
+fn padding_text() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let length = rng.gen_range(64..=512);
+    (0..length)
+        .map(|_| char::from(rng.gen_range(b'a'..=b'z')))
+        .collect()
 }
 
 /// Send one Hysteria2 UDP datagram and wait for the matching response.
@@ -360,14 +399,14 @@ pub async fn exchange_udp(
     addrs: &[SocketAddr],
     tls: &zero_security::TlsParams,
     password: &str,
-    obfs: Option<&str>,
+    shape: &QuicShape,
     destination: &Destination,
     payload: &[u8],
 ) -> Result<(Destination, Vec<u8>), String> {
     let mut last = String::new();
     // Once more on a fresh connection if the pooled one turns out dead.
     for attempt in 0..2 {
-        let (key, pooled) = pooled(addrs, tls, password, obfs).await?;
+        let (key, pooled) = pooled(addrs, tls, password, shape).await?;
         match exchange_on(&pooled, destination, payload).await {
             Ok(response) => return Ok(response),
             Err((error, retry)) => {
@@ -440,7 +479,7 @@ pub async fn connect(
     addrs: &[SocketAddr],
     tls: &zero_security::TlsParams,
     password: &str,
-    obfs: Option<&str>,
+    shape: &QuicShape,
     destination: &Destination,
 ) -> Result<BoxStream, String> {
     if destination.network != zero_core::Network::Tcp {
@@ -453,7 +492,7 @@ pub async fn connect(
     // the pooled one has died since it was last used.
     let mut opened = None;
     for attempt in 0..2 {
-        let (key, pooled) = pooled(addrs, tls, password, obfs).await?;
+        let (key, pooled) = pooled(addrs, tls, password, shape).await?;
         match pooled.connection.open_bi().await {
             Ok(pair) => {
                 opened = Some((pooled.stream_guard(), pair));
@@ -548,6 +587,7 @@ const ACCEPT_QUEUE: usize = 64;
 /// inbound (there was no timeout), and a spec-conforming client multiplexing
 /// several streams over one connection had all but the first ignored.
 pub struct Acceptor {
+    masquerade: Option<Arc<crate::masquerade::Masquerade>>,
     endpoint: h3_quinn::quinn::Endpoint,
     accepted: tokio::sync::mpsc::Receiver<Result<Accepted, String>>,
     sender: tokio::sync::mpsc::Sender<Result<Accepted, String>>,
@@ -557,10 +597,18 @@ impl Acceptor {
     pub fn new(endpoint: h3_quinn::quinn::Endpoint) -> Self {
         let (sender, accepted) = tokio::sync::mpsc::channel(ACCEPT_QUEUE);
         Self {
+            masquerade: None,
             endpoint,
             accepted,
             sender,
         }
+    }
+
+    /// Answer visitors who are not Hysteria2 clients as the website
+    /// `masquerade` describes, instead of with a bare 404.
+    pub fn with_masquerade(mut self, masquerade: crate::masquerade::Masquerade) -> Self {
+        self.masquerade = Some(Arc::new(masquerade));
+        self
     }
 
     /// Wait for the next proxy stream or datagram. `Err` reports one rejected
@@ -586,6 +634,7 @@ impl Acceptor {
                     tokio::spawn(serve_connection(
                         incoming,
                         Arc::clone(&passwords),
+                        self.masquerade.clone(),
                         self.sender.clone(),
                     ));
                 }
@@ -597,11 +646,12 @@ impl Acceptor {
 async fn serve_connection(
     incoming: h3_quinn::quinn::Incoming,
     passwords: Arc<[Box<str>]>,
+    masquerade: Option<Arc<crate::masquerade::Masquerade>>,
     out: tokio::sync::mpsc::Sender<Result<Accepted, String>>,
 ) {
     let authenticated = timeout(
         SERVER_AUTH_TIMEOUT,
-        authenticate_connection(incoming, &passwords),
+        authenticate_connection(incoming, &passwords, masquerade),
     )
     .await
     .unwrap_or_else(|_| Err("Hysteria2 handshake or authentication timed out".into()));
@@ -659,6 +709,7 @@ async fn serve_connection(
 async fn authenticate_connection(
     incoming: h3_quinn::quinn::Incoming,
     passwords: &[Box<str>],
+    masquerade: Option<Arc<crate::masquerade::Masquerade>>,
 ) -> Result<h3_quinn::quinn::Connection, String> {
     let connection = incoming
         .await
@@ -684,6 +735,16 @@ async fn authenticate_connection(
             .get("hysteria-auth")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| passwords.iter().any(|password| password.as_ref() == value));
+    // Not a login: with a masquerade set, this is a visitor to a website, and
+    // is served as one on its own task, however long it stays.
+    if let (false, Some(masquerade)) = (valid, masquerade) {
+        tokio::spawn(crate::masquerade::serve_connection(
+            h3_conn,
+            (request, stream),
+            masquerade,
+        ));
+        return Err("Hysteria2 visitor without credentials, answered as a website".into());
+    }
     let response = http::Response::builder()
         .status(if valid { AUTH_STATUS } else { 404 })
         .body(())

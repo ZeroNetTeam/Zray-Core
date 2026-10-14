@@ -237,6 +237,7 @@ fn parse_vless(rest: &str) -> Result<ShareLink, String> {
                 .map(String::as_str)
                 .unwrap_or("none")
                 .into(),
+            vision_seed: None,
         }),
         stream,
         mux: MuxConfig::default(),
@@ -575,6 +576,7 @@ fn parse_socks(rest: &str) -> Result<ShareLink, String> {
             address: Address::parse_host(host),
             port,
             auth,
+            http: false,
         }),
         stream: StreamSettings::default(),
         mux: MuxConfig::default(),
@@ -702,6 +704,7 @@ fn parse_tide(rest: &str) -> Result<ShareLink, String> {
     // The path is Tide's own; the stream below is plain TLS over TCP.
     query.remove("path");
     query.remove("type");
+    let tuning = TideTuning::parse(&|key| query.get(key).cloned())?;
     let stream = build_stream(&query, p.host)?;
     let outbound = Outbound {
         tag: Arc::from("proxy"),
@@ -715,6 +718,7 @@ fn parse_tide(rest: &str) -> Result<ShareLink, String> {
             packet_upload: query.get("upload").map(String::as_str) == Some("packet"),
             datagrams: query.get("dg").map(String::as_str) == Some("1"),
             rotate: query.get("rotate").map(String::as_str) != Some("0"),
+            tuning,
         }),
         stream,
         mux: MuxConfig::default(),
@@ -798,6 +802,8 @@ fn parse_hysteria2(rest: &str) -> Result<ShareLink, String> {
             ech: None,
             trusted_roots: Vec::new(),
             pinned_cert_sha256: Vec::new(),
+            verify_names: Vec::new(),
+            key_log_file: None,
         });
     }
     let outbound = Outbound {
@@ -843,6 +849,8 @@ fn parse_tuic(rest: &str) -> Result<ShareLink, String> {
             ech: None,
             trusted_roots: Vec::new(),
             pinned_cert_sha256: Vec::new(),
+            verify_names: Vec::new(),
+            key_log_file: None,
         });
     }
     let outbound = Outbound {
@@ -896,6 +904,8 @@ fn parse_juicity(rest: &str) -> Result<ShareLink, String> {
             ech: None,
             trusted_roots: Vec::new(),
             pinned_cert_sha256: Vec::new(),
+            verify_names: Vec::new(),
+            key_log_file: None,
         });
     }
     let outbound = Outbound {
@@ -1041,7 +1051,11 @@ fn build_stream(q: &BTreeMap<String, String>, host: &str) -> Result<StreamSettin
             // `/<service>` is rejected by every real gRPC server.
             let service = q.get("servicename").map(String::as_str).unwrap_or("");
             let mut config = build_ws(q);
-            config.path = Arc::from(crate::xray_json::grpc_path(service));
+            let (single, multi) = crate::xray_json::grpc_paths(service);
+            config.path = Arc::from(single);
+            config.grpc_multi_path = multi.map(Arc::from);
+            // `mode=multi` is Xray's `multiMode`: the client speaks MultiHunk.
+            config.grpc_multi = get("mode") == "multi";
             if let Some(authority) = q.get("authority").filter(|value| !value.is_empty()) {
                 config.host = Some(Arc::from(authority.as_str()));
             }
@@ -1118,6 +1132,8 @@ fn build_stream(q: &BTreeMap<String, String>, host: &str) -> Result<StreamSettin
                 allow_insecure: link_insecure(q),
                 ech: link_ech(q),
                 trusted_roots: Vec::new(),
+                verify_names: Vec::new(),
+                key_log_file: None,
                 pinned_cert_sha256: crate::xray_json::parse_cert_pins(get("pcs"))
                     .map_err(|error| format!("pcs: {error}"))?,
             })
@@ -1183,6 +1199,7 @@ fn build_stream(q: &BTreeMap<String, String>, host: &str) -> Result<StreamSettin
             true => link_http_camouflage(q),
             false => None,
         },
+        direct: None,
     })
 }
 
@@ -1286,6 +1303,8 @@ fn build_ws(q: &BTreeMap<String, String>) -> WebSocketConfig {
         xhttp_http_version: XhttpHttpVersion::Http1,
         xhttp_download: None,
         xhttp: Default::default(),
+        grpc_multi_path: None,
+        grpc_multi: false,
     }
 }
 
@@ -2264,6 +2283,20 @@ mod tests {
     const UUID: &str = "245abd35-7efa-4bc8-85d4-a04f3798329f";
 
     #[test]
+    fn a_grpc_link_with_mode_multi_speaks_multihunk() {
+        let link = parse_link(&format!(
+            "vless://{UUID}@example.com:443?type=grpc&serviceName=my-svc&mode=multi&security=tls&sni=example.com#g"
+        ))
+        .unwrap();
+        let Transport::Grpc(grpc) = &link.outbound.stream.transport else {
+            panic!("expected grpc");
+        };
+        assert!(grpc.grpc_multi);
+        assert_eq!(grpc.grpc_multi_path.as_deref(), Some("/my-svc/TunMulti"));
+        assert_eq!(&*grpc.path, "/my-svc/Tun");
+    }
+
+    #[test]
     fn grpc_links_keep_their_service_name_as_an_xray_grpc_path() {
         let link = parse_link(&format!(
             "vless://{UUID}@example.com:443?type=grpc&serviceName=my-svc&security=tls&sni=example.com#g"
@@ -2514,5 +2547,87 @@ mod tests {
         assert!(!datagrams(link("&dg=0")));
         // The old scheme name reads the same way.
         assert!(datagrams(link("&dg=1").replace("zerov1://", "tide://")));
+    }
+
+    fn tide_tuning(extra: &str) -> Result<TideTuning, String> {
+        let key = "A".repeat(43);
+        let user = "A".repeat(22);
+        let link = format!("zerov1://{user}@example.org:443?key={key}&path=/static/ab{extra}#n");
+        parse_link(&link).map(|parsed| match parsed.outbound.protocol {
+            OutboundProtocol::Tide(tide) => tide.tuning,
+            _ => panic!("expected a ZeroV1 outbound"),
+        })
+    }
+
+    #[test]
+    fn a_plain_zerov1_link_changes_nothing_about_the_defaults() {
+        assert_eq!(tide_tuning("").unwrap(), TideTuning::default());
+    }
+
+    #[test]
+    fn a_zerov1_link_can_set_how_it_looks_and_paces() {
+        let t = tide_tuning(
+            "&authority=Cdn.Example.com&ua=firefox&lang=fa-IR,fa;q%3D0.9&headers=referer:https://a.test/,x-visit:7\
+             &pipes=3&uploads=5&ping=20&idle=120&linger=0&age=60-300&volume=512",
+        )
+        .unwrap();
+        assert_eq!(t.authority.as_deref(), Some("cdn.example.com"));
+        assert!(t.user_agent.as_deref().unwrap().contains("Firefox/"));
+        assert_eq!(t.language.as_deref(), Some("fa-IR,fa;q=0.9"));
+        assert_eq!(t.headers.len(), 2);
+        assert_eq!(&*t.headers[0].0, "referer");
+        assert_eq!(&*t.headers[0].1, "https://a.test/");
+        assert_eq!(
+            (t.down_pipes, t.up_pipes, t.ping_secs, t.idle_secs),
+            (Some(3), Some(5), Some(20), Some(120))
+        );
+        assert_eq!(
+            (t.linger_ms, t.age_secs, t.volume_mb),
+            (Some(0), Some((60, 300)), Some(512))
+        );
+        // `host` is the name most people reach for; it means the same.
+        assert_eq!(
+            tide_tuning("&host=a.test").unwrap().authority.as_deref(),
+            Some("a.test")
+        );
+        // Any text is a user agent when it is not a preset name.
+        assert_eq!(
+            tide_tuning("&ua=MyBrowser%2F1.0")
+                .unwrap()
+                .user_agent
+                .as_deref(),
+            Some("MyBrowser/1.0")
+        );
+    }
+
+    #[test]
+    fn a_zerov1_option_out_of_range_is_refused_not_clamped() {
+        for bad in [
+            "&pipes=0",
+            "&pipes=9",
+            "&uploads=7",
+            "&ping=1",
+            "&idle=5",
+            "&linger=60000",
+            "&age=300-60",
+            "&age=5-9",
+            "&volume=8",
+            "&authority=bad/name",
+            "&ua=%00",
+            "&headers=content-type:text/html",
+            "&headers=host:evil.test",
+            "&headers=novalue",
+        ] {
+            assert!(tide_tuning(bad).is_err(), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn two_zerov1_links_that_differ_only_in_a_cookie_do_not_share_a_client() {
+        let a = tide_tuning("&headers=cookie:sesame-A").unwrap();
+        let b = tide_tuning("&headers=cookie:sesame-B").unwrap();
+        assert_ne!(format!("{a:?}"), format!("{b:?}"));
+        // The value itself never shows in the debug form.
+        assert!(!format!("{a:?}").contains("sesame"));
     }
 }

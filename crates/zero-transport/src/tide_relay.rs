@@ -41,7 +41,8 @@ use http::{Method, Request, Response, StatusCode};
 use zero_core::BoxStream;
 
 use crate::tide::{
-    answer_bad_gateway, answer_decoy, other, request, send_all, Carrier, Decoy, Dialer, H2_WINDOW,
+    answer_bad_gateway, answer_decoy, other, request, send_all, Carrier, Decoy, Dialer, Tuning,
+    H2_WINDOW,
 };
 
 pub struct RelayConfig {
@@ -72,7 +73,7 @@ const QUERY_MAX: usize = 128;
 impl Relay {
     /// `dial` reaches the egress (TLS done, `h2` negotiated).
     pub fn new(config: RelayConfig, dial: Dialer) -> Arc<Self> {
-        let upstream = Carrier::new(dial, config.host.clone(), None);
+        let upstream = Carrier::new(dial, config.host.clone(), None, &Tuning::default());
         Arc::new(Self { config, upstream })
     }
 
@@ -352,6 +353,7 @@ mod tests {
                 linger: Duration::from_millis(100),
                 lane: false,
                 rotation,
+                tuning: Default::default(),
             },
             to_relay,
         );
@@ -606,6 +608,7 @@ mod tests {
                 linger: Duration::ZERO,
                 lane: false,
                 rotation: None,
+                tuning: Default::default(),
             },
             to_relay,
         );

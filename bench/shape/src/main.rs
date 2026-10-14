@@ -368,6 +368,7 @@ async fn tide_split() -> Vec<Vec<i64>> {
             linger: Duration::from_millis(50),
             lane: false,
             rotation: None,
+            tuning: Default::default(),
         },
         dial,
     );

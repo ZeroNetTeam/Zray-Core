@@ -130,6 +130,7 @@ fn inspect_initial(datagram: &[u8]) -> Option<Sniffed> {
     Some(Sniffed {
         domain,
         protocol: Some("quic"),
+        http: None,
     })
 }
 

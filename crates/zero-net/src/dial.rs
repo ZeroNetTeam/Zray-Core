@@ -47,6 +47,11 @@ pub struct SocketOptions {
     pub tcp_fast_open: bool,
     pub mark: Option<u32>,
     pub bind_interface: Option<String>,
+    /// Xray's `customSockopt`, applied to each socket before it connects.
+    pub custom: Vec<zero_core::custom_sockopt::CustomSockopt>,
+    /// The local address to connect from (Xray's `sendThrough`), used for
+    /// candidates of its own IP family.
+    pub bind_address: Option<std::net::IpAddr>,
     pub send_buffer: Option<usize>,
     pub recv_buffer: Option<usize>,
     /// Named TCP congestion algorithm (`TCP_CONGESTION`). A name the kernel
@@ -54,6 +59,21 @@ pub struct SocketOptions {
     /// on the system default — the same contract Xray offers, and the only
     /// honest one for a config that can outlive the kernel it lands on.
     pub tcp_congestion: Option<String>,
+    /// Seconds idle before keepalive probes begin, and between probes (Xray's
+    /// `tcpKeepAliveIdle` and `tcpKeepAliveInterval`). `None` is the
+    /// built-in 45 and 45; `Some((0, 0))` turns keepalive off.
+    pub keepalive: Option<(u32, u32)>,
+    /// `TCP_USER_TIMEOUT` in milliseconds: how long unacknowledged data may
+    /// sit before the connection is given up on.
+    pub user_timeout_ms: Option<u32>,
+    /// `TCP_WINDOW_CLAMP`: the largest receive window advertised.
+    pub window_clamp: Option<u32>,
+    /// `TCP_MAXSEG`: the segment size to send.
+    pub max_seg: Option<u32>,
+    /// Multipath TCP, where the kernel has it (Linux 5.6 and later): the
+    /// connection may use several paths at once and survives losing one. A
+    /// kernel without it gets an ordinary TCP socket.
+    pub mptcp: bool,
     /// Asked about each candidate before it is dialled: `true` puts the
     /// ClientHello in the SYN (TCP Fast Open, see [`crate::fastopen`]). The
     /// answer comes from the caller's memory of what worked towards that
@@ -125,7 +145,8 @@ pub async fn dial_tcp(
     let mut pending = FuturesUnordered::new();
     let mut next = 0usize;
     let mut started_count = 0usize;
-    let mut last_error: Option<Failure> = None;
+    // Every candidate's failure, in the order they came back.
+    let mut failures: Vec<(SocketAddr, Failure)> = Vec::new();
 
     loop {
         // Top up in-flight attempts.
@@ -143,13 +164,7 @@ pub async fn dial_tcp(
         }
 
         if pending.is_empty() {
-            return Err(last_error.unwrap_or_else(|| {
-                Failure::new(
-                    zero_core::FailureKind::TcpUnreachable,
-                    Stage::SocketConnected,
-                )
-                .with_detail("all candidates failed")
-            }));
+            return Err(all_failed(failures));
         }
 
         // The stagger only matters while there is both a candidate left and a
@@ -175,7 +190,7 @@ pub async fn dial_tcp(
                     Err(f) => {
                         // A fast failure frees a slot; the loop starts the next
                         // candidate immediately rather than waiting out the stagger.
-                        last_error = Some(f);
+                        failures.push((addr, f));
                     }
                 }
             }
@@ -183,6 +198,44 @@ pub async fn dial_tcp(
             _ = stagger, if more_to_start => {}
         }
     }
+}
+
+/// The one failure to report when every candidate failed, naming them all.
+///
+/// A server name usually has both an IPv4 and an IPv6 address, and a network
+/// without IPv6 refuses the second at once with "network is unreachable";
+/// reporting only the last failure would show that, and hide that the IPv4
+/// attempt failed for another reason. So the failure that classifies the
+/// result is the first one that is not a plain unreachable (or the first
+/// at all), and its detail lists every address with what happened to it.
+fn all_failed(failures: Vec<(SocketAddr, Failure)>) -> Failure {
+    let Some(chosen) = failures
+        .iter()
+        .find(|(_, failure)| failure.kind != zero_core::FailureKind::TcpUnreachable)
+        .or_else(|| failures.first())
+        .map(|(_, failure)| failure.clone())
+    else {
+        return Failure::new(
+            zero_core::FailureKind::TcpUnreachable,
+            Stage::SocketConnected,
+        )
+        .with_detail("all candidates failed");
+    };
+    if failures.len() < 2 {
+        return chosen;
+    }
+    let listed = failures
+        .iter()
+        .map(|(addr, failure)| {
+            format!(
+                "{addr}: {}",
+                failure.detail.as_deref().unwrap_or("no detail")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let own = chosen.detail.clone().unwrap_or_default();
+    chosen.with_detail(format!("{own} (every address tried: {listed})"))
 }
 
 async fn connect_one(
@@ -193,7 +246,12 @@ async fn connect_one(
     let fut = async {
         let stream = connect_stream(addr, opts).await?;
         // Keepalive only after the race is won: the losers never need it.
-        set_keepalive(&stream);
+        set_keepalive(&stream, opts.keepalive);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(ms) = opts.user_timeout_ms {
+            let _ = socket2::SockRef::from(&stream)
+                .set_tcp_user_timeout(Some(Duration::from_millis(ms.into())));
+        }
         let _ = stream.set_nodelay(true);
         #[cfg(target_os = "linux")]
         {
@@ -242,10 +300,10 @@ async fn connect_stream(addr: SocketAddr, opts: &SocketOptions) -> io::Result<Tc
 }
 
 fn new_socket(addr: SocketAddr, opts: &SocketOptions) -> io::Result<tokio::net::TcpSocket> {
-    let socket = if addr.is_ipv4() {
-        tokio::net::TcpSocket::new_v4()?
-    } else {
-        tokio::net::TcpSocket::new_v6()?
+    let socket = match multipath_socket(addr, opts) {
+        Some(socket) => socket,
+        None if addr.is_ipv4() => tokio::net::TcpSocket::new_v4()?,
+        None => tokio::net::TcpSocket::new_v6()?,
     };
 
     // Before anything else, and before connect: on a mobile VPN an
@@ -263,6 +321,13 @@ fn new_socket(addr: SocketAddr, opts: &SocketOptions) -> io::Result<tokio::net::
         let _ = socket.set_recv_buffer_size(u32::try_from(sz).unwrap_or(u32::MAX));
     }
 
+    if let Some(ip) = opts
+        .bind_address
+        .filter(|ip| ip.is_ipv4() == addr.is_ipv4())
+    {
+        socket.bind(SocketAddr::new(ip, 0))?;
+    }
+
     // SO_MARK and SO_BINDTODEVICE exist on Android too, where routing marks
     // are exactly how a VPN app keeps its own traffic out of its tunnel.
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -277,12 +342,88 @@ fn new_socket(addr: SocketAddr, opts: &SocketOptions) -> io::Result<tokio::net::
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let Some(name) = &opts.tcp_congestion {
+    if !opts.custom.is_empty() {
         use std::os::fd::AsRawFd;
-        set_tcp_congestion(socket.as_raw_fd(), name);
+        let network = if addr.is_ipv4() { "tcp4" } else { "tcp6" };
+        zero_core::custom_sockopt::apply(socket.as_raw_fd(), network, &opts.custom)?;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+        if let Some(name) = &opts.tcp_congestion {
+            set_tcp_congestion(socket.as_raw_fd(), name);
+        }
+        if let Some(clamp) = opts.window_clamp {
+            set_int_option(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_WINDOW_CLAMP,
+                clamp as libc::c_int,
+            );
+        }
+        if let Some(segment) = opts.max_seg {
+            set_int_option(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_MAXSEG,
+                segment as libc::c_int,
+            );
+        }
     }
 
     Ok(socket)
+}
+
+/// A Multipath TCP socket for `addr`, when the options ask for one and the
+/// kernel has it; `None` otherwise, and the caller makes an ordinary one.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn multipath_socket(addr: SocketAddr, opts: &SocketOptions) -> Option<tokio::net::TcpSocket> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    if !opts.mptcp {
+        return None;
+    }
+    // IPPROTO_MPTCP is 262; socket2 has no name for it.
+    let socket = socket2::Socket::new(
+        if addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        },
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::from(262)),
+    )
+    .ok()?;
+    socket.set_nonblocking(true).ok()?;
+    // SAFETY: the descriptor is a fresh, open TCP-type socket whose only
+    // owner is handed over here.
+    Some(unsafe { tokio::net::TcpSocket::from_raw_fd(socket.into_raw_fd()) })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn multipath_socket(_addr: SocketAddr, _opts: &SocketOptions) -> Option<tokio::net::TcpSocket> {
+    None
+}
+
+/// An integer-valued socket option, best effort.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn set_int_option(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) {
+    // SAFETY: `fd` is a live socket, the option takes an int, and the value
+    // lives for the call.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            std::ptr::addr_of!(value).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
 }
 
 /// TCP keepalive with Xray's defaults (Chrome's: 45 s idle, 45 s interval).
@@ -294,8 +435,19 @@ fn new_socket(addr: SocketAddr, opts: &SocketOptions) -> io::Result<tokio::net::
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(45);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(45);
 
-fn set_keepalive(stream: &TcpStream) {
-    let keepalive = socket2::TcpKeepalive::new().with_time(KEEPALIVE_IDLE);
+fn set_keepalive(stream: &TcpStream, setting: Option<(u32, u32)>) {
+    let (idle, interval) = match setting {
+        Some((0, 0)) => {
+            let _ = socket2::SockRef::from(stream).set_keepalive(false);
+            return;
+        }
+        Some((idle, interval)) => (
+            Duration::from_secs(idle.into()),
+            Duration::from_secs(interval.into()),
+        ),
+        None => (KEEPALIVE_IDLE, KEEPALIVE_INTERVAL),
+    };
+    let keepalive = socket2::TcpKeepalive::new().with_time(idle);
     #[cfg(any(
         target_os = "linux",
         target_os = "android",
@@ -304,7 +456,7 @@ fn set_keepalive(stream: &TcpStream) {
         target_os = "freebsd",
         target_os = "windows"
     ))]
-    let keepalive = keepalive.with_interval(KEEPALIVE_INTERVAL);
+    let keepalive = keepalive.with_interval(interval);
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
@@ -313,7 +465,7 @@ fn set_keepalive(stream: &TcpStream) {
         target_os = "freebsd",
         target_os = "windows"
     )))]
-    let _ = KEEPALIVE_INTERVAL;
+    let _ = interval;
     let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
 }
 
@@ -374,6 +526,32 @@ mod tests {
 
     fn sa(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_failed_dial_names_every_address_it_tried() {
+        // Two ports nothing listens on: both refuse, and the report says so
+        // for each, not just for the last one to come back.
+        let free = || {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            socket.local_addr().unwrap()
+        };
+        let (first, second) = (free(), free());
+        let failure = dial_tcp(
+            &[first, second],
+            &RacePolicy::default(),
+            &SocketOptions::default(),
+        )
+        .await
+        .expect_err("nothing listens there");
+        let detail = failure.detail.unwrap_or_default();
+        assert!(detail.contains(&first.to_string()), "{detail}");
+        assert!(detail.contains(&second.to_string()), "{detail}");
+        // A single candidate keeps its own failure unchanged.
+        let single = dial_tcp(&[free()], &RacePolicy::default(), &SocketOptions::default())
+            .await
+            .expect_err("nothing listens there");
+        assert!(!single.detail.unwrap_or_default().contains("every address"));
     }
 
     #[test]
@@ -472,6 +650,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(d.addr, good);
+    }
+
+    /// A listener on loopback that accepts one connection and holds it.
+    async fn listening() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _held = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn keepalive_can_be_set_or_turned_off() {
+        let addr = listening().await;
+        let options = SocketOptions {
+            keepalive: Some((20, 7)),
+            ..SocketOptions::default()
+        };
+        let d = dial_tcp(&[addr], &RacePolicy::default(), &options)
+            .await
+            .unwrap();
+        let sock = socket2::SockRef::from(&d.stream);
+        assert!(sock.keepalive().unwrap());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert_eq!(sock.keepalive_time().unwrap(), Duration::from_secs(20));
+            assert_eq!(sock.keepalive_interval().unwrap(), Duration::from_secs(7));
+        }
+        let addr = listening().await;
+        let options = SocketOptions {
+            keepalive: Some((0, 0)),
+            ..SocketOptions::default()
+        };
+        let d = dial_tcp(&[addr], &RacePolicy::default(), &options)
+            .await
+            .unwrap();
+        assert!(!socket2::SockRef::from(&d.stream).keepalive().unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn user_timeout_window_clamp_and_segment_size_reach_the_socket() {
+        let addr = listening().await;
+        let options = SocketOptions {
+            user_timeout_ms: Some(12_000),
+            window_clamp: Some(70_000),
+            max_seg: Some(1200),
+            ..SocketOptions::default()
+        };
+        let d = dial_tcp(&[addr], &RacePolicy::default(), &options)
+            .await
+            .unwrap();
+        let sock = socket2::SockRef::from(&d.stream);
+        assert_eq!(
+            sock.tcp_user_timeout().unwrap(),
+            Some(Duration::from_millis(12_000))
+        );
+        // The kernel keeps the clamp as set, or a little below it.
+        let mut clamp: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: a live socket, an int-valued option and a matching buffer.
+        let rc = unsafe {
+            libc::getsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&d.stream),
+                libc::IPPROTO_TCP,
+                libc::TCP_WINDOW_CLAMP,
+                std::ptr::addr_of_mut!(clamp).cast(),
+                &mut size,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert!((60_000..=70_000).contains(&clamp), "clamp {clamp}");
+        assert!(sock.mss().unwrap() <= 1200, "mss {}", sock.mss().unwrap());
+    }
+
+    /// Multipath TCP when the kernel has it: either way the dial works, and
+    /// the socket says which protocol it is.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn multipath_tcp_is_used_when_there_is_a_kernel_for_it_and_never_blocks_a_dial() {
+        let addr = listening().await;
+        let options = SocketOptions {
+            mptcp: true,
+            ..SocketOptions::default()
+        };
+        let d = dial_tcp(&[addr], &RacePolicy::default(), &options)
+            .await
+            .unwrap();
+        let protocol = socket2::SockRef::from(&d.stream).protocol().unwrap();
+        let supported = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::from(262)),
+        )
+        .is_ok();
+        let expected = if supported { 262 } else { 6 };
+        assert_eq!(protocol.map(i32::from), Some(expected));
     }
 
     #[tokio::test]

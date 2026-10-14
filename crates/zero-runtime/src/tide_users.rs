@@ -92,16 +92,30 @@ fn save(config: &TideInboundConfig, users: &HashMap<UserId, String>) -> Result<(
 }
 
 /// The share link a client needs to connect as `user`.
+///
+/// Behind a certificate the link names the host in the TLS hello; behind
+/// REALITY it carries the REALITY name, public key and short id instead, and
+/// the host is only where to connect.
 pub fn share_link(config: &TideInboundConfig, user: &UserId, name: &str) -> Option<String> {
     let host = config.public_host.as_deref()?;
     let public = noise::public_key(&config.secret);
-    // A server reached by bare address has no name to put in the handshake;
-    // its certificate is checked against the address itself.
-    let named = host.parse::<std::net::IpAddr>().is_err();
-    let name_part = if named {
-        format!("&sni={host}")
-    } else {
-        String::new()
+    let security = match &config.reality {
+        Some(reality) => {
+            let short = if reality.short_id.is_empty() {
+                String::new()
+            } else {
+                format!("&sid={}", reality.short_id)
+            };
+            format!(
+                "reality&sni={}&pbk={}{short}",
+                reality.server_name,
+                encode_key(&noise::public_key(&reality.private_key)),
+            )
+        }
+        // A server reached by bare address has no name to put in the
+        // handshake; its certificate is checked against the address itself.
+        None if host.parse::<std::net::IpAddr>().is_err() => format!("tls&sni={host}"),
+        None => "tls".to_string(),
     };
     // An IPv6 address needs brackets to sit before a port.
     let authority = if host.contains(':') {
@@ -110,13 +124,12 @@ pub fn share_link(config: &TideInboundConfig, user: &UserId, name: &str) -> Opti
         host.to_string()
     };
     Some(format!(
-        "zerov1://{}@{}:{}?key={}&path={}&security=tls{}&fp=chrome&dg=1#{}",
+        "zerov1://{}@{}:{}?key={}&path={}&security={security}&fp=chrome&dg=1#{}",
         encode_key(user),
         authority,
         config.public_port,
         encode_key(&public),
         percent(&config.path),
-        name_part,
         percent(name),
     ))
 }
@@ -366,6 +379,7 @@ mod tests {
             public_port: 443,
             admin_path: Some("/secret-admin".into()),
             shape: Default::default(),
+            reality: None,
         }
     }
 
@@ -384,6 +398,37 @@ mod tests {
         assert_eq!(parsed.remark, "my phone");
         // Rotation is on unless the link turns it off.
         assert!(tide.rotate);
+    }
+
+    #[test]
+    fn a_link_from_a_server_behind_reality_carries_what_reality_needs() {
+        let mut config = config(None);
+        config.public_host = Some("203.0.113.9".into());
+        config.reality = Some(zero_config::TideRealityLink {
+            server_name: "www.example.test".into(),
+            private_key: [7; 32],
+            short_id: "ab12cd34ef56ab12".into(),
+        });
+        let link = share_link(&config, &[9; 16], "phone").unwrap();
+        let parsed = zero_config::share_link::parse_link(&link).unwrap();
+        let zero_config::Security::Reality(reality) = &parsed.outbound.stream.security else {
+            panic!("not a REALITY link: {link}");
+        };
+        assert_eq!(&*reality.server_name, "www.example.test");
+        assert_eq!(reality.public_key, noise::public_key(&[7; 32]));
+        assert_eq!(
+            reality.short_id,
+            [0xab, 0x12, 0xcd, 0x34, 0xef, 0x56, 0xab, 0x12]
+        );
+        // The link still carries the ZeroV1 key, which is a different one.
+        let zero_config::OutboundProtocol::Tide(tide) = &parsed.outbound.protocol else {
+            panic!("not a Tide link: {link}");
+        };
+        assert_eq!(tide.server_key, noise::public_key(&config.secret));
+        assert!(
+            !link.contains(&encode_key(&[7; 32])),
+            "the private key must not leak"
+        );
     }
 
     #[test]

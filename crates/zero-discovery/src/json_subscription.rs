@@ -151,6 +151,13 @@ fn with_fragment(link: String, mask: Option<Value>) -> String {
 
 /// One Xray outbound as `(link without remark, tag)`.
 fn xray_outbound(outbound: &Map<String, Value>) -> Option<(String, String)> {
+    // Xray writes a server either nested (`vnext`, `servers`) or, in its
+    // simplified form, flat; read both as the nested one.
+    let nested = zero_config::nested_outbound(&Value::Object(outbound.clone()));
+    let outbound = nested
+        .as_ref()
+        .and_then(Value::as_object)
+        .unwrap_or(outbound);
     let protocol = str_of(outbound, "protocol")?.to_ascii_lowercase();
     let tag = str_of(outbound, "tag").unwrap_or("").to_string();
     let settings = outbound.get("settings")?;
@@ -164,7 +171,13 @@ fn xray_outbound(outbound: &Map<String, Value>) -> Option<(String, String)> {
             let (host, port, user) = vnext(settings)?;
             let id = str_of(user, "id")?;
             let mut query = xray_stream(&stream)?;
-            query.insert(0, ("encryption", "none".into()));
+            // A VLESS Encryption server's setting travels in the link; "none"
+            // for an unencrypted one.
+            let encryption = str_of(user, "encryption")
+                .filter(|setting| !setting.is_empty())
+                .unwrap_or("none")
+                .to_string();
+            query.insert(0, ("encryption", encryption));
             if let Some(flow) = str_of(user, "flow").filter(|flow| !flow.is_empty()) {
                 query.push(("flow", flow.to_string()));
             }
@@ -706,6 +719,67 @@ mod tests {
             .expect("fragmented");
         assert_eq!(fragment.packets, zero_config::FragmentPackets::TlsHello);
         assert_eq!(parsed.remark, "Serverless 1");
+    }
+
+    #[test]
+    fn a_pasted_reality_config_in_either_form_becomes_the_same_link() {
+        let nested = r#"{"remarks": "r", "outbounds": [{"tag": "proxy", "protocol": "vless",
+            "settings": {"vnext": [{"address": "s.example", "port": 443, "users": [
+                {"id": "11111111-1111-4111-8111-111111111111", "encryption": "none",
+                 "flow": "xtls-rprx-vision"}]}]},
+            "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {
+                "serverName": "www.samsung.com", "fingerprint": "chrome",
+                "publicKey": "JZoEjtfm1Zv3zGd2nGJmGCVZU8EbIn0Wg2EvrQ3VXTA",
+                "shortId": "0123456789abcdef", "spiderX": "/"}}}]}"#;
+        let flat = nested.replace(
+            r#""vnext": [{"address": "s.example", "port": 443, "users": [
+                {"id": "11111111-1111-4111-8111-111111111111", "encryption": "none",
+                 "flow": "xtls-rprx-vision"}]}]"#,
+            r#""address": "s.example", "port": 443, "id": "11111111-1111-4111-8111-111111111111",
+                "encryption": "none", "flow": "xtls-rprx-vision""#,
+        );
+        assert_ne!(flat, nested, "the flat form was written");
+        for text in [
+            nested.to_string(),
+            format!("\u{feff}{flat}"),
+            format!("[{flat}]"),
+        ] {
+            let links = links_from_json(&text).expect("recognised as a config");
+            assert_eq!(links.len(), 1, "{text}");
+            let link = &links[0];
+            assert!(
+                link.starts_with("vless://11111111-1111-4111-8111-111111111111@s.example:443?"),
+                "{link}"
+            );
+            for part in [
+                "security=reality",
+                "sni=www.samsung.com",
+                "flow=xtls-rprx-vision",
+                "pbk=JZoEjtfm1Zv3zGd2nGJmGCVZU8EbIn0Wg2EvrQ3VXTA",
+                "sid=0123456789abcdef",
+            ] {
+                assert!(link.contains(part), "{part} missing from {link}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_simplified_outbound_form_and_vless_encryption_survive_the_import() {
+        let outbound: Value = serde_json::json!({
+            "protocol": "vless", "tag": "enc",
+            "settings": {"address": "198.51.100.7", "port": 443,
+                "id": "5783a3e7-e373-51cd-8642-c83782b807c5",
+                "encryption": "mlkem768x25519plus.native.0rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+            "streamSettings": {"network": "grpc", "grpcSettings": {"serviceName": "s", "multiMode": true}}
+        });
+        let (link, tag) = xray_outbound(outbound.as_object().unwrap()).expect("a link");
+        assert_eq!(tag, "enc");
+        assert!(link.starts_with("vless://5783a3e7-e373-51cd-8642-c83782b807c5@198.51.100.7:443?"));
+        assert!(
+            link.contains("encryption=mlkem768x25519plus.native.0rtt."),
+            "{link}"
+        );
+        assert!(link.contains("mode=multi"), "{link}");
     }
 
     #[test]

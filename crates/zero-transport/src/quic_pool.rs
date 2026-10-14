@@ -66,9 +66,9 @@ pub struct Pooled {
     /// with none, like the platform's network callback) the socket would
     /// belong to that one and die with it.
     runtime: tokio::runtime::Handle,
-    /// The Salamander password the endpoint's socket obfuscates with, so a
-    /// rebind onto a new network keeps obfuscating.
-    obfs: Option<crate::salamander::Salamander>,
+    /// How the endpoint's socket is shaped (obfuscation, port hopping), so a
+    /// rebind onto a new network keeps it.
+    shape: Option<Arc<crate::quic_shape::QuicShape>>,
     v6: bool,
     last_used: AtomicU64,
     /// Streams currently open on the connection.
@@ -82,14 +82,14 @@ impl Pooled {
         let Dialed {
             endpoint,
             connection,
-            obfs,
+            shape,
         } = dialed;
         let v6 = connection.remote_address().is_ipv6();
         Self {
             endpoint,
             connection,
             runtime: tokio::runtime::Handle::current(),
-            obfs,
+            shape,
             v6,
             last_used: AtomicU64::new(now_ms()),
             active: AtomicUsize::new(0),
@@ -189,11 +189,11 @@ pub fn key(
 }
 
 /// What a dial returns: the connection, the endpoint that owns its socket,
-/// and the Salamander password that socket obfuscates with, if any.
+/// and how that socket is shaped, if it is.
 pub struct Dialed {
     endpoint: Endpoint,
     connection: Connection,
-    obfs: Option<crate::salamander::Salamander>,
+    shape: Option<Arc<crate::quic_shape::QuicShape>>,
 }
 
 impl From<(Endpoint, Connection)> for Dialed {
@@ -201,19 +201,29 @@ impl From<(Endpoint, Connection)> for Dialed {
         Self {
             endpoint,
             connection,
-            obfs: None,
+            shape: None,
         }
     }
 }
 
-impl From<(Endpoint, Connection, Option<crate::salamander::Salamander>)> for Dialed {
+impl
+    From<(
+        Endpoint,
+        Connection,
+        Option<Arc<crate::quic_shape::QuicShape>>,
+    )> for Dialed
+{
     fn from(
-        (endpoint, connection, obfs): (Endpoint, Connection, Option<crate::salamander::Salamander>),
+        (endpoint, connection, shape): (
+            Endpoint,
+            Connection,
+            Option<Arc<crate::quic_shape::QuicShape>>,
+        ),
     ) -> Self {
         Self {
             endpoint,
             connection,
-            obfs,
+            shape,
         }
     }
 }
@@ -311,11 +321,11 @@ fn rebind_slots(slots: &[Slot]) -> usize {
         };
         let _runtime = pooled.runtime.enter();
         let rebound =
-            zero_core::platform::bind_protected_udp(bind).and_then(|socket| match &pooled.obfs {
-                Some(obfs) => pooled
+            zero_core::platform::bind_protected_udp(bind).and_then(|socket| match &pooled.shape {
+                Some(shape) if shape.salamander.is_some() || shape.hop.is_some() => pooled
                     .endpoint
-                    .rebind_abstract(crate::relay::obfuscated_socket(socket, obfs)?),
-                None => pooled.endpoint.rebind(socket),
+                    .rebind_abstract(shape.open_socket(pooled.connection.remote_address())?),
+                _ => pooled.endpoint.rebind(socket),
             });
         match rebound {
             Ok(()) => moved += 1,

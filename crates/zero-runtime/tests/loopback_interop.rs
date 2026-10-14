@@ -153,7 +153,12 @@ async fn socks_connect(socks: SocketAddr, target: SocketAddr) -> std::io::Result
 
     let mut reply = [0u8; 4];
     stream.read_exact(&mut reply).await?;
-    assert_eq!(reply[1], 0x00, "SOCKS5 CONNECT failed with {}", reply[1]);
+    if reply[1] != 0x00 {
+        return Err(std::io::Error::other(format!(
+            "SOCKS5 CONNECT failed with {}",
+            reply[1]
+        )));
+    }
     let skip = match reply[3] {
         0x01 => 4,
         0x04 => 16,

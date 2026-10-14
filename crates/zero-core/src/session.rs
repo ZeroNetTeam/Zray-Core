@@ -46,8 +46,37 @@ impl SessionId {
 pub struct Sniffed {
     /// Domain from a TLS SNI extension or an HTTP `Host:` header.
     pub domain: Option<Arc<str>>,
-    /// Application protocol label, e.g. `tls` or `http`.
+    /// Application protocol label: `tls`, `http`, `quic` or `bittorrent`.
     pub protocol: Option<&'static str>,
+    /// The request line and headers of a sniffed HTTP request, for routing
+    /// rules that match on `attrs`.
+    pub http: Option<Arc<HttpAttrs>>,
+}
+
+/// What a sniffed HTTP request looked like, in the names Xray's `attrs`
+/// routing rules use: `:method`, `:path`, and each header under its
+/// lower-case name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpAttrs {
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl HttpAttrs {
+    /// The value of attribute `name` (`:method`, `:path` or a header name,
+    /// case-insensitive), if the request had it.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        match name.to_ascii_lowercase().as_str() {
+            ":method" => Some(&self.method),
+            ":path" => Some(&self.path),
+            other => self
+                .headers
+                .iter()
+                .find(|(key, _)| key == other)
+                .map(|(_, value)| value.as_str()),
+        }
+    }
 }
 
 /// Everything the router and the connection planner are allowed to see.
@@ -58,6 +87,13 @@ pub struct SessionContext {
     pub inbound: InboundId,
     pub inbound_tag: Arc<str>,
     pub source: Option<SocketAddr>,
+    /// The local address the client connected to, for `localIP` and
+    /// `localPort` routing rules.
+    pub local: Option<SocketAddr>,
+    /// The account that authenticated (its `email`), for `user` rules.
+    pub user: Option<Arc<str>>,
+    /// The route number in the middle of the VLESS user id that connected.
+    pub vless_route: Option<u16>,
     /// Where the client asked to go.
     pub destination: Destination,
     /// Pre-sniffing destination, when sniffing rewrote it.
@@ -84,6 +120,9 @@ impl SessionContext {
             inbound,
             inbound_tag,
             source: None,
+            local: None,
+            user: None,
+            vless_route: None,
             destination,
             original_destination: None,
             sniffed: Sniffed::default(),
@@ -95,6 +134,16 @@ impl SessionContext {
 
     pub fn with_source(mut self, source: SocketAddr) -> Self {
         self.source = Some(source);
+        self
+    }
+
+    pub fn with_local(mut self, local: SocketAddr) -> Self {
+        self.local = Some(local);
+        self
+    }
+
+    pub fn with_user(mut self, user: Option<Arc<str>>) -> Self {
+        self.user = user;
         self
     }
 
@@ -151,6 +200,7 @@ mod tests {
             Sniffed {
                 domain: Some(Arc::from("example.com")),
                 protocol: Some("tls"),
+                ..Default::default()
             },
             true,
         );
@@ -170,6 +220,7 @@ mod tests {
             Sniffed {
                 domain: Some(Arc::from("sniffed.com")),
                 protocol: Some("tls"),
+                ..Default::default()
             },
             true,
         );
@@ -184,6 +235,7 @@ mod tests {
             Sniffed {
                 domain: Some(Arc::from("example.com")),
                 protocol: Some("tls"),
+                ..Default::default()
             },
             false,
         );

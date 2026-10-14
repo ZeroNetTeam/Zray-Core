@@ -226,13 +226,16 @@ fn rand_between(from: u32, to: u32) -> u32 {
 
 /// Xray's `CreatPadding`: the padding length, how to split the first flight,
 /// and the pauses between the pieces.
-fn create_padding(config: &ClientConfig) -> (usize, Vec<usize>, Vec<Duration>) {
+fn create_padding(
+    padding_lens: &[[u32; 3]],
+    padding_gaps: &[[u32; 3]],
+) -> (usize, Vec<usize>, Vec<Duration>) {
     let default_lens = [[100, 111, 1111], [50, 0, 3333]];
     let default_gaps = [[75, 0, 111]];
-    let (lens_spec, gaps_spec): (&[[u32; 3]], &[[u32; 3]]) = if config.padding_lens.is_empty() {
+    let (lens_spec, gaps_spec): (&[[u32; 3]], &[[u32; 3]]) = if padding_lens.is_empty() {
         (&default_lens, &default_gaps)
     } else {
-        (&config.padding_lens, &config.padding_gaps)
+        (padding_lens, padding_gaps)
     };
     let mut total = 0usize;
     let mut lens = Vec::with_capacity(lens_spec.len());
@@ -261,22 +264,49 @@ fn create_padding(config: &ClientConfig) -> (usize, Vec<usize>, Vec<Duration>) {
 
 // ------------------------------------------------------------------ primitives
 
-/// Xray's `NewAEAD`: AES-256-GCM keyed by BLAKE3 derive-key with `ctx` as
-/// the context. Xray's client uses ChaCha20-Poly1305 on machines without
-/// AES instructions; its server tries AES-GCM first and falls back, so
-/// always choosing AES-GCM is compatible.
+/// Xray's `NewAEAD`: AES-256-GCM, or ChaCha20-Poly1305 on machines without
+/// AES instructions, keyed by BLAKE3 derive-key with `ctx` as the context.
+///
+/// A client picks by its own hardware and the server tries AES-GCM first and
+/// falls back, so the server has to be able to speak either; this client
+/// always uses AES-GCM, which every server accepts. Both ends of one
+/// connection use the same cipher, including after a rekey.
 struct Aead {
-    cipher: Aes256Gcm,
+    cipher: Cipher,
     nonce: [u8; 12],
+}
+
+enum Cipher {
+    Aes(Box<Aes256Gcm>),
+    ChaCha(Box<chacha20poly1305::ChaCha20Poly1305>),
 }
 
 impl Aead {
     fn new(ctx: &[u8], key: &[u8]) -> Self {
+        Self::with_cipher(ctx, key, true)
+    }
+
+    fn with_cipher(ctx: &[u8], key: &[u8], aes: bool) -> Self {
         let derived = blake3_bytes::derive_key(ctx, key);
+        let cipher = if aes {
+            Cipher::Aes(Box::new(
+                Aes256Gcm::new_from_slice(&derived).expect("32-byte key"),
+            ))
+        } else {
+            Cipher::ChaCha(Box::new(
+                chacha20poly1305::ChaCha20Poly1305::new_from_slice(&derived).expect("32-byte key"),
+            ))
+        };
         Self {
-            cipher: Aes256Gcm::new_from_slice(&derived).expect("32-byte key"),
+            cipher,
             nonce: [0; 12],
         }
+    }
+
+    /// A fresh state for `ctx` and `key` with this one's cipher: what a
+    /// rekey, after the nonce counter fills, derives.
+    fn derive(&self, ctx: &[u8], key: &[u8]) -> Self {
+        Self::with_cipher(ctx, key, matches!(self.cipher, Cipher::Aes(_)))
     }
 
     /// Xray's `IncreaseNonce`: big-endian, incremented before each use.
@@ -301,10 +331,19 @@ impl Aead {
         let nonce = nonce.unwrap_or_else(|| self.next_nonce());
         let start = out.len();
         out.extend_from_slice(plaintext);
-        let tag = self
-            .cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&nonce), aad, &mut out[start..])
-            .expect("AES-GCM seal cannot fail for these sizes");
+        let tag = match &self.cipher {
+            Cipher::Aes(cipher) => cipher
+                .encrypt_in_place_detached(Nonce::from_slice(&nonce), aad, &mut out[start..])
+                .map(|tag| tag.to_vec()),
+            Cipher::ChaCha(cipher) => cipher
+                .encrypt_in_place_detached(
+                    chacha20poly1305::Nonce::from_slice(&nonce),
+                    aad,
+                    &mut out[start..],
+                )
+                .map(|tag| tag.to_vec()),
+        }
+        .expect("AEAD seal cannot fail for these sizes");
         out.extend_from_slice(&tag);
     }
 
@@ -322,14 +361,21 @@ impl Aead {
         }
         let split = sealed.len() - TAG_LEN;
         let (body, tag) = sealed.split_at_mut(split);
-        self.cipher
-            .decrypt_in_place_detached(
+        match &self.cipher {
+            Cipher::Aes(cipher) => cipher.decrypt_in_place_detached(
                 Nonce::from_slice(&nonce),
                 aad,
                 body,
                 aes_gcm::Tag::from_slice(tag),
-            )
-            .map_err(|_| invalid("VLESS encryption record failed authentication"))
+            ),
+            Cipher::ChaCha(cipher) => cipher.decrypt_in_place_detached(
+                chacha20poly1305::Nonce::from_slice(&nonce),
+                aad,
+                body,
+                chacha20poly1305::Tag::from_slice(tag),
+            ),
+        }
+        .map_err(|_| invalid("VLESS encryption record failed authentication"))
     }
 }
 
@@ -495,7 +541,8 @@ impl Client {
         pfs_public.extend_from_slice(x25519_dalek::PublicKey::from(&x25519_secret).as_bytes());
         nfs_aead.seal_into(None, &pfs_public, &[], &mut hello);
 
-        let (padding_len, mut piece_lens, gaps) = create_padding(config);
+        let (padding_len, mut piece_lens, gaps) =
+            create_padding(&config.padding_lens, &config.padding_gaps);
         nfs_aead.seal_into(None, &encode_length(padding_len - 18), &[], &mut hello);
         let zeros = vec![0u8; padding_len - 18 - TAG_LEN];
         nfs_aead.seal_into(None, &zeros, &[], &mut hello);
@@ -573,6 +620,520 @@ impl Client {
         }
         Ok(stream)
     }
+}
+
+// ------------------------------------------------------------------- server
+
+/// One of the server's private relay keys: an X25519 private key (32 bytes)
+/// or an ML-KEM-768 seed (64 bytes), as `xray vlessenc` prints them.
+enum ServerKey {
+    X25519 {
+        secret: x25519_dalek::StaticSecret,
+    },
+    MlKem {
+        key: Box<ml_kem::DecapsulationKey768>,
+    },
+}
+
+impl ServerKey {
+    /// How many bytes this key's relay takes in the client's hello.
+    fn relay_len(&self) -> usize {
+        match self {
+            ServerKey::X25519 { .. } => X25519_LEN,
+            ServerKey::MlKem { .. } => MLKEM_CT_LEN,
+        }
+    }
+}
+
+/// A parsed `decryption` value (Xray's `VLessInboundConfig.Build` and
+/// `ServerInstance.Init`):
+/// `mlkem768x25519plus.<native|xorpub|random>.<seconds>[.<padding>...].<key>[.<key>...]`.
+///
+/// `seconds` is how long a 0-RTT ticket lives (`600s`, or `300-600s` for a
+/// random time in a range); `0s` turns 0-RTT off. The keys are the private
+/// halves of the public keys in the clients' `encryption` strings.
+pub struct ServerConfig {
+    keys: Vec<ServerKey>,
+    /// The public key each private key matches, as the clients publish it.
+    public_keys: Vec<Vec<u8>>,
+    hash32s: Vec<[u8; 32]>,
+    relays_len: usize,
+    xor_mode: u8,
+    seconds_from: i64,
+    seconds_to: i64,
+    padding_lens: Vec<[u32; 3]>,
+    padding_gaps: Vec<[u32; 3]>,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("keys", &self.keys.len())
+            .field("xor_mode", &self.xor_mode)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServerConfig {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        use base64::Engine;
+        let parts: Vec<&str> = value.split('.').collect();
+        if parts.len() < 4 || parts[0] != "mlkem768x25519plus" {
+            return Err("unsupported VLESS decryption".into());
+        }
+        let xor_mode = match parts[1] {
+            "native" => 0,
+            "xorpub" => 1,
+            "random" => 2,
+            other => return Err(format!("unknown VLESS decryption mode {other:?}")),
+        };
+        let seconds = parts[2].strip_suffix('s').unwrap_or(parts[2]);
+        let (seconds_from, seconds_to) = match seconds.split_once('-') {
+            Some((from, to)) => (from, to),
+            None => (seconds, "0"),
+        };
+        let number = |text: &str| {
+            text.parse::<i64>()
+                .ok()
+                .filter(|seconds| *seconds >= 0)
+                .ok_or_else(|| {
+                    format!(
+                        "VLESS decryption ticket time {:?} is not a number",
+                        parts[2]
+                    )
+                })
+        };
+        let (seconds_from, seconds_to) = (number(seconds_from)?, number(seconds_to)?);
+        // Tokens shorter than 20 characters are padding groups, ahead of the
+        // keys, as on the client side.
+        let mut padding = Vec::new();
+        let mut keys = Vec::new();
+        let mut public_keys = Vec::new();
+        let mut hash32s = Vec::new();
+        let mut relays_len = 0usize;
+        for token in &parts[3..] {
+            if token.len() < 20 {
+                if !keys.is_empty() {
+                    return Err("VLESS decryption padding must come before the keys".into());
+                }
+                padding.push(*token);
+                continue;
+            }
+            let bytes = zeroize::Zeroizing::new(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(token)
+                    .map_err(|_| "VLESS decryption key is not base64url".to_string())?,
+            );
+            let (key, public) = match bytes.len() {
+                32 => {
+                    let secret = x25519_dalek::StaticSecret::from(
+                        <[u8; 32]>::try_from(bytes.as_slice()).expect("32 bytes"),
+                    );
+                    let public = x25519_dalek::PublicKey::from(&secret).as_bytes().to_vec();
+                    relays_len += X25519_LEN + 32;
+                    (ServerKey::X25519 { secret }, public)
+                }
+                64 => {
+                    let seed = ml_kem::Seed::try_from(bytes.as_slice())
+                        .map_err(|_| "ML-KEM-768 seed has the wrong length".to_string())?;
+                    let key = ml_kem::DecapsulationKey768::from_seed(seed);
+                    let encoded = key.encapsulation_key().to_bytes();
+                    let public: Vec<u8> = AsRef::<[u8]>::as_ref(&encoded).to_vec();
+                    relays_len += MLKEM_CT_LEN + 32;
+                    (ServerKey::MlKem { key: Box::new(key) }, public)
+                }
+                other => {
+                    return Err(format!(
+                        "VLESS decryption key is {other} bytes; expected 32 or 64"
+                    ))
+                }
+            };
+            hash32s.push(*blake3::hash(&public).as_bytes());
+            public_keys.push(public);
+            keys.push(key);
+        }
+        if keys.is_empty() {
+            return Err("VLESS decryption has no key".into());
+        }
+        relays_len -= 32;
+        let (padding_lens, padding_gaps) = parse_padding(&padding.join("."))?;
+        Ok(Self {
+            keys,
+            public_keys,
+            hash32s,
+            relays_len,
+            xor_mode,
+            seconds_from,
+            seconds_to,
+            padding_lens,
+            padding_gaps,
+        })
+    }
+}
+
+/// What the server remembers of a forward-secret key a 0-RTT ticket names.
+struct Session {
+    pfs_key: Vec<u8>,
+    /// The first-flight keys already used with it: a ticket works once per
+    /// first flight, so a replayed one is refused.
+    seen: std::collections::HashSet<[u8; 32]>,
+}
+
+/// Tickets the server has issued, expiring in the order they were made.
+#[derive(Default)]
+struct Tickets {
+    /// For each minute, the last ticket that will have expired by then.
+    lasts: std::collections::HashMap<i64, [u8; 16]>,
+    order: std::collections::VecDeque<[u8; 16]>,
+    sessions: std::collections::HashMap<[u8; 16], Session>,
+    swept_minute: i64,
+}
+
+impl Tickets {
+    /// Xray's once-a-minute sweep: every ticket up to the one scheduled to
+    /// have expired by this minute goes. Run lazily, when a handshake finds a
+    /// new minute, so the server needs no timer task.
+    fn sweep(&mut self, now: i64) {
+        let minute = now / 60;
+        if minute == self.swept_minute {
+            return;
+        }
+        self.swept_minute = minute;
+        let last = self.lasts.remove(&minute);
+        self.lasts.remove(&(minute - 1));
+        if let Some(last) = last {
+            while let Some(ticket) = self.order.pop_front() {
+                self.sessions.remove(&ticket);
+                if ticket == last {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The server half of VLESS Encryption (Xray's `ServerInstance`): one per
+/// inbound, shared by its connections.
+pub struct Server {
+    config: ServerConfig,
+    tickets: Mutex<Tickets>,
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
+impl Server {
+    pub fn new(config: ServerConfig) -> Arc<Self> {
+        Arc::new(Self {
+            config,
+            tickets: Mutex::new(Tickets::default()),
+        })
+    }
+
+    fn tickets(&self) -> std::sync::MutexGuard<'_, Tickets> {
+        self.tickets.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Xray's `ServerInstance.Handshake`. Every failure is the end of the
+    /// connection: there is no fallback behind encryption, since a prober who
+    /// cannot speak it learns nothing from an answer anyway.
+    pub async fn handshake<S>(self: &Arc<Self>, mut inner: S) -> io::Result<EncryptedStream<S>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let config = &self.config;
+        let mut hello = vec![0u8; 16 + config.relays_len];
+        inner.read_exact(&mut hello).await?;
+        let iv: [u8; 16] = hello[..16].try_into().unwrap();
+
+        // The relay chain, unwound: one key agreement per private key, each
+        // vouching for the next key's hash.
+        let mut nfs_key = zeroize::Zeroizing::new(Vec::new());
+        let mut last_ctr: Option<Aes256Ctr> = None;
+        let mut offset = 16usize;
+        for (j, key) in config.keys.iter().enumerate() {
+            let index = key.relay_len();
+            if let Some(ctr) = last_ctr.as_mut() {
+                ctr.apply_keystream(&mut hello[offset..offset + 32]);
+            }
+            if config.xor_mode > 0 {
+                new_ctr(&config.public_keys[j], &iv)
+                    .apply_keystream(&mut hello[offset..offset + index]);
+            }
+            match key {
+                ServerKey::X25519 { secret } => {
+                    let peer: [u8; 32] = hello[offset..offset + 32].try_into().unwrap();
+                    // A real public key never has its top bit set; one that
+                    // does was altered on the way, and is refused so that no
+                    // single bit can be flipped without breaking the connection.
+                    if peer[31] > 127 {
+                        return Err(invalid(
+                            "VLESS encryption: the peer's X25519 key has its top bit set",
+                        ));
+                    }
+                    let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(peer));
+                    if !shared.was_contributory() {
+                        return Err(invalid("VLESS encryption X25519 key is degenerate"));
+                    }
+                    *nfs_key = shared.as_bytes().to_vec();
+                }
+                ServerKey::MlKem { key } => {
+                    let shared = key
+                        .decapsulate_slice(&hello[offset..offset + MLKEM_CT_LEN])
+                        .map_err(|_| invalid("ML-KEM-768 decapsulation failed"))?;
+                    *nfs_key = AsRef::<[u8]>::as_ref(&shared).to_vec();
+                }
+            }
+            if j == config.keys.len() - 1 {
+                break;
+            }
+            offset += index;
+            let mut ctr = new_ctr(&nfs_key, &iv);
+            ctr.apply_keystream(&mut hello[offset..offset + 32]);
+            if hello[offset..offset + 32] != config.hash32s[j + 1] {
+                return Err(invalid(
+                    "VLESS encryption: unexpected key hash in the relay chain",
+                ));
+            }
+            offset += 32;
+            last_ctr = Some(ctr);
+        }
+
+        // The client's cipher shows in which one opens its length field.
+        let mut encrypted_length = [0u8; 18];
+        inner.read_exact(&mut encrypted_length).await?;
+        let mut opened = None;
+        for aes in [true, false] {
+            let mut nfs_aead = Aead::with_cipher(&iv, &nfs_key, aes);
+            let mut length = encrypted_length;
+            if nfs_aead.open_in_place(None, &mut length, &[]).is_ok() {
+                opened = Some((nfs_aead, decode_length(&length), aes));
+                break;
+            }
+        }
+        let Some((mut nfs_aead, length, aes)) = opened else {
+            return Err(invalid(
+                "VLESS encryption first flight failed authentication",
+            ));
+        };
+
+        if length == 32 {
+            return self.resume(inner, &iv, &nfs_key, nfs_aead, aes).await;
+        }
+        if length < MLKEM_EK_LEN + X25519_LEN + TAG_LEN {
+            return Err(invalid("VLESS encryption first flight is too short"));
+        }
+        let mut pfs_in = vec![0u8; length];
+        inner.read_exact(&mut pfs_in).await?;
+        nfs_aead.open_in_place(None, &mut pfs_in, &[])?;
+        let peer_pfs = &pfs_in[..MLKEM_EK_LEN + X25519_LEN];
+        let encapsulation_key = EncapsulationKey768::new(
+            &<[u8; MLKEM_EK_LEN]>::try_from(&peer_pfs[..MLKEM_EK_LEN])
+                .unwrap()
+                .into(),
+        )
+        .map_err(|_| invalid("ML-KEM-768 key from the client is invalid"))?;
+        let (ciphertext, mlkem_key) = encapsulation_key.encapsulate();
+        let x25519_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let peer_x25519: [u8; 32] = peer_pfs[MLKEM_EK_LEN..].try_into().unwrap();
+        let x25519_key = x25519_secret.diffie_hellman(&x25519_dalek::PublicKey::from(peer_x25519));
+        if !x25519_key.was_contributory() {
+            return Err(invalid("VLESS encryption client X25519 key is degenerate"));
+        }
+        let mut pfs_key = zeroize::Zeroizing::new(Vec::with_capacity(64));
+        pfs_key.extend_from_slice(AsRef::<[u8]>::as_ref(&mlkem_key));
+        pfs_key.extend_from_slice(x25519_key.as_bytes());
+        let mut pfs_public: Vec<u8> = AsRef::<[u8]>::as_ref(&ciphertext).to_vec();
+        pfs_public.extend_from_slice(x25519_dalek::PublicKey::from(&x25519_secret).as_bytes());
+        let mut united_key = pfs_key.to_vec();
+        united_key.extend_from_slice(&nfs_key);
+        let mut aead = Aead::with_cipher(&pfs_public, &united_key, aes);
+        let peer_aead = Aead::with_cipher(peer_pfs, &united_key, aes);
+
+        // The ticket: its first two bytes say how long it lives, the rest is
+        // random. Lifetime zero means no 0-RTT.
+        let mut ticket = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut ticket);
+        let seconds = if config.seconds_to == 0 {
+            config.seconds_from * rand_between(50, 100) as i64 / 100
+        } else {
+            rand_between(config.seconds_from as u32, config.seconds_to as u32) as i64
+        };
+        ticket[..2].copy_from_slice(&encode_length(seconds as usize));
+        if seconds > 0 {
+            let now = unix_seconds();
+            let mut tickets = self.tickets();
+            tickets.sweep(now);
+            tickets.lasts.insert(
+                (now + config.seconds_from.max(config.seconds_to)) / 60 + 2,
+                ticket,
+            );
+            tickets.order.push_back(ticket);
+            tickets.sessions.insert(
+                ticket,
+                Session {
+                    pfs_key: pfs_key.to_vec(),
+                    seen: Default::default(),
+                },
+            );
+        }
+
+        let mut server_hello = Vec::new();
+        nfs_aead.seal_into(Some(MAX_NONCE), &pfs_public, &[], &mut server_hello);
+        aead.seal_into(None, &ticket, &[], &mut server_hello);
+        let (padding_len, mut piece_lens, gaps) =
+            create_padding(&config.padding_lens, &config.padding_gaps);
+        aead.seal_into(
+            None,
+            &encode_length(padding_len - 18),
+            &[],
+            &mut server_hello,
+        );
+        let zeros = vec![0u8; padding_len - 18 - TAG_LEN];
+        aead.seal_into(None, &zeros, &[], &mut server_hello);
+
+        // Sent in pieces with pauses, like the client's: no fixed shape
+        // before the inner protocol takes over.
+        piece_lens[0] += server_hello.len() - padding_len;
+        let mut sent = 0usize;
+        for (i, len) in piece_lens.iter().enumerate() {
+            if *len > 0 {
+                inner.write_all(&server_hello[sent..sent + len]).await?;
+                inner.flush().await?;
+                sent += len;
+            }
+            if let Some(gap) = gaps.get(i) {
+                if !gap.is_zero() {
+                    tokio::time::sleep(*gap).await;
+                }
+            }
+        }
+
+        // The client may send its padding slowly, to hide the 1-RTT shape.
+        let mut padding_length = [0u8; 18];
+        inner.read_exact(&mut padding_length).await?;
+        nfs_aead.open_in_place(None, &mut padding_length, &[])?;
+        let mut padding = vec![0u8; decode_length(&padding_length)];
+        inner.read_exact(&mut padding).await?;
+        nfs_aead.open_in_place(None, &mut padding, &[])?;
+
+        let mut stream =
+            EncryptedStream::new(inner, united_key, aead, Some(peer_aead), ReadStage::Records);
+        if config.xor_mode == 2 {
+            stream.random_mode = true;
+            stream.out_mask = HeaderMask::new(Some(new_ctr(&stream.united_key, &ticket)), 0);
+            stream.in_mask = HeaderMask::new(Some(new_ctr(&stream.united_key, &iv)), 0);
+        }
+        Ok(stream)
+    }
+
+    /// A 0-RTT first flight: the client names a ticket and skips the
+    /// forward-secret exchange. An unknown or expired ticket is answered with
+    /// noise that is not a record, so the client starts over with a full
+    /// handshake.
+    async fn resume<S>(
+        &self,
+        mut inner: S,
+        iv: &[u8; 16],
+        nfs_key: &[u8],
+        mut nfs_aead: Aead,
+        aes: bool,
+    ) -> io::Result<EncryptedStream<S>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let config = &self.config;
+        if config.seconds_from == 0 && config.seconds_to == 0 {
+            return Err(invalid("VLESS encryption: 0-RTT is not allowed here"));
+        }
+        let mut encrypted_ticket = [0u8; 32];
+        inner.read_exact(&mut encrypted_ticket).await?;
+        let mut ticket = encrypted_ticket;
+        nfs_aead.open_in_place(None, &mut ticket, &[])?;
+        let ticket: [u8; 16] = ticket[..16].try_into().unwrap();
+        let nfs_id: [u8; 32] = nfs_key
+            .try_into()
+            .map_err(|_| invalid("VLESS encryption first-flight key has the wrong length"))?;
+        let pfs_key = {
+            let now = unix_seconds();
+            let mut tickets = self.tickets();
+            tickets.sweep(now);
+            match tickets.sessions.get_mut(&ticket) {
+                None => None,
+                Some(session) => {
+                    // The same first-flight key links this upload to its
+                    // download, and a repeat is a replay.
+                    if !session.seen.insert(nfs_id) {
+                        return Err(invalid("VLESS encryption: replayed 0-RTT first flight"));
+                    }
+                    Some(session.pfs_key.clone())
+                }
+            }
+        };
+        let Some(pfs_key) = pfs_key else {
+            // Noise of a length like a 1-RTT server hello, with a header no
+            // record could have, so the client can tell and handshake again.
+            let mut noise = vec![0u8; rand_between(1279, 2279) as usize];
+            loop {
+                rand::thread_rng().fill_bytes(&mut noise);
+                if decode_header(&noise[..HEADER_LEN]).is_none() {
+                    break;
+                }
+            }
+            let _ = inner.write_all(&noise).await;
+            return Err(invalid("VLESS encryption: unknown or expired ticket"));
+        };
+        let mut united_key = pfs_key;
+        united_key.extend_from_slice(nfs_key);
+        // Chosen here, never by the client, so neither side's keystream can be
+        // steered by what the other sends.
+        let mut pre_write = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut pre_write);
+        let aead = Aead::with_cipher(&pre_write, &united_key, aes);
+        let peer_aead = Aead::with_cipher(&encrypted_ticket, &united_key, aes);
+        let mut stream =
+            EncryptedStream::new(inner, united_key, aead, Some(peer_aead), ReadStage::Records);
+        stream.pre_write = pre_write.to_vec();
+        if config.xor_mode == 2 {
+            stream.random_mode = true;
+            stream.out_mask = HeaderMask::new(Some(new_ctr(&stream.united_key, &pre_write)), 16);
+            stream.in_mask = HeaderMask::new(Some(new_ctr(&stream.united_key, iv)), 0);
+        }
+        Ok(stream)
+    }
+}
+
+/// A fresh matching setting pair, `(encryption, decryption)`: what `xray
+/// vlessenc` prints, for tests and for tools that make a server's keys.
+///
+/// `mlkem` picks an ML-KEM-768 key over an X25519 one; `mode` is `native`,
+/// `xorpub` or `random`; `rtt` is `0rtt` or `1rtt` (for the client) and
+/// `seconds` (like `600s`) how long the server keeps a 0-RTT ticket.
+pub fn generate_pair(mlkem: bool, mode: &str, rtt: &str, seconds: &str) -> (String, String) {
+    use base64::Engine;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let (public, private) = if mlkem {
+        let mut seed = zeroize::Zeroizing::new([0u8; 64]);
+        rand::thread_rng().fill_bytes(&mut seed[..]);
+        let key = ml_kem::DecapsulationKey768::from_seed(
+            ml_kem::Seed::try_from(&seed[..]).expect("64 bytes"),
+        );
+        let encoded = key.encapsulation_key().to_bytes();
+        (b64(AsRef::<[u8]>::as_ref(&encoded)), b64(&seed[..]))
+    } else {
+        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        (
+            b64(x25519_dalek::PublicKey::from(&secret).as_bytes()),
+            b64(secret.as_bytes()),
+        )
+    };
+    (
+        format!("mlkem768x25519plus.{mode}.{rtt}.{public}"),
+        format!("mlkem768x25519plus.{mode}.{seconds}.{private}"),
+    )
 }
 
 // --------------------------------------------------------------- the stream
@@ -680,6 +1241,10 @@ pub struct EncryptedStream<S> {
     /// Vision received `PaddingDirect`: the server now writes its raw inner
     /// stream underneath this layer.
     direct_read: bool,
+    /// Lets a layer above ask for [`Self::enter_direct_mode`] without owning
+    /// the stream: on a server the stream sits under wrappers Vision cannot
+    /// reach by type.
+    direct_flag: Arc<std::sync::atomic::AtomicBool>,
     write_buf: WriteBuffer,
 }
 
@@ -712,6 +1277,7 @@ impl<S> EncryptedStream<S> {
             unmasked: 0,
             plain: PlainWindow::default(),
             direct_read: false,
+            direct_flag: Arc::default(),
             write_buf: WriteBuffer::default(),
         }
     }
@@ -722,6 +1288,12 @@ impl<S> EncryptedStream<S> {
     /// authenticating the frame inside a decrypted record.
     pub fn enter_direct_mode(&mut self) {
         self.direct_read = true;
+    }
+
+    /// A handle that, once set, has the same effect as
+    /// [`Self::enter_direct_mode`] at the next read.
+    pub fn direct_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.direct_flag)
     }
 
     /// Seal one record of `data` into the write buffer.
@@ -738,7 +1310,7 @@ impl<S> EncryptedStream<S> {
         let rekey = self.aead.nonce == MAX_NONCE;
         self.aead.seal_into(None, data, &header, out);
         if rekey {
-            self.aead = Aead::new(&out[header_at..], &self.united_key);
+            self.aead = self.aead.derive(&out[header_at..], &self.united_key);
         }
         self.out_mask.apply(&mut out[start..], true);
     }
@@ -773,7 +1345,7 @@ impl<S: AsyncRead + Unpin> EncryptedStream<S> {
                     }
                     let random: [u8; 16] = self.read_buf.data()[..16].try_into().unwrap();
                     self.consume(16);
-                    self.peer_aead = Some(Aead::new(&random, &self.united_key));
+                    self.peer_aead = Some(self.aead.derive(&random, &self.united_key));
                     if self.random_mode {
                         self.in_mask = HeaderMask::new(Some(new_ctr(&self.united_key, &random)), 0);
                         self.unmasked = 0;
@@ -821,7 +1393,7 @@ impl<S: AsyncRead + Unpin> EncryptedStream<S> {
                         .as_mut()
                         .expect("records follow the peer key");
                     let next = (peer.nonce == MAX_NONCE).then(|| {
-                        Aead::new(&self.read_buf.data()[..HEADER_LEN + len], &self.united_key)
+                        peer.derive(&self.read_buf.data()[..HEADER_LEN + len], &self.united_key)
                     });
                     let record = &mut self.read_buf.data_mut()[HEADER_LEN..HEADER_LEN + len];
                     let result = peer.open_in_place(None, record, &header);
@@ -865,6 +1437,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
+        if !this.direct_read && this.direct_flag.load(std::sync::atomic::Ordering::Acquire) {
+            this.direct_read = true;
+        }
         if this.plain.pos < this.plain.end {
             let window =
                 &this.read_buf.data()[HEADER_LEN + this.plain.pos..HEADER_LEN + this.plain.end];
@@ -1176,6 +1751,7 @@ mod blake3_bytes {
 
 #[cfg(test)]
 mod tests {
+    use super::Server as EncServer;
     use super::*;
 
     #[test]
@@ -1349,5 +1925,166 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ---- the server, against this file's own client
+
+    /// A matching client and server setting, as `xray vlessenc` would print
+    /// them: an X25519 key and an ML-KEM-768 key, in that order.
+    fn pair(mode: &str, rtt: &str, seconds: &str, padding: &str) -> (String, String) {
+        use base64::Engine;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let x_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        let x_public = x25519_dalek::PublicKey::from(&x_secret);
+        let mut seed = [0u8; 64];
+        rand::thread_rng().fill_bytes(&mut seed);
+        let dk = ml_kem::DecapsulationKey768::from_seed(ml_kem::Seed::try_from(&seed[..]).unwrap());
+        let ek = dk.encapsulation_key().to_bytes();
+        let padding = if padding.is_empty() {
+            String::new()
+        } else {
+            format!("{padding}.")
+        };
+        (
+            format!(
+                "mlkem768x25519plus.{mode}.{rtt}.{padding}{}.{}",
+                b64(x_public.as_bytes()),
+                b64(AsRef::<[u8]>::as_ref(&ek))
+            ),
+            format!(
+                "mlkem768x25519plus.{mode}.{seconds}.{padding}{}.{}",
+                b64(x_secret.as_bytes()),
+                b64(&seed)
+            ),
+        )
+    }
+
+    /// Open one connection: the server speaks first record after the
+    /// handshake finishes, the client sends first. Returns what each read.
+    async fn exchange(
+        client: &Arc<Client>,
+        server: &Arc<EncServer>,
+    ) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        let (near, far) = tokio::io::duplex(1 << 20);
+        let (client, server) = (Arc::clone(client), Arc::clone(server));
+        let serving = tokio::spawn(async move {
+            let mut stream = server.handshake(far).await?;
+            let mut got = vec![0u8; 5];
+            stream.read_exact(&mut got).await?;
+            stream.write_all(b"server says hello").await?;
+            stream.flush().await?;
+            Ok::<_, io::Error>(got)
+        });
+        let mut stream = client.handshake(near).await?;
+        stream.write_all(b"hello").await?;
+        stream.flush().await?;
+        let mut answer = vec![0u8; 17];
+        stream.read_exact(&mut answer).await?;
+        let got = serving.await.unwrap()?;
+        Ok((got, answer))
+    }
+
+    #[tokio::test]
+    async fn a_client_and_a_server_agree_in_every_mode() {
+        for mode in ["native", "xorpub", "random"] {
+            for padding in ["", "100-111-1111.50-0-3333.75-0-111"] {
+                let (encryption, decryption) = pair(mode, "1rtt", "0s", padding);
+                let client = Client::new(ClientConfig::parse(&encryption).unwrap());
+                let server = EncServer::new(ServerConfig::parse(&decryption).unwrap());
+                let (got, answer) = exchange(&client, &server).await.unwrap_or_else(|e| {
+                    panic!("{mode} padding {padding:?}: {e}");
+                });
+                assert_eq!(got, b"hello", "{mode}");
+                assert_eq!(answer, b"server says hello", "{mode}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ticket_lets_the_next_connection_skip_the_exchange() {
+        for mode in ["native", "xorpub", "random"] {
+            let (encryption, decryption) = pair(mode, "0rtt", "600s", "");
+            let client = Client::new(ClientConfig::parse(&encryption).unwrap());
+            let server = EncServer::new(ServerConfig::parse(&decryption).unwrap());
+            // The first connection is a full handshake and earns the ticket.
+            exchange(&client, &server)
+                .await
+                .unwrap_or_else(|e| panic!("{mode} first: {e}"));
+            assert!(
+                client.valid_ticket().is_some(),
+                "{mode}: no ticket was issued"
+            );
+            // The second resumes with it, and again, with the same ticket.
+            for round in 2..=3 {
+                let (got, answer) = exchange(&client, &server)
+                    .await
+                    .unwrap_or_else(|e| panic!("{mode} round {round}: {e}"));
+                assert_eq!(
+                    (got.as_slice(), answer.as_slice()),
+                    (&b"hello"[..], &b"server says hello"[..])
+                );
+            }
+            assert_eq!(
+                server.tickets().sessions.len(),
+                1,
+                "{mode}: resumed with one session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_that_forgot_the_ticket_makes_the_client_start_over() {
+        let (encryption, decryption) = pair("native", "0rtt", "600s", "");
+        let client = Client::new(ClientConfig::parse(&encryption).unwrap());
+        let server = EncServer::new(ServerConfig::parse(&decryption).unwrap());
+        exchange(&client, &server).await.unwrap();
+        // A restart: same keys, no memory of tickets.
+        let restarted = EncServer::new(ServerConfig::parse(&decryption).unwrap());
+        assert!(
+            exchange(&client, &restarted).await.is_err(),
+            "the stale ticket is refused"
+        );
+        assert!(client.valid_ticket().is_none(), "and forgotten");
+        let (got, _) = exchange(&client, &restarted)
+            .await
+            .expect("a fresh handshake works");
+        assert_eq!(got, b"hello");
+    }
+
+    #[tokio::test]
+    async fn a_zero_rtt_server_setting_of_zero_refuses_tickets_and_a_wrong_key_fails() {
+        // The server keeps no tickets (0s), so a client that has one is refused.
+        let (encryption, decryption) = pair("native", "0rtt", "0s", "");
+        let client = Client::new(ClientConfig::parse(&encryption).unwrap());
+        let server = EncServer::new(ServerConfig::parse(&decryption).unwrap());
+        exchange(&client, &server).await.unwrap();
+        assert!(client.valid_ticket().is_none(), "0s issues no ticket");
+        // Keys that do not match.
+        let (_, other_decryption) = pair("native", "1rtt", "0s", "");
+        let wrong = EncServer::new(ServerConfig::parse(&other_decryption).unwrap());
+        assert!(exchange(&client, &wrong).await.is_err());
+    }
+
+    #[test]
+    fn a_server_setting_is_parsed_like_xray_does() {
+        let (_, good) = pair(
+            "random",
+            "1rtt",
+            "300-600s",
+            "100-111-1111.50-0-3333.75-0-111",
+        );
+        assert!(ServerConfig::parse(&good).is_ok());
+        let (_, tail) = pair("native", "1rtt", "600s", "");
+        for bad in [
+            "none".to_string(),
+            "mlkem768x25519plus.native.600s".to_string(),
+            tail.replace("native", "sideways"),
+            tail.replace("600s", "soon"),
+            tail.replacen("mlkem768x25519plus", "other", 1),
+        ] {
+            assert!(ServerConfig::parse(&bad).is_err(), "{bad}");
+        }
+        // Debug output never carries a key.
+        assert!(!format!("{:?}", ServerConfig::parse(&good).unwrap()).contains("secret"));
     }
 }

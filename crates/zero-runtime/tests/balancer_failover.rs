@@ -170,3 +170,33 @@ async fn a_silent_member_is_raced_by_the_next_one() {
     assert_eq!(&back, b"ping");
     assert!(started.elapsed() < Duration::from_secs(7));
 }
+
+/// A transparent session (the path a VPN's TUN device uses) fails over too:
+/// it used to take whichever member the balancer picked and give up when that
+/// one could not be reached, again and again, since nothing learned from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transparent_session_goes_through_the_next_member_when_one_is_dead() {
+    let echo = echo_service().await;
+    let (forward_port, dead_port) = (free_port(), free_port());
+    let mut config = config(free_port(), dead_port);
+    config["inbounds"] = json!([{
+        "tag": "forward-in",
+        "listen": "127.0.0.1",
+        "port": forward_port,
+        "protocol": "dokodemo-door",
+        "settings": {"address": "127.0.0.1", "port": echo.port(), "network": "tcp"},
+    }]);
+    let _server = spawn(&config);
+    let forward = SocketAddr::from(([127, 0, 0, 1], forward_port));
+    wait_for_listener(forward).await;
+    for round in 0..4 {
+        let mut client = TcpStream::connect(forward).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut back = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut back))
+            .await
+            .unwrap_or_else(|_| panic!("session {round} got no answer"))
+            .unwrap_or_else(|error| panic!("session {round} was closed: {error}"));
+        assert_eq!(&back, b"ping", "session {round}");
+    }
+}

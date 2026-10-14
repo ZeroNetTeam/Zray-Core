@@ -148,6 +148,16 @@ pub struct Rule {
     pub protocols: Vec<Box<str>>,
     /// The program that opened the connection (see [`ProcessPattern`]).
     pub processes: Vec<ProcessPattern>,
+    /// Accounts (`email`) the connection authenticated as.
+    pub users: Vec<Box<str>>,
+    /// The inbound address the client connected to.
+    pub local_ips: Vec<IpPattern>,
+    pub local_ports: Vec<PortRange>,
+    /// Sniffed HTTP attributes: `(name, regular expression)`, all of which
+    /// must match (`:method`, `:path`, or a lower-case header name).
+    pub attrs: Vec<(Box<str>, Box<str>)>,
+    /// Route numbers carried in the middle of a VLESS user id.
+    pub vless_routes: Vec<PortRange>,
     pub target: RuleTarget,
 }
 
@@ -163,6 +173,11 @@ impl Rule {
             inbound_tags: Vec::new(),
             protocols: Vec::new(),
             processes: Vec::new(),
+            users: Vec::new(),
+            local_ips: Vec::new(),
+            local_ports: Vec::new(),
+            attrs: Vec::new(),
+            vless_routes: Vec::new(),
             target,
         }
     }
@@ -179,6 +194,11 @@ impl Rule {
             && self.inbound_tags.is_empty()
             && self.protocols.is_empty()
             && self.processes.is_empty()
+            && self.users.is_empty()
+            && self.local_ips.is_empty()
+            && self.local_ports.is_empty()
+            && self.attrs.is_empty()
+            && self.vless_routes.is_empty()
     }
 }
 
@@ -210,6 +230,8 @@ pub struct Balancer {
     /// Tag prefixes expanded against the outbound table at compile time.
     pub selector: Vec<Box<str>>,
     pub strategy: BalancerStrategy,
+    /// Xray's `fallbackTag`: the outbound used while every member is failing.
+    pub fallback: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -12,7 +12,7 @@
 //! 16 uuid
 //! 1  addons length M
 //! M  addons (protobuf-encoded Addons{ flow })
-//! 1  command (1=TCP, 2=UDP, 3=MUX)
+//! 1  command (1=TCP, 2=UDP, 3=MUX, 4=RVS)
 //! 2  port, big endian (TCP/UDP only)
 //! 1  address type (1=IPv4, 2=domain, 3=IPv6) (TCP/UDP only)
 //! N  address (TCP/UDP only)
@@ -29,6 +29,7 @@ pub const VERSION: u8 = 0;
 pub const CMD_TCP: u8 = 1;
 pub const CMD_UDP: u8 = 2;
 pub const CMD_MUX: u8 = 3;
+const CMD_RVS: u8 = 4;
 
 pub const ADDR_IPV4: u8 = 1;
 pub const ADDR_DOMAIN: u8 = 2;
@@ -41,7 +42,13 @@ pub struct Request {
     pub destination: Destination,
     pub flow: Option<Box<str>>,
     pub mux: bool,
+    /// The reverse-proxy command: the sender is a bridge that will serve
+    /// connections the receiver sends back down this one.
+    pub reverse: bool,
 }
+
+/// The name VLESS gives the destination of a reverse-proxy dial-in.
+pub const REVERSE_HOST: &str = "v1.rvs.cool";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestParse {
@@ -77,7 +84,17 @@ pub fn parse_request(buf: &[u8]) -> Result<RequestParse, String> {
     } else {
         None
     };
-    let (network, port, at, address, mux) = if buf[command_at] == CMD_MUX {
+    let (network, port, at, address, mux, reverse) = if buf[command_at] == CMD_RVS {
+        // Like Mux, the reverse command has no port or address bytes.
+        (
+            Network::Tcp,
+            0,
+            command_at + 1,
+            Address::domain(REVERSE_HOST),
+            false,
+            true,
+        )
+    } else if buf[command_at] == CMD_MUX {
         // Xray's Mux command has no port/address bytes. The carrier target is
         // the fixed dispatcher endpoint and each logical destination is in
         // the first Mux metadata frame that follows this header.
@@ -87,6 +104,7 @@ pub fn parse_request(buf: &[u8]) -> Result<RequestParse, String> {
             command_at + 1,
             Address::domain(crate::mux::CONTROL_HOST),
             true,
+            false,
         )
     } else {
         let network = match buf[command_at] {
@@ -133,7 +151,7 @@ pub fn parse_request(buf: &[u8]) -> Result<RequestParse, String> {
             }
             other => return Err(format!("unsupported VLESS address type {other}")),
         };
-        (network, port, address.0, address.1, false)
+        (network, port, address.0, address.1, false, false)
     };
 
     Ok(RequestParse::Complete {
@@ -142,6 +160,7 @@ pub fn parse_request(buf: &[u8]) -> Result<RequestParse, String> {
             destination: Destination::new(address, port, network),
             flow,
             mux,
+            reverse,
         },
         consumed: at,
     })
@@ -255,6 +274,17 @@ pub fn encode_mux_request(uuid: &[u8; 16], flow: &str) -> BytesMut {
     out
 }
 
+/// Build the outer VLESS request of a reverse-proxy bridge dialling its
+/// portal (Xray's `RequestCommandRvs`): no address, like Mux.
+pub fn encode_reverse_request(uuid: &[u8; 16], flow: &str) -> BytesMut {
+    let mut out = BytesMut::with_capacity(32);
+    out.put_u8(VERSION);
+    out.put_slice(uuid);
+    out.put_slice(&encode_addons(flow));
+    out.put_u8(CMD_RVS);
+    out
+}
+
 /// Outcome of trying to parse a response header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseParse {
@@ -346,6 +376,17 @@ mod tests {
         let req = encode_request(&[0u8; 16], "", &d);
         assert_eq!(req[21], ADDR_IPV6);
         assert_eq!(req.len(), 22 + 16);
+    }
+
+    #[test]
+    fn the_reverse_command_has_no_address_and_reads_back() {
+        let request = encode_reverse_request(&[7u8; 16], "").to_vec();
+        let RequestParse::Complete { request, consumed } = parse_request(&request).unwrap() else {
+            panic!("expected a complete reverse request")
+        };
+        assert!(request.reverse && !request.mux);
+        assert_eq!(request.destination.address, Address::domain(REVERSE_HOST));
+        assert_eq!(consumed, 1 + 16 + 1 + 1, "version, id, no addons, command");
     }
 
     #[test]

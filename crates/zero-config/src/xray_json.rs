@@ -42,6 +42,7 @@ type R<T> = Result<T, String>;
 pub fn parse_config(v: &Value) -> R<(RuntimeConfig, ParseOutput)> {
     let mut out = ParseOutput::default();
     let obj = v.as_object().ok_or("config root must be an object")?;
+    note_unsupported_sections(obj, &mut out);
 
     let log_level = obj
         .get("log")
@@ -61,7 +62,14 @@ pub fn parse_config(v: &Value) -> R<(RuntimeConfig, ParseOutput)> {
         .get("outbounds")
         .and_then(Value::as_array)
         .ok_or("config has no outbounds array")?;
-    let outbounds = parse_outbounds(outbounds, &mut out)?;
+    let mut outbounds = parse_outbounds(outbounds, &mut out)?;
+    let mut bridges = parse_reverse(obj.get("reverse"), &mut outbounds)?;
+    add_vless_reverse(
+        &inbounds,
+        obj.get("outbounds"),
+        &mut outbounds,
+        &mut bridges,
+    )?;
 
     let routing = match obj.get("routing") {
         Some(r) => parse_routing(r, &mut out)?,
@@ -79,23 +87,33 @@ pub fn parse_config(v: &Value) -> R<(RuntimeConfig, ParseOutput)> {
     if !outbounds.iter().all(|o| {
         matches!(
             o.protocol,
-            OutboundProtocol::Freedom { .. } | OutboundProtocol::Blackhole
+            OutboundProtocol::Freedom { .. } | OutboundProtocol::Blackhole { .. }
         )
     }) {
         dns.leak_policy = LeakPolicy::Strict;
     }
 
-    let observatory = obj
-        .get("observatory")
-        .map(|value| parse_observatory(value, "observatory"))
-        .transpose()?;
+    // `burstObservatory` is Xray's other way of probing outbounds: the same
+    // idea (an address to fetch through each, how often), with the address
+    // and the interval under `pingConfig`.
+    let observatory = match (obj.get("observatory"), obj.get("burstObservatory")) {
+        (Some(value), _) => Some(parse_observatory(value, "observatory")?),
+        (None, Some(burst)) => Some(parse_burst_observatory(burst)?),
+        (None, None) => None,
+    };
 
     let assets = obj
         .get("assets")
         .map(|value| parse_assets(value, "assets"))
         .transpose()?;
 
+    let policy = match obj.get("policy") {
+        Some(policy) => parse_policy(policy, &mut out)?,
+        None => Policy::default(),
+    };
+
     let cfg = RuntimeConfig {
+        policy,
         inbounds: inbounds.into_boxed_slice(),
         outbounds: outbounds.into_boxed_slice(),
         routing,
@@ -103,9 +121,193 @@ pub fn parse_config(v: &Value) -> R<(RuntimeConfig, ParseOutput)> {
         observatory,
         assets,
         log_level,
+        bridges: bridges.into_boxed_slice(),
     };
     cfg.validate()?;
     Ok((cfg, out))
+}
+
+/// VLESS's own reverse proxy, in the accounts: a server account with
+/// `reverse.tag` makes a portal of that name (an outbound routing can send
+/// traffic to), and an outbound account with `reverse.tag` is a bridge that
+/// dials its server with the reverse command and serves what comes back.
+fn add_vless_reverse(
+    inbounds: &[Inbound],
+    outbound_json: Option<&Value>,
+    outbounds: &mut Vec<Outbound>,
+    bridges: &mut Vec<ReverseBridge>,
+) -> R<()> {
+    for inbound in inbounds {
+        let InboundProtocol::Vless(config) = &inbound.protocol else {
+            continue;
+        };
+        for tag in config.users.iter().filter_map(|user| user.reverse.as_ref()) {
+            if outbounds.iter().any(|outbound| outbound.tag == *tag) {
+                if matches!(
+                    outbounds
+                        .iter()
+                        .find(|o| o.tag == *tag)
+                        .map(|o| &o.protocol),
+                    Some(OutboundProtocol::Portal { .. })
+                ) {
+                    continue;
+                }
+                return Err(format!("VLESS reverse tag {tag:?} is already an outbound"));
+            }
+            outbounds.push(Outbound {
+                tag: Arc::clone(tag),
+                protocol: OutboundProtocol::Portal {
+                    domain: Arc::from(VLESS_REVERSE_HOST),
+                },
+                stream: StreamSettings::default(),
+                mux: MuxConfig::default(),
+            });
+        }
+    }
+    for outbound in outbound_json
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if outbound.get("protocol").and_then(Value::as_str) != Some("vless") {
+            continue;
+        }
+        let via: Arc<str> = Arc::from(outbound.get("tag").and_then(Value::as_str).unwrap_or("out"));
+        let normalized = unflatten_outbound(outbound);
+        let outbound = normalized.as_ref().unwrap_or(outbound);
+        let users = outbound
+            .get("settings")
+            .and_then(|settings| settings.get("vnext"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|server| server.get("users").and_then(Value::as_array))
+            .flatten();
+        for user in users {
+            let Some(tag) = user
+                .get("reverse")
+                .and_then(|reverse| reverse.get("tag"))
+                .and_then(Value::as_str)
+                .filter(|tag| !tag.is_empty())
+            else {
+                continue;
+            };
+            bridges.push(ReverseBridge {
+                tag: Arc::from(tag),
+                domain: Arc::from(VLESS_REVERSE_HOST),
+                via: Some(Arc::clone(&via)),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The destination name of a VLESS reverse dial-in.
+const VLESS_REVERSE_HOST: &str = "v1.rvs.cool";
+
+/// Xray's `reverse`: `{"bridges": [{"tag", "domain"}], "portals": [...]}`.
+///
+/// A portal is an outbound of its own tag, added to the table here so routing
+/// can send traffic to it like to any other. A bridge is not an outbound or
+/// an inbound but a tag that its own connections are routed under.
+fn parse_reverse(value: Option<&Value>, outbounds: &mut Vec<Outbound>) -> R<Vec<ReverseBridge>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let entries = |key: &str| -> R<Vec<(Arc<str>, Arc<str>)>> {
+        let Some(list) = value.get(key).filter(|list| !list.is_null()) else {
+            return Ok(Vec::new());
+        };
+        let list = list
+            .as_array()
+            .ok_or_else(|| format!("reverse.{key} must be an array"))?;
+        list.iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let text = |name: &str| {
+                    entry
+                        .get(name)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(Arc::<str>::from)
+                        .ok_or_else(|| format!("reverse.{key}[{index}].{name} is required"))
+                };
+                Ok((text("tag")?, text("domain")?))
+            })
+            .collect()
+    };
+    for (tag, domain) in entries("portals")? {
+        if outbounds.iter().any(|outbound| outbound.tag == tag) {
+            return Err(format!("reverse portal tag {tag:?} is already an outbound"));
+        }
+        outbounds.push(Outbound {
+            tag,
+            protocol: OutboundProtocol::Portal { domain },
+            stream: StreamSettings::default(),
+            mux: MuxConfig::default(),
+        });
+    }
+    Ok(entries("bridges")?
+        .into_iter()
+        .map(|(tag, domain)| ReverseBridge {
+            tag,
+            domain,
+            via: None,
+        })
+        .collect())
+}
+
+/// Sections of an Xray configuration that Zray accepts and does not act on.
+/// They are named so that a config that relies on one finds out when it is
+/// checked, not when a feature it expected is missing.
+fn note_unsupported_sections(obj: &serde_json::Map<String, Value>, out: &mut ParseOutput) {
+    const UNSUPPORTED: &[(&str, &str)] = &[
+        (
+            "api",
+            "the gRPC API is not served; `zray run --management` is Zray's own",
+        ),
+        (
+            "stats",
+            "statistics are always kept; read them through the management API",
+        ),
+        (
+            "metrics",
+            "no expvar/pprof endpoint; the management API reports usage",
+        ),
+        (
+            "fakedns",
+            "the FakeDNS pool is Zray's own range; its settings are not read",
+        ),
+        (
+            "transport",
+            "global transport settings are not read; set them per outbound",
+        ),
+        (
+            "geodata",
+            "rule sets are refreshed through `assets`, not on this schedule",
+        ),
+        ("env", "environment variables are not set from the config"),
+    ];
+    for (key, why) in UNSUPPORTED {
+        if obj.get(*key).is_some_and(|value| !value.is_null()) {
+            out.note(*key, format!("accepted, not applied: {why}"));
+        }
+    }
+    if let Some(log) = obj.get("log").and_then(Value::as_object) {
+        for key in ["access", "error"] {
+            if log
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|path| !path.is_empty() && path != "none")
+            {
+                out.note(
+                    format!("log.{key}"),
+                    "accepted, not applied: logs go to standard error, set with ZRAY_LOG",
+                );
+            }
+        }
+    }
 }
 
 /// Parse and compile one configuration in a single, explicit boundary.
@@ -149,16 +351,69 @@ pub fn parse_config_array(text: &str) -> R<Vec<(String, RuntimeConfig, ParseOutp
 // ----------------------------------------------------------------- inbounds
 
 fn parse_inbounds(arr: &[Value], out: &mut ParseOutput) -> R<Vec<Inbound>> {
-    arr.iter()
-        .enumerate()
-        .map(|(i, v)| parse_inbound(v, i, out))
-        .collect()
+    let mut inbounds = Vec::new();
+    for (i, v) in arr.iter().enumerate() {
+        inbounds.extend(parse_inbound_ports(v, i, out)?);
+    }
+    Ok(inbounds)
+}
+
+/// The most ports one inbound may span; a range this wide is a mistake, and
+/// each port is a listening socket.
+const MAX_INBOUND_PORTS: usize = 1024;
+
+/// One inbound entry as one listener per port: `port` may be a number, a
+/// string such as `"443"`, `"20000-20100"` or `"80,443,8000-8010"`. Every
+/// listener keeps the entry's tag, as Xray's does, so one rule covers the
+/// whole range.
+fn parse_inbound_ports(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Vec<Inbound>> {
+    let ports = match v.get("port") {
+        Some(Value::String(text)) => {
+            let ranges: Vec<routing::PortRange> = text
+                .split(',')
+                .map(|part| {
+                    routing::PortRange::parse(part)
+                        .filter(|range| range.start <= range.end)
+                        .ok_or_else(|| {
+                            format!("inbounds[{idx}].port {text:?} is not a port, range or list")
+                        })
+                })
+                .collect::<R<_>>()?;
+            let ports: Vec<u16> = ranges.iter().flat_map(|r| r.start..=r.end).collect();
+            if ports.len() > MAX_INBOUND_PORTS {
+                return Err(format!(
+                    "inbounds[{idx}].port spans {} ports; at most {MAX_INBOUND_PORTS}",
+                    ports.len()
+                ));
+            }
+            Some(ports)
+        }
+        _ => None,
+    };
+    match ports {
+        None => Ok(vec![parse_inbound(v, idx, out)?]),
+        Some(ports) => ports
+            .into_iter()
+            .map(|port| {
+                let mut single = v.clone();
+                single["port"] = Value::from(port);
+                parse_inbound(&single, idx, out)
+            })
+            .collect(),
+    }
 }
 
 fn parse_inbound(v: &Value, idx: usize, _out: &mut ParseOutput) -> R<Inbound> {
     let path = format!("inbounds[{idx}]");
+    let translated;
+    let v = if v.get("protocol").and_then(Value::as_str) == Some("hysteria") {
+        translated = xray_hysteria_inbound(v, &path)?;
+        &translated
+    } else {
+        v
+    };
     let proto = v.get("protocol").and_then(Value::as_str).unwrap_or("");
-    let protocol = match proto {
+    let mut protocol = match proto {
         "socks" => InboundProtocol::Socks,
         "http" => InboundProtocol::Http,
         "mixed" => InboundProtocol::Mixed,
@@ -177,26 +432,73 @@ fn parse_inbound(v: &Value, idx: usize, _out: &mut ParseOutput) -> R<Inbound> {
         }
         "tuic" => InboundProtocol::Tuic(parse_tuic_inbound(v.get("settings"), &path)?),
         "tun" => InboundProtocol::Tun(parse_tun_inbound(v.get("settings"), &path)?),
+        "wireguard" => {
+            InboundProtocol::WireGuard(parse_wireguard_inbound(v.get("settings"), &path)?)
+        }
         "dokodemo-door" => {
             let s = v.get("settings");
-            let target = match (
-                s.and_then(|s| s.get("address")).and_then(Value::as_str),
-                s.and_then(|s| s.get("port")).and_then(json_port),
-            ) {
-                (Some(a), Some(p)) => Some((Address::parse_host(a), p)),
-                _ => None,
+            let get = |new: &str, old: &str| {
+                s.and_then(|s| s.get(new).or_else(|| s.get(old)))
+                    .filter(|value| !value.is_null())
             };
-            let network = match s.and_then(|s| s.get("network")).and_then(Value::as_str) {
-                Some("udp") => Network::Udp,
-                _ => Network::Tcp,
-            };
-            InboundProtocol::Dokodemo { target, network }
+            // `network` is a comma list ("tcp,udp"); absent means TCP.
+            let (mut tcp, mut udp) = (false, false);
+            let listed = get("allowedNetwork", "network")
+                .and_then(Value::as_str)
+                .unwrap_or("tcp");
+            for name in listed.split(',') {
+                match name.trim().to_ascii_lowercase().as_str() {
+                    "tcp" => tcp = true,
+                    "udp" => udp = true,
+                    "" => {}
+                    other => {
+                        return Err(format!(
+                            "{path}.settings.network: {other:?} is not \"tcp\" or \"udp\""
+                        ))
+                    }
+                }
+            }
+            let mut port_map = Vec::new();
+            if let Some(map) = s.and_then(|s| s.get("portMap")).and_then(Value::as_object) {
+                for (from, to) in map {
+                    let key: u16 = from.trim().parse().map_err(|_| {
+                        format!("{path}.settings.portMap: key {from:?} is not a port")
+                    })?;
+                    let (host, to_port) = to
+                        .as_str()
+                        .and_then(zero_core::address::split_host_port)
+                        .ok_or_else(|| {
+                            format!("{path}.settings.portMap[{from}] must be \"host:port\"")
+                        })?;
+                    port_map.push((key, Address::parse_host(host), to_port));
+                }
+            }
+            InboundProtocol::Dokodemo {
+                address: get("rewriteAddress", "address")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(Address::parse_host),
+                port: get("rewritePort", "port")
+                    .and_then(json_port)
+                    .filter(|port| *port != 0),
+                port_map,
+                tcp,
+                udp,
+                follow_redirect: s
+                    .and_then(|s| s.get("followRedirect"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            }
         }
         "" => {
             // Placeholder / empty inbound or API inbound tag
             InboundProtocol::Dokodemo {
-                target: None,
-                network: Network::Tcp,
+                address: None,
+                port: None,
+                port_map: Vec::new(),
+                tcp: true,
+                udp: false,
+                follow_redirect: false,
             }
         }
         other => {
@@ -260,10 +562,24 @@ fn parse_inbound(v: &Value, idx: usize, _out: &mut ParseOutput) -> R<Inbound> {
         match &mut security {
             // Tide is HTTP/2 whatever the config says about ALPN.
             InboundSecurity::Tls(tls) => tls.alpn = vec![Box::from("h2")].into_boxed_slice(),
-            InboundSecurity::Reality(_) => {
-                return Err(format!(
-                    "{path}.streamSettings.security: Tide uses certificate TLS, or none behind a web server"
-                ))
+            // REALITY hands over a plain encrypted stream once the client has
+            // proved itself, and HTTP/2 runs over that as it does over TLS.
+            // The links this server makes carry what the client needs to
+            // get through it, so they are told here.
+            InboundSecurity::Reality(reality) => {
+                if let (InboundProtocol::Tide(tide), Some(name)) =
+                    (&mut protocol, reality.server_names.first())
+                {
+                    tide.reality = Some(TideRealityLink {
+                        server_name: name.clone(),
+                        private_key: reality.private_key,
+                        short_id: reality
+                            .short_ids
+                            .first()
+                            .map(|id| id.iter().map(|byte| format!("{byte:02x}")).collect())
+                            .unwrap_or_default(),
+                    });
+                }
             }
             InboundSecurity::None => {}
         }
@@ -322,6 +638,20 @@ fn parse_inbound(v: &Value, idx: usize, _out: &mut ParseOutput) -> R<Inbound> {
                 sniff_tls: dests.contains(&"tls"),
                 sniff_quic: dests.contains(&"quic"),
                 route_only: s.get("routeOnly").and_then(Value::as_bool).unwrap_or(false),
+                domains_excluded: s
+                    .get("domainsExcluded")
+                    .and_then(Value::as_array)
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(Value::as_str)
+                            .map(routing::DomainPattern::parse)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                metadata_only: s
+                    .get("metadataOnly")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             }
         })
         .unwrap_or_default();
@@ -345,6 +675,28 @@ fn parse_inbound(v: &Value, idx: usize, _out: &mut ParseOutput) -> R<Inbound> {
         security,
         sniffing,
         socks_auth,
+        sockopt: match v.get("streamSettings").and_then(|s| s.get("sockopt")) {
+            Some(sockopt) => parse_sockopt(sockopt, &path)?,
+            None => Sockopt::default(),
+        },
+        accept_proxy_protocol: v
+            .get("streamSettings")
+            .map(|stream| {
+                [
+                    stream.get("sockopt"),
+                    stream.get("rawSettings"),
+                    stream.get("tcpSettings"),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|section| {
+                    section
+                        .get("acceptProxyProtocol")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false),
     })
 }
 
@@ -438,7 +790,7 @@ fn parse_inbound_transport(v: &Value, path: &str) -> R<Transport> {
         ))),
         "grpc" => Ok(Transport::Grpc(parse_grpc(v.get("grpcSettings")))),
         "xhttp" | "splithttp" => {
-            let config = parse_xhttp(v.get("xhttpSettings"), v, path)?;
+            let config = parse_xhttp(xhttp_settings(v), v, path)?;
             if matches!(
                 config.xhttp_http_version,
                 XhttpHttpVersion::Http1 | XhttpHttpVersion::Http2
@@ -482,24 +834,52 @@ fn parse_inbound_security(settings: Option<&Value>, path: &str) -> R<InboundSecu
             let tls = settings
                 .get("tlsSettings")
                 .ok_or_else(|| format!("{path}.streamSettings.tlsSettings is required"))?;
-            let certificate_value = tls
+            // Every entry that is a server identity: Xray's default usage is
+            // `encipherment`; `verify` and `issue` entries name other things
+            // and are not certificates this server presents.
+            let mut identities = Vec::new();
+            for (index, entry) in tls
                 .get("certificates")
                 .and_then(Value::as_array)
-                .and_then(|a| a.first())
-                .ok_or_else(|| {
-                    format!("{path}.streamSettings.tlsSettings.certificates is required")
-                })?;
-            let certificate = read_certificate_blob(certificate_value, path)?;
-            let private_key = read_key_blob(certificate_value, path)?;
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                match entry.get("usage").and_then(Value::as_str) {
+                    None | Some("encipherment") => {}
+                    Some("verify" | "issue") => continue,
+                    Some(other) => {
+                        return Err(format!(
+                            "{path}.streamSettings.tlsSettings.certificates[{index}].usage {other:?} is not known"
+                        ))
+                    }
+                }
+                let entry_path = format!("{path}.streamSettings.tlsSettings.certificates[{index}]");
+                identities.push((
+                    read_certificate_blob(entry, &entry_path)?.into_boxed_slice(),
+                    read_key_blob(entry, &entry_path)?.into_boxed_slice(),
+                ));
+            }
+            if identities.is_empty() {
+                return Err(format!(
+                    "{path}.streamSettings.tlsSettings.certificates is required"
+                ));
+            }
+            let (certificate, private_key) = identities.remove(0);
             let alpn = tls
                 .get("alpn")
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).map(Box::from).collect())
                 .unwrap_or_default();
             Ok(InboundSecurity::Tls(InboundTlsConfig {
-                certificate: certificate.into_boxed_slice(),
-                private_key: private_key.into_boxed_slice(),
+                certificate,
+                private_key,
                 alpn,
+                extra_identities: identities.into_boxed_slice(),
+                reject_unknown_sni: tls
+                    .get("rejectUnknownSni")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             }))
         }
         "reality" => {
@@ -541,11 +921,78 @@ fn parse_inbound_security(settings: Option<&Value>, path: &str) -> R<InboundSecu
                 .and_then(Value::as_str)
                 .and_then(zero_core::address::split_host_port)
                 .map(|(host, port)| (Address::parse_host(host), port));
+            let mldsa65_seed = match reality.get("mldsa65Seed").and_then(Value::as_str) {
+                None | Some("") => None,
+                Some(text) => {
+                    use base64::Engine as _;
+                    let seed: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(text.trim())
+                        .ok()
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .ok_or_else(|| {
+                            format!("{path}: reality mldsa65Seed must be 32 bytes of base64url")
+                        })?;
+                    Some(Secret32(seed))
+                }
+            };
+            let version = |key: &str| -> R<Option<[u8; 3]>> {
+                match reality
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                {
+                    None => Ok(None),
+                    Some(text) => {
+                        let parts: Vec<u8> = text
+                            .split('.')
+                            .map(|part| part.parse().ok())
+                            .collect::<Option<_>>()
+                            .filter(|parts: &Vec<u8>| parts.len() == 3)
+                            .ok_or_else(|| format!("{path}: reality {key} must look like 1.2.3"))?;
+                        Ok(Some([parts[0], parts[1], parts[2]]))
+                    }
+                }
+            };
+            let limit = |key: &str| -> R<FallbackLimit> {
+                let Some(value) = reality.get(key).filter(|v| !v.is_null()) else {
+                    return Ok(FallbackLimit::default());
+                };
+                let number = |name: &str| {
+                    value.get(name).map_or(Ok(0u64), |v| {
+                        v.as_u64()
+                            .ok_or_else(|| format!("{path}: reality {key}.{name} must be a number"))
+                    })
+                };
+                Ok(FallbackLimit {
+                    after_bytes: number("afterBytes")?,
+                    bytes_per_sec: number("bytesPerSec")?,
+                    burst_bytes_per_sec: number("burstBytesPerSec")?,
+                })
+            };
+            let fallback_xver = match reality.get("xver").and_then(Value::as_u64) {
+                None | Some(0) => 0,
+                Some(version @ (1 | 2)) => version as u8,
+                Some(other) => {
+                    return Err(format!(
+                        "{path}: reality xver must be 0, 1 or 2, not {other}"
+                    ))
+                }
+            };
             Ok(InboundSecurity::Reality(InboundRealityConfig {
                 server_names: server_names.into_boxed_slice(),
                 private_key,
                 short_ids: short_ids.into_boxed_slice(),
                 target,
+                mldsa65_seed,
+                max_time_diff_ms: reality
+                    .get("maxTimeDiff")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                min_client_ver: version("minClientVer")?,
+                max_client_ver: version("maxClientVer")?,
+                fallback_xver,
+                fallback_limit_up: limit("limitFallbackUpload")?,
+                fallback_limit_down: limit("limitFallbackDownload")?,
             }))
         }
         other => Err(format!(
@@ -630,18 +1077,21 @@ fn parse_trusted_roots(tls: Option<&Value>, path: &str) -> R<Vec<Box<[u8]>>> {
     Ok(roots)
 }
 
+/// An inline certificate or key: Xray writes it as an array of lines (what
+/// `xray tls cert` prints), joined by newlines to make the PEM text. One
+/// element holding the whole PEM is the same thing.
+fn pem_lines(lines: &[Value]) -> Option<Vec<u8>> {
+    let lines: Vec<&str> = lines.iter().filter_map(Value::as_str).collect();
+    (!lines.is_empty()).then(|| lines.join("\n").into_bytes())
+}
+
 fn read_certificate_blob(certificate: &Value, path: &str) -> R<Vec<u8>> {
     if let Some(file) = certificate.get("certificateFile").and_then(Value::as_str) {
         return std::fs::read(file)
             .map_err(|e| format!("{path}: reading certificateFile {file:?}: {e}"));
     }
     if let Some(inline) = certificate.get("certificate").and_then(Value::as_array) {
-        return inline
-            .iter()
-            .filter_map(Value::as_str)
-            .map(|value| value.as_bytes().to_vec())
-            .next()
-            .ok_or_else(|| format!("{path}: certificate array is empty"));
+        return pem_lines(inline).ok_or_else(|| format!("{path}: certificate array is empty"));
     }
     Err(format!(
         "{path}: certificateFile or certificate is required"
@@ -653,14 +1103,19 @@ fn read_key_blob(certificate: &Value, path: &str) -> R<Vec<u8>> {
         return std::fs::read(file).map_err(|e| format!("{path}: reading keyFile {file:?}: {e}"));
     }
     if let Some(inline) = certificate.get("key").and_then(Value::as_array) {
-        return inline
-            .iter()
-            .filter_map(Value::as_str)
-            .map(|value| value.as_bytes().to_vec())
-            .next()
-            .ok_or_else(|| format!("{path}: key array is empty"));
+        return pem_lines(inline).ok_or_else(|| format!("{path}: key array is empty"));
     }
     Err(format!("{path}: keyFile or key is required"))
+}
+
+/// A client's `email`, the name Xray's `user` rules and statistics use.
+fn client_email(client: &Value) -> Option<Arc<str>> {
+    client
+        .get("email")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .map(Arc::from)
 }
 
 fn parse_vless_inbound(settings: Option<&Value>, path: &str) -> R<VlessInboundConfig> {
@@ -681,14 +1136,50 @@ fn parse_vless_inbound(settings: Option<&Value>, path: &str) -> R<VlessInboundCo
         let flow_text = client.get("flow").and_then(Value::as_str).unwrap_or("");
         let flow = Flow::parse(flow_text)
             .ok_or_else(|| format!("{client_path}.flow is not supported: {flow_text:?}"))?;
-        users.push(VlessInboundUser { uuid, flow });
+        users.push(VlessInboundUser {
+            uuid,
+            flow,
+            vision_seed: parse_vision_seed(
+                client
+                    .get("testseed")
+                    .or_else(|| settings.and_then(|s| s.get("testseed"))),
+                &client_path,
+            )?,
+            email: client_email(client),
+            reverse: client
+                .get("reverse")
+                .and_then(|reverse| reverse.get("tag"))
+                .and_then(Value::as_str)
+                .filter(|tag| !tag.is_empty())
+                .map(Arc::from),
+        });
     }
     if users.is_empty() {
         return Err(format!("{path}.settings.clients must not be empty"));
     }
+    let decryption = match settings
+        .and_then(|s| s.get("decryption"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        None | Some("") | Some("none") => None,
+        Some(value) if value.starts_with("mlkem768x25519plus.") => Some(Arc::<str>::from(value)),
+        Some(_) => {
+            return Err(format!(
+                "{path}.settings.decryption is not \"none\" or a mlkem768x25519plus setting"
+            ))
+        }
+    };
+    let fallbacks = parse_fallback(settings, path)?;
+    if decryption.is_some() && !fallbacks.is_empty() {
+        return Err(format!(
+            "{path}.settings: fallbacks cannot be used together with decryption"
+        ));
+    }
     Ok(VlessInboundConfig {
         users: users.into_boxed_slice(),
-        fallback: parse_fallback(settings, path)?,
+        decryption,
+        fallbacks,
     })
 }
 
@@ -700,52 +1191,73 @@ fn parse_vless_inbound(settings: Option<&Value>, path: &str) -> R<VlessInboundCo
 /// every failed connection. `dest` is a port on this machine (`80`), or
 /// `host:port`. A Unix socket is refused rather than silently ignored, since
 /// a fallback that does not work leaves the server recognisable.
-fn parse_fallback(settings: Option<&Value>, path: &str) -> R<Option<(Address, u16)>> {
+fn parse_fallback(settings: Option<&Value>, path: &str) -> R<Box<[FallbackRule]>> {
     let Some(entries) = settings
         .and_then(|s| s.get("fallbacks"))
         .and_then(Value::as_array)
     else {
-        return Ok(None);
+        return Ok(Box::new([]));
     };
+    let mut rules = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
-        let conditional = ["name", "alpn", "path"].iter().any(|key| {
+        let here = format!("{path}.settings.fallbacks[{index}]");
+        let text = |key: &str| {
             entry
-                .get(*key)
+                .get(key)
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty())
-        });
-        if conditional {
-            continue;
+                .filter(|value| !value.is_empty())
+                .map(Box::<str>::from)
+        };
+        let route = text("path");
+        if route
+            .as_deref()
+            .is_some_and(|route| !route.starts_with('/'))
+        {
+            return Err(format!("{here}.path must start with /"));
         }
-        let what = format!("{path}.settings.fallbacks[{index}].dest");
+        let what = format!("{here}.dest");
         let port = |value: u64| {
             u16::try_from(value)
                 .ok()
                 .filter(|port| *port > 0)
                 .ok_or_else(|| format!("{what} is not a valid port"))
         };
-        return match entry.get("dest") {
-            Some(Value::Number(number)) => Ok(Some((
+        let dest = match entry.get("dest") {
+            Some(Value::Number(number)) => (
                 Address::parse_host("127.0.0.1"),
                 port(number.as_u64().unwrap_or(0))?,
-            ))),
-            Some(Value::String(text)) if text.starts_with('/') || text.starts_with('@') => Err(
-                format!("{what}: Unix socket fallbacks are not supported; use a port"),
             ),
+            Some(Value::String(text)) if text.starts_with('/') || text.starts_with('@') => {
+                return Err(format!(
+                    "{what}: Unix socket fallbacks are not supported; use a port"
+                ))
+            }
             Some(Value::String(text)) => match text.rsplit_once(':') {
-                Some((host, number)) => Ok(Some((
+                Some((host, number)) => (
                     Address::parse_host(host.trim_matches(|c| c == '[' || c == ']')),
                     port(number.parse().unwrap_or(0))?,
-                ))),
-                None => Ok(Some((
+                ),
+                None => (
                     Address::parse_host("127.0.0.1"),
                     port(text.parse().unwrap_or(0))?,
-                ))),
+                ),
             },
-            _ => Err(format!("{what} is required")),
+            _ => return Err(format!("{what} is required")),
         };
+        let xver = match entry.get("xver").and_then(Value::as_u64) {
+            None | Some(0) => 0,
+            Some(version @ (1 | 2)) => version as u8,
+            Some(other) => return Err(format!("{here}.xver must be 0, 1 or 2, not {other}")),
+        };
+        rules.push(FallbackRule {
+            name: text("name"),
+            alpn: text("alpn"),
+            path: route,
+            dest,
+            xver,
+        });
     }
-    Ok(None)
+    Ok(rules.into_boxed_slice())
 }
 
 fn parse_trojan_inbound(settings: Option<&Value>, path: &str) -> R<TrojanInboundConfig> {
@@ -754,6 +1266,7 @@ fn parse_trojan_inbound(settings: Option<&Value>, path: &str) -> R<TrojanInbound
         .and_then(Value::as_array)
         .ok_or_else(|| format!("{path}.settings.clients is required for trojan"))?;
     let mut password_hashes = Vec::with_capacity(clients.len());
+    let mut emails = Vec::with_capacity(clients.len());
     for (idx, client) in clients.iter().enumerate() {
         let client_path = format!("{path}.settings.clients[{idx}]");
         let password = client
@@ -761,13 +1274,15 @@ fn parse_trojan_inbound(settings: Option<&Value>, path: &str) -> R<TrojanInbound
             .and_then(Value::as_str)
             .ok_or_else(|| format!("{client_path}.password is required"))?;
         password_hashes.push(crate::trojan_hash(password));
+        emails.push(client_email(client));
     }
     if password_hashes.is_empty() {
         return Err(format!("{path}.settings.clients must not be empty"));
     }
     Ok(TrojanInboundConfig {
         password_hashes: password_hashes.into_boxed_slice(),
-        fallback: parse_fallback(settings, path)?,
+        emails: emails.into_boxed_slice(),
+        fallbacks: parse_fallback(settings, path)?,
     })
 }
 
@@ -796,7 +1311,11 @@ fn parse_vmess_inbound(settings: Option<&Value>, path: &str) -> R<VmessInboundCo
                     .unwrap_or("auto"),
             )
             .ok_or_else(|| format!("{client_path}.security is unsupported"))?;
-            Ok(VmessInboundUser { uuid, cipher })
+            Ok(VmessInboundUser {
+                uuid,
+                cipher,
+                email: client_email(client),
+            })
         })
         .collect::<R<Vec<_>>>()?;
     if users.is_empty() {
@@ -837,8 +1356,81 @@ fn parse_outbounds(arr: &[Value], out: &mut ParseOutput) -> R<Vec<Outbound>> {
         .collect()
 }
 
+/// Xray's simplified outbound form: `settings` holds one server's
+/// `address`, `port` and account directly,
+///
+/// ```json
+/// {"protocol": "vless", "settings": {"address": "a.example", "port": 443, "id": "..."}}
+/// ```
+///
+/// where the older form wraps them in `vnext[].users[]` (VLESS, VMess) or
+/// `servers[]` (Trojan, Shadowsocks). Both mean the same, and a current Xray
+/// or panel writes the first. This returns the config rewritten in the nested
+/// form the parsers below read; `None` when the settings are already nested
+/// or belong to another protocol.
+fn unflatten_outbound(v: &Value) -> Option<Value> {
+    nested_outbound(v)
+}
+
+/// [`unflatten_outbound`] for the apps that read Xray outbounds themselves
+/// (subscription import, sharing a stored profile): the same rewrite, so they
+/// see one shape however the outbound was written.
+pub fn nested_outbound(v: &Value) -> Option<Value> {
+    let protocol = v.get("protocol").and_then(Value::as_str)?;
+    let settings = v.get("settings").and_then(Value::as_object)?;
+    if settings.contains_key("vnext") || settings.contains_key("servers") {
+        return None;
+    }
+    let address = settings.get("address")?.clone();
+    let mut nested = settings.clone();
+    let mut server = serde_json::Map::new();
+    server.insert("address".into(), address);
+    nested.remove("address");
+    if let Some(port) = nested.remove("port") {
+        server.insert("port".into(), port);
+    }
+    let settings = match protocol {
+        // The account is everything left that belongs to one user; the
+        // outbound-wide `testseed` stays where the parser looks for it too.
+        "vless" | "vmess" => {
+            server.insert(
+                "users".into(),
+                Value::Array(vec![Value::Object(nested.clone())]),
+            );
+            nested.retain(|key, _| key == "testseed" || key == "mux");
+            nested.insert("vnext".into(), Value::Array(vec![Value::Object(server)]));
+            nested
+        }
+        "trojan" | "shadowsocks" => {
+            server.extend(nested);
+            let mut settings = serde_json::Map::new();
+            settings.insert("servers".into(), Value::Array(vec![Value::Object(server)]));
+            settings
+        }
+        _ => return None,
+    };
+    let mut flat = v.clone();
+    flat["settings"] = Value::Object(settings);
+    Some(flat)
+}
+
 fn parse_outbound(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Outbound> {
     let path = format!("outbounds[{idx}]");
+    let translated;
+    let v = if v.get("protocol").and_then(Value::as_str) == Some("hysteria") {
+        translated = xray_hysteria_outbound(v, &path)?;
+        &translated
+    } else {
+        v
+    };
+    let unflattened;
+    let v = match unflatten_outbound(v) {
+        Some(nested) => {
+            unflattened = nested;
+            &unflattened
+        }
+        None => v,
+    };
     let tag: Arc<str> = Arc::from(v.get("tag").and_then(Value::as_str).unwrap_or("out"));
 
     // A Zray extension: an outbound may be written as the share link it came
@@ -971,14 +1563,27 @@ fn parse_outbound(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Outbound> {
         "freedom" => OutboundProtocol::Freedom {
             domain_strategy: parse_freedom_domain_strategy(settings, &path)?,
         },
-        "blackhole" => OutboundProtocol::Blackhole,
-        "dns" => OutboundProtocol::Dns,
+        "blackhole" => OutboundProtocol::Blackhole {
+            response: parse_blackhole_response(settings, &path)?,
+        },
+        "dns" => OutboundProtocol::Dns {
+            rules: parse_dns_outbound_rules(settings, &path)?,
+        },
+        "loopback" => OutboundProtocol::Loopback {
+            inbound_tag: settings
+                .and_then(|s| s.get("inboundTag"))
+                .and_then(Value::as_str)
+                .filter(|tag| !tag.is_empty())
+                .map(Arc::from)
+                .ok_or_else(|| format!("{path}.settings.inboundTag is required for loopback"))?,
+        },
         "vless" => parse_vless(settings, &path)?,
         "trojan" => parse_trojan(settings, &path)?,
         "shadowsocks" => parse_shadowsocks(settings, &path)?,
         "vmess" => parse_vmess(settings, &path)?,
         "anytls" => parse_anytls(settings, &path)?,
         "socks" => parse_socks(settings, &path)?,
+        "http" => parse_http_upstream(settings, &path)?,
         "tor" => parse_tor(settings, &path)?,
         "zerov1" | "tide" => parse_tide(settings, &path)?,
         "hysteria2" => parse_hysteria2(settings, &path)?,
@@ -988,7 +1593,7 @@ fn parse_outbound(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Outbound> {
         "warp" | "masque" => parse_warp(settings, &path)?,
         "" => {
             // Empty outbound protocol placeholder often generated by clients like Qv2ray for dummy proxy node
-            OutboundProtocol::Blackhole
+            OutboundProtocol::Blackhole { response: None }
         }
         other => {
             return Err(format!("{path}.protocol: unsupported outbound {other:?}"));
@@ -1019,6 +1624,7 @@ fn parse_outbound(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Outbound> {
         }
     }
     if matches!(&protocol, OutboundProtocol::Freedom { .. }) {
+        stream.direct = parse_direct_policy(settings, &path)?;
         let legacy = parse_legacy_freedom_evasion(settings, &path)?;
         if !legacy.is_empty() {
             if !stream.evasion.is_empty() {
@@ -1033,6 +1639,16 @@ fn parse_outbound(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Outbound> {
     // ask for it too (`{"evasion": {"sniSpoof": {"method": "urgent"}}}`).
     layer_evasion(&mut stream.evasion, v.get("evasion"), &path)?;
 
+    // Hysteria 2 has Salamander of its own; Xray writes it as a `finalmask`
+    // UDP mask on the connection. Both spellings reach the one setting.
+    let mut protocol = protocol;
+    if let OutboundProtocol::Hysteria2(hysteria) = &mut protocol {
+        if hysteria.obfs_password.is_none() {
+            hysteria.obfs_password = stream.evasion.udp_salamander.clone();
+        }
+    }
+
+    stream.sockopt.bind_address = parse_send_through(v, &path)?;
     let ob = Outbound {
         tag,
         protocol,
@@ -1041,6 +1657,130 @@ fn parse_outbound(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Outbound> {
     };
     ob.validate()?;
     Ok(ob)
+}
+
+/// An outbound's `sendThrough`: the local address to leave from. Xray also
+/// accepts `"origin"` (leave from the address the client reached us on),
+/// which Zray cannot know per connection, and an empty or unspecified
+/// address, which both mean the system's choice.
+fn parse_send_through(v: &Value, path: &str) -> R<Option<std::net::IpAddr>> {
+    let Some(text) = v.get("sendThrough").and_then(Value::as_str).map(str::trim) else {
+        return Ok(None);
+    };
+    if text.is_empty() {
+        return Ok(None);
+    }
+    if text.eq_ignore_ascii_case("origin") {
+        return Err(format!(
+            "{path}.sendThrough \"origin\" is not supported; name the address to leave from"
+        ));
+    }
+    let ip: std::net::IpAddr = text
+        .parse()
+        .map_err(|_| format!("{path}.sendThrough {text:?} is not an IP address"))?;
+    Ok((!ip.is_unspecified()).then_some(ip))
+}
+
+/// Freedom's `redirect`, `proxyProtocol` and `finalRules`.
+///
+/// `redirect` is `"host:port"`, `":port"` (only the port) or `"host"` (only
+/// the address). `finalRules` entries need an `action`; their `ip` lists may
+/// hold CIDR ranges and `geoip:private`, nothing else (a country list needs
+/// geodata that is not at hand where the connection is made, and a rule that
+/// silently matched nothing would let through what it was written to stop).
+fn parse_direct_policy(settings: Option<&Value>, path: &str) -> R<Option<Arc<DirectPolicy>>> {
+    let Some(settings) = settings else {
+        return Ok(None);
+    };
+    let mut policy = DirectPolicy::default();
+    if let Some(text) = settings
+        .get("redirect")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        let (host, port) = match zero_core::address::split_host_port(text) {
+            Some((host, port)) => (host.to_string(), Some(port)),
+            None => match text.strip_prefix(':') {
+                Some(port) => (String::new(), port.parse::<u16>().ok()),
+                None => (text.to_string(), None),
+            },
+        };
+        if port.is_none() && text.contains(':') && host.is_empty() {
+            return Err(format!(
+                "{path}.settings.redirect {text:?} is not host:port"
+            ));
+        }
+        policy.redirect = Some(DirectRedirect {
+            address: (!host.is_empty()).then(|| Address::parse_host(&host)),
+            port,
+        });
+    }
+    match settings.get("proxyProtocol").and_then(Value::as_u64) {
+        None | Some(0) => {}
+        Some(version @ (1 | 2)) => policy.proxy_protocol = version as u8,
+        Some(other) => {
+            return Err(format!(
+                "{path}.settings.proxyProtocol must be 0, 1 or 2, not {other}"
+            ))
+        }
+    }
+    if let Some(rules) = settings.get("finalRules").and_then(Value::as_array) {
+        let mut parsed = Vec::with_capacity(rules.len());
+        for (index, rule) in rules.iter().enumerate() {
+            let here = format!("{path}.settings.finalRules[{index}]");
+            let allow = match rule.get("action").and_then(Value::as_str) {
+                Some("allow") => true,
+                Some("block") => false,
+                _ => return Err(format!("{here}.action must be \"allow\" or \"block\"")),
+            };
+            let networks = match rule.get("network").and_then(Value::as_str) {
+                None | Some("") => Vec::new(),
+                Some(text) => text
+                    .split(',')
+                    .map(|name| match name.trim() {
+                        "tcp" => Ok(Network::Tcp),
+                        "udp" => Ok(Network::Udp),
+                        other => Err(format!("{here}.network: unknown network {other:?}")),
+                    })
+                    .collect::<R<_>>()?,
+            };
+            let ports = rule.get("port").map(parse_port_list).unwrap_or_default();
+            if rule.get("port").is_some_and(|p| !p.is_null()) && ports.is_empty() {
+                return Err(format!("{here}.port is not a port or range"));
+            }
+            let mut ips = Vec::new();
+            for entry in rule
+                .get("ip")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                match parse_ip_pattern(entry) {
+                    routing::IpPattern::Geoip(tag) if &*tag != "private" => {
+                        return Err(format!(
+                            "{here}.ip: geoip:{tag} is not supported in finalRules; list CIDR ranges or use geoip:private"
+                        ))
+                    }
+                    pattern => ips.push(pattern),
+                }
+            }
+            let block_delay_secs = match rule.get("blockDelay") {
+                None | Some(Value::Null) => (30, 90),
+                Some(value) => parse_secs_range(value, 0, &format!("{here}.blockDelay"))?,
+            };
+            parsed.push(FinalRule {
+                allow,
+                networks,
+                ports,
+                ips,
+                block_delay_secs,
+            });
+        }
+        policy.final_rules = parsed.into_boxed_slice();
+    }
+    Ok((policy != DirectPolicy::default()).then(|| Arc::new(policy)))
 }
 
 /// Parse Freedom's destination-resolution policy without treating an explicit
@@ -1099,10 +1839,41 @@ fn parse_mux(value: Option<&Value>, path: &str) -> R<MuxConfig> {
         })
         .transpose()?
         .unwrap_or(0);
+    let udp443 = match object
+        .get("xudpProxyUDP443")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+    {
+        "" | "reject" => Udp443::Reject,
+        "allow" => Udp443::Allow,
+        "skip" => Udp443::Skip,
+        other => return Err(format!("{path}.mux.xudpProxyUDP443 {other:?} is unknown")),
+    };
     Ok(MuxConfig {
         enabled,
         max_concurrency,
+        udp443,
     })
+}
+
+/// Xray's `testseed`: four numbers that size Vision's padding. Fewer than
+/// four are ignored by Xray (the defaults apply); anything else is an error
+/// here, so a typo does not quietly turn the padding off.
+fn parse_vision_seed(value: Option<&Value>, path: &str) -> R<Option<[u32; 4]>> {
+    let Some(Value::Array(items)) = value else {
+        return Ok(None);
+    };
+    if items.len() < 4 {
+        return Ok(None);
+    }
+    let mut seed = [0u32; 4];
+    for (slot, item) in seed.iter_mut().zip(items) {
+        *slot = item
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| format!("{path}.testseed must be four non-negative numbers"))?;
+    }
+    Ok(Some(seed))
 }
 
 fn parse_vless(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
@@ -1120,6 +1891,13 @@ fn parse_vless(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
 
     let flow_str = user.get("flow").and_then(Value::as_str).unwrap_or("");
     let flow = Flow::parse(flow_str).ok_or_else(|| format!("{path}: unknown flow {flow_str:?}"))?;
+    // The seed names the padding this end adds: the account's own, or else
+    // the one set for the whole outbound.
+    let vision_seed = parse_vision_seed(
+        user.get("testseed")
+            .or_else(|| settings.and_then(|s| s.get("testseed"))),
+        &format!("{path}.settings"),
+    )?;
 
     Ok(OutboundProtocol::Vless(VlessConfig {
         address: Address::parse_host(
@@ -1139,6 +1917,7 @@ fn parse_vless(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
         )
         .map_err(|e| format!("{path}: {e}"))?,
         flow,
+        vision_seed,
         encryption: user
             .get("encryption")
             .and_then(Value::as_str)
@@ -1302,7 +2081,18 @@ fn parse_anytls(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
 /// optional `users[0]` (`user`, `pass`). Xray 26's flat form
 /// (`settings.address/port/user/pass`) is accepted as well.
 fn parse_socks(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
-    let settings = settings.ok_or_else(|| format!("{path}.settings is required for socks"))?;
+    parse_upstream(settings, path, false)
+}
+
+/// Xray's `http` outbound, the same shape as `socks` but spoken to with HTTP
+/// `CONNECT`.
+fn parse_http_upstream(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
+    parse_upstream(settings, path, true)
+}
+
+fn parse_upstream(settings: Option<&Value>, path: &str, http: bool) -> R<OutboundProtocol> {
+    let kind = if http { "http" } else { "socks" };
+    let settings = settings.ok_or_else(|| format!("{path}.settings is required for {kind}"))?;
     let server = settings
         .get("servers")
         .and_then(Value::as_array)
@@ -1312,12 +2102,13 @@ fn parse_socks(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
         .get("address")
         .and_then(Value::as_str)
         .filter(|a| !a.is_empty())
-        .ok_or_else(|| format!("{path}.settings.address is required for socks"))?;
+        .ok_or_else(|| format!("{path}.settings.address is required for {kind}"))?;
     let port = server
         .get("port")
         .and_then(Value::as_u64)
         .filter(|port| *port > 0 && *port <= u16::MAX as u64)
-        .ok_or_else(|| format!("{path}.settings.port is invalid for socks"))? as u16;
+        .ok_or_else(|| format!("{path}.settings.port is invalid for {kind}"))?
+        as u16;
     let user = server
         .get("users")
         .and_then(Value::as_array)
@@ -1334,12 +2125,13 @@ fn parse_socks(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
             username: username.into(),
             password: password.into(),
         }),
-        _ => return Err(format!("{path}.settings: socks needs both user and pass")),
+        _ => return Err(format!("{path}.settings: {kind} needs both user and pass")),
     };
     Ok(OutboundProtocol::Socks(SocksConfig {
         address: Address::parse_host(address),
         port,
         auth,
+        http,
     }))
 }
 
@@ -1458,6 +2250,19 @@ fn parse_tide(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
             .get("rotate")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        tuning: TideTuning::parse(&|key| match settings.get(key)? {
+            Value::String(text) => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            // Headers read naturally as an object in JSON.
+            Value::Object(map) if key == "headers" => Some(
+                map.iter()
+                    .filter_map(|(name, value)| Some(format!("{name}:{}", value.as_str()?)))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            _ => None,
+        })
+        .map_err(|error| format!("{path}.settings: {error}"))?,
     }))
 }
 
@@ -1514,6 +2319,7 @@ fn parse_tide_inbound(settings: Option<&Value>, path: &str) -> R<TideInboundConf
             Some(text) => TideShape::parse(text)
                 .ok_or_else(|| format!("{path}.settings.shape must be off, light or full"))?,
         },
+        reality: None,
     })
 }
 
@@ -1569,6 +2375,118 @@ fn parse_anytls_inbound(settings: Option<&Value>, path: &str) -> R<AnyTlsInbound
     Ok(AnyTlsInboundConfig {
         passwords: passwords.into_boxed_slice(),
     })
+}
+
+/// Xray's `hysteria` outbound as the Hysteria 2 outbound Zray has. Xray
+/// splits the protocol across three places: the server and version in
+/// `settings`, the password as `hysteriaSettings.auth` of the `hysteria`
+/// transport, and the Salamander obfuscation as a `finalmask` UDP mask. They
+/// are brought together here, so the rest of the parser sees one Hysteria 2
+/// outbound with TLS.
+fn xray_hysteria_outbound(v: &Value, path: &str) -> R<Value> {
+    let settings = v
+        .get("settings")
+        .ok_or_else(|| format!("{path}.settings is required for hysteria"))?;
+    hysteria_version_check(settings, path)?;
+    let stream = v.get("streamSettings");
+    let auth = stream
+        .and_then(|s| s.get("hysteriaSettings"))
+        .and_then(|h| h.get("auth"))
+        .or_else(|| settings.get("auth"))
+        .or_else(|| settings.get("password"))
+        .and_then(Value::as_str)
+        .filter(|auth| !auth.is_empty())
+        .ok_or_else(|| {
+            format!("{path}.streamSettings.hysteriaSettings.auth is required for hysteria")
+        })?;
+    let mut translated = v.clone();
+    translated["protocol"] = Value::from("hysteria2");
+    let mut new_settings = settings.clone();
+    new_settings["password"] = Value::from(auth);
+    translated["settings"] = new_settings;
+    hysteria_transport_to_raw(&mut translated);
+    Ok(translated)
+}
+
+/// Xray's `hysteria` inbound as Zray's Hysteria 2 inbound: the users' `auth`
+/// strings are the passwords, the transport is plain QUIC with certificate
+/// TLS, and a Salamander `finalmask` UDP mask becomes the `obfs` setting.
+fn xray_hysteria_inbound(v: &Value, path: &str) -> R<Value> {
+    let settings = v
+        .get("settings")
+        .ok_or_else(|| format!("{path}.settings is required for hysteria"))?;
+    hysteria_version_check(settings, path)?;
+    let users: Vec<Value> = settings
+        .get("users")
+        .or_else(|| settings.get("clients"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, user)| {
+            user.get("auth")
+                .and_then(Value::as_str)
+                .filter(|auth| !auth.is_empty())
+                .map(|auth| serde_json::json!({ "password": auth }))
+                .ok_or_else(|| format!("{path}.settings.users[{index}].auth is required"))
+        })
+        .collect::<R<_>>()?;
+    let mut translated = v.clone();
+    translated["protocol"] = Value::from("hysteria2");
+    let mut new_settings = settings.clone();
+    new_settings["users"] = Value::Array(users);
+    if let Some(password) = salamander_password(v) {
+        new_settings["obfs"] = serde_json::json!({ "type": "salamander", "password": password });
+    }
+    // The masquerade lives with the transport's own settings in Xray.
+    if let Some(masquerade) = v
+        .get("streamSettings")
+        .and_then(|stream| stream.get("hysteriaSettings"))
+        .and_then(|settings| settings.get("masquerade"))
+    {
+        new_settings["masquerade"] = masquerade.clone();
+    }
+    translated["settings"] = new_settings;
+    hysteria_transport_to_raw(&mut translated);
+    Ok(translated)
+}
+
+fn hysteria_version_check(settings: &Value, path: &str) -> R<()> {
+    match settings.get("version").and_then(Value::as_u64) {
+        None | Some(2) => Ok(()),
+        Some(other) => Err(format!(
+            "{path}.settings.version: only Hysteria 2 is supported, not {other}"
+        )),
+    }
+}
+
+/// `network: "hysteria"` is plain QUIC to the parser that follows; the
+/// transport's own settings have been read.
+fn hysteria_transport_to_raw(config: &mut Value) {
+    if let Some(stream) = config
+        .get_mut("streamSettings")
+        .and_then(Value::as_object_mut)
+    {
+        if stream.get("network").and_then(Value::as_str) == Some("hysteria") {
+            stream.insert("network".into(), Value::from("raw"));
+        }
+        stream.remove("hysteriaSettings");
+    }
+}
+
+/// The password of a `finalmask.udp` Salamander mask, if there is one.
+fn salamander_password(config: &Value) -> Option<String> {
+    config
+        .get("streamSettings")?
+        .get("finalmask")?
+        .get("udp")?
+        .as_array()?
+        .iter()
+        .find(|mask| mask.get("type").and_then(Value::as_str) == Some("salamander"))?
+        .get("settings")?
+        .get("password")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn parse_hysteria2(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
@@ -2209,6 +3127,241 @@ fn parse_optional_wireguard_key(value: Option<&Value>, path: &str) -> R<Option<[
     parse_wireguard_key(Some(value), path).map(Some)
 }
 
+/// Xray's `wireguard` inbound: `secretKey`, `peers` (`publicKey`,
+/// `preSharedKey`, `allowedIPs`, `keepAlive`, `email`) and `mtu`.
+fn parse_wireguard_inbound(settings: Option<&Value>, path: &str) -> R<WireGuardInboundConfig> {
+    let settings = settings.ok_or_else(|| format!("{path}.settings is required for wireguard"))?;
+    let secret_key = parse_wireguard_key(
+        settings.get("secretKey").and_then(Value::as_str),
+        &format!("{path}.settings.secretKey"),
+    )?;
+    let mtu = match settings.get("mtu").and_then(Value::as_u64) {
+        None | Some(0) => 1420,
+        Some(mtu @ 576..=9000) => mtu as usize,
+        Some(other) => return Err(format!("{path}.settings.mtu {other} is outside 576..=9000")),
+    };
+    let mut peers = Vec::new();
+    for (index, peer) in settings
+        .get("peers")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        let peer_path = format!("{path}.settings.peers[{index}]");
+        let allowed_ips = match peer.get("allowedIPs").and_then(Value::as_array) {
+            // Xray's default: the peer may use any address.
+            None => ["0.0.0.0/0", "::/0"]
+                .iter()
+                .filter_map(|text| routing::ipnet_lite::Cidr::parse(text))
+                .collect(),
+            Some(list) => list
+                .iter()
+                .map(|entry| {
+                    entry
+                        .as_str()
+                        .and_then(routing::ipnet_lite::Cidr::parse)
+                        .ok_or_else(|| {
+                            format!("{peer_path}.allowedIPs has {entry} which is not a CIDR")
+                        })
+                })
+                .collect::<R<Vec<_>>>()?,
+        };
+        peers.push(WireGuardPeer {
+            public_key: parse_wireguard_key(
+                peer.get("publicKey").and_then(Value::as_str),
+                &format!("{peer_path}.publicKey"),
+            )?,
+            preshared_key: parse_optional_wireguard_key(
+                peer.get("preSharedKey")
+                    .or_else(|| peer.get("presharedKey")),
+                &format!("{peer_path}.preSharedKey"),
+            )?,
+            allowed_ips: allowed_ips.into_boxed_slice(),
+            keepalive: peer
+                .get("keepAlive")
+                .and_then(Value::as_u64)
+                .filter(|seconds| *seconds > 0)
+                .and_then(|seconds| u16::try_from(seconds).ok()),
+            email: peer
+                .get("email")
+                .and_then(Value::as_str)
+                .filter(|email| !email.is_empty())
+                .map(Arc::from),
+        });
+    }
+    if peers.is_empty() {
+        return Err(format!("{path}.settings.peers needs at least one peer"));
+    }
+    Ok(WireGuardInboundConfig {
+        secret_key,
+        mtu,
+        peers: peers.into_boxed_slice(),
+    })
+}
+
+/// The `dns` outbound's `rules`, or the legacy `blockTypes` and `nonIPQuery`
+/// that Xray turns into rules. `direct` (forward the query to its real
+/// server) is refused: this outbound answers DNS itself and has nothing to
+/// forward with, and a rule that quietly did something else would be worse.
+fn parse_dns_outbound_rules(settings: Option<&Value>, path: &str) -> R<Box<[DnsOutboundRule]>> {
+    let Some(settings) = settings else {
+        return Ok(Box::new([]));
+    };
+    let legacy = settings.get("blockTypes").is_some() || settings.get("nonIPQuery").is_some();
+    if legacy && settings.get("rules").is_some() {
+        return Err(format!(
+            "{path}.settings: nonIPQuery and blockTypes cannot be mixed with rules"
+        ));
+    }
+    if legacy {
+        let mode = settings
+            .get("nonIPQuery")
+            .and_then(Value::as_str)
+            .filter(|mode| !mode.is_empty())
+            .unwrap_or("reject");
+        let action = match mode {
+            "reject" => DnsAction::Return(5),
+            "drop" | "skip" => DnsAction::Drop,
+            other => return Err(format!("{path}.settings.nonIPQuery {other:?} is unknown")),
+        };
+        let qtypes: Vec<u16> = settings
+            .get("blockTypes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_u64().and_then(|n| u16::try_from(n).ok()))
+            .collect();
+        return Ok(if qtypes.is_empty() {
+            Box::new([])
+        } else {
+            Box::new([DnsOutboundRule {
+                action,
+                qtypes: qtypes.into_boxed_slice(),
+                domains: Box::new([]),
+            }])
+        });
+    }
+    let mut rules = Vec::new();
+    for (index, rule) in settings
+        .get("rules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let rule_path = format!("{path}.settings.rules[{index}]");
+        let action = match rule
+            .get("action")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("hijack") => DnsAction::Hijack,
+            Some("drop") => DnsAction::Drop,
+            Some("return") => {
+                let code = rule.get("rCode").and_then(Value::as_u64).unwrap_or(0);
+                DnsAction::Return(
+                    u8::try_from(code)
+                        .ok()
+                        .filter(|code| *code <= 15)
+                        .ok_or_else(|| format!("{rule_path}.rCode {code} is not 0-15"))?,
+                )
+            }
+            Some("direct") => {
+                return Err(format!(
+                    "{rule_path}.action \"direct\" is not supported: the dns outbound answers queries itself"
+                ))
+            }
+            other => return Err(format!("{rule_path}.action {other:?} is unknown")),
+        };
+        // `qType` is a port-style list: 28, "1,28", "64-66".
+        let mut qtypes = Vec::new();
+        match rule.get("qType") {
+            None | Some(Value::Null) => {}
+            Some(Value::Number(number)) => {
+                qtypes.extend(number.as_u64().and_then(|n| u16::try_from(n).ok()))
+            }
+            Some(Value::String(text)) => {
+                for part in text
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                {
+                    let (from, to) = part.split_once('-').unwrap_or((part, part));
+                    let (Ok(from), Ok(to)) = (from.trim().parse::<u16>(), to.trim().parse::<u16>())
+                    else {
+                        return Err(format!("{rule_path}.qType {part:?} is not a type or range"));
+                    };
+                    qtypes.extend(from..=to.max(from));
+                }
+            }
+            Some(_) => return Err(format!("{rule_path}.qType must be a number or string")),
+        }
+        let domains: Vec<routing::DomainPattern> = rule
+            .get("domain")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(routing::DomainPattern::parse)
+            .collect();
+        if domains.iter().any(|pattern| {
+            matches!(
+                pattern,
+                routing::DomainPattern::Regex(_) | routing::DomainPattern::Geosite(_)
+            )
+        }) {
+            return Err(format!(
+                "{rule_path}.domain takes full:, domain: and keyword: names here, not regexp: or geosite:"
+            ));
+        }
+        rules.push(DnsOutboundRule {
+            action,
+            qtypes: qtypes.into_boxed_slice(),
+            domains: domains.into_boxed_slice(),
+        });
+    }
+    Ok(rules.into_boxed_slice())
+}
+
+/// Blackhole's `response`: `{"type": "none" | "http" | "custom",
+/// "customResponseData": <base64>}`.
+fn parse_blackhole_response(settings: Option<&Value>, path: &str) -> R<Option<Arc<[u8]>>> {
+    let Some(response) = settings
+        .and_then(|s| s.get("response"))
+        .filter(|r| r.is_object())
+    else {
+        return Ok(None);
+    };
+    match response
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("") | Some("none") => Ok(None),
+        Some("http") => Ok(Some(Arc::from(
+            &b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nCache-Control: max-age=3600, public\r\nContent-Length: 0\r\n\r\n\r\n\r\n"[..],
+        ))),
+        Some("custom") => {
+            use base64::Engine;
+            let data = response
+                .get("customResponseData")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map(|bytes| Some(Arc::from(bytes)))
+                .map_err(|error| {
+                    format!("{path}.settings.response.customResponseData is not base64: {error}")
+                })
+        }
+        Some(other) => Err(format!("{path}.settings.response.type {other:?} is unknown")),
+    }
+}
+
 fn parse_wireguard_endpoint(value: &str, path: &str) -> R<(Address, u16)> {
     if let Ok(socket) = value.parse::<std::net::SocketAddr>() {
         return Ok((Address::Ip(socket.ip()), socket.port()));
@@ -2333,9 +3486,91 @@ fn parse_hysteria2_inbound(settings: Option<&Value>, path: &str) -> R<Hysteria2I
             "{path}.settings.password or settings.users is required for hysteria2"
         ));
     }
+    let obfs_password = match settings.get("obfs").filter(|obfs| !obfs.is_null()) {
+        Some(obfs) => {
+            let kind = obfs
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("salamander");
+            if !kind.eq_ignore_ascii_case("salamander") {
+                return Err(format!(
+                    "{path}.settings.obfs.type: only salamander is supported, not {kind:?}"
+                ));
+            }
+            let password = obfs
+                .get("password")
+                .and_then(Value::as_str)
+                .filter(|password| password.len() >= 4)
+                .ok_or_else(|| format!("{path}.settings.obfs.password must be at least 4 bytes"))?;
+            Some(Box::from(password))
+        }
+        None => None,
+    };
     Ok(Hysteria2InboundConfig {
         passwords: passwords.into_boxed_slice(),
+        obfs_password,
+        masquerade: parse_hysteria_masquerade(settings.get("masquerade"), path)?,
     })
+}
+
+/// Hysteria's `masquerade`: `{"type": "string" | "file" | "proxy", ...}`.
+/// `insecure`, `rewriteHost` and `xForwarded` of a proxy are not applied: the
+/// page is fetched like any other, with certificate checks and the site's own
+/// name in `Host`.
+fn parse_hysteria_masquerade(value: Option<&Value>, path: &str) -> R<Option<Hysteria2Masquerade>> {
+    let Some(value) = value.filter(|value| value.is_object()) else {
+        return Ok(None);
+    };
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+    };
+    let kind = text("type").unwrap_or("").to_ascii_lowercase();
+    Ok(Some(match kind.as_str() {
+        "" => return Ok(None),
+        "string" => {
+            let status = value
+                .get("statusCode")
+                .and_then(Value::as_u64)
+                .map_or(200, |code| code.clamp(100, 599) as u16);
+            let headers = value
+                .get("headers")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter_map(|(name, content)| {
+                    Some((name.as_str().into(), content.as_str()?.into()))
+                })
+                .collect();
+            Hysteria2Masquerade::Text {
+                status,
+                headers,
+                content: text("content").unwrap_or("").into(),
+            }
+        }
+        "file" => Hysteria2Masquerade::Files {
+            dir: text("dir")
+                .ok_or_else(|| format!("{path}.settings.masquerade.dir is required for file"))?
+                .into(),
+        },
+        "proxy" => {
+            let url = text("url")
+                .ok_or_else(|| format!("{path}.settings.masquerade.url is required for proxy"))?;
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(format!(
+                    "{path}.settings.masquerade.url must be an http or https URL"
+                ));
+            }
+            Hysteria2Masquerade::Proxy { url: url.into() }
+        }
+        other => {
+            return Err(format!(
+                "{path}.settings.masquerade.type {other:?} is not string, file or proxy"
+            ))
+        }
+    }))
 }
 
 fn parse_tuic_inbound(settings: Option<&Value>, path: &str) -> R<TuicInboundConfig> {
@@ -2486,7 +3721,7 @@ fn parse_tun_cidr_list(value: &Value, path: &str) -> R<Box<[Box<str>]>> {
 
 // --------------------------------------------------------------- stream
 
-fn parse_stream(v: &Value, path: &str, _out: &mut ParseOutput) -> R<StreamSettings> {
+fn parse_stream(v: &Value, path: &str, out: &mut ParseOutput) -> R<StreamSettings> {
     let network = v.get("network").and_then(Value::as_str).unwrap_or("raw");
 
     let mut transport = match network {
@@ -2494,7 +3729,7 @@ fn parse_stream(v: &Value, path: &str, _out: &mut ParseOutput) -> R<StreamSettin
         "ws" => Transport::WebSocket(parse_ws(v.get("wsSettings"))),
         "httpupgrade" => Transport::HttpUpgrade(parse_ws(v.get("httpupgradeSettings"))),
         "grpc" => Transport::Grpc(parse_grpc(v.get("grpcSettings"))),
-        "xhttp" | "splithttp" => Transport::Xhttp(parse_xhttp(v.get("xhttpSettings"), v, path)?),
+        "xhttp" | "splithttp" => Transport::Xhttp(parse_xhttp(xhttp_settings(v), v, path)?),
         other => {
             return Err(format!(
                 "{path}.streamSettings.network: unsupported transport {other:?}"
@@ -2502,11 +3737,66 @@ fn parse_stream(v: &Value, path: &str, _out: &mut ParseOutput) -> R<StreamSettin
         }
     };
 
+    // Transport and socket settings Zray accepts and has no use for: it keeps
+    // connections alive on its own (see `zero_evasion::KeepaliveCarrier`),
+    // resolves names its own way, and does not read `X-Forwarded-For`.
+    for (section, keys) in [
+        (
+            "wsSettings",
+            &["heartbeatPeriod", "trustedXForwardedFor"][..],
+        ),
+        ("httpupgradeSettings", &["trustedXForwardedFor"][..]),
+        (
+            "sockopt",
+            &["addressPortStrategy", "penetrate", "trustedXForwardedFor"][..],
+        ),
+    ] {
+        for key in keys {
+            if v.get(section)
+                .and_then(|settings| settings.get(*key))
+                .is_some_and(|value| {
+                    !value.is_null() && value != "" && value != false && value != 0
+                })
+            {
+                out.note(
+                    format!("{path}.streamSettings.{section}.{key}"),
+                    "accepted, not applied: Zray has no such setting",
+                );
+            }
+        }
+    }
+
     // Panels write `"security": ""` for "none" as well as omitting it.
     let security = match v.get("security").and_then(Value::as_str).unwrap_or("none") {
         "none" | "" => Security::None,
         "tls" => {
             let t = v.get("tlsSettings");
+            // What Zray's TLS takes from the browser fingerprint, or from the
+            // bundled roots, and so does not let a setting override.
+            for key in [
+                "minVersion",
+                "maxVersion",
+                "cipherSuites",
+                "curvePreferences",
+                "disableSystemRoot",
+                "enableSessionResumption",
+                "echForceQuery",
+                "echSockopt",
+                "ocspStapling",
+                "useSystemCA",
+                "buildChain",
+                "oneTimeLoading",
+            ] {
+                if t.is_some_and(|t| {
+                    t.get(key)
+                        .is_some_and(|value| !value.is_null() && value != "" && value != false)
+                }) {
+                    out.note(
+                        format!("{path}.streamSettings.tlsSettings.{key}"),
+                        "accepted, not applied: the TLS shape comes from `fingerprint`",
+                    );
+                }
+            }
             let allow_insecure = t
                 .and_then(|t| t.get("allowInsecure"))
                 .and_then(Value::as_bool)
@@ -2530,6 +3820,30 @@ fn parse_stream(v: &Value, path: &str, _out: &mut ParseOutput) -> R<StreamSettin
             Security::Tls(TlsConfig {
                 trusted_roots,
                 pinned_cert_sha256,
+                verify_names: match t.and_then(|t| t.get("verifyPeerCertByName")) {
+                    None | Some(Value::Null) => Vec::new(),
+                    Some(Value::String(text)) => text
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(Box::from)
+                        .collect(),
+                    Some(Value::Array(names)) => names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(Box::from)
+                        .collect(),
+                    Some(_) => {
+                        return Err(format!(
+                            "{path}.streamSettings.tlsSettings.verifyPeerCertByName must be a name or a list of names"
+                        ))
+                    }
+                },
+                key_log_file: t
+                    .and_then(|t| t.get("masterKeyLog"))
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .map(Box::from),
                 server_name: t
                     .and_then(|t| t.get("serverName"))
                     .and_then(Value::as_str)
@@ -2645,6 +3959,7 @@ fn parse_stream(v: &Value, path: &str, _out: &mut ParseOutput) -> R<StreamSettin
         sockopt,
         evasion,
         raw_http_header,
+        direct: None,
     })
 }
 
@@ -2657,7 +3972,10 @@ fn parse_ech_config(settings: Option<&Value>, path: &str) -> R<Option<EchConfig>
         .get("enableECH")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let encoded = settings.get("echConfigList");
+    // An empty string is how panels write "not set".
+    let encoded = settings
+        .get("echConfigList")
+        .filter(|value| value.as_str().is_none_or(|text| !text.trim().is_empty()));
     let has_config = encoded.is_some_and(|value| !value.is_null());
     let inner_name = settings
         .get("echServerName")
@@ -2927,6 +4245,8 @@ fn parse_ws(v: Option<&Value>) -> WebSocketConfig {
         xhttp_http_version: XhttpHttpVersion::Http1,
         xhttp_download: None,
         xhttp: Default::default(),
+        grpc_multi_path: None,
+        grpc_multi: false,
     }
 }
 
@@ -2948,26 +4268,35 @@ fn json_port(value: &Value) -> Option<u16> {
     u16::try_from(port).ok().filter(|port| *port != 0)
 }
 
-pub(crate) fn grpc_path(service: &str) -> String {
+/// The single-stream (`Tun`) path of a `serviceName`, and the multi-stream
+/// (`TunMulti`) one when it is a different path (Xray's `getTunStreamName` and
+/// `getTunMultiStreamName`): a plain name has `Tun` and `TunMulti`; a custom
+/// path `/p/single|multi` names both; `/p/name` is one method for both.
+pub(crate) fn grpc_paths(service: &str) -> (String, Option<String>) {
     let service = service.trim();
     if service.is_empty() {
-        return "/Tun".into();
+        return ("/Tun".into(), Some("/TunMulti".into()));
     }
-    if let Some(custom) = service.strip_prefix('/') {
-        // Custom path form: the final segment names the stream, and an
-        // optional `|` separates the single and multiplexed stream names.
-        let (prefix, ending) = match custom.rfind('/') {
-            Some(index) => (&custom[..index], &custom[index + 1..]),
-            None => ("", custom),
-        };
-        let method = ending.split('|').next().unwrap_or(ending);
-        return if prefix.is_empty() {
+    let Some(custom) = service.strip_prefix('/') else {
+        let name = service.trim_matches('/');
+        return (format!("/{name}/Tun"), Some(format!("/{name}/TunMulti")));
+    };
+    // Custom path form: the final segment names the stream, and an optional
+    // `|` separates the single and multiplexed stream names.
+    let (prefix, ending) = match custom.rfind('/') {
+        Some(index) => (&custom[..index], &custom[index + 1..]),
+        None => ("", custom),
+    };
+    let join = |method: &str| {
+        if prefix.is_empty() {
             format!("/{method}")
         } else {
             format!("/{prefix}/{method}")
-        };
-    }
-    format!("/{}/Tun", service.trim_matches('/'))
+        }
+    };
+    let mut names = ending.split('|');
+    let single = names.next().unwrap_or(ending);
+    (join(single), names.next().map(join))
 }
 
 fn parse_grpc(v: Option<&Value>) -> WebSocketConfig {
@@ -2976,7 +4305,13 @@ fn parse_grpc(v: Option<&Value>) -> WebSocketConfig {
         .and_then(|settings| settings.get("serviceName"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    config.path = Arc::from(grpc_path(service));
+    let (single, multi) = grpc_paths(service);
+    config.path = Arc::from(single);
+    config.grpc_multi_path = multi.map(Arc::from);
+    config.grpc_multi = v
+        .and_then(|settings| settings.get("multiMode"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if config.host.is_none() {
         config.host = v
             .and_then(|settings| settings.get("authority"))
@@ -2984,6 +4319,14 @@ fn parse_grpc(v: Option<&Value>) -> WebSocketConfig {
             .map(Arc::from);
     }
     config
+}
+
+/// A stream's XHTTP settings object: `xhttpSettings`, or `splithttpSettings`,
+/// the name older panels and clients still write for the same transport.
+fn xhttp_settings(stream: &Value) -> Option<&Value> {
+    stream
+        .get("xhttpSettings")
+        .or_else(|| stream.get("splithttpSettings"))
 }
 
 fn parse_xhttp(v: Option<&Value>, stream: &Value, path: &str) -> R<WebSocketConfig> {
@@ -3072,7 +4415,7 @@ pub(crate) fn xray_http_version(security: &str, alpn: &[&str]) -> XhttpHttpVersi
 }
 
 pub(crate) fn parse_xhttp_download(v: &Value, path: &str) -> R<XhttpDownloadConfig> {
-    if v.get("xhttpSettings")
+    if xhttp_settings(v)
         .and_then(|settings| settings.get("downloadSettings"))
         .is_some()
     {
@@ -3166,7 +4509,107 @@ fn parse_sockopt(v: &Value, path: &str) -> R<Sockopt> {
             .filter(|name| !name.is_empty())
             .map(Arc::from),
         bind_interface: v.get("interface").and_then(Value::as_str).map(Arc::from),
+        keepalive: parse_keepalive_pair(v),
+        user_timeout_ms: v
+            .get("tcpUserTimeout")
+            .and_then(Value::as_u64)
+            .and_then(|ms| u32::try_from(ms).ok())
+            .filter(|ms| *ms > 0),
+        window_clamp: v
+            .get("tcpWindowClamp")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0),
+        max_seg: v
+            .get("tcpMaxSeg")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0),
+        mptcp: v.get("tcpMptcp").and_then(Value::as_bool).unwrap_or(false),
+        v6_only: v.get("V6Only").and_then(Value::as_bool),
+        tproxy: match v.get("tproxy").and_then(Value::as_str) {
+            None => Tproxy::Off,
+            Some(name) => Tproxy::parse(name).ok_or_else(|| {
+                format!(
+                    "{path}.sockopt.tproxy: {name:?} is not \"off\", \"redirect\" or \"tproxy\""
+                )
+            })?,
+        },
+        bind_address: None,
+        custom: parse_custom_sockopt(v, path)?,
     })
+}
+
+/// `customSockopt`: `[{"system", "network", "level", "opt", "value", "type"}]`.
+/// `level` and `opt` are numbers (as text or as JSON numbers); `type` is
+/// `int` or `str`.
+fn parse_custom_sockopt(v: &Value, path: &str) -> R<Vec<zero_core::custom_sockopt::CustomSockopt>> {
+    use zero_core::custom_sockopt::{CustomSockopt, CustomValue};
+    let Some(list) = v.get("customSockopt").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let number = |value: Option<&Value>, what: &str, at: usize| -> R<Option<i32>> {
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(text)) if text.trim().is_empty() => Ok(None),
+            Some(Value::String(text)) => text.trim().parse().map(Some).map_err(|_| {
+                format!("{path}.sockopt.customSockopt[{at}].{what} {text:?} is not a number")
+            }),
+            Some(Value::Number(number)) => number
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .map(Some)
+                .ok_or_else(|| {
+                    format!("{path}.sockopt.customSockopt[{at}].{what} is out of range")
+                }),
+            Some(_) => Err(format!(
+                "{path}.sockopt.customSockopt[{at}].{what} must be a number"
+            )),
+        }
+    };
+    let mut options = Vec::new();
+    for (at, entry) in list.iter().enumerate() {
+        let text = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or("");
+        let opt = number(entry.get("opt"), "opt", at)?
+            .ok_or_else(|| format!("{path}.sockopt.customSockopt[{at}].opt is required"))?;
+        let value = match text("type") {
+            "int" => CustomValue::Int(number(entry.get("value"), "value", at)?.unwrap_or(0)),
+            "str" => CustomValue::Bytes(text("value").as_bytes().to_vec()),
+            other => {
+                return Err(format!(
+                    "{path}.sockopt.customSockopt[{at}].type {other:?} is not int or str"
+                ))
+            }
+        };
+        options.push(CustomSockopt {
+            system: Some(text("system").to_string()).filter(|system| !system.is_empty()),
+            network: text("network").to_string(),
+            // Xray's default level is TCP.
+            level: number(entry.get("level"), "level", at)?.unwrap_or(6),
+            opt,
+            value,
+        });
+    }
+    Ok(options)
+}
+
+/// `tcpKeepAliveIdle` and `tcpKeepAliveInterval`, in Xray's convention: a
+/// positive number is seconds, zero or absent is the default (45), and a
+/// negative number turns keepalive off. `None` when neither is set.
+fn parse_keepalive_pair(v: &Value) -> Option<(u32, u32)> {
+    let get = |key: &str| v.get(key).and_then(Value::as_i64);
+    let (idle, interval) = (get("tcpKeepAliveIdle"), get("tcpKeepAliveInterval"));
+    if idle.is_none() && interval.is_none() {
+        return None;
+    }
+    if idle.is_some_and(|n| n < 0) || interval.is_some_and(|n| n < 0) {
+        return Some((0, 0));
+    }
+    let seconds = |n: Option<i64>| match n {
+        Some(n) if n > 0 => u32::try_from(n).unwrap_or(u32::MAX),
+        _ => 45,
+    };
+    Some((seconds(idle), seconds(interval)))
 }
 
 /// The TCP fragmentation a share link's `fm=` carries: Xray's `finalmask`
@@ -3232,6 +4675,42 @@ fn parse_finalmask(v: &Value, path: &str) -> R<Evasion> {
                         ev.udp_noise.push(parse_noise(n)?);
                     }
                 }
+                "salamander" => {
+                    let here = format!("{path}.finalmask.udp[{i}]");
+                    let settings = entry.get("settings");
+                    let password = settings
+                        .and_then(|s| s.get("password"))
+                        .and_then(Value::as_str)
+                        .filter(|password| password.len() >= 4)
+                        .ok_or_else(|| {
+                            format!("{here}.settings.password must be at least 4 bytes")
+                        })?;
+                    // Gecko padding changes datagram sizes; without it the
+                    // two ends disagree, so it is refused, not ignored.
+                    let packet_size = settings.and_then(|s| s.get("packetSize"));
+                    if packet_size.is_some_and(|size| match size {
+                        Value::String(text) => !text.trim().is_empty(),
+                        Value::Number(number) => number.as_u64() != Some(0),
+                        Value::Null => false,
+                        _ => true,
+                    }) {
+                        return Err(format!(
+                            "{here}.settings.packetSize: Gecko packet-size padding is not supported"
+                        ));
+                    }
+                    ev.udp_salamander = Some(password.into());
+                }
+                "udphop" => {
+                    ev.udp_hop = Some(parse_udp_hop(
+                        entry.get("settings"),
+                        &format!("{path}.finalmask.udp[{i}]"),
+                    )?)
+                }
+                "mkcp-legacy" | "header-custom" | "sudoku" | "xdns" | "xicmp" | "realm" => {
+                    return Err(format!(
+                        "{path}.finalmask.udp[{i}].type: the {ty:?} mask is not implemented"
+                    ))
+                }
                 other => {
                     return Err(format!(
                         "{path}.finalmask.udp[{i}].type: unsupported mask {other:?}"
@@ -3241,7 +4720,189 @@ fn parse_finalmask(v: &Value, path: &str) -> R<Evasion> {
         }
     }
 
+    if let Some(params) = v.get("quicParams").filter(|params| !params.is_null()) {
+        let here = format!("{path}.finalmask.quicParams");
+        ev.quic = Some(parse_quic_params(params, &here)?);
+        // The hop plan may be written here too (`udpHop`); it is the same
+        // plan the `udphop` mask makes, and naming both is a conflict.
+        if let Some(hop) = params.get("udpHop").filter(|hop| !hop.is_null()) {
+            if ev.udp_hop.is_some() {
+                return Err(format!("{here}.udpHop conflicts with a udphop mask"));
+            }
+            let ports = hop.get("ports").map(parse_hop_ports).unwrap_or_default();
+            if ports.is_empty() {
+                return Err(format!("{here}.udpHop.ports must list at least one port"));
+            }
+            let interval_secs = match hop.get("interval") {
+                None | Some(Value::Null) => (30, 30),
+                Some(value) => parse_secs_range(value, 5, &format!("{here}.udpHop.interval"))?,
+            };
+            ev.udp_hop = Some(UdpHop {
+                ports,
+                interval_secs,
+            });
+        }
+    }
+
     Ok(ev)
+}
+
+/// `udphop` settings: `remotePorts` (a list or ranges, `"20000-50000,443"`)
+/// and `interval` seconds (a number or `"5-10"`, at least 5). Only the mode
+/// that Zray can carry out on its own is accepted, `intervallocal`; the
+/// others rely on the firewall to do part of the work.
+fn parse_udp_hop(settings: Option<&Value>, path: &str) -> R<UdpHop> {
+    let settings = settings.ok_or_else(|| format!("{path}.settings is required for udphop"))?;
+    let mode = settings
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("intervallocal");
+    for part in mode.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if part != "intervallocal" {
+            return Err(format!(
+                "{path}.settings.mode: {part:?} needs firewall support that Zray does not set up; use intervallocal"
+            ));
+        }
+    }
+    if settings
+        .get("remoteIPs")
+        .and_then(Value::as_array)
+        .is_some_and(|ips| {
+            ips.iter()
+                .any(|ip| ip.as_str().is_some_and(|ip| !ip.is_empty()))
+        })
+    {
+        return Err(format!(
+            "{path}.settings.remoteIPs: hopping between addresses is not supported"
+        ));
+    }
+    let ports = settings
+        .get("remotePorts")
+        .map(parse_hop_ports)
+        .unwrap_or_default();
+    if ports.is_empty() {
+        return Err(format!(
+            "{path}.settings.remotePorts must list at least one port"
+        ));
+    }
+    let interval_secs = match settings.get("interval") {
+        None | Some(Value::Null) => (30, 30),
+        Some(value) => parse_secs_range(value, 5, &format!("{path}.settings.interval"))?,
+    };
+    Ok(UdpHop {
+        ports,
+        interval_secs,
+    })
+}
+
+/// Ports as `"443"`, `"11,13,15-17"`, `"11;13"`, a number, or a list of those.
+fn parse_hop_ports(value: &Value) -> Vec<routing::PortRange> {
+    match value {
+        Value::String(text) => text
+            .split([',', ';'])
+            .filter_map(routing::PortRange::parse)
+            .filter(|range| range.start <= range.end)
+            .collect(),
+        other => parse_port_list(other),
+    }
+}
+
+/// Seconds as a number or `"min-max"`, neither below `floor`.
+fn parse_secs_range(value: &Value, floor: u32, what: &str) -> R<(u32, u32)> {
+    let text = match value {
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.trim().to_string(),
+        _ => return Err(format!("{what} must be seconds, or a range like \"5-10\"")),
+    };
+    let (low, high) = text.split_once('-').unwrap_or((&text, &text));
+    let number = |part: &str| -> R<u32> {
+        part.trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n >= floor)
+            .ok_or_else(|| format!("{what} must be at least {floor} seconds"))
+    };
+    let (low, high) = (number(low)?, number(high)?);
+    if low > high {
+        return Err(format!("{what} must be written smallest first"));
+    }
+    Ok((low, high))
+}
+
+/// A rate such as `"60 mbps"`, `"100kb"`, `"1g"` or a bare number, as bytes
+/// per second. Units are bits per second (`bps`, `kbps`, `mbps`, `gbps`, or
+/// without the `ps`) counted in powers of 1024, as Xray counts them (so
+/// `"20 mbps"` is 2,621,440 bytes per second); a bare number is bits per
+/// second too. Zero means none.
+fn parse_rate(value: &Value, what: &str) -> R<u64> {
+    let text = match value {
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.trim().to_ascii_lowercase(),
+        Value::Null => return Ok(0),
+        _ => return Err(format!("{what} must be a rate like \"60 mbps\"")),
+    };
+    let split = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("{what} must be a rate like \"60 mbps\""))?;
+    let factor = match unit.trim() {
+        "" | "b" | "bps" => 1.0,
+        "k" | "kb" | "kbps" => 1024.0,
+        "m" | "mb" | "mbps" => 1024.0 * 1024.0,
+        "g" | "gb" | "gbps" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tbps" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        other => return Err(format!("{what}: unknown rate unit {other:?}")),
+    };
+    let bits = number * factor;
+    if bits != 0.0 && bits < 65_535.0 {
+        return Err(format!("{what} must be at least 65535 bps"));
+    }
+    Ok((bits / 8.0) as u64)
+}
+
+fn parse_quic_params(v: &Value, path: &str) -> R<QuicParams> {
+    let number = |key: &str, low: u64, high: u64| -> R<Option<u32>> {
+        match v.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => value
+                .as_u64()
+                .filter(|n| (low..=high).contains(n))
+                .map(|n| Some(n as u32))
+                .ok_or_else(|| format!("{path}.{key} must be a number from {low} to {high}")),
+        }
+    };
+    let congestion = match v.get("congestion").and_then(Value::as_str).unwrap_or("") {
+        "" => QuicCongestion::Default,
+        "reno" => QuicCongestion::Reno,
+        "bbr" => QuicCongestion::Bbr,
+        "brutal" => QuicCongestion::Brutal,
+        "force-brutal" => QuicCongestion::ForceBrutal,
+        other => return Err(format!("{path}.congestion: unknown algorithm {other:?}")),
+    };
+    let rate = |key: &str| -> R<u64> {
+        v.get(key)
+            .map_or(Ok(0), |value| parse_rate(value, &format!("{path}.{key}")))
+    };
+    Ok(QuicParams {
+        congestion,
+        up_bytes_per_sec: rate("brutalUp")?,
+        down_bytes_per_sec: rate("brutalDown")?,
+        init_stream_window: number("initStreamReceiveWindow", 16 * 1024, u32::MAX as u64)?,
+        max_stream_window: number("maxStreamReceiveWindow", 16 * 1024, u32::MAX as u64)?,
+        init_connection_window: number("initConnectionReceiveWindow", 16 * 1024, u32::MAX as u64)?,
+        max_connection_window: number("maxConnectionReceiveWindow", 16 * 1024, u32::MAX as u64)?,
+        max_idle_secs: number("maxIdleTimeout", 4, 120)?,
+        keep_alive_secs: number("keepAlivePeriod", 2, 60)?,
+        disable_mtu_discovery: v
+            .get("disablePathMTUDiscovery")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        max_incoming_streams: number("maxIncomingStreams", 8, u32::MAX as u64)?,
+    })
 }
 
 /// Xray's older Freedom schema put the same mechanisms under the outbound's
@@ -3601,12 +5262,87 @@ fn parse_noise(v: &Value) -> R<NoiseConfig> {
     Ok(NoiseConfig { kind, delay, count })
 }
 
+/// `burstObservatory`: `subjectSelector` and `pingConfig.destination` /
+/// `pingConfig.interval` become the observatory's selector, probe address and
+/// probe interval. How many samples a round takes, and the timeout, are the
+/// runtime's own.
+fn parse_burst_observatory(v: &Value) -> R<ObservatoryConfig> {
+    let ping = v.get("pingConfig");
+    let mut translated = serde_json::Map::new();
+    if let Some(selector) = v.get("subjectSelector") {
+        translated.insert("subjectSelector".into(), selector.clone());
+    }
+    if let Some(destination) = ping.and_then(|p| p.get("destination")) {
+        translated.insert("probeUrl".into(), destination.clone());
+    }
+    if let Some(interval) = ping.and_then(|p| p.get("interval")) {
+        translated.insert("probeInterval".into(), interval.clone());
+    }
+    parse_observatory(&Value::Object(translated), "burstObservatory")
+}
+
+/// `policy.levels."0"`: `handshake`, `connIdle`, `uplinkOnly` and
+/// `downlinkOnly`, in seconds. Other levels belong to accounts with that
+/// level, which Zray's do not have; they, `system`, and `bufferSize` are
+/// accepted and reported, not applied.
+fn parse_policy(v: &Value, out: &mut ParseOutput) -> R<Policy> {
+    let mut policy = Policy::default();
+    let level0 = v.get("levels").and_then(|levels| levels.get("0"));
+    if let Some(level) = level0 {
+        let seconds = |key: &str| -> R<Option<std::time::Duration>> {
+            match level.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(value) => value
+                    .as_u64()
+                    .map(|secs| Some(std::time::Duration::from_secs(secs)))
+                    .ok_or_else(|| format!("policy.levels.0.{key} must be a number of seconds")),
+            }
+        };
+        if let Some(handshake) = seconds("handshake")?.filter(|d| !d.is_zero()) {
+            policy.handshake = handshake;
+        }
+        if let Some(idle) = seconds("connIdle")? {
+            policy.conn_idle = idle;
+        }
+        let half = [seconds("uplinkOnly")?, seconds("downlinkOnly")?]
+            .into_iter()
+            .flatten()
+            .max();
+        if let Some(half) = half {
+            policy.half_close = half;
+        }
+        if level.get("bufferSize").is_some() {
+            out.note(
+                "policy.levels.0.bufferSize",
+                "accepted, not applied: relay buffers are sized by use",
+            );
+        }
+    }
+    if v.get("levels")
+        .and_then(Value::as_object)
+        .is_some_and(|levels| levels.keys().any(|key| key != "0"))
+    {
+        out.note(
+            "policy.levels",
+            "levels other than 0 are accepted, not applied: accounts have no level here",
+        );
+    }
+    if v.get("system").is_some() {
+        out.note(
+            "policy.system",
+            "accepted, not applied: the statistics switches have no counterpart here",
+        );
+    }
+    Ok(policy)
+}
+
 fn parse_observatory(v: &Value, path: &str) -> R<ObservatoryConfig> {
     let object = v
         .as_object()
         .ok_or_else(|| format!("{path} must be an object"))?;
     let probe_url: Arc<str> = object
         .get("probeUrl")
+        .or_else(|| object.get("probeURL"))
         .and_then(Value::as_str)
         .unwrap_or("https://www.google.com/generate_204")
         .into();
@@ -3936,6 +5672,28 @@ fn parse_routing(v: &Value, out: &mut ParseOutput) -> R<Routing> {
         .transpose()?
         .unwrap_or_default();
 
+    // `leastLoad`'s own tuning (how many nodes to keep, the RTT ceiling, the
+    // costs) is not read: Zray's least-load picks by recent failures and
+    // rotates among equals.
+    for (index, balancer) in v
+        .get("balancers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let settings = balancer
+            .get("strategy")
+            .and_then(|strategy| strategy.get("settings"));
+        if settings.is_some_and(|settings| settings.as_object().is_some_and(|map| !map.is_empty()))
+        {
+            out.note(
+                format!("routing.balancers[{index}].strategy.settings"),
+                "accepted, not applied: the balancer strategies take no tuning here",
+            );
+        }
+    }
+
     let balancers = v
         .get("balancers")
         .and_then(Value::as_array)
@@ -3977,7 +5735,11 @@ fn parse_rule(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Rule> {
 
     let mut rule = Rule::new(target);
 
-    if let Some(a) = v.get("domain").and_then(Value::as_array) {
+    if let Some(a) = v
+        .get("domain")
+        .or_else(|| v.get("domains"))
+        .and_then(Value::as_array)
+    {
         rule.domains = a
             .iter()
             .filter_map(Value::as_str)
@@ -3991,7 +5753,11 @@ fn parse_rule(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Rule> {
             .map(parse_ip_pattern)
             .collect();
     }
-    if let Some(a) = v.get("source").and_then(Value::as_array) {
+    if let Some(a) = v
+        .get("source")
+        .or_else(|| v.get("sourceIP"))
+        .and_then(Value::as_array)
+    {
         rule.source_ips = a
             .iter()
             .filter_map(Value::as_str)
@@ -4005,14 +5771,16 @@ fn parse_rule(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Rule> {
         rule.source_ports = parse_port_list(p);
     }
     if let Some(n) = v.get("network").and_then(Value::as_str) {
+        // A name that is neither tcp nor udp must not be dropped: a rule left
+        // with no network at all would match every flow.
         rule.networks = n
             .split(',')
-            .filter_map(|s| match s.trim() {
-                "tcp" => Some(Network::Tcp),
-                "udp" => Some(Network::Udp),
-                _ => None,
+            .map(|s| match s.trim() {
+                "tcp" => Ok(Network::Tcp),
+                "udp" => Ok(Network::Udp),
+                other => Err(format!("{path}.network: unknown network {other:?}")),
             })
-            .collect();
+            .collect::<R<_>>()?;
     }
     if let Some(a) = v.get("inboundTag").and_then(Value::as_array) {
         rule.inbound_tags = a.iter().filter_map(Value::as_str).map(Box::from).collect();
@@ -4026,6 +5794,85 @@ fn parse_rule(v: &Value, idx: usize, out: &mut ParseOutput) -> R<Rule> {
             .filter_map(Value::as_str)
             .filter_map(routing::ProcessPattern::parse)
             .collect();
+    }
+
+    let strings = |key: &str| -> R<Vec<Box<str>>> {
+        match v.get(key) {
+            None => Ok(Vec::new()),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(Box::from)
+                        .ok_or_else(|| format!("{path}.{key} must list strings"))
+                })
+                .collect(),
+            Some(_) => Err(format!("{path}.{key} must be an array")),
+        }
+    };
+    rule.users = strings("user")?;
+    rule.local_ips = strings("localIP")?
+        .iter()
+        .map(|text| parse_ip_pattern(text))
+        .collect();
+    if let Some(p) = v.get("localPort") {
+        rule.local_ports = parse_port_list(p);
+    }
+    if let Some(p) = v.get("vlessRoute") {
+        rule.vless_routes = parse_port_list(p);
+    }
+    if let Some(attrs) = v.get("attrs") {
+        let attrs = attrs
+            .as_object()
+            .ok_or_else(|| format!("{path}.attrs must be an object"))?;
+        for (name, pattern) in attrs {
+            let pattern = pattern
+                .as_str()
+                .ok_or_else(|| format!("{path}.attrs.{name} must be a string"))?;
+            // Checked here so a typo is an error now, not a rule that never
+            // matches.
+            regex::Regex::new(pattern).map_err(|error| format!("{path}.attrs.{name}: {error}"))?;
+            rule.attrs
+                .push((name.to_ascii_lowercase().into(), pattern.into()));
+        }
+    }
+    if v.get("webhook").is_some() {
+        out.note(
+            &path,
+            "webhook is accepted but not sent; Zray does not call out when a rule matches",
+        );
+    }
+    // Every key Xray defines for a rule is read above or below; anything else
+    // is reported rather than dropped without a word.
+    const KNOWN: &[&str] = &[
+        "type",
+        "ruleTag",
+        "domain",
+        "domains",
+        "ip",
+        "port",
+        "sourcePort",
+        "localPort",
+        "network",
+        "source",
+        "sourceIP",
+        "localIP",
+        "user",
+        "vlessRoute",
+        "inboundTag",
+        "protocol",
+        "attrs",
+        "outboundTag",
+        "balancerTag",
+        "process",
+        "webhook",
+        "domainMatcher",
+        "directVia",
+    ];
+    if let Some(map) = v.as_object() {
+        for key in map.keys().filter(|key| !KNOWN.contains(&key.as_str())) {
+            out.note(&path, format!("unknown rule field {key:?} is ignored"));
+        }
     }
 
     if rule.is_unconditional() {
@@ -4082,12 +5929,69 @@ fn parse_balancer(v: &Value) -> R<routing::Balancer> {
             .and_then(Value::as_str)
             .and_then(routing::BalancerStrategy::parse)
             .unwrap_or_default(),
+        fallback: v
+            .get("fallbackTag")
+            .and_then(Value::as_str)
+            .filter(|tag| !tag.is_empty())
+            .map(Arc::from),
     })
 }
 
 // ------------------------------------------------------------------- dns
 
+/// DNS settings Xray has and Zray does not apply, named so a config that
+/// leans on one learns it when checked. Each is accepted and ignored: none of
+/// them changes whether a name resolves, only how fast, how fresh or how
+/// private.
+fn note_unapplied_dns(v: &Value, out: &mut ParseOutput) {
+    const TOP: &[&str] = &[
+        "clientIp",
+        "serveStale",
+        "serveExpiredTTL",
+        "disableFallback",
+        "disableFallbackIfMatch",
+        "enableParallelQuery",
+        "useSystemHosts",
+        "script",
+    ];
+    const SERVER: &[&str] = &[
+        "clientIp",
+        "timeoutMs",
+        "finalQuery",
+        "serveStale",
+        "serveExpiredTTL",
+        "disableCache",
+        "queryStrategy",
+        "id",
+    ];
+    for key in TOP {
+        if v.get(*key).is_some_and(|value| !value.is_null()) {
+            out.note(
+                format!("dns.{key}"),
+                "accepted, not applied: Zray has no such resolver setting",
+            );
+        }
+    }
+    for (index, server) in v
+        .get("servers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for key in SERVER {
+            if server.get(*key).is_some_and(|value| !value.is_null()) {
+                out.note(
+                    format!("dns.servers[{index}].{key}"),
+                    "accepted, not applied: Zray has no such resolver setting",
+                );
+            }
+        }
+    }
+}
+
 fn parse_dns(v: &Value, out: &mut ParseOutput) -> R<DnsSettings> {
+    note_unapplied_dns(v, out);
     let mut hosts = BTreeMap::new();
     if let Some(h) = v.get("hosts").and_then(Value::as_object) {
         for (k, val) in h {
@@ -4167,6 +6071,7 @@ fn parse_dns_server(v: &Value) -> Result<DnsServer, String> {
                 .ok_or_else(|| format!("cannot parse resolver {s:?}"))?,
             domains: Vec::new(),
             expect_ips: Vec::new(),
+            unexpect_ips: Vec::new(),
             skip_fallback: false,
             tag: None,
         }),
@@ -4199,6 +6104,16 @@ fn parse_dns_server(v: &Value) -> Result<DnsServer, String> {
                 expect_ips: o
                     .get("expectedIPs")
                     .or_else(|| o.get("expectIPs"))
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(parse_ip_pattern)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                unexpect_ips: o
+                    .get("unexpectedIPs")
                     .and_then(Value::as_array)
                     .map(|a| {
                         a.iter()
@@ -4970,6 +6885,24 @@ mod tests {
     }
 
     #[test]
+    fn a_zerov1_link_can_be_carried_by_another_outbound() {
+        let value = serde_json::json!({"outbounds": [
+            {"tag": "tide", "link": "zerov1://IJs62pjNyTJ6lcQI2RTJgw@203.0.113.9:443?key=8IlzK3FhAVnYNxXhX2Xvo8xANX6TjE8-zdHPObMR02A&path=%2Fstatic%2Fabc&security=tls&sni=t.example.com#t",
+             "streamSettings": {"sockopt": {"dialerProxy": "reality"}}},
+            {"tag": "reality", "link": "vless://245abd35-7efa-4bc8-85d4-a04f3798329f@203.0.113.7:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=example.com&pbk=F6PK1mARGsyeoVDKws76F0tNoIC1wd9sEG20c7yF2wY&sid=7963d08380d47375&fp=chrome&type=tcp#r"}
+        ]});
+        let (config, _) = parse_config(&value).unwrap();
+        assert!(matches!(
+            config.outbounds[0].protocol,
+            crate::model::OutboundProtocol::Tide(_)
+        ));
+        assert_eq!(
+            config.outbounds[0].stream.sockopt.dialer_proxy.as_deref(),
+            Some("reality")
+        );
+    }
+
+    #[test]
     fn xray_wireguard_peer_shape_is_compiled() {
         use base64::Engine;
 
@@ -5479,5 +7412,603 @@ mod tests {
         let empty = parse_sni_spoof(&serde_json::json!({"method": "empty"}), "x").unwrap();
         assert_eq!(empty.method, crate::model::SniMethod::EmptyRecord);
         assert!(parse_sni_spoof(&serde_json::json!({"method": "sudoku"}), "x").is_err());
+    }
+
+    #[test]
+    fn quic_rates_are_counted_the_way_xray_counts_them() {
+        let rate = |text: &str| parse_rate(&Value::from(text), "r").unwrap();
+        assert_eq!(rate("20 mbps"), 2_621_440);
+        assert_eq!(rate("20mb"), 2_621_440);
+        assert_eq!(rate("1g"), 134_217_728);
+        assert_eq!(rate("0"), 0);
+        assert!(
+            parse_rate(&Value::from("100"), "r").is_err(),
+            "below 65535 bps"
+        );
+        assert!(parse_rate(&Value::from("5 parsecs"), "r").is_err());
+        assert_eq!(parse_rate(&Value::from(0), "r").unwrap(), 0);
+    }
+
+    #[test]
+    fn finalmask_udp_masks_become_quic_shaping() {
+        let mask = serde_json::json!({
+            "udp": [
+                {"type": "salamander", "settings": {"password": "obfs-secret"}},
+                {"type": "udphop", "settings": {
+                    "mode": "intervallocal", "interval": "5-10", "remotePorts": "20000-20002,443"
+                }},
+            ],
+            "quicParams": {
+                "congestion": "brutal", "brutalUp": "30 mbps", "brutalDown": "40 mbps",
+                "maxIdleTimeout": 20, "keepAlivePeriod": 5, "disablePathMTUDiscovery": true,
+            },
+        });
+        let evasion = parse_finalmask(&mask, "x").unwrap();
+        assert_eq!(evasion.udp_salamander.as_deref(), Some("obfs-secret"));
+        let hop = evasion.udp_hop.unwrap();
+        assert_eq!(hop.interval_secs, (5, 10));
+        assert_eq!(hop.all_ports(), vec![443, 20000, 20001, 20002]);
+        let quic = evasion.quic.unwrap();
+        assert_eq!(quic.congestion, QuicCongestion::Brutal);
+        assert_eq!(quic.up_bytes_per_sec, 30 * 1024 * 1024 / 8);
+        assert_eq!(quic.max_idle_secs, Some(20));
+        assert!(quic.disable_mtu_discovery);
+    }
+
+    #[test]
+    fn udp_masks_that_cannot_be_carried_out_are_refused_not_dropped() {
+        for mask in [
+            serde_json::json!({"udp": [{"type": "salamander", "settings": {"password": "ab"}}]}),
+            serde_json::json!({"udp": [{"type": "salamander", "settings": {"password": "long-enough", "packetSize": "512-1200"}}]}),
+            serde_json::json!({"udp": [{"type": "udphop", "settings": {"mode": "intervalremote", "remotePorts": "1-2"}}]}),
+            serde_json::json!({"udp": [{"type": "udphop", "settings": {"interval": "1-2", "remotePorts": "1-2"}}]}),
+            serde_json::json!({"udp": [{"type": "udphop", "settings": {}}]}),
+            serde_json::json!({"udp": [{"type": "xdns", "settings": {}}]}),
+            serde_json::json!({"quicParams": {"maxIdleTimeout": 1}}),
+            serde_json::json!({"quicParams": {"congestion": "cubic-ish"}}),
+        ] {
+            assert!(parse_finalmask(&mask, "x").is_err(), "{mask}");
+        }
+    }
+
+    #[test]
+    fn xray_hysteria_configs_become_hysteria2_ones() {
+        let outbound = serde_json::json!({
+            "tag": "h", "protocol": "hysteria",
+            "settings": {"version": 2, "address": "203.0.113.5", "port": 8443},
+            "streamSettings": {
+                "network": "hysteria", "security": "tls",
+                "tlsSettings": {"serverName": "front.example"},
+                "hysteriaSettings": {"version": 2, "auth": "secret-auth"},
+                "finalmask": {"udp": [{"type": "salamander", "settings": {"password": "obfs-secret"}}]},
+            },
+        });
+        let config = serde_json::json!({"inbounds": [], "outbounds": [outbound]});
+        let (parsed, _) = parse_config(&config).unwrap();
+        let OutboundProtocol::Hysteria2(hy) = &parsed.outbounds[0].protocol else {
+            panic!("expected a Hysteria 2 outbound");
+        };
+        assert_eq!(&*hy.password, "secret-auth");
+        assert_eq!(hy.obfs_password.as_deref(), Some("obfs-secret"));
+        assert_eq!(hy.port, 8443);
+
+        let wrong = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [{
+                "protocol": "hysteria", "settings": {"version": 1, "address": "a.example", "port": 1},
+            }],
+        });
+        assert!(parse_config(&wrong).is_err());
+    }
+
+    #[test]
+    fn a_salamander_mask_on_a_tcp_protocol_is_refused() {
+        let config = serde_json::json!({"inbounds": [], "outbounds": [{
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "a.example", "port": 443,
+                "users": [{"id": "5783a3e7-e373-51cd-8642-c83782b807c5", "encryption": "none"}]}]},
+            "streamSettings": {"network": "raw",
+                "finalmask": {"udp": [{"type": "salamander", "settings": {"password": "obfs-secret"}}]}},
+        }]});
+        assert!(parse_config(&config)
+            .unwrap_err()
+            .contains("Hysteria 2 only"));
+    }
+
+    #[test]
+    fn inbound_ports_may_be_ranges_and_lists() {
+        let config = serde_json::json!({
+            "inbounds": [{"tag": "many", "protocol": "socks", "listen": "127.0.0.1", "port": "20000-20002,443"}],
+            "outbounds": [{"protocol": "freedom"}],
+        });
+        let (parsed, _) = parse_config(&config).unwrap();
+        let ports: Vec<u16> = parsed.inbounds.iter().map(|i| i.port).collect();
+        assert_eq!(ports, vec![20000, 20001, 20002, 443]);
+        assert!(parsed.inbounds.iter().all(|i| &*i.tag == "many"));
+        let too_wide = serde_json::json!({
+            "inbounds": [{"tag": "x", "protocol": "socks", "port": "1000-9000"}],
+            "outbounds": [{"protocol": "freedom"}],
+        });
+        assert!(parse_config(&too_wide).is_err());
+    }
+
+    #[test]
+    fn dokodemo_reads_both_networks_and_the_transparent_options() {
+        let config = serde_json::json!({
+            "inbounds": [
+                {"tag": "t", "protocol": "dokodemo-door", "port": 12346,
+                 "settings": {"network": "tcp,udp", "followRedirect": true},
+                 "streamSettings": {"sockopt": {"tproxy": "tproxy"}}},
+                {"tag": "d", "protocol": "dokodemo-door", "port": 5353,
+                 "settings": {"address": "1.1.1.1", "port": 53, "network": "udp"}},
+            ],
+            "outbounds": [{"protocol": "freedom"}],
+        });
+        let (parsed, _) = parse_config(&config).unwrap();
+        match &parsed.inbounds[0].protocol {
+            InboundProtocol::Dokodemo {
+                address: None,
+                port: None,
+                tcp: true,
+                udp: true,
+                follow_redirect: true,
+                ..
+            } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(parsed.inbounds[0].sockopt.tproxy, Tproxy::Tproxy);
+        assert!(matches!(
+            parsed.inbounds[1].protocol,
+            InboundProtocol::Dokodemo {
+                address: Some(_),
+                port: Some(53),
+                tcp: false,
+                udp: true,
+                follow_redirect: false,
+                ..
+            }
+        ));
+        for bad in [
+            serde_json::json!({"network": "icmp"}),
+            serde_json::json!({"network": "tcp"}),
+        ] {
+            let tproxy = if bad["network"] == "tcp" {
+                "sideways"
+            } else {
+                "off"
+            };
+            let config = serde_json::json!({
+                "inbounds": [{"protocol": "dokodemo-door", "port": 1, "settings": bad,
+                    "streamSettings": {"sockopt": {"tproxy": tproxy}}}],
+                "outbounds": [{"protocol": "freedom"}],
+            });
+            assert!(parse_config(&config).is_err(), "{config}");
+        }
+    }
+
+    #[test]
+    fn dokodemo_destination_follows_port_map_then_rewrites_then_the_fixed_target() {
+        let config = serde_json::json!({
+            "inbounds": [
+                {"tag": "m", "protocol": "dokodemo-door", "listen": "127.0.0.1", "port": "5000-5001",
+                 "settings": {"portMap": {"5001": "10.0.0.9:853"}, "rewriteAddress": "192.0.2.1",
+                              "followRedirect": true, "allowedNetwork": "tcp"}},
+                {"tag": "f", "protocol": "dokodemo-door", "port": 5300,
+                 "settings": {"address": "1.1.1.1", "port": 53}},
+            ],
+            "outbounds": [{"protocol": "freedom"}],
+        });
+        let (parsed, _) = parse_config(&config).unwrap();
+        let original: std::net::SocketAddr = "203.0.113.5:8443".parse().unwrap();
+        let (a, b, fixed) = (
+            &parsed.inbounds[0],
+            &parsed.inbounds[1],
+            &parsed.inbounds[2],
+        );
+        // Port 5000 is not in the map: the original, with its address rewritten.
+        assert_eq!(
+            a.dokodemo_destination(Some(original)),
+            Some((Address::parse_host("192.0.2.1"), 8443))
+        );
+        // Without a redirect there is no port to rewrite into: nothing to dial.
+        assert_eq!(a.dokodemo_destination(None), None);
+        // Port 5001 is mapped, whatever else is set.
+        assert_eq!(
+            b.dokodemo_destination(Some(original)),
+            Some((Address::parse_host("10.0.0.9"), 853))
+        );
+        assert_eq!(
+            fixed.dokodemo_destination(None),
+            Some((Address::parse_host("1.1.1.1"), 53))
+        );
+        let bad = serde_json::json!({
+            "inbounds": [{"protocol": "dokodemo-door", "port": 1,
+                          "settings": {"portMap": {"1": "no-port"}}}],
+            "outbounds": [{"protocol": "freedom"}],
+        });
+        assert!(parse_config(&bad).is_err());
+    }
+
+    #[test]
+    fn a_wireguard_inbound_reads_its_peers() {
+        let key = |byte: u8| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode([byte; 32])
+        };
+        let config = |peers: serde_json::Value| {
+            serde_json::json!({
+                "inbounds": [{"protocol": "wireguard", "port": 51820,
+                    "settings": {"secretKey": key(1), "peers": peers}}],
+                "outbounds": [{"protocol": "freedom"}],
+            })
+        };
+        let (parsed, _) = parse_config(&config(serde_json::json!([
+            {"publicKey": key(2), "allowedIPs": ["10.7.0.2/32"], "keepAlive": 25, "email": "a@x"},
+            {"publicKey": key(3), "preSharedKey": key(4)},
+        ])))
+        .unwrap();
+        let InboundProtocol::WireGuard(wg) = &parsed.inbounds[0].protocol else {
+            panic!("not a wireguard inbound");
+        };
+        assert_eq!(wg.mtu, 1420, "Xray's default");
+        assert_eq!(wg.peers[0].keepalive, Some(25));
+        assert_eq!(wg.peers[0].allowed_ips.len(), 1);
+        assert_eq!(wg.peers[0].email.as_deref(), Some("a@x"));
+        assert_eq!(wg.peers[1].allowed_ips.len(), 2, "any address by default");
+        assert_eq!(wg.peers[1].preshared_key, Some([4; 32]));
+        // The key must never reach a log through the debug form.
+        assert!(!format!("{wg:?}").contains(&key(1)));
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!([{"publicKey": "not-a-key"}]),
+            serde_json::json!([{"publicKey": key(2), "allowedIPs": ["nope"]}]),
+        ] {
+            assert!(parse_config(&config(bad)).is_err());
+        }
+    }
+
+    #[test]
+    fn older_spellings_and_the_dns_and_blackhole_outbounds_are_read() {
+        // `splithttpSettings` is the same transport as `xhttpSettings`.
+        let config = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [
+                {"tag": "a", "protocol": "vless",
+                 "settings": {"vnext": [{"address": "a.example", "port": 443,
+                    "users": [{"id": "5783a3e7-e373-51cd-8642-c83782b807c5", "encryption": "none"}]}]},
+                 "streamSettings": {"network": "splithttp", "security": "tls",
+                    "tlsSettings": {"serverName": "a.example"},
+                    "splithttpSettings": {"path": "/legacy", "host": "front.example"}}},
+                {"tag": "d", "protocol": "dns", "settings": {"rules": [
+                    {"action": "drop", "qType": "28"},
+                    {"action": "return", "rCode": 3, "domain": ["full:x.example"]}]}},
+                {"tag": "legacy", "protocol": "dns", "settings": {"blockTypes": [65]}},
+                {"tag": "h", "protocol": "blackhole", "settings": {"response": {"type": "http"}}},
+                {"tag": "n", "protocol": "blackhole"},
+            ],
+        });
+        let (parsed, _) = parse_config(&config).unwrap();
+        let Transport::Xhttp(xhttp) = &parsed.outbounds[0].stream.transport else {
+            panic!("not xhttp");
+        };
+        assert_eq!(
+            &*xhttp.path, "/legacy",
+            "the older name must not be ignored"
+        );
+        let OutboundProtocol::Dns { rules } = &parsed.outbounds[1].protocol else {
+            panic!("not dns");
+        };
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].action, DnsAction::Drop);
+        assert_eq!(&*rules[0].qtypes, &[28]);
+        assert_eq!(rules[1].action, DnsAction::Return(3));
+        let OutboundProtocol::Dns { rules } = &parsed.outbounds[2].protocol else {
+            panic!("not dns");
+        };
+        assert_eq!(
+            rules[0].action,
+            DnsAction::Return(5),
+            "legacy reject is REFUSED"
+        );
+        assert!(matches!(
+            &parsed.outbounds[3].protocol,
+            OutboundProtocol::Blackhole { response: Some(bytes) } if bytes.starts_with(b"HTTP/1.1 403")
+        ));
+        assert!(matches!(
+            parsed.outbounds[4].protocol,
+            OutboundProtocol::Blackhole { response: None }
+        ));
+        // A rule that would forward the query is refused, not ignored.
+        let bad = serde_json::json!({"inbounds": [], "outbounds": [
+            {"protocol": "dns", "settings": {"rules": [{"action": "direct"}]}}]});
+        assert!(parse_config(&bad).is_err());
+    }
+
+    #[test]
+    fn hysteria2_masquerade_is_read_from_either_spelling() {
+        let native = serde_json::json!({"inbounds": [{"protocol": "hysteria2", "port": 443,
+            "settings": {"password": "pw", "masquerade": {"type": "proxy", "url": "https://example.org"}},
+            "streamSettings": {"security": "tls", "tlsSettings": {"certificates": [{"certificate": ["-----BEGIN CERTIFICATE-----", "AAAA", "-----END CERTIFICATE-----"], "key": ["-----BEGIN PRIVATE KEY-----", "AAAA", "-----END PRIVATE KEY-----"]}]}}}], "outbounds": [{"protocol": "freedom"}]});
+        let xray = serde_json::json!({"inbounds": [{"protocol": "hysteria", "port": 443,
+            "settings": {"version": 2, "clients": [{"auth": "pw"}]},
+            "streamSettings": {"network": "hysteria", "security": "tls", "tlsSettings": {"certificates": [{"certificate": ["-----BEGIN CERTIFICATE-----", "AAAA", "-----END CERTIFICATE-----"], "key": ["-----BEGIN PRIVATE KEY-----", "AAAA", "-----END PRIVATE KEY-----"]}]}, "hysteriaSettings": {"version": 2, "auth": "pw",
+                "masquerade": {"type": "string", "content": "hi", "statusCode": 404,
+                               "headers": {"x-a": "b"}}}}}],
+            "outbounds": [{"protocol": "freedom"}]});
+        let (a, _) = parse_config(&native).unwrap();
+        let InboundProtocol::Hysteria2(a) = &a.inbounds[0].protocol else {
+            panic!()
+        };
+        assert_eq!(
+            a.masquerade,
+            Some(Hysteria2Masquerade::Proxy {
+                url: "https://example.org".into()
+            })
+        );
+        let (b, _) = parse_config(&xray).unwrap();
+        let InboundProtocol::Hysteria2(b) = &b.inbounds[0].protocol else {
+            panic!()
+        };
+        assert!(matches!(
+            &b.masquerade,
+            Some(Hysteria2Masquerade::Text { status: 404, content, .. }) if &**content == "hi"
+        ));
+        let bad = serde_json::json!({"inbounds": [{"protocol": "hysteria2", "port": 443,
+            "settings": {"password": "pw", "masquerade": {"type": "file"}},
+            "streamSettings": {"security": "tls", "tlsSettings": {"certificates": [{"certificate": ["-----BEGIN CERTIFICATE-----", "AAAA", "-----END CERTIFICATE-----"], "key": ["-----BEGIN PRIVATE KEY-----", "AAAA", "-----END PRIVATE KEY-----"]}]}}}],
+            "outbounds": [{"protocol": "freedom"}]});
+        assert!(
+            parse_config(&bad).is_err(),
+            "a file masquerade needs its directory"
+        );
+    }
+
+    #[test]
+    fn the_simplified_outbound_form_means_the_same_as_the_nested_one() {
+        let id = "5783a3e7-e373-51cd-8642-c83782b807c5";
+        let parse = |settings: serde_json::Value, protocol: &str| {
+            let config = serde_json::json!({"inbounds": [], "outbounds": [
+                {"protocol": protocol, "settings": settings,
+                 "streamSettings": {"network": "raw", "security": "tls",
+                                    "tlsSettings": {"serverName": "a.example"}}}]});
+            parse_config(&config).unwrap().0.outbounds[0]
+                .protocol
+                .clone()
+        };
+        let flat = parse(
+            serde_json::json!({"address": "198.51.100.7", "port": 8443, "id": id,
+                               "encryption": "none", "flow": "xtls-rprx-vision"}),
+            "vless",
+        );
+        let nested = parse(
+            serde_json::json!({"vnext": [{"address": "198.51.100.7", "port": 8443,
+                "users": [{"id": id, "encryption": "none", "flow": "xtls-rprx-vision"}]}]}),
+            "vless",
+        );
+        assert_eq!(flat, nested);
+        for (protocol, flat_settings) in [
+            (
+                "vmess",
+                serde_json::json!({"address": "198.51.100.7", "port": 1, "id": id}),
+            ),
+            (
+                "trojan",
+                serde_json::json!({"address": "198.51.100.7", "port": 1, "password": "pw"}),
+            ),
+            (
+                "shadowsocks",
+                serde_json::json!({"address": "198.51.100.7", "port": 1,
+                                   "method": "aes-256-gcm", "password": "pw"}),
+            ),
+        ] {
+            // Each reads without error and names the server it was given.
+            let parsed = parse(flat_settings, protocol);
+            assert_eq!(parsed.name(), protocol);
+        }
+        // A flat reverse account makes a bridge, as the nested one does.
+        let config = serde_json::json!({"inbounds": [], "outbounds": [{"tag": "link",
+            "protocol": "vless", "settings": {"address": "198.51.100.7", "port": 443, "id": id,
+                "reverse": {"tag": "r"}}}]});
+        let bridges = parse_config(&config).unwrap().0.bridges;
+        assert_eq!(bridges.len(), 1);
+        assert_eq!(bridges[0].via.as_deref(), Some("link"));
+    }
+
+    #[test]
+    fn custom_sockopts_are_read_with_xrays_defaults() {
+        use zero_core::custom_sockopt::CustomValue;
+        let config = |list: serde_json::Value| {
+            serde_json::json!({"inbounds": [], "outbounds": [{"protocol": "freedom",
+                "streamSettings": {"sockopt": {"customSockopt": list}}}]})
+        };
+        let (parsed, _) = parse_config(&config(serde_json::json!([
+            {"opt": "13", "value": "bbr", "type": "str", "network": "tcp"},
+            {"level": 1, "opt": 8, "value": "212992", "type": "int", "system": "linux"},
+        ])))
+        .unwrap();
+        let custom = &parsed.outbounds[0].stream.sockopt.custom;
+        assert_eq!(
+            (custom[0].level, custom[0].opt),
+            (6, 13),
+            "the level defaults to TCP"
+        );
+        assert_eq!(custom[0].value, CustomValue::Bytes(b"bbr".to_vec()));
+        assert_eq!(custom[0].network, "tcp");
+        assert_eq!(
+            (custom[1].level, custom[1].value.clone()),
+            (1, CustomValue::Int(212992))
+        );
+        assert_eq!(custom[1].system.as_deref(), Some("linux"));
+        for bad in [
+            serde_json::json!([{"value": "1", "type": "int"}]),
+            serde_json::json!([{"opt": "x", "value": "1", "type": "int"}]),
+            serde_json::json!([{"opt": "1", "value": "1", "type": "float"}]),
+        ] {
+            assert!(parse_config(&config(bad)).is_err());
+        }
+    }
+
+    #[test]
+    fn send_through_names_the_address_to_leave_from() {
+        let parse = |value: serde_json::Value| {
+            parse_config(&serde_json::json!({
+                "inbounds": [], "outbounds": [{"protocol": "freedom", "sendThrough": value}]
+            }))
+        };
+        let (parsed, _) = parse(serde_json::json!("192.0.2.7")).unwrap();
+        assert_eq!(
+            parsed.outbounds[0].stream.sockopt.bind_address,
+            Some("192.0.2.7".parse().unwrap())
+        );
+        for system_choice in ["", "0.0.0.0"] {
+            let (parsed, _) = parse(serde_json::json!(system_choice)).unwrap();
+            assert_eq!(parsed.outbounds[0].stream.sockopt.bind_address, None);
+        }
+        assert!(parse(serde_json::json!("origin")).is_err());
+        assert!(parse(serde_json::json!("not-an-ip")).is_err());
+    }
+
+    #[test]
+    fn an_empty_ech_config_list_means_none() {
+        let config = serde_json::json!({"inbounds": [], "outbounds": [{
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "a.example", "port": 443,
+                "users": [{"id": "5783a3e7-e373-51cd-8642-c83782b807c5", "encryption": "none"}]}]},
+            "streamSettings": {"network": "raw", "security": "tls",
+                "tlsSettings": {"serverName": "a.example", "echConfigList": ""}},
+        }]});
+        let (parsed, _) = parse_config(&config).unwrap();
+        let Security::Tls(tls) = &parsed.outbounds[0].stream.security else {
+            panic!("expected TLS");
+        };
+        assert!(tls.ech.is_none());
+    }
+
+    /// Xray writes an inline certificate and key as arrays of PEM lines, the
+    /// shape `xray tls cert` prints; every line has to be read, not the first.
+    #[test]
+    fn an_inline_certificate_written_as_pem_lines_is_read_whole() {
+        let lines = |text: &str| -> Vec<Value> { text.lines().map(Value::from).collect() };
+        let pem = "-----BEGIN CERTIFICATE-----\nAAAA\nBBBB\n-----END CERTIFICATE-----";
+        let key = "-----BEGIN PRIVATE KEY-----\nCCCC\n-----END PRIVATE KEY-----";
+        let entry = serde_json::json!({"certificate": lines(pem), "key": lines(key)});
+        assert_eq!(read_certificate_blob(&entry, "x").unwrap(), pem.as_bytes());
+        assert_eq!(read_key_blob(&entry, "x").unwrap(), key.as_bytes());
+        // One element holding it all is the same text.
+        let whole = serde_json::json!({"certificate": [pem], "key": [key]});
+        assert_eq!(read_certificate_blob(&whole, "x").unwrap(), pem.as_bytes());
+        assert!(read_certificate_blob(&serde_json::json!({"certificate": []}), "x").is_err());
+    }
+
+    #[test]
+    fn socket_options_are_read_in_xrays_conventions() {
+        let sockopt =
+            |text: &str| parse_sockopt(&serde_json::from_str::<Value>(text).unwrap(), "x").unwrap();
+        let all = sockopt(
+            r#"{"tcpKeepAliveIdle": 30, "tcpKeepAliveInterval": 10, "tcpUserTimeout": 9000,
+                "tcpWindowClamp": 65000, "tcpMaxSeg": 1300, "tcpMptcp": true, "V6Only": true}"#,
+        );
+        assert_eq!(all.keepalive, Some((30, 10)));
+        assert_eq!(all.user_timeout_ms, Some(9000));
+        assert_eq!(all.window_clamp, Some(65000));
+        assert_eq!(all.max_seg, Some(1300));
+        assert!(all.mptcp);
+        assert_eq!(all.v6_only, Some(true));
+        // Zero is the default; one given makes the other default too.
+        assert_eq!(
+            sockopt(r#"{"tcpKeepAliveIdle": 0}"#).keepalive,
+            Some((45, 45))
+        );
+        assert_eq!(
+            sockopt(r#"{"tcpKeepAliveInterval": 5}"#).keepalive,
+            Some((45, 5))
+        );
+        // Negative turns it off.
+        assert_eq!(
+            sockopt(r#"{"tcpKeepAliveIdle": -1}"#).keepalive,
+            Some((0, 0))
+        );
+        assert_eq!(sockopt("{}"), Sockopt::default());
+    }
+
+    #[test]
+    fn an_inbound_keeps_its_socket_options() {
+        let config = serde_json::json!({
+            "inbounds": [{
+                "tag": "in", "port": 1080, "protocol": "socks",
+                "streamSettings": {"sockopt": {"tcpKeepAliveIdle": 20, "tcpMptcp": true}},
+            }],
+            "outbounds": [{"protocol": "freedom"}],
+        });
+        let (parsed, _) = parse_config(&config).unwrap();
+        assert_eq!(parsed.inbounds[0].sockopt.keepalive, Some((20, 45)));
+        assert!(parsed.inbounds[0].sockopt.mptcp);
+    }
+
+    #[test]
+    fn sections_that_are_accepted_and_not_applied_are_named() {
+        let config = serde_json::json!({
+            "stats": {}, "api": {"tag": "api", "services": ["StatsService"]},
+            "metrics": {"tag": "m"},
+            "log": {"loglevel": "info", "access": "/var/log/x.log"},
+            "inbounds": [],
+            "outbounds": [{"protocol": "vless",
+                "settings": {"vnext": [{"address": "a.example", "port": 443,
+                    "users": [{"id": "5783a3e7-e373-51cd-8642-c83782b807c5", "encryption": "none"}]}]},
+                "streamSettings": {"network": "raw", "security": "tls",
+                    "tlsSettings": {"serverName": "a.example", "minVersion": "1.2",
+                        "cipherSuites": "TLS_AES_128_GCM_SHA256", "enableSessionResumption": false}}}],
+            "policy": {"levels": {"0": {"bufferSize": 4}, "1": {}}, "system": {}},
+        });
+        let (_, out) = parse_config(&config).unwrap();
+        let paths: Vec<&str> = out.diagnostics.iter().map(|d| d.path.as_str()).collect();
+        for expected in [
+            "stats",
+            "api",
+            "metrics",
+            "log.access",
+            "policy.levels",
+            "policy.system",
+            "policy.levels.0.bufferSize",
+        ] {
+            assert!(
+                paths.contains(&expected),
+                "no note for {expected}: {paths:?}"
+            );
+        }
+        assert!(paths.iter().any(|p| p.ends_with("tlsSettings.minVersion")));
+        assert!(paths
+            .iter()
+            .any(|p| p.ends_with("tlsSettings.cipherSuites")));
+        // A setting that says "off" is not a request, so no note for it.
+        assert!(!paths.iter().any(|p| p.ends_with("enableSessionResumption")));
+    }
+
+    #[test]
+    fn policy_and_burst_observatory_are_read() {
+        let config = serde_json::json!({
+            "policy": {"levels": {"0": {
+                "handshake": 8, "connIdle": 120, "uplinkOnly": 2, "downlinkOnly": 5}}},
+            "burstObservatory": {
+                "subjectSelector": ["proxy"],
+                "pingConfig": {"destination": "https://www.gstatic.com/generate_204",
+                               "interval": "90s", "sampling": 3, "timeout": "5s"}},
+            "inbounds": [],
+            "outbounds": [{"protocol": "freedom"}],
+        });
+        let (parsed, _) = parse_config(&config).unwrap();
+        assert_eq!(parsed.policy.handshake, std::time::Duration::from_secs(8));
+        assert_eq!(parsed.policy.conn_idle, std::time::Duration::from_secs(120));
+        assert_eq!(parsed.policy.half_close, std::time::Duration::from_secs(5));
+        let observatory = parsed.observatory.expect("an observatory");
+        assert_eq!(
+            &*observatory.probe_url,
+            "https://www.gstatic.com/generate_204"
+        );
+        assert_eq!(
+            observatory.probe_interval,
+            std::time::Duration::from_secs(90)
+        );
+        assert_eq!(&*observatory.subject_selector[0], "proxy");
     }
 }

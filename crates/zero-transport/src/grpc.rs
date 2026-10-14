@@ -49,7 +49,7 @@ pub async fn connect(stream: BoxStream, config: &WsConfig) -> Result<BoxStream, 
         .send_request(request, false)
         .map_err(|error| format!("gRPC request: {error}"))?;
     let (app, worker) = tokio::io::duplex(128 * 1024);
-    tokio::spawn(run_client(response, send, worker));
+    tokio::spawn(run_client(response, send, worker, config.grpc_multi));
     Ok(zero_core::boxed(app))
 }
 
@@ -128,7 +128,11 @@ fn open_stream(
     mut respond: h2::server::SendResponse<Bytes>,
     config: &WsConfig,
 ) -> Result<BoxStream, String> {
-    if request.method() != http::Method::POST || request.uri().path() != config.path {
+    // The server answers `Tun` and `TunMulti` alike, as Xray's does; which
+    // one a request names says how its messages are framed.
+    let path = request.uri().path();
+    let multi = config.grpc_multi_path.as_deref() == Some(path) && path != config.path;
+    if request.method() != http::Method::POST || (path != config.path && !multi) {
         respond.send_reset(h2::Reason::REFUSED_STREAM);
         return Err("gRPC request method or path does not match".into());
     }
@@ -158,7 +162,7 @@ fn open_stream(
         .map_err(|error| format!("gRPC response: {error}"))?;
     let body = request.into_body();
     let (app, worker) = tokio::io::duplex(128 * 1024);
-    tokio::spawn(run_server(body, send, worker, request_encoding));
+    tokio::spawn(run_server(body, send, worker, request_encoding, multi));
     Ok(zero_core::boxed(app))
 }
 
@@ -166,12 +170,13 @@ async fn run_client(
     response: h2::client::ResponseFuture,
     send: h2::SendStream<Bytes>,
     app: tokio::io::DuplexStream,
+    multi: bool,
 ) {
     let (app_read, app_write) = tokio::io::split(app);
     crate::relay::drive_both(
         "gRPC",
         upload_messages(app_read, send),
-        download_messages(response, app_write),
+        download_messages(response, app_write, multi),
     )
     .await;
 }
@@ -181,12 +186,13 @@ async fn run_server(
     send: h2::SendStream<Bytes>,
     app: tokio::io::DuplexStream,
     request_encoding: String,
+    multi: bool,
 ) {
     let (app_read, app_write) = tokio::io::split(app);
     crate::relay::drive_both(
         "gRPC server",
         upload_messages(app_read, send),
-        download_body(body, app_write, &request_encoding),
+        download_body(body, app_write, &request_encoding, multi),
     )
     .await;
 }
@@ -243,6 +249,7 @@ fn encode_message(data: &[u8], out: &mut BytesMut) {
 async fn download_messages<W>(
     response: h2::client::ResponseFuture,
     mut app: W,
+    multi: bool,
 ) -> Result<(), String>
 where
     W: AsyncWrite + Unpin,
@@ -260,7 +267,7 @@ where
         .unwrap_or("identity")
         .to_owned();
     let mut body = response.into_body();
-    read_messages_with_encoding(&mut body, &mut app, &encoding).await?;
+    read_messages_with_encoding(&mut body, &mut app, &encoding, multi).await?;
     // The response is complete: pass the EOF on, or the application waits
     // for bytes that will never come until it closes its own uplink.
     app.shutdown()
@@ -268,12 +275,17 @@ where
         .map_err(|error| format!("gRPC application close: {error}"))
 }
 
-async fn download_body<W>(body: h2::RecvStream, mut app: W, encoding: &str) -> Result<(), String>
+async fn download_body<W>(
+    body: h2::RecvStream,
+    mut app: W,
+    encoding: &str,
+    multi: bool,
+) -> Result<(), String>
 where
     W: AsyncWrite + Unpin,
 {
     let mut body = body;
-    let result = read_messages_with_encoding(&mut body, &mut app, encoding).await;
+    let result = read_messages_with_encoding(&mut body, &mut app, encoding, multi).await;
     if result.is_ok() {
         app.shutdown()
             .await
@@ -286,6 +298,7 @@ async fn read_messages_with_encoding<R, W>(
     body: &mut R,
     app: &mut W,
     encoding: &str,
+    multi: bool,
 ) -> Result<(), String>
 where
     R: MessageBody,
@@ -301,14 +314,14 @@ where
             // into `pending` first; only an incomplete tail is carried over.
             // This is the common shape on a bulk download, where a chunk holds
             // whole messages.
-            let consumed = drain_messages(&chunk, app, encoding).await?;
+            let consumed = drain_messages(&chunk, app, encoding, multi).await?;
             pending.extend_from_slice(&chunk[consumed..]);
         } else {
             // A message straddles the chunk boundary: join the carried head to
             // the new bytes, drain whatever is now complete, and drop the
             // consumed prefix with an O(1) `advance`.
             pending.extend_from_slice(&chunk);
-            let consumed = drain_messages(&pending, app, encoding).await?;
+            let consumed = drain_messages(&pending, app, encoding, multi).await?;
             pending.advance(consumed);
         }
     }
@@ -326,7 +339,12 @@ where
 /// body is awaited, so an attacker-declared size fails fast rather than growing
 /// a buffer. The envelope is the one-byte compression flag and a four-byte
 /// big-endian length, matching `encode_message`.
-async fn drain_messages<W>(data: &[u8], app: &mut W, encoding: &str) -> Result<usize, String>
+async fn drain_messages<W>(
+    data: &[u8],
+    app: &mut W,
+    encoding: &str,
+    multi: bool,
+) -> Result<usize, String>
 where
     W: AsyncWrite + Unpin,
 {
@@ -345,10 +363,18 @@ where
             break;
         }
         let message = decode_message(&frame[5..5 + length], compressed, encoding)?;
-        let payload = decode_hunk(&message)?;
-        app.write_all(payload)
-            .await
-            .map_err(|error| format!("gRPC application write: {error}"))?;
+        if multi {
+            // `MultiHunk { repeated bytes data = 1; }`: every entry, in order.
+            for entry in decode_multi_hunk(&message)? {
+                app.write_all(entry)
+                    .await
+                    .map_err(|error| format!("gRPC application write: {error}"))?;
+            }
+        } else {
+            app.write_all(decode_hunk(&message)?)
+                .await
+                .map_err(|error| format!("gRPC application write: {error}"))?;
+        }
         consumed += 5 + length;
     }
     Ok(consumed)
@@ -420,6 +446,38 @@ fn decode_hunk(message: &[u8]) -> Result<&[u8], String> {
         }
     }
     Ok(data)
+}
+
+/// Decode `MultiHunk { repeated bytes data = 1; }`: each entry, in order.
+/// Other fields are skipped, as for [`decode_hunk`].
+fn decode_multi_hunk(message: &[u8]) -> Result<Vec<&[u8]>, String> {
+    let mut cursor = 0;
+    let mut entries = Vec::new();
+    while cursor < message.len() {
+        let key = read_varint(message, &mut cursor)?;
+        let (field, wire_type) = (key >> 3, (key & 0x07) as u8);
+        if field == 0 {
+            return Err("gRPC MultiHunk contains an invalid protobuf field number".into());
+        }
+        if field == 1 {
+            if wire_type != 2 {
+                return Err("gRPC MultiHunk data has the wrong protobuf wire type".into());
+            }
+            let length = read_length(message, &mut cursor)?;
+            let end = cursor
+                .checked_add(length)
+                .ok_or_else(|| "gRPC MultiHunk data length overflow".to_string())?;
+            entries.push(
+                message
+                    .get(cursor..end)
+                    .ok_or_else(|| "gRPC MultiHunk data is truncated".to_string())?,
+            );
+            cursor = end;
+        } else {
+            skip_field(message, &mut cursor, wire_type)?;
+        }
+    }
+    Ok(entries)
 }
 
 fn varint_len(mut value: u64) -> usize {
@@ -611,6 +669,58 @@ mod tests {
         server_task.await.unwrap();
     }
 
+    /// A server that answers `Tun` and `TunMulti` both, as Xray's does, and a
+    /// client of each kind: the multi client names the other method.
+    #[tokio::test]
+    async fn a_server_answers_the_single_and_the_multi_method() {
+        for client_multi in [false, true] {
+            let (client, server) = tokio::io::duplex(128 * 1024);
+            let mut server_config = WsConfig::new("/svc/Tun", "edge.example");
+            server_config.grpc_multi_path = Some("/svc/TunMulti".into());
+            let mut config = WsConfig::new(
+                if client_multi {
+                    "/svc/TunMulti"
+                } else {
+                    "/svc/Tun"
+                },
+                "edge.example",
+            );
+            config.grpc_multi = client_multi;
+            let server_task = tokio::spawn(async move {
+                let mut app = accept(zero_core::boxed(server), &server_config)
+                    .await
+                    .unwrap();
+                let mut request = [0u8; 4];
+                app.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request, b"ping");
+                app.write_all(b"reply").await.unwrap();
+                app.shutdown().await.unwrap();
+            });
+            let mut app = connect(zero_core::boxed(client), &config).await.unwrap();
+            app.write_all(b"ping").await.unwrap();
+            app.flush().await.unwrap();
+            let mut response = [0u8; 5];
+            app.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"reply", "client multi = {client_multi}");
+            server_task.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn a_multi_hunk_carries_every_entry_in_order() {
+        // `MultiHunk { data: ["ab", "cde"] }`, and an unknown field between.
+        let message = b"\x0a\x02ab\x10\x07\x0a\x03cde";
+        let entries = decode_multi_hunk(message).unwrap();
+        assert_eq!(entries, vec![&b"ab"[..], &b"cde"[..]]);
+        // One entry is the same bytes as a Hunk.
+        assert_eq!(
+            decode_multi_hunk(&encode_hunk(b"x")).unwrap(),
+            vec![&b"x"[..]]
+        );
+        assert!(decode_multi_hunk(b"\x0a\x05no").is_err());
+        assert!(decode_multi_hunk(b"\x0b").is_err());
+    }
+
     #[test]
     fn decodes_bounded_gzip_messages() {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -772,7 +882,7 @@ mod tests {
                 .collect::<std::collections::VecDeque<_>>();
                 let mut body = ChunkedBody { chunks };
                 let mut sink = Collect(Vec::new());
-                read_messages_with_encoding(&mut body, &mut sink, "identity")
+                read_messages_with_encoding(&mut body, &mut sink, "identity", false)
                     .await
                     .expect("every chunk split reassembles");
                 assert_eq!(sink.0, expected, "split at {first},{second}");
@@ -791,7 +901,7 @@ mod tests {
         };
         let mut sink = Collect(Vec::new());
         assert!(
-            read_messages_with_encoding(&mut body, &mut sink, "identity")
+            read_messages_with_encoding(&mut body, &mut sink, "identity", false)
                 .await
                 .is_err()
         );
@@ -802,7 +912,7 @@ mod tests {
         };
         let mut sink = Collect(Vec::new());
         assert!(
-            read_messages_with_encoding(&mut body, &mut sink, "identity")
+            read_messages_with_encoding(&mut body, &mut sink, "identity", false)
                 .await
                 .is_err()
         );

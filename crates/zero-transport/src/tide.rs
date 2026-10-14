@@ -73,6 +73,61 @@ const SESSION_FORGET: Duration = Duration::from_secs(300);
 const MAX_FAILURES: u32 = 6;
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 
+/// What the client's requests look like to anything reading them: the
+/// browser it says it is, the language it asks for, and any headers a site
+/// would send that the user wants added. Every request carries it, so a
+/// middlebox sees one consistent visitor.
+///
+/// The rule: `headers` never holds a name Tide itself sets (`content-type`,
+/// `host`, `content-length`), which the link parser refuses; if one got in,
+/// it would break the protocol, not just change the look.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Look {
+    pub user_agent: String,
+    pub language: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl Default for Look {
+    fn default() -> Self {
+        Self {
+            user_agent: USER_AGENT.into(),
+            language: "en-US,en;q=0.9".into(),
+            headers: Vec::new(),
+        }
+    }
+}
+
+/// How many connections a session keeps busy and how often it checks on
+/// them. The defaults are what Tide was tuned with; each is a link setting
+/// for a path where something else works better (a proxy that allows one
+/// open request per client, a mobile network that kills quiet connections
+/// early, a server that wants a bigger spread).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tuning {
+    pub look: Look,
+    /// Download requests open at once.
+    pub down_pipes: usize,
+    /// Upload requests that may wait for their answer at once.
+    pub up_pipes: usize,
+    /// How often each HTTP/2 connection is pinged.
+    pub ping: Duration,
+    /// A session with no streams for this long is closed.
+    pub idle: Duration,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            look: Look::default(),
+            down_pipes: DOWNLOAD_PIPES,
+            up_pipes: UPLOADS_IN_FLIGHT,
+            ping: PING_EVERY,
+            idle: SESSION_IDLE,
+        }
+    }
+}
+
 pub(crate) fn other(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
@@ -231,6 +286,7 @@ pub struct ClientConfig {
     pub lane: bool,
     /// When to replace a working connection; `None` keeps one until it breaks.
     pub rotation: Option<Rotation>,
+    pub tuning: Tuning,
 }
 
 /// The smallest volume limit a connection is given, however hard the network
@@ -337,6 +393,8 @@ pub(crate) struct Carrier {
     dial: Dialer,
     host: String,
     rotation: Option<Rotation>,
+    look: Look,
+    ping: Duration,
     state: tokio::sync::Mutex<State>,
     /// The epoch of the current connection, for requests that outlive their
     /// connection's turn (a download) to see they should move.
@@ -344,11 +402,18 @@ pub(crate) struct Carrier {
 }
 
 impl Carrier {
-    pub(crate) fn new(dial: Dialer, host: String, rotation: Option<Rotation>) -> Arc<Self> {
+    pub(crate) fn new(
+        dial: Dialer,
+        host: String,
+        rotation: Option<Rotation>,
+        tuning: &Tuning,
+    ) -> Arc<Self> {
         Arc::new(Self {
             dial,
             host,
             rotation,
+            look: tuning.look.clone(),
+            ping: tuning.ping,
             state: tokio::sync::Mutex::new(State::default()),
             epoch: tokio::sync::watch::channel(0).0,
         })
@@ -372,10 +437,10 @@ impl Carrier {
         // still held back, so the HTTP/2 preface, the settings and the
         // request leave together in one write, as a browser's do, and not as
         // a 46-byte packet followed by the request.
-        let page = front_page_request(sender.clone(), &self.host);
+        let page = front_page_request(sender.clone(), &self.host, &self.look);
         uncork.store(true, Ordering::Release);
         let pings = connection.ping_pong();
-        tokio::spawn(drive(connection, pings, PING_EVERY, PING_DEADLINE));
+        tokio::spawn(drive(connection, pings, self.ping, PING_DEADLINE));
         let time = front_page(page).await;
         let live = Live {
             sender,
@@ -625,14 +690,29 @@ impl tokio::io::AsyncWrite for Cork {
 }
 
 pub(crate) fn request(method: Method, host: &str, path: &str) -> Request<()> {
-    Request::builder()
+    request_as(method, host, path, &Look::default())
+}
+
+/// A request as `look` makes it. The extra headers replace any header of the
+/// same name, so a link can swap `accept` as well as add `referer`.
+pub(crate) fn request_as(method: Method, host: &str, path: &str, look: &Look) -> Request<()> {
+    let mut request = Request::builder()
         .method(method)
         .uri(format!("https://{host}{path}"))
-        .header("user-agent", USER_AGENT)
+        .header("user-agent", look.user_agent.as_str())
         .header("accept", "*/*")
-        .header("accept-language", "en-US,en;q=0.9")
+        .header("accept-language", look.language.as_str())
         .body(())
-        .expect("a request built from checked parts")
+        .expect("a request built from checked parts");
+    for (name, value) in &look.headers {
+        if let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(value),
+        ) {
+            request.headers_mut().insert(name, value);
+        }
+    }
+    request
 }
 
 /// Queue a request for the site's front page, as a browser makes on a new
@@ -641,8 +721,9 @@ pub(crate) fn request(method: Method, host: &str, path: &str) -> Request<()> {
 fn front_page_request(
     mut sender: SendRequest<Bytes>,
     host: &str,
+    look: &Look,
 ) -> Option<h2::client::ResponseFuture> {
-    let mut page = request(Method::GET, host, "/");
+    let mut page = request_as(Method::GET, host, "/", look);
     page.headers_mut().insert(
         "accept",
         "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
@@ -706,9 +787,10 @@ impl From<io::Error> for PipeError {
 
 impl Client {
     pub fn new(config: ClientConfig, dial: Dialer) -> Arc<Self> {
-        let down = Carrier::new(dial.clone(), config.host.clone(), config.rotation);
+        let (host, rotation, tuning) = (&config.host, config.rotation, &config.tuning);
+        let down = Carrier::new(dial.clone(), host.clone(), rotation, tuning);
         let up = if config.split {
-            Carrier::new(dial, config.host.clone(), config.rotation)
+            Carrier::new(dial, host.clone(), rotation, tuning)
         } else {
             down.clone()
         };
@@ -770,7 +852,12 @@ impl Client {
 
         let opened = async {
             let mut sender = sender.ready().await.map_err(other)?;
-            let open = request(Method::POST, &self.config.host, &format!("{base}/open"));
+            let open = request_as(
+                Method::POST,
+                &self.config.host,
+                &format!("{base}/open"),
+                &self.config.tuning.look,
+            );
             let (response, mut body) = sender.send_request(open, false).map_err(other)?;
             // A server or proxy that answers before it has read the whole
             // request ends the stream under the writer; what it said is more
@@ -827,6 +914,7 @@ impl Client {
             self.down.clone(),
             self.config.host.clone(),
             base.clone(),
+            self.config.tuning.down_pipes,
         ));
         tokio::spawn(upload(
             session.clone(),
@@ -838,6 +926,7 @@ impl Client {
             session.clone(),
             self.down.clone(),
             self.up.clone(),
+            self.config.tuning.idle,
         ));
         Ok(session)
     }
@@ -847,13 +936,18 @@ fn hex_name(name: &[u8; 16]) -> String {
     name.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-async fn close_when_idle(session: Arc<Session>, down: Arc<Carrier>, up: Arc<Carrier>) {
+async fn close_when_idle(
+    session: Arc<Session>,
+    down: Arc<Carrier>,
+    up: Arc<Carrier>,
+    idle: Duration,
+) {
     loop {
         tokio::time::sleep(Duration::from_secs(10)).await;
         if session.is_closed() {
             break;
         }
-        if session.streams() == 0 && session.idle_for() > SESSION_IDLE {
+        if session.streams() == 0 && session.idle_for() > idle {
             session.close();
             break;
         }
@@ -878,11 +972,17 @@ async fn back_off(failures: u32) {
 const DOWNLOAD_PIPES: usize = 2;
 
 /// Keep download requests open for as long as the session lives.
-async fn download(session: Arc<Session>, carrier: Arc<Carrier>, host: String, base: String) {
+async fn download(
+    session: Arc<Session>,
+    carrier: Arc<Carrier>,
+    host: String,
+    base: String,
+    pipes: usize,
+) {
     let numbers = Arc::new(AtomicU64::new(0));
     let failures = Arc::new(AtomicU32::new(0));
     let mut slots = Vec::new();
-    for index in 0..DOWNLOAD_PIPES {
+    for index in 0..pipes {
         let (session, carrier, host, base) =
             (session.clone(), carrier.clone(), host.clone(), base.clone());
         let (numbers, failures) = (numbers.clone(), failures.clone());
@@ -892,7 +992,7 @@ async fn download(session: Arc<Session>, carrier: Arc<Carrier>, host: String, ba
                 let wait = rand::thread_rng().gen_range(300..1500);
                 tokio::time::sleep(Duration::from_millis(wait)).await;
             }
-            download_slot(session, carrier, host, base, numbers, failures).await;
+            download_slot(session, carrier, host, base, numbers, failures, pipes).await;
         }));
     }
     for slot in slots {
@@ -910,6 +1010,7 @@ async fn download_slot(
     base: String,
     numbers: Arc<AtomicU64>,
     failures: Arc<AtomicU32>,
+    pipes: usize,
 ) {
     use Ordering::Relaxed;
     while !session.is_closed() {
@@ -928,10 +1029,10 @@ async fn download_slot(
                 tracing::debug!(%error, "tide download pipe failed");
                 carrier.invalidate(epoch).await;
                 let total = failures.fetch_add(1, Relaxed) + 1;
-                if total > MAX_FAILURES * DOWNLOAD_PIPES as u32 {
+                if total > MAX_FAILURES * pipes as u32 {
                     break;
                 }
-                back_off(total.div_ceil(DOWNLOAD_PIPES as u32)).await;
+                back_off(total.div_ceil(pipes as u32)).await;
             }
         }
     }
@@ -965,7 +1066,7 @@ async fn open_download(
     *epoch = lease.epoch;
     let mut sender = lease.sender.clone().ready().await.map_err(other)?;
     let (response, _) = sender
-        .send_request(request(Method::GET, host, &path), true)
+        .send_request(request_as(Method::GET, host, &path, &carrier.look), true)
         .map_err(other)?;
     let response = response.await.map_err(other)?;
     match response.status() {
@@ -1056,7 +1157,8 @@ const UPLOADS_IN_FLIGHT: usize = 3;
 async fn upload(session: Arc<Session>, carrier: Arc<Carrier>, config: ClientConfig, base: String) {
     let mut number = 0u64;
     let failures = Arc::new(AtomicU32::new(0));
-    let slots = Arc::new(tokio::sync::Semaphore::new(UPLOADS_IN_FLIGHT));
+    let up_pipes = config.tuning.up_pipes;
+    let slots = Arc::new(tokio::sync::Semaphore::new(up_pipes));
     loop {
         // Wait for room, then for something to send, before making a request.
         let Ok(slot) = slots.clone().acquire_owned().await else {
@@ -1097,7 +1199,7 @@ async fn upload(session: Arc<Session>, carrier: Arc<Carrier>, config: ClientConf
                             session.pipe_closed(number, false);
                             carrier.invalidate(epoch).await;
                             let total = failures.fetch_add(1, Ordering::Relaxed) + 1;
-                            if total > MAX_FAILURES * UPLOADS_IN_FLIGHT as u32 {
+                            if total > MAX_FAILURES * up_pipes as u32 {
                                 session.close();
                             }
                         }
@@ -1139,7 +1241,7 @@ async fn upload_send(
     let lease = carrier.get().await?;
     *epoch = lease.epoch;
     let mut sender = lease.sender.clone().ready().await.map_err(other)?;
-    let mut post = request(Method::POST, &config.host, path);
+    let mut post = request_as(Method::POST, &config.host, path, &config.tuning.look);
     post.headers_mut().insert(
         "content-type",
         "application/octet-stream"
@@ -1308,6 +1410,10 @@ pub struct Server {
     sessions: Mutex<HashMap<String, Known>>,
     replay: ReplayGuard,
     incoming: tokio::sync::mpsc::Sender<Incoming>,
+    /// What each request looked like on arrival, so a test can check what the
+    /// client put on the wire.
+    #[cfg(test)]
+    seen: Mutex<Vec<(String, String, http::HeaderMap)>>,
 }
 
 impl Server {
@@ -1319,6 +1425,8 @@ impl Server {
                 sessions: Mutex::new(HashMap::new()),
                 replay: ReplayGuard::default(),
                 incoming,
+                #[cfg(test)]
+                seen: Mutex::default(),
             }),
             streams,
         )
@@ -1359,6 +1467,15 @@ impl Server {
             .map_err(other)?;
         while let Some(accepted) = connection.accept().await {
             let (request, respond) = accepted.map_err(other)?;
+            #[cfg(test)]
+            self.seen.lock().unwrap().push((
+                request
+                    .uri()
+                    .authority()
+                    .map_or_else(String::new, |a| a.to_string()),
+                request.uri().path().to_string(),
+                request.headers().clone(),
+            ));
             let server = Arc::clone(self);
             tokio::spawn(async move {
                 if let Err(error) = server.handle(request, respond).await {
@@ -1751,6 +1868,8 @@ mod tests {
         refuse: Arc<std::sync::atomic::AtomicBool>,
         /// Connections the server has seen end.
         ended: Arc<AtomicUsize>,
+        /// The server, for the requests it has seen.
+        server: Arc<Server>,
     }
 
     /// A server answering every stream as an echo, and a client wired to it
@@ -1828,6 +1947,26 @@ mod tests {
         one_way: Duration,
         rotation: Option<Rotation>,
     ) -> Bench {
+        bench_core(
+            split,
+            linger,
+            known_user,
+            one_way,
+            rotation,
+            "example.test",
+            Tuning::default(),
+        )
+    }
+
+    fn bench_core(
+        split: bool,
+        linger: Duration,
+        known_user: bool,
+        one_way: Duration,
+        rotation: Option<Rotation>,
+        host: &str,
+        tuning: Tuning,
+    ) -> Bench {
         let (secret, public) = tide::generate_keypair();
         let user = [9u8; 16];
         let users = Arc::new(RwLock::new(HashMap::new()));
@@ -1842,6 +1981,7 @@ mod tests {
             decoy: Decoy::default(),
             shape: tide::ShapeLevel::default(),
         });
+        let observed = server.clone();
         tokio::spawn(async move {
             while let Some((_, destination, mut stream)) = streams.recv().await {
                 if destination.network == zero_core::Network::Udp {
@@ -1904,7 +2044,7 @@ mod tests {
         };
         let client = Client::new(
             ClientConfig {
-                host: "example.test".into(),
+                host: host.into(),
                 path: "/static/app".into(),
                 server_public: public,
                 user,
@@ -1912,6 +2052,7 @@ mod tests {
                 linger,
                 lane: true,
                 rotation,
+                tuning,
             },
             dial,
         );
@@ -1922,6 +2063,7 @@ mod tests {
             hold,
             refuse,
             ended,
+            server: observed,
         }
     }
 
@@ -2398,5 +2540,122 @@ mod tests {
             assert_eq!(status, plain_status, "{path}");
             assert_eq!(got, plain_body, "{path}");
         }
+    }
+
+    /// What a link says about the look of the requests reaches the server on
+    /// every request: the opening handshake, the pipes, the front page.
+    #[tokio::test]
+    async fn the_look_a_link_asks_for_is_on_every_request() {
+        let tuning = Tuning {
+            look: Look {
+                user_agent:
+                    "Mozilla/5.0 (X11; Linux x86_64; rv:134.0) Gecko/20100101 Firefox/134.0".into(),
+                language: "fa-IR,fa;q=0.9".into(),
+                headers: vec![
+                    ("referer".into(), "https://front.test/".into()),
+                    ("x-visit".into(), "7".into()),
+                ],
+            },
+            ..Tuning::default()
+        };
+        let bench = bench_core(
+            true,
+            Duration::from_millis(100),
+            true,
+            Duration::ZERO,
+            None,
+            "front.test",
+            tuning.clone(),
+        );
+        let mut stream = bench.client.open(target()).await.unwrap();
+        round_trip(&mut stream, &pattern(20_000)).await;
+        let seen = bench.server.seen.lock().unwrap();
+        // The front page of each connection, the open, a download, an upload.
+        let paths: Vec<&str> = seen.iter().map(|(_, path, _)| path.as_str()).collect();
+        for expected in ["/", "/open", "/d/1", "/u/1"] {
+            assert!(
+                paths.iter().any(|path| path.ends_with(expected)),
+                "no request for {expected}: {paths:?}"
+            );
+        }
+        for (authority, path, headers) in seen.iter() {
+            assert_eq!(authority, "front.test", "{path}");
+            assert_eq!(
+                headers["user-agent"],
+                tuning.look.user_agent.as_str(),
+                "{path}"
+            );
+            assert_eq!(headers["accept-language"], "fa-IR,fa;q=0.9", "{path}");
+            assert_eq!(headers["referer"], "https://front.test/", "{path}");
+            assert_eq!(headers["x-visit"], "7", "{path}");
+        }
+    }
+
+    /// Pipes are the number of download requests held open: with one, the
+    /// session never opens a second beside it.
+    #[tokio::test]
+    async fn the_download_pipe_count_is_honoured() {
+        for pipes in [1usize, 3] {
+            let bench = bench_core(
+                true,
+                Duration::from_millis(100),
+                true,
+                Duration::ZERO,
+                None,
+                "example.test",
+                Tuning {
+                    down_pipes: pipes,
+                    ..Tuning::default()
+                },
+            );
+            let mut stream = bench.client.open(target()).await.unwrap();
+            round_trip(&mut stream, &pattern(5_000)).await;
+            // The extra pipes are staggered by up to a second and a half.
+            tokio::time::sleep(Duration::from_millis(2_200)).await;
+            let downloads = bench
+                .server
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, path, _)| path.contains("/d/"))
+                .count();
+            assert_eq!(downloads, pipes, "pipes={pipes}");
+        }
+    }
+
+    /// A short idle limit closes a session with nothing open on it, and its
+    /// connections with it. The check runs every ten seconds, so this waits
+    /// for one; with the default limit a session this young stays open.
+    #[tokio::test]
+    async fn the_idle_setting_closes_a_quiet_session() {
+        let bench = bench_core(
+            true,
+            Duration::from_millis(100),
+            true,
+            Duration::ZERO,
+            None,
+            "example.test",
+            Tuning {
+                idle: Duration::from_millis(50),
+                ..Tuning::default()
+            },
+        );
+        let stream = bench.client.open(target()).await.unwrap();
+        drop(stream);
+        for _ in 0..140 {
+            let closed = bench
+                .client
+                .live
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|session| session.is_closed());
+            if closed {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the quiet session was not closed");
     }
 }

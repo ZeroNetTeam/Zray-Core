@@ -54,6 +54,8 @@ url = { workspace = true }
 qrcode = { version = "0.14", default-features = false, optional = true }
 
 [dev-dependencies]
+# The WireGuard inbound test derives public keys for its client peers.
+x25519-dalek = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time", "test-util"] }
 tracing-subscriber = { workspace = true }
 zero-security = { workspace = true }

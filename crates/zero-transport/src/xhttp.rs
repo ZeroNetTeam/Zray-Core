@@ -1840,6 +1840,18 @@ pub fn h3_server_endpoint(
     certificate: &[u8],
     private_key: &[u8],
 ) -> Result<h3_quinn::quinn::Endpoint, String> {
+    h3_server_endpoint_obfuscated(listen, certificate, private_key, None)
+}
+
+/// [`h3_server_endpoint`], with every UDP datagram obfuscated by Salamander
+/// when a password is given. A peer that does not hold the password sends
+/// noise the server cannot read, and gets no reply to it.
+pub fn h3_server_endpoint_obfuscated(
+    listen: SocketAddr,
+    certificate: &[u8],
+    private_key: &[u8],
+    obfs: Option<&str>,
+) -> Result<h3_quinn::quinn::Endpoint, String> {
     let tls =
         zero_security::server::server_config(certificate, private_key, &[Box::<str>::from("h3")])?;
     let crypto = h3_quinn::quinn::crypto::rustls::QuicServerConfig::try_from((*tls).clone())
@@ -1852,8 +1864,22 @@ pub fn h3_server_endpoint(
     let mut transport = crate::relay::quic_transport(SERVER_QUIC_IDLE_TIMEOUT, None);
     transport.max_concurrent_bidi_streams(1024u32.into());
     server_config.transport_config(Arc::new(transport));
-    h3_quinn::quinn::Endpoint::server(server_config, listen)
-        .map_err(|error| format!("XHTTP HTTP/3 server endpoint: {error}"))
+    let Some(obfs) = obfs else {
+        return h3_quinn::quinn::Endpoint::server(server_config, listen)
+            .map_err(|error| format!("XHTTP HTTP/3 server endpoint: {error}"));
+    };
+    let salamander = crate::salamander::Salamander::new(obfs)?;
+    let socket = std::net::UdpSocket::bind(listen)
+        .map_err(|error| format!("HTTP/3 server socket {listen}: {error}"))?;
+    let socket = crate::relay::obfuscated_socket(socket, &salamander)
+        .map_err(|error| format!("HTTP/3 server socket {listen}: {error}"))?;
+    h3_quinn::quinn::Endpoint::new_with_abstract_socket(
+        h3_quinn::quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(h3_quinn::quinn::TokioRuntime),
+    )
+    .map_err(|error| format!("HTTP/3 server endpoint: {error}"))
 }
 
 /// Turn one accepted HTTP/3 POST request into the byte stream consumed by the

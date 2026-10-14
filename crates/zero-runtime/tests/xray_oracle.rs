@@ -35,6 +35,16 @@ const DECOY_CERTIFICATE: &str = include_str!("fixtures/loopback-cert.pem");
 const DECOY_PRIVATE_KEY: &str = include_str!("fixtures/loopback-key.pem");
 const LOOPBACK_CA: &str = include_str!("fixtures/loopback-ca.pem");
 const PASSWORD: &str = "an-example-shared-password";
+/// A decoy certificate of almost 5 KB. REALITY with ML-DSA-65 sends a
+/// certificate of about 3.5 KB, and Xray's server pads its records to the
+/// size of what the decoy really sends, which it cannot do for a decoy
+/// whose certificate is smaller than that.
+const BIG_DECOY_CERTIFICATE: &str = include_str!("fixtures/big-decoy-cert.pem");
+const BIG_DECOY_PRIVATE_KEY: &str = include_str!("fixtures/big-decoy-key.pem");
+/// SHA-256 of the DER of `fixtures/loopback-cert.pem`, for an Xray client that
+/// pins the certificate (Xray removed `allowInsecure`).
+const LOOPBACK_CERT_SHA256: &str =
+    "d17c1d562756ba5c26d0379b869ce9f97f4d37812244f48206819a09f16a90bc";
 
 /// Locate the oracle, or explain why the comparison cannot be made.
 fn oracle_binary() -> Result<String, String> {
@@ -475,6 +485,10 @@ fn oracle_x25519_keypair(binary: &str) -> (String, String) {
 /// means this fixture cannot accidentally pass by being shaped the way Zray
 /// happens to expect.
 fn spawn_decoy(binary: &str, port: u16) -> Oracle {
+    spawn_decoy_with(binary, port, DECOY_CERTIFICATE, DECOY_PRIVATE_KEY)
+}
+
+fn spawn_decoy_with(binary: &str, port: u16, certificate: &str, key: &str) -> Oracle {
     spawn_oracle(
         binary,
         json!({
@@ -491,8 +505,8 @@ fn spawn_decoy(binary: &str, port: u16) -> Oracle {
                     "tlsSettings": {
                         "serverName": REALITY_SNI,
                         "certificates": [{
-                            "certificate": [DECOY_CERTIFICATE],
-                            "key": [DECOY_PRIVATE_KEY],
+                            "certificate": [certificate],
+                            "key": [key],
                         }],
                     },
                 },
@@ -502,10 +516,28 @@ fn spawn_decoy(binary: &str, port: u16) -> Oracle {
     )
 }
 
+/// A seed and verify key for REALITY's ML-DSA-65 binding, made by the
+/// oracle's own `mldsa65` command.
+fn oracle_mldsa65_keypair(binary: &str) -> (String, String) {
+    let output = Command::new(binary)
+        .arg("mldsa65")
+        .output()
+        .expect("the oracle binary should be able to generate an ML-DSA-65 keypair");
+    assert!(output.status.success(), "`{binary} mldsa65` failed");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(|rest| rest.trim().to_string())
+            .unwrap_or_else(|| panic!("no {name} line in:\n{text}"))
+    };
+    (field("Seed:"), field("Verify:"))
+}
+
 /// The REALITY server half, for an Xray inbound.
 fn reality_server_settings(private_key: &str, fallback: SocketAddr) -> Value {
     json!({
-        "show": false,
+        "show": std::env::var_os("ZRAY_ORACLE_LOG").is_some(),
         "dest": fallback.to_string(),
         "xver": 0,
         "serverNames": [REALITY_SNI],
@@ -534,6 +566,16 @@ fn apply_flow(server_settings: &mut Value, client_settings: &mut Value, flow: Op
     let Some(flow) = flow else {
         return;
     };
+    // `"xtls-rprx-vision+testseed"` also gives both ends a non-default
+    // Vision padding seed.
+    let (flow, seeded) = match flow.strip_suffix("+testseed") {
+        Some(flow) => (flow, true),
+        None => (flow, false),
+    };
+    if seeded {
+        server_settings["testseed"] = json!([300, 120, 700, 60]);
+        client_settings["testseed"] = json!([1200, 40, 1100, 400]);
+    }
     for client in server_settings["clients"]
         .as_array_mut()
         .expect("VLESS inbound settings carry a clients array")
@@ -561,7 +603,12 @@ fn apply_flow(server_settings: &mut Value, client_settings: &mut Value, flow: Op
 /// place does not produce an error — the server silently relays the connection
 /// to the decoy site — so the assertion has to be that payload came *back*,
 /// not that the socket opened.
-async fn zray_client_to_xray_reality_server(binary: &str, carrier: &str, flow: Option<&str>) {
+async fn zray_client_to_xray_reality_server(
+    binary: &str,
+    carrier: &str,
+    flow: Option<&str>,
+    mldsa: Option<&(String, String)>,
+) {
     let echo = echo_service().await;
     let relay_port = free_port();
     let socks_port = free_port();
@@ -569,7 +616,16 @@ async fn zray_client_to_xray_reality_server(binary: &str, carrier: &str, flow: O
     let (mut server_settings, mut client_settings) = protocol_settings("vless", relay_port);
     apply_flow(&mut server_settings, &mut client_settings, flow);
     let decoy_port = free_port();
-    let _decoy = spawn_decoy(binary, decoy_port);
+    let _decoy = if mldsa.is_some() {
+        spawn_decoy_with(
+            binary,
+            decoy_port,
+            BIG_DECOY_CERTIFICATE,
+            BIG_DECOY_PRIVATE_KEY,
+        )
+    } else {
+        spawn_decoy(binary, decoy_port)
+    };
     let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
     assert!(wait_for(decoy).await, "the REALITY decoy never listened");
 
@@ -580,6 +636,10 @@ async fn zray_client_to_xray_reality_server(binary: &str, carrier: &str, flow: O
     let mut zray_stream = transport(carrier);
     zray_stream["security"] = json!("reality");
     zray_stream["realitySettings"] = reality_client_settings(&public_key);
+    if let Some((seed, verify)) = mldsa {
+        oracle_stream["realitySettings"]["mldsa65Seed"] = json!(seed);
+        zray_stream["realitySettings"]["mldsa65Verify"] = json!(verify);
+    }
 
     let _oracle = spawn_oracle(
         binary,
@@ -631,7 +691,27 @@ async fn zray_client_to_xray_reality_server(binary: &str, carrier: &str, flow: O
 }
 
 /// Xray client → Zray REALITY server.
-async fn xray_client_to_zray_reality_server(binary: &str, carrier: &str, flow: Option<&str>) {
+async fn xray_client_to_zray_reality_server(
+    binary: &str,
+    carrier: &str,
+    flow: Option<&str>,
+    mldsa: Option<&(String, String)>,
+) {
+    xray_client_to_zray_reality_server_with(binary, carrier, flow, mldsa, json!({}), true).await
+}
+
+/// The same, with `server_extra` merged into the Zray server's REALITY
+/// settings. `expect_through` says whether the Xray client should get
+/// through to the echo service; when it should not, what is asserted is that
+/// it did not, and that the decoy answered it instead.
+async fn xray_client_to_zray_reality_server_with(
+    binary: &str,
+    carrier: &str,
+    flow: Option<&str>,
+    mldsa: Option<&(String, String)>,
+    server_extra: Value,
+    expect_through: bool,
+) {
     let echo = echo_service().await;
     let relay_port = free_port();
     let socks_port = free_port();
@@ -639,7 +719,16 @@ async fn xray_client_to_zray_reality_server(binary: &str, carrier: &str, flow: O
     let (mut server_settings, mut client_settings) = protocol_settings("vless", relay_port);
     apply_flow(&mut server_settings, &mut client_settings, flow);
     let decoy_port = free_port();
-    let _decoy = spawn_decoy(binary, decoy_port);
+    let _decoy = if mldsa.is_some() {
+        spawn_decoy_with(
+            binary,
+            decoy_port,
+            BIG_DECOY_CERTIFICATE,
+            BIG_DECOY_PRIVATE_KEY,
+        )
+    } else {
+        spawn_decoy(binary, decoy_port)
+    };
     let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
     assert!(wait_for(decoy).await, "the REALITY decoy never listened");
 
@@ -650,6 +739,13 @@ async fn xray_client_to_zray_reality_server(binary: &str, carrier: &str, flow: O
     let mut oracle_stream = transport(carrier);
     oracle_stream["security"] = json!("reality");
     oracle_stream["realitySettings"] = reality_client_settings(&public_key);
+    if let Some((seed, verify)) = mldsa {
+        zray_stream["realitySettings"]["mldsa65Seed"] = json!(seed);
+        oracle_stream["realitySettings"]["mldsa65Verify"] = json!(verify);
+    }
+    for (key, value) in server_extra.as_object().into_iter().flatten() {
+        zray_stream["realitySettings"][key] = value.clone();
+    }
 
     spawn_zray(json!({
         "log": {"loglevel": "warning"},
@@ -687,6 +783,38 @@ async fn xray_client_to_zray_reality_server(binary: &str, carrier: &str, flow: O
     assert!(wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), relay_port)).await);
     assert!(wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port)).await);
 
+    if !expect_through {
+        // A client the server's limits refuse is relayed to the decoy, which
+        // does not speak VLESS: the SOCKS connect or the first exchange fails.
+        let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+        let outcome = tokio::time::timeout(Duration::from_secs(6), async {
+            let mut stream = tokio::net::TcpStream::connect(socks).await.ok()?;
+            stream.write_all(&[5, 1, 0]).await.ok()?;
+            let mut method = [0u8; 2];
+            stream.read_exact(&mut method).await.ok()?;
+            let mut request = vec![5, 1, 0, 1];
+            match echo.ip() {
+                std::net::IpAddr::V4(ip) => request.extend_from_slice(&ip.octets()),
+                std::net::IpAddr::V6(_) => return None,
+            }
+            request.extend_from_slice(&echo.port().to_be_bytes());
+            stream.write_all(&request).await.ok()?;
+            let mut reply = [0u8; 10];
+            stream.read_exact(&mut reply).await.ok()?;
+            if reply[1] != 0 {
+                return None;
+            }
+            stream.write_all(&payload(15, 64)).await.ok()?;
+            let mut echoed = [0u8; 64];
+            stream.read_exact(&mut echoed).await.ok()?;
+            Some(())
+        })
+        .await
+        .ok()
+        .flatten();
+        assert!(outcome.is_none(), "a client outside the limits got through");
+        return;
+    }
     let mut stream = socks_connect(
         SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port),
         echo,
@@ -1021,8 +1149,8 @@ async fn vless_over_reality_raw_tcp_matches_the_oracle() {
         "oracle: {} (VLESS/REALITY over raw TCP)",
         oracle_version(&binary)
     );
-    zray_client_to_xray_reality_server(&binary, "tcp", None).await;
-    xray_client_to_zray_reality_server(&binary, "tcp", None).await;
+    zray_client_to_xray_reality_server(&binary, "tcp", None, None).await;
+    xray_client_to_zray_reality_server(&binary, "tcp", None, None).await;
 }
 
 /// The combination the working Iranian configuration actually uses.
@@ -1044,8 +1172,8 @@ async fn vless_vision_over_reality_matches_the_oracle() {
         oracle_version(&binary)
     );
     let flow = Some("xtls-rprx-vision");
-    zray_client_to_xray_reality_server(&binary, "tcp", flow).await;
-    xray_client_to_zray_reality_server(&binary, "tcp", flow).await;
+    zray_client_to_xray_reality_server(&binary, "tcp", flow, None).await;
+    xray_client_to_zray_reality_server(&binary, "tcp", flow, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1631,5 +1759,361 @@ async fn vless_over_tls_with_a_hello_split_inside_the_name_matches_the_oracle() 
             round_trip(&mut tunnel, &payload(connection, 64)).await;
             round_trip(&mut tunnel, &payload(connection + 7, 96 * 1024)).await;
         }
+    }
+}
+
+/// The name the Tide server goes by behind the REALITY hop in the test below.
+const TIDE_NAME: &str = "tide-egress.internal";
+
+/// ZeroV1 carried through a real Xray REALITY + Vision server (`dialerProxy`).
+///
+/// The shape a censor that tolerates only REALITY handshakes leaves open: the
+/// client shows the censor one REALITY connection per Tide connection, and the
+/// Tide server is reached from the REALITY server's side as a plain address.
+/// The Tide server is a Zray inbound behind Xray's `freedom` outbound; the
+/// client names no address for it that it could reach by itself (the REALITY
+/// server is the only thing it dials).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn zerov1_runs_through_an_xray_reality_vision_hop() {
+    use zero_protocol::tide::{encode_key, generate_keypair};
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!(
+        "oracle: {} (ZeroV1 inside VLESS/Vision/REALITY)",
+        oracle_version(&binary)
+    );
+    let echo = echo_service().await;
+    let (egress_port, hop_port, socks_port, decoy_port) =
+        (free_port(), free_port(), free_port(), free_port());
+    let (private_key, public_key) = oracle_x25519_keypair(&binary);
+    let (secret, public) = generate_keypair();
+    let user = [7u8; 16];
+    let flow = "xtls-rprx-vision";
+
+    spawn_zray(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "egress-in",
+            "listen": "127.0.0.1",
+            "port": egress_port,
+            "protocol": "zerov1",
+            "settings": {
+                "path": "/assets/app",
+                "secretKey": encode_key(&secret),
+                "users": [{"id": encode_key(&user), "name": "test"}],
+            },
+            "streamSettings": {
+                "security": "tls",
+                "tlsSettings": {"certificates": [{
+                    "certificate": [DECOY_CERTIFICATE],
+                    "key": [DECOY_PRIVATE_KEY],
+                }]},
+            },
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }));
+
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the REALITY decoy never listened");
+    let mut hop_stream = json!({"network": "tcp", "security": "reality"});
+    hop_stream["realitySettings"] = reality_server_settings(&private_key, decoy);
+    let _hop = spawn_oracle(
+        &binary,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "reality-in",
+                "listen": "127.0.0.1",
+                "port": hop_port,
+                "protocol": "vless",
+                "settings": {"clients": [{"id": UUID, "flow": flow}], "decryption": "none"},
+                "streamSettings": hop_stream,
+            }],
+            // Only the hop's own resolver knows the Tide server's name, so a
+            // client that dialled it directly could not pass this test.
+            "dns": {"hosts": {TIDE_NAME: "127.0.0.1"}},
+            "outbounds": [{
+                "protocol": "freedom",
+                "settings": {"domainStrategy": "UseIPv4", "finalRules": [{"action": "allow"}]},
+            }],
+        }),
+    );
+
+    let mut reality_client = json!({"network": "tcp", "security": "reality"});
+    reality_client["realitySettings"] = reality_client_settings(&public_key);
+    spawn_zray(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": socks_port,
+            "protocol": "socks",
+        }],
+        "outbounds": [
+            {
+                "tag": "proxy",
+                "protocol": "zerov1",
+                "settings": {
+                    "address": TIDE_NAME,
+                    "port": egress_port,
+                    "path": "/assets/app",
+                    "serverKey": encode_key(&public),
+                    "user": encode_key(&user),
+                },
+                "streamSettings": {
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "zray.test",
+                        "certificates": [{"usage": "verify", "certificate": [LOOPBACK_CA]}],
+                    },
+                    "sockopt": {"dialerProxy": "reality"},
+                },
+            },
+            {
+                "tag": "reality",
+                "protocol": "vless",
+                "settings": {"vnext": [{
+                    "address": "127.0.0.1",
+                    "port": hop_port,
+                    "users": [{"id": UUID, "encryption": "none", "flow": flow}],
+                }]},
+                "streamSettings": reality_client,
+            },
+        ],
+    }));
+
+    assert!(wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), hop_port)).await);
+    assert!(wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port)).await);
+    let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    let mut stream = socks_connect(socks, echo).await.unwrap();
+    round_trip(&mut stream, &payload(21, 64)).await;
+    round_trip(&mut stream, &payload(22, 512 * 1024)).await;
+    // A second stream rides the session the first one made.
+    let mut again = socks_connect(socks, echo).await.unwrap();
+    round_trip(&mut again, &payload(23, 96 * 1024)).await;
+}
+
+/// What Xray's `hysteria` transport and a Zray Hysteria 2 endpoint make of
+/// each other, with and without Salamander, in both directions. Xray spells
+/// the protocol across the outbound, `hysteriaSettings` and a `finalmask`
+/// UDP mask; Zray reads that spelling and its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn hysteria_matches_the_oracle_with_and_without_salamander() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!("oracle: {} (hysteria)", oracle_version(&binary));
+    for salamander in [None, Some("a-shared-obfs-password")] {
+        eprintln!("  salamander={salamander:?}");
+        let masks = |password: Option<&str>| match password {
+            Some(password) => json!({"udp": [{
+                "type": "salamander",
+                "settings": {"password": password},
+            }]}),
+            None => json!({}),
+        };
+
+        // Zray client -> Xray server.
+        {
+            let echo = echo_service().await;
+            let relay_port = free_port();
+            let socks_port = free_port();
+            let _oracle = spawn_oracle(
+                &binary,
+                json!({
+                    "log": {"loglevel": "debug"},
+                    "inbounds": [{
+                        "tag": "in", "listen": "127.0.0.1", "port": relay_port,
+                        "protocol": "hysteria",
+                        "settings": {"version": 2, "clients": [{"auth": PASSWORD}]},
+                        "streamSettings": {
+                            "network": "hysteria",
+                            "security": "tls",
+                            "tlsSettings": {
+                                "alpn": ["h3"],
+                                "certificates": [{
+                                    "certificate": [DECOY_CERTIFICATE],
+                                    "key": [DECOY_PRIVATE_KEY],
+                                }],
+                            },
+                            "hysteriaSettings": {"version": 2, "auth": PASSWORD},
+                            "finalmask": masks(salamander),
+                        },
+                    }],
+                    "outbounds": [oracle_loopback_freedom()],
+                }),
+            );
+            spawn_zray(json!({
+                "log": {"loglevel": "warning"},
+                "inbounds": [{
+                    "tag": "socks-in", "listen": "127.0.0.1",
+                    "port": socks_port, "protocol": "socks",
+                }],
+                "outbounds": [{
+                    "tag": "proxy",
+                    "protocol": "hysteria",
+                    "settings": {"version": 2, "address": "127.0.0.1", "port": relay_port},
+                    "streamSettings": {
+                        "network": "hysteria",
+                        "security": "tls",
+                        "tlsSettings": {
+                            "serverName": "zray.test",
+                            "certificates": [{"usage": "verify", "certificate": [LOOPBACK_CA]}],
+                        },
+                        "hysteriaSettings": {"version": 2, "auth": PASSWORD},
+                        "finalmask": masks(salamander),
+                    },
+                }],
+            }));
+            let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+            assert!(wait_for(socks).await);
+            // QUIC is UDP, so there is no port to wait for: give the oracle
+            // a moment, then let the first connection retry if it was early.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let mut tunnel = None;
+            for _ in 0..5 {
+                match socks_connect(socks, echo).await {
+                    Ok(stream) => {
+                        tunnel = Some(stream);
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                }
+            }
+            let mut tunnel = tunnel.expect("Zray never reached the Xray hysteria server");
+            round_trip(&mut tunnel, &payload(1, 64)).await;
+            round_trip(&mut tunnel, &payload(2, 96 * 1024)).await;
+        }
+
+        // Xray client -> Zray server.
+        {
+            let echo = echo_service().await;
+            let relay_port = free_port();
+            let socks_port = free_port();
+            spawn_zray(json!({
+                "log": {"loglevel": "warning"},
+                "inbounds": [{
+                    "tag": "in", "listen": "127.0.0.1", "port": relay_port,
+                    "protocol": "hysteria",
+                    "settings": {"version": 2, "users": [{"auth": PASSWORD}]},
+                    "streamSettings": {
+                        "network": "hysteria",
+                        "security": "tls",
+                        "tlsSettings": {"certificates": [{
+                            "certificate": [DECOY_CERTIFICATE],
+                            "key": [DECOY_PRIVATE_KEY],
+                        }]},
+                        "finalmask": masks(salamander),
+                    },
+                }],
+                "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            }));
+            let _oracle = spawn_oracle(
+                &binary,
+                json!({
+                    "log": {"loglevel": "debug"},
+                    "inbounds": [{
+                        "tag": "socks-in", "listen": "127.0.0.1",
+                        "port": socks_port, "protocol": "socks",
+                        "settings": {"udp": true},
+                    }],
+                    "outbounds": [{
+                        "tag": "proxy",
+                        "protocol": "hysteria",
+                        "settings": {"version": 2, "address": "127.0.0.1", "port": relay_port},
+                        "streamSettings": {
+                            "network": "hysteria",
+                            "security": "tls",
+                            "tlsSettings": {
+                                "serverName": "zray.test",
+                                "alpn": ["h3"],
+                                "pinnedPeerCertSha256": LOOPBACK_CERT_SHA256,
+                            },
+                            "hysteriaSettings": {"version": 2, "auth": PASSWORD},
+                            "finalmask": masks(salamander),
+                        },
+                    }],
+                }),
+            );
+            let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+            assert!(wait_for(socks).await);
+            let mut tunnel = None;
+            for _ in 0..5 {
+                match socks_connect(socks, echo).await {
+                    Ok(stream) => {
+                        tunnel = Some(stream);
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                }
+            }
+            let mut tunnel = tunnel.expect("Xray never reached the Zray hysteria server");
+            round_trip(&mut tunnel, &payload(3, 64)).await;
+            round_trip(&mut tunnel, &payload(4, 96 * 1024)).await;
+        }
+    }
+}
+
+/// REALITY with the post-quantum signature binding (`mldsa65Seed` on the
+/// server, `mldsa65Verify` on the client), in both directions: the server
+/// has to sign what Go's client checks, and the client has to check what
+/// Go's server signs.
+/// Vision with padding numbers of its own on each end (Xray's `testseed`):
+/// the receiver reads padding by length, so any pair works, in both
+/// directions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn vision_with_a_custom_testseed_matches_the_oracle() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!("oracle: {} (Vision testseed)", oracle_version(&binary));
+    let flow = Some("xtls-rprx-vision+testseed");
+    zray_client_to_xray_reality_server(&binary, "tcp", flow, None).await;
+    xray_client_to_zray_reality_server(&binary, "tcp", flow, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn reality_with_the_mldsa65_binding_matches_the_oracle() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!("oracle: {} (REALITY + ML-DSA-65)", oracle_version(&binary));
+    let keys = oracle_mldsa65_keypair(&binary);
+    zray_client_to_xray_reality_server(&binary, "tcp", None, Some(&keys)).await;
+    xray_client_to_zray_reality_server(&binary, "tcp", None, Some(&keys)).await;
+}
+
+/// The REALITY server's limits on who may connect: client version and clock
+/// (Xray's `minClientVer`, `maxClientVer`, `maxTimeDiff`) and the PROXY
+/// header it can send to its decoy (`xver`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn the_reality_server_limits_hold_against_the_oracles_client() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!("oracle: {} (REALITY limits)", oracle_version(&binary));
+    // Inside the limits.
+    xray_client_to_zray_reality_server_with(
+        &binary,
+        "tcp",
+        None,
+        None,
+        json!({"minClientVer": "1.0.0", "maxClientVer": "99.0.0", "maxTimeDiff": 60000, "xver": 2}),
+        true,
+    )
+    .await;
+    // The client is older than the minimum, or newer than the maximum.
+    for extra in [
+        json!({"minClientVer": "99.0.0"}),
+        json!({"maxClientVer": "1.0.0"}),
+    ] {
+        xray_client_to_zray_reality_server_with(&binary, "tcp", None, None, extra, false).await;
     }
 }

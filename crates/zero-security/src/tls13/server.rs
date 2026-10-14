@@ -6,6 +6,7 @@
 //! type used by the client implementation.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use aes_gcm::{
     aead::{Aead, Payload},
@@ -30,15 +31,36 @@ use super::record::{
 use super::{CipherSuite, Tls13Stream};
 use zero_core::{Confidence, Failure, FailureKind, Stage};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RealityServerParams {
     pub private_key: [u8; 32],
     pub server_names: Box<[Box<str>]>,
     pub short_ids: Box<[Box<[u8]>]>,
+    /// Seed of the ML-DSA-65 key that signs each handshake's binding to the
+    /// client's hello and the server's (Xray's `mldsa65Seed`); `None` leaves
+    /// the certificate as it has always been.
+    pub mldsa65_seed: Option<[u8; 32]>,
+    /// Refuse (as not REALITY) a hello whose clock is further than this from
+    /// ours; zero for no check.
+    pub max_time_diff: std::time::Duration,
+    /// Refuse a client older or newer than these, as `[major, minor, patch]`.
+    pub min_client_ver: Option<[u8; 3]>,
+    pub max_client_ver: Option<[u8; 3]>,
     /// What each server name's real site sends after a handshake, filled in
     /// by whoever can reach that site. Empty until then, and the server sends
     /// nothing extra for a name it has no entry for.
     pub post_handshake: Arc<PostHandshakeShapes>,
+}
+
+impl std::fmt::Debug for RealityServerParams {
+    // Neither key is ever printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealityServerParams")
+            .field("server_names", &self.server_names)
+            .field("short_ids", &self.short_ids.len())
+            .field("mldsa65", &self.mldsa65_seed.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The sizes of the records a camouflage site sends straight after a
@@ -220,12 +242,51 @@ where
             failure: reality_error("REALITY shortId is not authorised"),
         };
     }
+    if let Err(failure) = check_client_limits(params, &plaintext) {
+        return HandshakeOutcome::Fallback {
+            stream: io,
+            client_hello,
+            failure,
+        };
+    }
 
     let post_handshake = params.post_handshake.get(&hello.sni);
-    match complete_handshake(io, hello, auth_key, post_handshake).await {
+    match complete_handshake(io, hello, auth_key, post_handshake, params.mldsa65_seed).await {
         Ok(stream) => HandshakeOutcome::Accepted(stream),
         Err(failure) => HandshakeOutcome::Rejected(failure),
     }
+}
+
+/// The client's version and clock, from the session id's plaintext, held to
+/// the limits the server was given. A client that fails them is answered as
+/// any non-REALITY visitor is, so the limits are not an oracle either.
+fn check_client_limits(params: &RealityServerParams, plaintext: &[u8]) -> Result<(), Failure> {
+    let version = [plaintext[0], plaintext[1], plaintext[2]];
+    if params.min_client_ver.is_some_and(|min| version < min)
+        || params.max_client_ver.is_some_and(|max| version > max)
+    {
+        return Err(reality_error(
+            "REALITY client version is outside the accepted range",
+        ));
+    }
+    if !params.max_time_diff.is_zero() {
+        let sent = u64::from(u32::from_be_bytes([
+            plaintext[4],
+            plaintext[5],
+            plaintext[6],
+            plaintext[7],
+        ]));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let difference = Duration::from_secs(now.abs_diff(sent));
+        if difference > params.max_time_diff {
+            return Err(reality_error(
+                "REALITY client clock is too far from this server's",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn complete_handshake<S>(
@@ -233,6 +294,7 @@ async fn complete_handshake<S>(
     hello: ClientHelloInfo,
     auth_key: [u8; 32],
     post_handshake: Option<Arc<[u16]>>,
+    mldsa65_seed: Option<[u8; 32]>,
 ) -> Result<Tls13Stream<S>, Failure>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -287,7 +349,14 @@ where
     rand::rngs::OsRng.fill_bytes(&mut signing_seed);
     let signing = SigningKey::from_bytes(&signing_seed);
     signing_seed.zeroize();
-    let certificate = reality_certificate(&signing, &auth_key, &hello.sni);
+    let certificate = reality_certificate(
+        &signing,
+        &auth_key,
+        &hello.sni,
+        mldsa65_seed
+            .as_ref()
+            .map(|seed| (seed, hello.message.as_slice(), server_hello.as_slice())),
+    );
     let encrypted_flight = build_encrypted_flight(
         hello.suite,
         &schedule.server_hs_traffic,
@@ -728,7 +797,16 @@ where
     }
 }
 
-fn reality_certificate(signing: &SigningKey, auth_key: &[u8; 32], hostname: &str) -> Vec<u8> {
+/// The certificate REALITY presents. With `binding` (the ML-DSA-65 seed and
+/// the two hello messages) it carries one extension: the signature, by the
+/// ML-DSA key, of an HMAC over the certificate's key and both hellos, which
+/// ties this handshake to this server for a client that knows the verify key.
+fn reality_certificate(
+    signing: &SigningKey,
+    auth_key: &[u8; 32],
+    hostname: &str,
+    binding: Option<(&[u8; 32], &[u8], &[u8])>,
+) -> Vec<u8> {
     let public = signing.verifying_key().to_bytes();
     let algorithm = der_sequence(&[0x06, 0x03, 0x2b, 0x65, 0x70]);
     let spki = der_sequence(&[algorithm.as_slice(), &der_bit_string(&public)].concat());
@@ -746,6 +824,23 @@ fn reality_certificate(signing: &SigningKey, auth_key: &[u8; 32], hostname: &str
     // Keep all mandatory RFC 5280 fields present. REALITY replaces ordinary
     // certificate-chain verification with the HMAC below, but Xray's Go
     // parser still requires a structurally valid certificate.
+    let extensions = binding.map_or_else(Vec::new, |(seed, client_hello, server_hello)| {
+        use ml_dsa::{MlDsa65, Signer, SigningKey as MlDsaKey};
+        let mut signed = <Hmac<Sha512> as Mac>::new_from_slice(auth_key).expect("fixed HMAC key");
+        signed.update(&public);
+        signed.update(client_hello);
+        signed.update(server_hello);
+        let key = MlDsaKey::<MlDsa65>::from_seed(&(*seed).into());
+        let signature = key.sign(signed.finalize().into_bytes().as_slice());
+        let extension = der_sequence(
+            &[
+                &[0x06, 0x01, 0x2b][..],
+                der_tlv(0x04, signature.encode().as_slice()).as_slice(),
+            ]
+            .concat(),
+        );
+        der_tlv(0xa3, &der_sequence(&extension))
+    });
     let tbs = der_sequence(
         &[
             version.as_slice(),
@@ -755,6 +850,7 @@ fn reality_certificate(signing: &SigningKey, auth_key: &[u8; 32], hostname: &str
             validity.as_slice(),
             name.as_slice(),
             spki.as_slice(),
+            extensions.as_slice(),
         ]
         .concat(),
     );
@@ -870,6 +966,10 @@ mod tests {
             private_key,
             server_names: vec![Box::from("example.test")].into_boxed_slice(),
             short_ids: vec![vec![0xaa, 0xbb, 0xcc, 0xdd].into_boxed_slice()].into_boxed_slice(),
+            mldsa65_seed: None,
+            max_time_diff: Duration::ZERO,
+            min_client_ver: None,
+            max_client_ver: None,
             post_handshake: Default::default(),
         };
         let client_params = crate::reality::RealityParams::from_config(
@@ -900,6 +1000,77 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// The ML-DSA-65 verify key for `seed`, as a client is configured with it.
+    fn mldsa65_verify_key(seed: [u8; 32]) -> Box<[u8]> {
+        use ml_dsa::{Keypair, MlDsa65, SigningKey as MlDsaKey};
+        MlDsaKey::<MlDsa65>::from_seed(&seed.into())
+            .verifying_key()
+            .encode()
+            .as_slice()
+            .into()
+    }
+
+    /// Run one handshake between a server holding `server_seed` and a client
+    /// holding `verify`; true when the client got through and exchanged data.
+    async fn handshake_with_mldsa65(
+        server_seed: Option<[u8; 32]>,
+        verify: Option<Box<[u8]>>,
+    ) -> bool {
+        let (mut server_params, _) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        server_params.mldsa65_seed = server_seed;
+        let client_params = crate::reality::RealityParams::from_config_with_fingerprint_and_mldsa(
+            std::sync::Arc::from("example.test"),
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([7u8; 32])).to_bytes(),
+            &[0xaa, 0xbb, 0xcc, 0xdd],
+            crate::FingerprintProfile::Chrome,
+            verify,
+        )
+        .with_hybrid_kem(false);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let Ok(mut stream) = handshake(server_io, &server_params).await else {
+                return;
+            };
+            let mut request = [0u8; 4];
+            if stream.read_exact(&mut request).await.is_ok() {
+                let _ = stream.write_all(b"pong").await;
+                let _ = stream.flush().await;
+            }
+        });
+        let outcome = async {
+            let mut client = crate::reality::connect(client_io, &client_params)
+                .await
+                .ok()?;
+            client.write_all(b"ping").await.ok()?;
+            client.flush().await.ok()?;
+            let mut response = [0u8; 4];
+            client.read_exact(&mut response).await.ok()?;
+            (&response == b"pong").then_some(())
+        }
+        .await
+        .is_some();
+        let _ = server.await;
+        outcome
+    }
+
+    #[tokio::test]
+    async fn a_client_with_the_verify_key_accepts_the_server_that_holds_the_seed() {
+        let seed = [9u8; 32];
+        assert!(handshake_with_mldsa65(Some(seed), Some(mldsa65_verify_key(seed))).await);
+        // Neither side uses it: the handshake is what it always was.
+        assert!(handshake_with_mldsa65(None, None).await);
+        // A server that signs is fine with a client that does not check.
+        assert!(handshake_with_mldsa65(Some(seed), None).await);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_wants_the_signature_refuses_a_server_without_it_or_with_another() {
+        let seed = [9u8; 32];
+        let verify = mldsa65_verify_key(seed);
+        assert!(!handshake_with_mldsa65(None, Some(verify.clone())).await);
+        assert!(!handshake_with_mldsa65(Some([10u8; 32]), Some(verify)).await);
+    }
+
     fn reality_pair(
         client_short_id: &[u8],
     ) -> (RealityServerParams, crate::reality::RealityParams) {
@@ -908,6 +1079,10 @@ mod tests {
             x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key))
                 .to_bytes();
         let server_params = RealityServerParams {
+            mldsa65_seed: None,
+            max_time_diff: Duration::ZERO,
+            min_client_ver: None,
+            max_client_ver: None,
             private_key,
             server_names: vec![Box::from("example.test")].into_boxed_slice(),
             short_ids: vec![
@@ -1109,6 +1284,10 @@ mod tests {
         client.flush().await.unwrap();
 
         let params = RealityServerParams {
+            mldsa65_seed: None,
+            max_time_diff: Duration::ZERO,
+            min_client_ver: None,
+            max_client_ver: None,
             private_key: [7u8; 32],
             server_names: vec![Box::from("reality.example")].into_boxed_slice(),
             short_ids: vec![vec![1, 2, 3, 4].into_boxed_slice()].into_boxed_slice(),

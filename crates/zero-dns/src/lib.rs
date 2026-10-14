@@ -2036,6 +2036,7 @@ fn peer_group_end(servers: &[&DnsServer], start: usize) -> usize {
         && interchangeable(servers[end])
         && servers[end].domains == first.domains
         && servers[end].expect_ips == first.expect_ips
+        && servers[end].unexpect_ips == first.unexpect_ips
         // Same route out: racing a tunnelled resolver against a direct one
         // would send every hedged query to the local network.
         && servers[end].tag == first.tag
@@ -2138,13 +2139,26 @@ fn hedge_delay(rtt: Option<Rtt>) -> Duration {
     Duration::from_millis(u64::from(base) * 2).clamp(HEDGE_MIN, HEDGE_MAX)
 }
 
+fn matches_pattern(pattern: &IpPattern, ip: IpAddr) -> bool {
+    match pattern {
+        IpPattern::Cidr(cidr) => cidr.contains(ip),
+        IpPattern::Private => is_private(ip),
+        IpPattern::Geoip(_) => false,
+    }
+}
+
+/// Whether `server`'s answer `ip` is acceptable: inside `expectedIPs` when
+/// that is set, and never inside `unexpectedIPs`.
 fn expected_ip_allowed(server: &DnsServer, ip: IpAddr) -> bool {
-    server.expect_ips.is_empty()
-        || server.expect_ips.iter().any(|pattern| match pattern {
-            IpPattern::Cidr(cidr) => cidr.contains(ip),
-            IpPattern::Private => is_private(ip),
-            IpPattern::Geoip(_) => false,
-        })
+    (server.expect_ips.is_empty()
+        || server
+            .expect_ips
+            .iter()
+            .any(|pattern| matches_pattern(pattern, ip)))
+        && !server
+            .unexpect_ips
+            .iter()
+            .any(|pattern| matches_pattern(pattern, ip))
 }
 
 fn is_private(ip: IpAddr) -> bool {
@@ -2744,6 +2758,7 @@ mod tests {
                     endpoint: zero_config::dns::ResolverEndpoint::parse("193.186.32.32").unwrap(),
                     domains: Vec::new(),
                     expect_ips: Vec::new(),
+                    unexpect_ips: Vec::new(),
                     skip_fallback: false,
                     tag: Some("anti-sanction".into()),
                 },
@@ -2751,6 +2766,7 @@ mod tests {
                     endpoint: zero_config::dns::ResolverEndpoint::parse("178.22.122.100").unwrap(),
                     domains: Vec::new(),
                     expect_ips: Vec::new(),
+                    unexpect_ips: Vec::new(),
                     skip_fallback: false,
                     tag: Some("anti-sanction".into()),
                 },
@@ -2818,6 +2834,32 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn unexpected_answers_are_dropped_and_expected_ones_still_required() {
+        let server = |expect: Vec<IpPattern>, unexpect: Vec<IpPattern>| DnsServer {
+            endpoint: ResolverEndpoint::FakeDns,
+            domains: Vec::new(),
+            expect_ips: expect,
+            unexpect_ips: unexpect,
+            skip_fallback: false,
+            tag: None,
+        };
+        let cidr = |text: &str| {
+            IpPattern::Cidr(zero_config::routing::ipnet_lite::Cidr::parse(text).unwrap())
+        };
+        let poisoned: IpAddr = "10.10.34.35".parse().unwrap();
+        let real: IpAddr = "93.184.216.34".parse().unwrap();
+        let none = server(vec![], vec![]);
+        assert!(expected_ip_allowed(&none, poisoned));
+        let blocked = server(vec![], vec![cidr("10.10.34.0/24")]);
+        assert!(!expected_ip_allowed(&blocked, poisoned));
+        assert!(expected_ip_allowed(&blocked, real));
+        // An address both expected and unexpected is refused.
+        let both = server(vec![cidr("10.0.0.0/8")], vec![cidr("10.10.34.0/24")]);
+        assert!(!expected_ip_allowed(&both, poisoned));
+        assert!(!expected_ip_allowed(&both, real), "outside expectedIPs");
+    }
+
     #[tokio::test]
     async fn fake_dns_is_stable_and_reversible() {
         let settings = DnsSettings {
@@ -2825,6 +2867,7 @@ mod tests {
                 endpoint: ResolverEndpoint::FakeDns,
                 domains: Vec::new(),
                 expect_ips: Vec::new(),
+                unexpect_ips: Vec::new(),
                 skip_fallback: false,
                 tag: None,
             }]
@@ -2875,6 +2918,7 @@ mod tests {
             endpoint,
             domains: Vec::new(),
             expect_ips: Vec::new(),
+            unexpect_ips: Vec::new(),
             skip_fallback: false,
             tag: None,
         };
@@ -2967,6 +3011,7 @@ mod tests {
                 },
                 domains: Vec::new(),
                 expect_ips: Vec::new(),
+                unexpect_ips: Vec::new(),
                 skip_fallback: false,
                 tag: None,
             }]
@@ -3025,6 +3070,7 @@ mod tests {
                     },
                     domains: Vec::new(),
                     expect_ips: vec![IpPattern::Private],
+                    unexpect_ips: Vec::new(),
                     skip_fallback: false,
                     tag: None,
                 },
@@ -3035,6 +3081,7 @@ mod tests {
                     },
                     domains: Vec::new(),
                     expect_ips: vec![IpPattern::Private],
+                    unexpect_ips: Vec::new(),
                     skip_fallback: false,
                     tag: None,
                 },
@@ -3063,6 +3110,7 @@ mod tests {
                 },
                 domains: Vec::new(),
                 expect_ips: Vec::new(),
+                unexpect_ips: Vec::new(),
                 skip_fallback: false,
                 tag: None,
             }]
@@ -3098,6 +3146,7 @@ mod tests {
                 endpoint: ResolverEndpoint::System,
                 domains: Vec::new(),
                 expect_ips: Vec::new(),
+                unexpect_ips: Vec::new(),
                 skip_fallback: false,
                 tag: None,
             }]
@@ -3117,6 +3166,7 @@ mod tests {
                 endpoint: ResolverEndpoint::FakeDns,
                 domains: Vec::new(),
                 expect_ips: Vec::new(),
+                unexpect_ips: Vec::new(),
                 skip_fallback: false,
                 tag: None,
             }]
@@ -3157,6 +3207,7 @@ mod tests {
                 },
                 domains: Vec::new(),
                 expect_ips: Vec::new(),
+                unexpect_ips: Vec::new(),
                 skip_fallback: false,
                 tag: None,
             }]
@@ -3381,6 +3432,7 @@ mod tests {
                 endpoint: ResolverEndpoint::FakeDns,
                 domains: Vec::new(),
                 expect_ips: Vec::new(),
+                unexpect_ips: Vec::new(),
                 skip_fallback: false,
                 tag: None,
             }]
@@ -3441,6 +3493,7 @@ mod tests {
                     endpoint: ResolverEndpoint::parse(endpoint).unwrap(),
                     domains: Vec::new(),
                     expect_ips: Vec::new(),
+                    unexpect_ips: Vec::new(),
                     skip_fallback: false,
                     tag: None,
                 }]
@@ -3484,6 +3537,7 @@ mod tests {
                 endpoint: ResolverEndpoint::parse("https://dns.google/dns-query").unwrap(),
                 domains: Vec::new(),
                 expect_ips: Vec::new(),
+                unexpect_ips: Vec::new(),
                 skip_fallback: false,
                 tag: None,
             }]
@@ -3646,6 +3700,7 @@ mod tests {
                 endpoint,
                 domains: Vec::new(),
                 expect_ips: Vec::new(),
+                unexpect_ips: Vec::new(),
                 skip_fallback: false,
                 tag: None,
             }]
@@ -3793,6 +3848,7 @@ mod tests {
                 .map(|pattern| zero_config::routing::DomainPattern::parse(pattern))
                 .collect(),
             expect_ips: Vec::new(),
+            unexpect_ips: Vec::new(),
             skip_fallback: false,
             tag: None,
         }
@@ -3911,6 +3967,7 @@ mod tests {
             },
             domains: Vec::new(),
             expect_ips: Vec::new(),
+            unexpect_ips: Vec::new(),
             skip_fallback: false,
             tag: None,
         };
@@ -3997,6 +4054,7 @@ mod race_tests {
             },
             domains: Vec::new(),
             expect_ips: Vec::new(),
+            unexpect_ips: Vec::new(),
             skip_fallback: false,
             tag: None,
         }

@@ -1156,7 +1156,7 @@ mod tests {
             .outbounds
             .iter()
             .any(|outbound| outbound.tag.as_ref() == "dns-out"
-                && matches!(outbound.protocol, zero_config::OutboundProtocol::Dns)));
+                && matches!(outbound.protocol, zero_config::OutboundProtocol::Dns { .. })));
         let first = &compiled.routing.rules[0];
         assert!(
             matches!(&first.target, zero_config::routing::RuleTarget::Outbound(tag) if tag.as_ref() == "dns-out")
@@ -1353,10 +1353,10 @@ mod tests {
             .inbounds
             .iter()
             .all(|inbound| inbound.listen.host_string() == "127.0.0.1"));
-        assert!(!compiled
-            .outbounds
-            .iter()
-            .any(|outbound| matches!(outbound.protocol, zero_config::OutboundProtocol::Dns)));
+        assert!(!compiled.outbounds.iter().any(|outbound| matches!(
+            outbound.protocol,
+            zero_config::OutboundProtocol::Dns { .. }
+        )));
     }
 
     #[test]

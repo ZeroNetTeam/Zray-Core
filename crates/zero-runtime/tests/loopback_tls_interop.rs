@@ -621,6 +621,132 @@ async fn tide_through_a_relay_carries_payload_intact() {
     round_trip(&mut again, &payload(3, 64)).await;
 }
 
+/// A ZeroV1 server that sits behind REALITY instead of a certificate: the
+/// client proves itself with the REALITY key, then speaks HTTP/2 over the
+/// stream that results. A client with the wrong key never gets a tunnel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tide_runs_over_reality_and_refuses_the_wrong_key() {
+    use base64::Engine as _;
+    use zero_protocol::tide::{encode_key, generate_keypair};
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let reality_secret = x25519_dalek::StaticSecret::from([21u8; 32]);
+    let reality_public = x25519_dalek::PublicKey::from(&reality_secret);
+    let other_public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([22u8; 32]));
+    let echo = echo_service().await;
+    let (server_port, socks_port, wrong_port) = (free_tcp_port(), free_tcp_port(), free_tcp_port());
+    let (secret, public) = generate_keypair();
+    let user = [7u8; 16];
+    let server = spawn(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "zerov1-in",
+            "listen": "127.0.0.1",
+            "port": server_port,
+            "protocol": "zerov1",
+            "settings": {
+                "path": "/assets/app",
+                "secretKey": encode_key(&secret),
+                "users": [{"id": encode_key(&user), "name": "test"}],
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "dest": echo.to_string(),
+                    "serverNames": ["www.example.test"],
+                    "privateKey": encode(&reality_secret.to_bytes()),
+                    "shortIds": ["ab12cd34ef56ab12"],
+                },
+            },
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }));
+    let client = |socks_port: u16, public_key: &x25519_dalek::PublicKey| {
+        spawn(json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "port": socks_port,
+                "protocol": "socks",
+                "settings": {},
+            }],
+            "outbounds": [{
+                "tag": "proxy",
+                "protocol": "zerov1",
+                "settings": {
+                    "address": "127.0.0.1",
+                    "port": server_port,
+                    "path": "/assets/app",
+                    "serverKey": encode_key(&public),
+                    "user": encode_key(&user),
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "serverName": "www.example.test",
+                        "publicKey": encode(public_key.as_bytes()),
+                        "shortId": "ab12cd34ef56ab12",
+                        "fingerprint": "chrome",
+                    },
+                },
+            }],
+        }))
+    };
+    let good = client(socks_port, &reality_public);
+    let wrong = client(wrong_port, &other_public);
+    wait_until_listening(&server).await;
+    wait_until_listening(&good).await;
+    wait_until_listening(&wrong).await;
+
+    let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    let mut stream = socks_connect(socks, echo).await.unwrap();
+    round_trip(&mut stream, &payload(1, 64)).await;
+    round_trip(&mut stream, &payload(2, 512 * 1024)).await;
+
+    // The server's "who is connected" figures count the proven client, and
+    // only that one: the wrong-key attempt below never shows up.
+    let usage = server.stats.usage.snapshot();
+    let figure = usage
+        .inbounds
+        .iter()
+        .find(|inbound| inbound.tag == "zerov1-in")
+        .expect("the ZeroV1 inbound is counted");
+    assert_eq!(figure.devices_now, 1);
+    let sessions_before = figure.sessions;
+
+    // The wrong REALITY key is sent to the camouflage target, so no ZeroV1
+    // session ever opens: the SOCKS client is told the host is unreachable
+    // (`socks_connect` panics on that reply) or gets nothing back.
+    let wrong_socks = SocketAddr::new("127.0.0.1".parse().unwrap(), wrong_port);
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::spawn(async move {
+            let mut stream = socks_connect(wrong_socks, echo).await?;
+            stream.write_all(&payload(3, 64)).await?;
+            let mut back = vec![0u8; 64];
+            stream.read_exact(&mut back).await?;
+            std::io::Result::Ok(back == payload(3, 64))
+        }),
+    )
+    .await;
+    assert!(
+        !matches!(attempt, Ok(Ok(Ok(true)))),
+        "a client with the wrong REALITY key got a tunnel"
+    );
+    let after = server.stats.usage.snapshot();
+    let figure = after
+        .inbounds
+        .iter()
+        .find(|inbound| inbound.tag == "zerov1-in")
+        .unwrap();
+    assert_eq!(
+        figure.sessions, sessions_before,
+        "a prober was counted as a user"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn tide_keeps_concurrent_flows_separate() {
     // Every flow shares one session and two connections; a mistake in stream
@@ -1050,21 +1176,166 @@ async fn hysteria2_reconnects_in_zero_rtt_when_the_server_allows_it() {
     }
 
     let before = zero_transport::hysteria2::zero_rtt_accepted();
-    let first = zero_transport::hysteria2::connect(&[server], &tls, PASSWORD, None, &destination)
-        .await
-        .expect("first connection");
+    let first = zero_transport::hysteria2::connect(
+        &[server],
+        &tls,
+        PASSWORD,
+        &zero_transport::quic_shape::QuicShape::default(),
+        &destination,
+    )
+    .await
+    .expect("first connection");
     echo_once(first, b"first, in 1-RTT").await;
     // Give the server's session ticket time to arrive, then drop the pooled
     // connection so the next stream has to dial.
     tokio::time::sleep(Duration::from_millis(200)).await;
     zero_transport::quic_pool::close_all_to(server);
 
-    let second = zero_transport::hysteria2::connect(&[server], &tls, PASSWORD, None, &destination)
-        .await
-        .expect("resumed connection");
+    let second = zero_transport::hysteria2::connect(
+        &[server],
+        &tls,
+        PASSWORD,
+        &zero_transport::quic_shape::QuicShape::default(),
+        &destination,
+    )
+    .await
+    .expect("resumed connection");
     echo_once(second, b"second, resumed").await;
     assert!(
         zero_transport::hysteria2::zero_rtt_accepted() > before,
         "the reconnection did not use 0-RTT"
+    );
+}
+
+/// A client, a hop that carries it and a Tide server only the hop can name.
+struct ChainedTide {
+    tunnel: Tunnel,
+    /// The hop's core: its counters show whether traffic really crossed it.
+    hop: Arc<zero_runtime::Server>,
+}
+
+/// Tide reached through `dialerProxy`: the client holds no address for the
+/// Tide server (only the hop's own resolver knows its name), so every
+/// connection to it has to be carried by the hop.
+async fn chained_tide(datagrams: bool) -> ChainedTide {
+    use zero_protocol::tide::{encode_key, generate_keypair};
+    let echo = echo_service().await;
+    let udp_echo = udp_echo_service().await;
+    let (egress_port, hop_port, socks_port) = (free_tcp_port(), free_tcp_port(), free_tcp_port());
+    let (secret, public) = generate_keypair();
+    let user = [7u8; 16];
+    let egress = spawn(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "egress-in",
+            "listen": "127.0.0.1",
+            "port": egress_port,
+            "protocol": "zerov1",
+            "settings": {
+                "path": "/assets/app",
+                "secretKey": encode_key(&secret),
+                "users": [{"id": encode_key(&user), "name": "test"}],
+            },
+            "streamSettings": inbound_tls(),
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }));
+    let hop = spawn(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "hop-in",
+            "listen": "127.0.0.1",
+            "port": hop_port,
+            "protocol": "vless",
+            "settings": {"clients": [{"id": UUID}]},
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+        "dns": {"hosts": {SERVER_NAME: ["127.0.0.1"]}},
+    }));
+    let mut tide_stream = client_tls();
+    tide_stream["sockopt"] = json!({"dialerProxy": "hop"});
+    let client = spawn(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": socks_port,
+            "protocol": "socks",
+            "settings": {"udp": true},
+        }],
+        "outbounds": [
+            {
+                "tag": "proxy",
+                "protocol": "zerov1",
+                "settings": {
+                    "address": SERVER_NAME,
+                    "port": egress_port,
+                    "path": "/assets/app",
+                    "serverKey": encode_key(&public),
+                    "user": encode_key(&user),
+                    "datagrams": datagrams,
+                },
+                "streamSettings": tide_stream,
+            },
+            {
+                "tag": "hop",
+                "protocol": "vless",
+                "settings": {"vnext": [{
+                    "address": "127.0.0.1",
+                    "port": hop_port,
+                    "users": [{"id": UUID, "encryption": "none"}],
+                }]},
+                "streamSettings": {"network": "tcp", "security": "none"},
+            },
+        ],
+    }));
+    wait_until_listening(&egress).await;
+    wait_until_listening(&hop).await;
+    wait_until_listening(&client).await;
+    ChainedTide {
+        tunnel: Tunnel {
+            socks: SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port),
+            echo,
+            udp_echo,
+            relay: SocketAddr::new("127.0.0.1".parse().unwrap(), hop_port),
+        },
+        hop,
+    }
+}
+
+/// `zerov1` with `dialerProxy` set: the Tide server is dialled through the
+/// hop, over as many connections as the session asks for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tide_runs_through_a_dialer_proxy_hop() {
+    let chained = chained_tide(false).await;
+    let tunnel = &chained.tunnel;
+    let mut stream = socks_connect(tunnel.socks, tunnel.echo).await.unwrap();
+    round_trip(&mut stream, &payload(1, 64)).await;
+    round_trip(&mut stream, &payload(2, 512 * 1024)).await;
+    let mut again = socks_connect(tunnel.socks, tunnel.echo).await.unwrap();
+    round_trip(&mut again, &payload(3, 64)).await;
+    // The hop counts a connection when it accepts it (traffic only when the
+    // connection ends): Tide opens a download and an upload connection.
+    let accepted = chained.hop.stats.snapshot().accepted;
+    assert!(
+        accepted >= 2,
+        "Tide did not connect through the hop: {accepted}"
+    );
+}
+
+/// The same chain carries Tide's UDP flows, which must not go around it to
+/// the server's own address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tide_datagrams_follow_a_dialer_proxy_hop() {
+    let chained = chained_tide(true).await;
+    udp_round_trip(&chained.tunnel, b"datagram through a hop").await;
+    let mut stream = socks_connect(chained.tunnel.socks, chained.tunnel.echo)
+        .await
+        .unwrap();
+    round_trip(&mut stream, &payload(5, 64 * 1024)).await;
+    let accepted = chained.hop.stats.snapshot().accepted;
+    assert!(
+        accepted >= 2,
+        "Tide did not connect through the hop: {accepted}"
     );
 }

@@ -172,20 +172,6 @@ pub(crate) fn obfuscated_socket(
     ))
 }
 
-/// [`protected_client_endpoint`], on an obfuscated socket.
-pub(crate) fn protected_obfuscated_client_endpoint(
-    bind: std::net::SocketAddr,
-    salamander: &crate::salamander::Salamander,
-) -> std::io::Result<h3_quinn::quinn::Endpoint> {
-    let socket = zero_core::platform::bind_protected_udp(bind)?;
-    h3_quinn::quinn::Endpoint::new_with_abstract_socket(
-        h3_quinn::quinn::EndpointConfig::default(),
-        None,
-        obfuscated_socket(socket, salamander)?,
-        std::sync::Arc::new(h3_quinn::quinn::TokioRuntime),
-    )
-}
-
 /// Per-stream QUIC receive window. quinn's default (1.25 MB) is sized for
 /// 100 Mbit/s at 100 ms; on the long, lossy paths these carriers exist for it
 /// caps a single stream well below the link. This matches the Hysteria2

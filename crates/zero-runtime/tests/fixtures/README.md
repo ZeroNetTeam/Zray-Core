@@ -7,6 +7,7 @@ A two-level test PKI used by the loopback interoperability tests:
 | `loopback-ca.pem`   | test CA certificate; the client trusts this |
 | `loopback-cert.pem` | server leaf for `zray.test` / `localhost` / `127.0.0.1` |
 | `loopback-key.pem`  | the leaf's private key |
+| `big-decoy-cert.pem` / `big-decoy-key.pem` | a self-signed 4.9 KB certificate (140 names) for a REALITY decoy large enough to carry the ML-DSA-65 binding |
 
 A leaf signed by a separate CA, rather than one self-signed certificate,
 because a CA certificate presented as an end-entity is rejected outright

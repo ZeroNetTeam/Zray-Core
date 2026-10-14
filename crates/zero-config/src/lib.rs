@@ -5,6 +5,7 @@
 //! (RESEARCH-01 §4).
 
 pub mod dns;
+pub mod merge;
 pub mod model;
 pub mod presets;
 pub mod routing;
@@ -12,10 +13,13 @@ pub mod share_link;
 pub mod xhttp;
 pub mod xray_json;
 
+pub use merge::merge_documents;
 pub use model::*;
 pub use presets::{AntiSanctionDns, IranPreset, LocalDns, RemoteDns, RuleAction, UserRule};
 pub use share_link::{parse_link, parse_subscription, ShareLink};
-pub use xray_json::{compile_config, parse_config, parse_config_array, Diagnostic, ParseOutput};
+pub use xray_json::{
+    compile_config, nested_outbound, parse_config, parse_config_array, Diagnostic, ParseOutput,
+};
 
 /// Trojan's wire credential: lowercase hex of SHA-224 over the password.
 pub fn trojan_hash(password: &str) -> [u8; 56] {

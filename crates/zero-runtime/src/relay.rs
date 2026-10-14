@@ -8,6 +8,7 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -44,6 +45,27 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// nothing, which otherwise held both sockets and their buffers for the full
 /// five-minute idle period (and, in TUN mode, the stack's buffers with them).
 pub const HALF_CLOSE_IDLE: Duration = Duration::from_secs(1);
+
+static CONN_IDLE_MS: AtomicU64 = AtomicU64::new(DEFAULT_IDLE_TIMEOUT.as_millis() as u64);
+static HALF_CLOSE_MS: AtomicU64 = AtomicU64::new(HALF_CLOSE_IDLE.as_millis() as u64);
+
+/// Use the configured `policy` for every flow started from now on: how long
+/// a silent flow lives, and how long the second direction of a half-closed
+/// one may stay silent. A flow already running keeps the limits it started
+/// with.
+pub fn set_policy(conn_idle: Duration, half_close: Duration) {
+    CONN_IDLE_MS.store(conn_idle.as_millis() as u64, Ordering::Relaxed);
+    HALF_CLOSE_MS.store(half_close.as_millis() as u64, Ordering::Relaxed);
+}
+
+/// The idle limit new flows are given.
+pub fn idle_timeout() -> Duration {
+    Duration::from_millis(CONN_IDLE_MS.load(Ordering::Relaxed))
+}
+
+fn half_close_idle() -> Duration {
+    Duration::from_millis(HALF_CLOSE_MS.load(Ordering::Relaxed))
+}
 
 type BufferPool = Mutex<Vec<Box<[u8]>>>;
 
@@ -474,13 +496,14 @@ where
 }
 
 /// Copy in both directions until both sides close, either side errors, or the
-/// flow stays idle for [`DEFAULT_IDLE_TIMEOUT`].
+/// flow stays idle for the configured limit ([`DEFAULT_IDLE_TIMEOUT`] unless
+/// `policy.connIdle` says otherwise).
 pub async fn relay<A, B>(client: A, remote: B) -> RelayOutcome
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    relay_with_idle_timeout(client, remote, Some(DEFAULT_IDLE_TIMEOUT)).await
+    relay_with_idle_timeout(client, remote, Some(idle_timeout())).await
 }
 
 /// [`relay`] with an explicit idle limit; `None` never times out.
@@ -506,7 +529,7 @@ where
         half_closed: None,
         // A caller that asked for no idle limit gets no half-close limit
         // either.
-        half_close_limit: idle_timeout.map(|_| HALF_CLOSE_IDLE),
+        half_close_limit: idle_timeout.map(|_| half_close_idle()),
     };
     let CopyResult {
         uploaded,

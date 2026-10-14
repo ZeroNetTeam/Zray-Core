@@ -57,6 +57,7 @@ fn rig() -> Arc<Client> {
             linger: Duration::from_millis(50),
             lane: false,
             rotation: None,
+            tuning: Default::default(),
         },
         dial,
     )

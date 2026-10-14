@@ -84,6 +84,13 @@ impl Salamander {
         out.extend(plain.iter().enumerate().map(|(i, b)| b ^ key[i % KEY_LEN]));
     }
 
+    /// The obfuscation of a fixed text under a fixed salt: a value that
+    /// differs between passwords and reveals neither, for telling two
+    /// configurations apart (a pool key) without holding the password.
+    pub(crate) fn obfuscate_with_fixed_salt(&self, out: &mut Vec<u8>) {
+        self.obfuscate_with_salt(&[0u8; SALT_LEN], b"zray salamander key probe", out);
+    }
+
     /// Undo [`Self::obfuscate`] on `datagram` in place, moving the payload to
     /// the front of the slice. Returns the payload length, or `None` when
     /// the datagram is too short to hold a salt and a byte.

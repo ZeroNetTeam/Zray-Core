@@ -34,6 +34,12 @@ struct CompiledRule {
     inbound_tags: Vec<Box<str>>,
     protocols: Vec<Box<str>>,
     processes: Vec<ProcessPattern>,
+    users: Vec<Box<str>>,
+    local_ips: IpMatcher,
+    local_ports: Vec<PortRange>,
+    /// `(attribute, pattern)`; every one must match the sniffed request.
+    attrs: Vec<(Box<str>, regex::Regex)>,
+    vless_routes: Vec<PortRange>,
     target: RuleTarget,
     /// True when every selector this rule declared was unusable (e.g. it was
     /// nothing but geosite tags and no geodata is loaded). Such a rule must
@@ -62,24 +68,45 @@ impl Router {
             let domains = DomainMatcher::build_with_geodata(&r.domains, geodata);
             let ips = IpMatcher::build_with_geodata(&r.ips, geodata);
             let source_ips = IpMatcher::build_with_geodata(&r.source_ips, geodata);
+            let local_ips = IpMatcher::build_with_geodata(&r.local_ips, geodata);
+            // Patterns were checked when the configuration was read; one that
+            // still fails here makes the rule inert, never unconditional.
+            let attrs: Result<Vec<_>, _> = r
+                .attrs
+                .iter()
+                .map(|(name, pattern)| regex::Regex::new(pattern).map(|re| (name.clone(), re)))
+                .collect();
+            let attrs_broken = attrs.is_err();
+            let attrs = attrs.unwrap_or_default();
 
             unresolved.extend(domains.unresolved_geosites.iter().cloned());
             unresolved.extend(ips.unresolved_geoips.iter().cloned());
             unresolved.extend(source_ips.unresolved_geoips.iter().cloned());
+            unresolved.extend(local_ips.unresolved_geoips.iter().cloned());
 
             // A rule that declared only selectors we cannot evaluate has lost
             // its meaning. Treating it as "matches everything" would send all
             // traffic to, say, `block`.
-            let declared_something =
-                !r.domains.is_empty() || !r.ips.is_empty() || !r.source_ips.is_empty();
-            let usable_something = !domains.is_empty() || !ips.is_empty() || !source_ips.is_empty();
+            let declared_something = !r.domains.is_empty()
+                || !r.ips.is_empty()
+                || !r.source_ips.is_empty()
+                || !r.local_ips.is_empty();
+            let usable_something = !domains.is_empty()
+                || !ips.is_empty()
+                || !source_ips.is_empty()
+                || !local_ips.is_empty();
             let other_selectors = !r.ports.is_empty()
                 || !r.source_ports.is_empty()
                 || !r.networks.is_empty()
                 || !r.inbound_tags.is_empty()
                 || !r.protocols.is_empty()
-                || !r.processes.is_empty();
-            let inert = declared_something && !usable_something && !other_selectors;
+                || !r.processes.is_empty()
+                || !r.users.is_empty()
+                || !r.local_ports.is_empty()
+                || !r.attrs.is_empty()
+                || !r.vless_routes.is_empty();
+            let inert =
+                attrs_broken || (declared_something && !usable_something && !other_selectors);
 
             rules.push(CompiledRule {
                 domains,
@@ -91,6 +118,11 @@ impl Router {
                 inbound_tags: r.inbound_tags.clone(),
                 protocols: r.protocols.clone(),
                 processes: r.processes.clone(),
+                users: r.users.clone(),
+                local_ips,
+                local_ports: r.local_ports.clone(),
+                attrs,
+                vless_routes: r.vless_routes.clone(),
                 target: r.target.clone(),
                 inert,
             });
@@ -180,6 +212,47 @@ impl Router {
             }
         }
 
+        if !rule.users.is_empty() {
+            match &ctx.user {
+                Some(user) if rule.users.iter().any(|u| u.as_ref() == user.as_ref()) => {}
+                _ => return false,
+            }
+        }
+
+        if !rule.local_ports.is_empty() {
+            match ctx.local.map(|l| l.port()) {
+                Some(p) if rule.local_ports.iter().any(|r| r.contains(p)) => {}
+                _ => return false,
+            }
+        }
+
+        if !rule.local_ips.is_empty() {
+            match ctx.local.map(|l| l.ip()) {
+                Some(ip) if rule.local_ips.matches(ip) => {}
+                _ => return false,
+            }
+        }
+
+        if !rule.vless_routes.is_empty() {
+            match ctx.vless_route {
+                Some(route) if rule.vless_routes.iter().any(|r| r.contains(route)) => {}
+                _ => return false,
+            }
+        }
+
+        if !rule.attrs.is_empty() {
+            let Some(http) = &ctx.sniffed.http else {
+                return false;
+            };
+            let all = rule
+                .attrs
+                .iter()
+                .all(|(name, re)| http.get(name).is_some_and(|value| re.is_match(value)));
+            if !all {
+                return false;
+            }
+        }
+
         if !rule.domains.is_empty() {
             match ctx.effective_domain() {
                 Some(d) if rule.domains.matches(d) => {}
@@ -246,6 +319,7 @@ mod tests {
 
     fn cfg(rules: Vec<Rule>) -> RuntimeConfig {
         RuntimeConfig {
+            policy: Default::default(),
             inbounds: Box::new([]),
             outbounds: vec![outbound("proxy"), outbound("direct"), outbound("block")]
                 .into_boxed_slice(),
@@ -258,6 +332,7 @@ mod tests {
             observatory: None,
             assets: None,
             log_level: "warning".into(),
+            bridges: Box::new([]),
         }
     }
 
@@ -426,5 +501,74 @@ mod tests {
         assert_eq!(r.route(&c, None), Decision::Outbound(Arc::from("proxy")));
         c.sniffed.protocol = Some("tls");
         assert_eq!(r.route(&c, None), Decision::Block);
+    }
+
+    #[test]
+    fn a_rule_on_the_account_matches_only_that_account() {
+        let mut rule = Rule::new(RuleTarget::Block);
+        rule.users = vec!["alice@example".into()];
+        let r = Router::build(&cfg(vec![rule]));
+        let mut session = ctx("example.com", 443);
+        assert_ne!(r.route(&session, None), Decision::Block);
+        session.user = Some(Arc::from("bob@example"));
+        assert_ne!(r.route(&session, None), Decision::Block);
+        session.user = Some(Arc::from("alice@example"));
+        assert_eq!(r.route(&session, None), Decision::Block);
+    }
+
+    #[test]
+    fn local_address_and_port_rules_look_at_where_the_client_connected() {
+        let mut rule = Rule::new(RuleTarget::Block);
+        rule.local_ips = vec![IpPattern::Cidr(
+            zero_config::routing::ipnet_lite::Cidr::parse("10.0.0.0/8").unwrap(),
+        )];
+        rule.local_ports = vec![PortRange {
+            start: 8443,
+            end: 8443,
+        }];
+        let r = Router::build(&cfg(vec![rule]));
+        let mut session = ctx("example.com", 443);
+        assert_ne!(r.route(&session, None), Decision::Block);
+        session.local = Some("10.1.2.3:8443".parse().unwrap());
+        assert_eq!(r.route(&session, None), Decision::Block);
+        session.local = Some("10.1.2.3:9000".parse().unwrap());
+        assert_ne!(r.route(&session, None), Decision::Block);
+        session.local = Some("192.168.1.1:8443".parse().unwrap());
+        assert_ne!(r.route(&session, None), Decision::Block);
+    }
+
+    #[test]
+    fn an_attrs_rule_needs_a_sniffed_request_that_matches_every_attribute() {
+        let mut rule = Rule::new(RuleTarget::Block);
+        rule.attrs = vec![
+            (":method".into(), "^GET$".into()),
+            ("user-agent".into(), "(?i)curl".into()),
+        ];
+        let r = Router::build(&cfg(vec![rule]));
+        let mut session = ctx("example.com", 80);
+        assert_ne!(r.route(&session, None), Decision::Block);
+        session.sniffed.http = Some(Arc::new(zero_core::HttpAttrs {
+            method: "GET".into(),
+            path: "/".into(),
+            headers: vec![("user-agent".into(), "Curl/8".into())],
+        }));
+        assert_eq!(r.route(&session, None), Decision::Block);
+        session.sniffed.http = Some(Arc::new(zero_core::HttpAttrs {
+            method: "POST".into(),
+            path: "/".into(),
+            headers: vec![("user-agent".into(), "curl/8".into())],
+        }));
+        assert_ne!(r.route(&session, None), Decision::Block);
+    }
+
+    #[test]
+    fn a_bittorrent_rule_matches_the_sniffed_protocol() {
+        let mut rule = Rule::new(RuleTarget::Block);
+        rule.protocols = vec!["bittorrent".into()];
+        let r = Router::build(&cfg(vec![rule]));
+        let mut session = ctx("1.2.3.4", 6881);
+        assert_ne!(r.route(&session, None), Decision::Block);
+        session.sniffed.protocol = Some("bittorrent");
+        assert_eq!(r.route(&session, None), Decision::Block);
     }
 }

@@ -10,7 +10,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use zero_core::{Address, Network, OutboundId};
+use zero_core::{Address, OutboundId};
 
 // ---------------------------------------------------------------- transports
 
@@ -103,6 +103,12 @@ pub struct WebSocketConfig {
     /// XHTTP padding, placement and upload settings (Xray's
     /// `xhttpSettings`, or its `extra`).
     pub xhttp: crate::xhttp::XhttpSettings,
+    /// gRPC only: the path of the `TunMulti` method when it differs from
+    /// `path`; a server serves both, and the path of a request says which.
+    pub grpc_multi_path: Option<Arc<str>>,
+    /// gRPC only (Xray's `multiMode`): a client frames its stream as
+    /// `MultiHunk` and calls the multi method.
+    pub grpc_multi: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +191,13 @@ pub struct TlsConfig {
     /// still needs the chain and name to verify; no match at all is refused.
     /// Empty means no pinning.
     pub pinned_cert_sha256: Vec<[u8; 32]>,
+    /// Xray's `verifyPeerCertByName`: the names the server's certificate may
+    /// carry in place of the server name sent. Empty verifies for the name
+    /// sent.
+    pub verify_names: Vec<Box<str>>,
+    /// Xray's `masterKeyLog`: a file the session secrets are appended to for
+    /// Wireshark. Anyone who can read it can decrypt the traffic.
+    pub key_log_file: Option<Box<str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,6 +402,13 @@ pub struct Evasion {
     /// with a TCP split need both. Never set without `tcp_fragment`.
     pub tcp_fragment_under: Option<FragmentConfig>,
     pub udp_noise: Vec<NoiseConfig>,
+    /// Salamander obfuscation of every UDP datagram of a QUIC carrier
+    /// (`finalmask.udp` `salamander`): the password both ends share.
+    pub udp_salamander: Option<Box<str>>,
+    /// Move a QUIC carrier's server port over time (`udphop`).
+    pub udp_hop: Option<UdpHop>,
+    /// QUIC transport settings (`finalmask.quicParams`).
+    pub quic: Option<QuicParams>,
     /// Optional Linux raw-packet fake-SNI injection selected by the planner.
     pub sni_desync: Option<SniDesyncConfig>,
     /// Optional keepalive shaping for a network that resets flows on a time
@@ -397,13 +417,86 @@ pub struct Evasion {
 }
 
 impl Evasion {
+    /// Whether any shaping other than the UDP/QUIC kind is set: what a QUIC
+    /// carrier cannot take (TCP fragments, noise, SNI tricks, keepalive
+    /// probes). Salamander, port hopping and QUIC parameters are the shaping
+    /// it does take.
+    pub fn has_non_quic_shaping(&self) -> bool {
+        self.tcp_fragment.is_some()
+            || self.tcp_fragment_under.is_some()
+            || !self.udp_noise.is_empty()
+            || self.sni_desync.is_some()
+            || self.keepalive.is_some()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tcp_fragment.is_none()
             && self.tcp_fragment_under.is_none()
             && self.udp_noise.is_empty()
+            && self.udp_salamander.is_none()
+            && self.udp_hop.is_none()
+            && self.quic.is_none()
             && self.sni_desync.is_none()
             && self.keepalive.is_none()
     }
+}
+
+/// Port hopping for a UDP carrier: the client sends to a different server
+/// port every so often, picked from `ports`, while the QUIC connection above
+/// it carries on unchanged. A filter that blocks one UDP flow by its port
+/// pair sees it end and a new one begin. The server side is a port range that
+/// forwards to one listening port (a firewall redirect), as Hysteria's is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpHop {
+    /// Server ports to choose from, in the order given.
+    pub ports: Vec<crate::routing::PortRange>,
+    /// Seconds between moves, drawn at random from this range each time
+    /// (Xray's minimum is 5).
+    pub interval_secs: (u32, u32),
+}
+
+impl UdpHop {
+    /// Every port the ranges cover, without repeats.
+    pub fn all_ports(&self) -> Vec<u16> {
+        let mut ports: Vec<u16> = self.ports.iter().flat_map(|r| r.start..=r.end).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+}
+
+/// How a QUIC carrier controls its sending rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuicCongestion {
+    /// What the protocol defaults to: Hysteria 2 negotiates its rate with the
+    /// peer, the others use BBR.
+    #[default]
+    Default,
+    Reno,
+    Bbr,
+    /// Send at the configured rate whatever the loss, if the peer agreed.
+    Brutal,
+    /// Send at the configured rate whether or not the peer agreed.
+    ForceBrutal,
+}
+
+/// Xray's `finalmask.quicParams`. Every field unset means "as before".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QuicParams {
+    pub congestion: QuicCongestion,
+    /// Bytes per second the client may send at under brutal; 0 = unlimited
+    /// (BBR instead).
+    pub up_bytes_per_sec: u64,
+    /// Bytes per second the client asks the server to send at; 0 = unknown.
+    pub down_bytes_per_sec: u64,
+    pub init_stream_window: Option<u32>,
+    pub max_stream_window: Option<u32>,
+    pub init_connection_window: Option<u32>,
+    pub max_connection_window: Option<u32>,
+    pub max_idle_secs: Option<u32>,
+    pub keep_alive_secs: Option<u32>,
+    pub disable_mtu_discovery: bool,
+    pub max_incoming_streams: Option<u32>,
 }
 
 /// Shaping for a flow-timeout policy: keep an idle carrier from looking
@@ -755,6 +848,52 @@ pub struct Sockopt {
     /// means "leave the system default alone" — which is also the honest
     /// answer on a platform with no such sockopt at all.
     pub tcp_congestion: Option<Arc<str>>,
+    /// Seconds idle before TCP keepalive probes and between them (Xray's
+    /// `tcpKeepAliveIdle` and `tcpKeepAliveInterval`, each 45 when unset or
+    /// 0). `Some((0, 0))` turns keepalive off (Xray: a negative number).
+    pub keepalive: Option<(u32, u32)>,
+    /// `tcpUserTimeout`, in milliseconds.
+    pub user_timeout_ms: Option<u32>,
+    /// `tcpWindowClamp`: the largest receive window advertised.
+    pub window_clamp: Option<u32>,
+    /// `tcpMaxSeg`: the segment size to send.
+    pub max_seg: Option<u32>,
+    /// `tcpMptcp`: Multipath TCP where the kernel has it.
+    pub mptcp: bool,
+    /// `V6Only`, for an inbound listening on `::`.
+    pub v6_only: Option<bool>,
+    /// Xray's `tproxy`: how a gateway steers traffic into this inbound.
+    pub tproxy: Tproxy,
+    /// Xray's `customSockopt`: raw `setsockopt` calls on this socket.
+    pub custom: Vec<zero_core::custom_sockopt::CustomSockopt>,
+    /// Xray's `sendThrough`: the local address this outbound's connections
+    /// leave from, on a host with several. A connection to a server of the
+    /// other IP family leaves from the system's choice.
+    pub bind_address: Option<std::net::IpAddr>,
+}
+
+/// How traffic reaches a transparent inbound (Xray's `sockopt.tproxy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tproxy {
+    #[default]
+    Off,
+    /// `iptables -j REDIRECT`: the original destination comes from the
+    /// kernel's connection tracking. TCP only.
+    Redirect,
+    /// `TPROXY`: the listener is `IP_TRANSPARENT` and sees the real
+    /// destination as its local address. TCP and UDP.
+    Tproxy,
+}
+
+impl Tproxy {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "" => Tproxy::Off,
+            "redirect" => Tproxy::Redirect,
+            "tproxy" => Tproxy::Tproxy,
+            _ => return None,
+        })
+    }
 }
 
 impl Default for Sockopt {
@@ -767,6 +906,15 @@ impl Default for Sockopt {
             mark: None,
             bind_interface: None,
             tcp_congestion: None,
+            keepalive: None,
+            user_timeout_ms: None,
+            window_clamp: None,
+            max_seg: None,
+            mptcp: false,
+            v6_only: None,
+            tproxy: Tproxy::Off,
+            custom: Vec::new(),
+            bind_address: None,
         }
     }
 }
@@ -837,6 +985,9 @@ pub struct StreamSettings {
     /// request/response exchange around the protocol stream, not an HTTP
     /// proxy and not a second carrier.
     pub raw_http_header: Option<RawHttpHeader>,
+    /// What a Freedom outbound does with the destination before and after it
+    /// connects. `None` for every other protocol, and for a plain Freedom.
+    pub direct: Option<Arc<DirectPolicy>>,
 }
 
 impl Default for StreamSettings {
@@ -847,6 +998,113 @@ impl Default for StreamSettings {
             sockopt: Sockopt::default(),
             evasion: Evasion::default(),
             raw_http_header: None,
+            direct: None,
+        }
+    }
+}
+
+/// The parts of Xray's `freedom` outbound beyond fragmenting and noise:
+/// where a connection is redirected, whether a PROXY protocol header is
+/// sent, and which final destinations are allowed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DirectPolicy {
+    /// Replace the destination's address and/or port before connecting.
+    pub redirect: Option<DirectRedirect>,
+    /// 1 or 2: send a PROXY protocol header of that version first (so a
+    /// backend behind the server learns the client's address). 0 sends none.
+    pub proxy_protocol: u8,
+    /// Checked against every address the destination resolves to; the first
+    /// rule that matches decides, and an address no rule matches is allowed.
+    pub final_rules: Box<[FinalRule]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectRedirect {
+    pub address: Option<Address>,
+    pub port: Option<u16>,
+}
+
+/// One entry of Freedom's `finalRules`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalRule {
+    pub allow: bool,
+    /// Empty means every network.
+    pub networks: Vec<zero_core::Network>,
+    /// Empty means every port.
+    pub ports: Vec<crate::routing::PortRange>,
+    /// Empty means every address. Only CIDR ranges and `geoip:private`.
+    pub ips: Vec<crate::routing::IpPattern>,
+    /// How long a blocked connection is held before it is dropped, as a
+    /// range in seconds, so a prober learns nothing from the timing.
+    pub block_delay_secs: (u32, u32),
+}
+
+impl FinalRule {
+    /// Whether this rule applies to a connection to `ip:port` over `network`.
+    pub fn matches(&self, network: zero_core::Network, ip: std::net::IpAddr, port: u16) -> bool {
+        use crate::routing::IpPattern;
+        // An IPv4 address written as ::ffff:a.b.c.d is that IPv4 address.
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+            other => other,
+        };
+        (self.networks.is_empty() || self.networks.contains(&network))
+            && (self.ports.is_empty() || self.ports.iter().any(|range| range.contains(port)))
+            && (self.ips.is_empty()
+                || self.ips.iter().any(|pattern| match pattern {
+                    IpPattern::Cidr(cidr) => cidr.contains(ip),
+                    IpPattern::Private => is_private_or_reserved(ip),
+                    IpPattern::Geoip(_) => false,
+                }))
+    }
+}
+
+impl DirectPolicy {
+    /// The rule that decides for this connection, if any matches.
+    pub fn decide(
+        &self,
+        network: zero_core::Network,
+        ip: std::net::IpAddr,
+        port: u16,
+    ) -> Option<&FinalRule> {
+        self.final_rules
+            .iter()
+            .find(|rule| rule.matches(network, ip, port))
+    }
+}
+
+/// Loopback, private, link-local, shared, documentation, multicast and
+/// otherwise reserved addresses: where a proxy's own network and its cloud
+/// provider's metadata service live.
+pub fn is_private_or_reserved(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
+                || (o[0] == 192 && o[1] == 0 && o[2] == 2) // TEST-NET-1
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100) // TEST-NET-2
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113) // TEST-NET-3
+                || o[0] >= 240 // 240.0.0.0/4
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
+                || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
+                || (s[0] == 0x0064 && s[1] == 0xff9b) // NAT64 well-known prefix
         }
     }
 }
@@ -873,14 +1131,55 @@ pub struct RawHttpResponse {
     pub headers: BTreeMap<Box<str>, Box<str>>,
 }
 
+/// What the `dns` outbound does with a query (Xray's `dns` outbound `rules`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsAction {
+    /// Answer it from the runtime's own resolver (the default for A and AAAA).
+    Hijack,
+    /// Give no answer at all.
+    Drop,
+    /// Answer with an empty response carrying this result code.
+    Return(u8),
+}
+
+/// One rule of the `dns` outbound; the first that matches decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsOutboundRule {
+    pub action: DnsAction,
+    /// Query types it covers (1 = A, 28 = AAAA, 65 = HTTPS); empty is any.
+    pub qtypes: Box<[u16]>,
+    /// Names it covers; empty is any.
+    pub domains: Box<[crate::routing::DomainPattern]>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundProtocol {
     Freedom {
         domain_strategy: DomainStrategy,
     },
-    Blackhole,
-    /// Hijacks DNS queries routed to it.
-    Dns,
+    /// Refuses the connection, or answers it with `response` first (Xray's
+    /// `blackhole` `response`: `http` is a bodiless 403, `custom` is bytes
+    /// from the config).
+    Blackhole {
+        response: Option<Arc<[u8]>>,
+    },
+    /// Hijacks DNS queries routed to it, treating each as its `rules` say.
+    Dns {
+        rules: Box<[DnsOutboundRule]>,
+    },
+    /// Sends the connection back through routing as if it had arrived on the
+    /// inbound with this tag (Xray's `loopback`): a second look with that
+    /// inbound's rules, for example after a first rule has sent it through a
+    /// tunnel whose own destination should be routed again.
+    Loopback {
+        inbound_tag: Arc<str>,
+    },
+    /// The public end of a reverse proxy (Xray's `reverse.portals`): what is
+    /// routed here leaves through a bridge that has dialled in, and the
+    /// bridge's own dial-in (addressed to `domain`) is how it registers.
+    Portal {
+        domain: Arc<str>,
+    },
     Vless(VlessConfig),
     Trojan(TrojanConfig),
     Shadowsocks(ShadowsocksConfig),
@@ -923,13 +1222,16 @@ impl OutboundProtocol {
     pub fn name(&self) -> &'static str {
         match self {
             OutboundProtocol::Freedom { .. } => "freedom",
-            OutboundProtocol::Blackhole => "blackhole",
-            OutboundProtocol::Dns => "dns",
+            OutboundProtocol::Blackhole { .. } => "blackhole",
+            OutboundProtocol::Dns { .. } => "dns",
+            OutboundProtocol::Loopback { .. } => "loopback",
+            OutboundProtocol::Portal { .. } => "portal",
             OutboundProtocol::Vless(_) => "vless",
             OutboundProtocol::Trojan(_) => "trojan",
             OutboundProtocol::Shadowsocks(_) => "shadowsocks",
             OutboundProtocol::Vmess(_) => "vmess",
             OutboundProtocol::AnyTls(_) => "anytls",
+            OutboundProtocol::Socks(k) if k.http => "http",
             OutboundProtocol::Socks(_) => "socks",
             OutboundProtocol::Tor(_) => "tor",
             OutboundProtocol::MasterDns(_) => "masterdns",
@@ -971,6 +1273,9 @@ pub struct VlessConfig {
     /// `none`, or Xray's post-quantum VLESS Encryption
     /// (`mlkem768x25519plus...`, see [`is_vless_encryption`]).
     pub encryption: Box<str>,
+    /// Xray's `testseed` for Vision's padding (four numbers; see
+    /// `zero_protocol::vision::VisionSeed`). `None` is the defaults.
+    pub vision_seed: Option<[u32; 4]>,
 }
 
 impl VlessConfig {
@@ -1135,6 +1440,10 @@ pub struct SocksConfig {
     pub address: Address,
     pub port: u16,
     pub auth: Option<SocksCredential>,
+    /// The upstream is an HTTP proxy spoken to with `CONNECT` (Xray's `http`
+    /// outbound), not a SOCKS5 one. Everything else about it is the same: a
+    /// TCP-only upstream that resolves names itself.
+    pub http: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1229,6 +1538,210 @@ pub struct TideConfig {
     /// Replace a working connection now and then, before it gets old enough
     /// to be remembered. On unless the link says `rotate=0`.
     pub rotate: bool,
+    /// Everything else a link can adjust; all unset in a plain link.
+    pub tuning: TideTuning,
+}
+
+/// The optional knobs of a Tide link, each `None` (or empty) meaning "the
+/// built-in default". They change how the client *looks* and *paces*; none of
+/// them changes what the server must know, so any client may use any mix
+/// against the same server.
+///
+/// How it is read: [`TideTuning::parse`] takes a lookup (`key -> text`), so a
+/// share link's query and a JSON `settings` object go through the same
+/// checks. A value that is out of range is an error, never silently clamped:
+/// `pipes=9` should say so, not quietly mean 4.
+///
+/// | key         | meaning                                               | range            |
+/// |-------------|-------------------------------------------------------|------------------|
+/// | `authority` | HTTP `:authority` / `Host`, apart from the TLS name   | a host name      |
+/// | `ua`        | browser: `chrome` `firefox` `safari` `edge` `android` `ios`, or any text | printable ASCII |
+/// | `lang`      | `accept-language`                                     | printable ASCII  |
+/// | `headers`   | extra headers, `name:value,name:value`                | up to 8          |
+/// | `pipes`     | download requests open at once                        | 1 to 4           |
+/// | `uploads`   | upload requests waiting for an answer at once         | 1 to 6           |
+/// | `ping`      | seconds between HTTP/2 pings                          | 4 to 120         |
+/// | `idle`      | seconds with no stream before a session closes        | 30 to 3600       |
+/// | `linger`    | milliseconds an upload waits for more to send         | 0 to 5000        |
+/// | `age`       | connection age before replacing it, `min-max` seconds | 30 to 86400      |
+/// | `volume`    | megabytes through a connection before replacing it    | 64 to 65536      |
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct TideTuning {
+    pub authority: Option<Box<str>>,
+    pub user_agent: Option<Box<str>>,
+    pub language: Option<Box<str>>,
+    pub headers: Vec<(Box<str>, Box<str>)>,
+    pub down_pipes: Option<u8>,
+    pub up_pipes: Option<u8>,
+    pub ping_secs: Option<u16>,
+    pub idle_secs: Option<u16>,
+    pub linger_ms: Option<u16>,
+    pub age_secs: Option<(u32, u32)>,
+    pub volume_mb: Option<u32>,
+}
+
+/// The `User-Agent` a `ua=` preset stands for. Each is a current stable
+/// release of that browser, so the header matches what the TLS `fp=` of the
+/// same name sends.
+pub fn tide_user_agent_preset(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "chrome" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "edge" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
+        "firefox" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
+        "safari" => "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15",
+        "android" => "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36",
+        "ios" => "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1",
+        _ => return None,
+    })
+}
+
+/// Header names a link may not set: the ones Tide or HTTP/2 itself depends on
+/// (`content-type` marks a Tide body, `content-length` frames it), the ones
+/// that would change how the connection behaves, and the two that have their
+/// own keys.
+const TIDE_HEADERS_REFUSED: &[&str] = &[
+    "host",
+    "content-length",
+    "content-type",
+    "content-encoding",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "upgrade",
+    "te",
+    "trailer",
+    "expect",
+    "proxy-authorization",
+    "proxy-connection",
+    "user-agent",
+    "accept-language",
+];
+
+fn tide_plain_text(text: &str, what: &str, max: usize) -> Result<Box<str>, String> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > max || !text.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        return Err(format!(
+            "Tide {what} must be 1 to {max} printable ASCII characters"
+        ));
+    }
+    Ok(text.into())
+}
+
+fn tide_number<T: TryFrom<u64>>(text: &str, what: &str, low: u64, high: u64) -> Result<T, String> {
+    text.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|n| (low..=high).contains(n))
+        .and_then(|n| T::try_from(n).ok())
+        .ok_or_else(|| format!("Tide {what} must be a number from {low} to {high}"))
+}
+
+impl TideTuning {
+    /// Read the options from `get`, which returns the text for a key or
+    /// `None` when the link does not set it. An empty value counts as unset.
+    pub fn parse(get: &dyn Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let get = |key: &str| get(key).filter(|value| !value.trim().is_empty());
+        let mut tuning = Self::default();
+        if let Some(name) = get("authority").or_else(|| get("host")) {
+            let name = name.trim();
+            let plain = name.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']')
+            });
+            if name.len() > 253 || !plain {
+                return Err("Tide authority must be a host name".into());
+            }
+            tuning.authority = Some(name.to_ascii_lowercase().into());
+        }
+        if let Some(agent) = get("ua") {
+            let key = agent.trim().to_ascii_lowercase();
+            tuning.user_agent = Some(match tide_user_agent_preset(&key) {
+                Some(preset) => preset.into(),
+                None => tide_plain_text(&agent, "ua", 256)?,
+            });
+        }
+        if let Some(language) = get("lang") {
+            tuning.language = Some(tide_plain_text(&language, "lang", 64)?);
+        }
+        if let Some(list) = get("headers") {
+            for pair in list.split(',').filter(|pair| !pair.trim().is_empty()) {
+                let (name, value) = pair
+                    .split_once(':')
+                    .ok_or("Tide headers must look like name:value,name:value")?;
+                let name = name.trim().to_ascii_lowercase();
+                let token = !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+                if !token || TIDE_HEADERS_REFUSED.contains(&name.as_str()) {
+                    return Err(format!("Tide headers may not set {name:?}"));
+                }
+                let value = tide_plain_text(value, "header value", 512)?;
+                tuning.headers.push((name.into(), value));
+            }
+            if tuning.headers.len() > 8 {
+                return Err("Tide headers allows at most 8 headers".into());
+            }
+        }
+        if let Some(text) = get("pipes") {
+            tuning.down_pipes = Some(tide_number(&text, "pipes", 1, 4)?);
+        }
+        if let Some(text) = get("uploads") {
+            tuning.up_pipes = Some(tide_number(&text, "uploads", 1, 6)?);
+        }
+        if let Some(text) = get("ping") {
+            tuning.ping_secs = Some(tide_number(&text, "ping", 4, 120)?);
+        }
+        if let Some(text) = get("idle") {
+            tuning.idle_secs = Some(tide_number(&text, "idle", 30, 3600)?);
+        }
+        if let Some(text) = get("linger") {
+            tuning.linger_ms = Some(tide_number(&text, "linger", 0, 5000)?);
+        }
+        if let Some(text) = get("age") {
+            let (low, high) = text.split_once('-').unwrap_or((&text, &text));
+            let low: u32 = tide_number(low, "age", 30, 86_400)?;
+            let high: u32 = tide_number(high, "age", 30, 86_400)?;
+            if low > high {
+                return Err("Tide age must be min-max, smallest first".into());
+            }
+            tuning.age_secs = Some((low, high));
+        }
+        if let Some(text) = get("volume") {
+            tuning.volume_mb = Some(tide_number(&text, "volume", 64, 65_536)?);
+        }
+        Ok(tuning)
+    }
+}
+
+// Header values may carry a cookie, which is a password of sorts: the debug
+// form names the headers and stands a digest in for their values, so two
+// different cookies still make two different cache keys.
+impl std::fmt::Debug for TideTuning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let digest = self
+            .headers
+            .iter()
+            .flat_map(|(_, value)| value.bytes())
+            .fold(0u64, |mark, b| {
+                mark.wrapping_mul(0x100_0000_01b3) ^ u64::from(b)
+            });
+        let names: Vec<&str> = self.headers.iter().map(|(name, _)| &**name).collect();
+        f.debug_struct("TideTuning")
+            .field("authority", &self.authority)
+            .field("user_agent", &self.user_agent)
+            .field("language", &self.language)
+            .field("headers", &names)
+            .field("headers_digest", &format_args!("{digest:016x}"))
+            .field("down_pipes", &self.down_pipes)
+            .field("up_pipes", &self.up_pipes)
+            .field("ping_secs", &self.ping_secs)
+            .field("idle_secs", &self.idle_secs)
+            .field("linger_ms", &self.linger_ms)
+            .field("age_secs", &self.age_secs)
+            .field("volume_mb", &self.volume_mb)
+            .finish()
+    }
 }
 
 /// How much a Tide server pads its answers to an upload, so the flow's
@@ -1479,13 +1992,31 @@ pub struct Outbound {
 pub struct MuxConfig {
     pub enabled: bool,
     pub max_concurrency: u16,
+    /// Xray's `xudpProxyUDP443`: what happens to UDP datagrams for port 443
+    /// (QUIC) on a mux outbound.
+    pub udp443: Udp443,
+}
+
+/// Xray's `xudpProxyUDP443`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Udp443 {
+    /// Refused, so the application falls back to TCP (Xray's default).
+    #[default]
+    Reject,
+    /// Carried over the mux like any other datagram.
+    Allow,
+    /// Sent outside the mux, as the outbound would without it.
+    Skip,
 }
 
 impl Outbound {
     /// Whether this outbound can run over a connection another outbound
     /// already opened (`dialerProxy`, a WARP exit): a stream protocol over
     /// plain TCP, WebSocket, HTTPUpgrade or gRPC, without Mux. QUIC carriers
-    /// and XHTTP need a socket of their own.
+    /// and XHTTP need a socket of their own. A Tide server is not listed: it
+    /// needs several connections, so it takes a way to open them instead
+    /// (`zero_runtime::outbound::connect_tide_via`) and has no place where a
+    /// single carried stream is all there is (a WARP exit list).
     pub fn chainable(&self) -> bool {
         matches!(
             self.protocol,
@@ -1508,6 +2039,20 @@ impl Outbound {
     /// Reject combinations that cannot work, before any socket is opened.
     pub fn validate(&self) -> Result<(), String> {
         let caps = self.stream.transport.capabilities();
+
+        // Salamander, port hopping and QUIC parameters shape a QUIC carrier's
+        // UDP socket. On anything else they would be dropped without a word,
+        // and the connection would go out plain while the config said it was
+        // obfuscated.
+        let evasion = &self.stream.evasion;
+        if (evasion.udp_salamander.is_some() || evasion.udp_hop.is_some() || evasion.quic.is_some())
+            && !matches!(self.protocol, OutboundProtocol::Hysteria2(_))
+        {
+            return Err(format!(
+                "outbound {}: the UDP masks salamander and udphop and quicParams apply to Hysteria 2 only",
+                self.tag
+            ));
+        }
 
         if self.stream.raw_http_header.is_some() && !matches!(self.stream.transport, Transport::Raw)
         {
@@ -1772,7 +2317,7 @@ impl Outbound {
                     self.tag
                 ));
             }
-            if !self.stream.evasion.is_empty() || self.stream.raw_http_header.is_some() {
+            if self.stream.evasion.has_non_quic_shaping() || self.stream.raw_http_header.is_some() {
                 return Err(format!(
                     "outbound {}: Hysteria2 cannot carry TCP finalmask or raw HTTP camouflage",
                     self.tag
@@ -1799,7 +2344,7 @@ impl Outbound {
                     self.tag
                 ));
             }
-            if !self.stream.evasion.is_empty() || self.stream.raw_http_header.is_some() {
+            if self.stream.evasion.has_non_quic_shaping() || self.stream.raw_http_header.is_some() {
                 return Err(format!(
                     "outbound {}: TUIC cannot carry TCP finalmask or raw HTTP camouflage",
                     self.tag
@@ -1826,7 +2371,7 @@ impl Outbound {
                     self.tag
                 ));
             }
-            if !self.stream.evasion.is_empty() || self.stream.raw_http_header.is_some() {
+            if self.stream.evasion.has_non_quic_shaping() || self.stream.raw_http_header.is_some() {
                 return Err(format!(
                     "outbound {}: Juicity cannot carry TCP finalmask or raw HTTP camouflage",
                     self.tag
@@ -2069,11 +2614,60 @@ pub enum InboundProtocol {
     Tuic(TuicInboundConfig),
     /// Full IP TUN inbound backed by the userspace TCP/UDP netstack.
     Tun(TunInboundConfig),
-    /// Fixed-destination listener, used for DNS interception.
+    /// A WireGuard server: peers' tunnelled IP packets are terminated in the
+    /// same userspace netstack the TUN inbound uses.
+    WireGuard(WireGuardInboundConfig),
+    /// Dokodemo-door: a listener that takes whatever arrives for one fixed
+    /// destination (DNS interception), or, with `follow_redirect`, for the
+    /// destination a gateway rule redirected it from (see `Sockopt::tproxy`).
     Dokodemo {
-        target: Option<(Address, u16)>,
-        network: Network,
+        /// Xray's `address` / `rewriteAddress` and `port` / `rewritePort`.
+        /// Both set, they are the fixed destination. With `follow_redirect`
+        /// they replace just that part of the destination the connection was
+        /// really addressed to.
+        address: Option<Address>,
+        port: Option<u16>,
+        /// Xray's `portMap`: the destination for a connection that arrived on
+        /// a given listening port. It wins over `address` and `port`.
+        port_map: Vec<(u16, Address, u16)>,
+        /// Which of TCP and UDP it listens for (Xray's `network`).
+        tcp: bool,
+        udp: bool,
+        /// Xray's `followRedirect`: use the destination the connection was
+        /// really addressed to (see `Sockopt::tproxy`).
+        follow_redirect: bool,
     },
+}
+
+impl Inbound {
+    /// Where a dokodemo connection should go. `original` is the destination a
+    /// transparent connection was really addressed to, when there is one.
+    /// `None` for any other kind of inbound, or when nothing names a
+    /// destination.
+    pub fn dokodemo_destination(
+        &self,
+        original: Option<std::net::SocketAddr>,
+    ) -> Option<(Address, u16)> {
+        let InboundProtocol::Dokodemo {
+            address,
+            port,
+            port_map,
+            ..
+        } = &self.protocol
+        else {
+            return None;
+        };
+        if let Some((_, address, port)) = port_map.iter().find(|(from, ..)| *from == self.port) {
+            return Some((address.clone(), *port));
+        }
+        match original {
+            Some(found) => Some((
+                address.clone().unwrap_or(Address::Ip(found.ip())),
+                port.unwrap_or(found.port()),
+            )),
+            None => Some((address.clone()?, (*port)?)),
+        }
+    }
 }
 
 impl InboundProtocol {
@@ -2096,6 +2690,7 @@ impl InboundProtocol {
             InboundProtocol::Tuic(_) => "tuic",
             InboundProtocol::Tun(_) => "tun",
             InboundProtocol::Dokodemo { .. } => "dokodemo",
+            InboundProtocol::WireGuard(_) => "wireguard",
         }
     }
 }
@@ -2103,24 +2698,121 @@ impl InboundProtocol {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VlessInboundConfig {
     pub users: Box<[VlessInboundUser]>,
+    /// Xray's `decryption`: the VLESS Encryption server setting
+    /// (`mlkem768x25519plus.<mode>.<seconds>.<keys>`), or `None` for plain
+    /// VLESS. Its contents are private keys and are checked when the inbound
+    /// starts, not here.
+    pub decryption: Option<Arc<str>>,
     /// Where a connection that is not a valid VLESS request is sent instead
     /// of being closed (Xray's `fallbacks`): usually a web server, so that a
     /// prober is answered by a real site.
-    pub fallback: Option<(Address, u16)>,
+    pub fallbacks: Box<[FallbackRule]>,
+}
+
+/// One entry of Xray's `fallbacks`: which unauthenticated connections it
+/// takes (by the server name they asked for, the ALPN they negotiated and the
+/// path of the HTTP request they opened with) and where they go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackRule {
+    /// The TLS server name; `None` takes any.
+    pub name: Option<Box<str>>,
+    /// The negotiated ALPN protocol (`h2`, `http/1.1`); `None` takes any.
+    pub alpn: Option<Box<str>>,
+    /// The path of an HTTP/1 request the connection starts with; `None`
+    /// takes any, including a connection that is not HTTP.
+    pub path: Option<Box<str>>,
+    pub dest: (Address, u16),
+    /// The PROXY protocol version to send ahead of the connection (1 or 2),
+    /// so the web server behind learns the real client; 0 sends none.
+    pub xver: u8,
+}
+
+/// What is known about a connection when it is handed to a fallback.
+#[derive(Debug, Clone, Default)]
+pub struct FallbackProbe<'a> {
+    pub server_name: Option<&'a str>,
+    pub alpn: Option<&'a [u8]>,
+    /// The first bytes the client sent.
+    pub first_bytes: &'a [u8],
+}
+
+impl FallbackProbe<'_> {
+    /// The request path if the first bytes are the start of an HTTP/1
+    /// request, without its query.
+    fn http_path(&self) -> Option<&str> {
+        let line_end = self
+            .first_bytes
+            .iter()
+            .position(|b| *b == b'\r' || *b == b'\n')?;
+        let line = std::str::from_utf8(&self.first_bytes[..line_end]).ok()?;
+        let mut parts = line.split(' ');
+        let method = parts.next()?;
+        let target = parts.next()?;
+        let version = parts.next()?;
+        (method.bytes().all(|b| b.is_ascii_uppercase())
+            && version.starts_with("HTTP/")
+            && target.starts_with('/'))
+        .then(|| target.split(['?', '#']).next().unwrap_or(target))
+    }
+}
+
+/// The rule that takes a connection, as Xray chooses: among the rules whose
+/// conditions all hold, the one most particular about the name first, then
+/// the ALPN, then the path; a rule with no conditions is the default.
+pub fn select_fallback<'a>(
+    rules: &'a [FallbackRule],
+    probe: &FallbackProbe<'_>,
+) -> Option<&'a FallbackRule> {
+    let path = probe.http_path();
+    rules
+        .iter()
+        .filter(|rule| {
+            rule.name.as_deref().is_none_or(|name| {
+                probe
+                    .server_name
+                    .is_some_and(|sni| sni.eq_ignore_ascii_case(name))
+            }) && rule
+                .alpn
+                .as_deref()
+                .is_none_or(|alpn| probe.alpn.is_some_and(|got| got == alpn.as_bytes()))
+                && rule
+                    .path
+                    .as_deref()
+                    .is_none_or(|wanted| path == Some(wanted))
+        })
+        .max_by_key(|rule| {
+            (
+                rule.name.is_some(),
+                rule.alpn.is_some(),
+                rule.path.is_some(),
+            )
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VlessInboundUser {
     pub uuid: [u8; 16],
     pub flow: Flow,
+    /// The `testseed` for this account's Vision padding: its own, or the
+    /// inbound's.
+    pub vision_seed: Option<[u32; 4]>,
+    /// The account's name (Xray's `email`), what `user` routing rules and
+    /// per-account figures refer to.
+    pub email: Option<Arc<str>>,
+    /// Xray's `reverse.tag` on an account: this account belongs to a
+    /// reverse-proxy bridge. It may only dial in as one, and what it carries
+    /// is reached by routing to an outbound of this tag.
+    pub reverse: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TrojanInboundConfig {
     pub password_hashes: Box<[[u8; 56]]>,
+    /// The `email` of each client, in the order of `password_hashes`.
+    pub emails: Box<[Option<Arc<str>>]>,
     /// Where a connection without a valid password is sent instead of being
     /// closed (Xray's `fallbacks`).
-    pub fallback: Option<(Address, u16)>,
+    pub fallbacks: Box<[FallbackRule]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -2128,10 +2820,11 @@ pub struct VmessInboundConfig {
     pub users: Box<[VmessInboundUser]>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmessInboundUser {
     pub uuid: [u8; 16],
     pub cipher: VmessCipher,
+    pub email: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2163,6 +2856,29 @@ pub struct TideInboundConfig {
     /// The secret path the control panel is served under; none, no panel.
     pub admin_path: Option<Box<str>>,
     pub shape: TideShape,
+    /// Set when the inbound sits behind REALITY: what a client's link must
+    /// carry to get through it.
+    pub reality: Option<TideRealityLink>,
+}
+
+/// The parts of a ZeroV1 server's REALITY setup that its links repeat: the
+/// name clients put in the hello, the secret their public key is made from,
+/// and the first short id (empty when the server takes any).
+#[derive(Clone, PartialEq, Eq)]
+pub struct TideRealityLink {
+    pub server_name: Box<str>,
+    pub private_key: [u8; 32],
+    pub short_id: Box<str>,
+}
+
+// The REALITY secret is the server's key: never in a log.
+impl std::fmt::Debug for TideRealityLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TideRealityLink")
+            .field("server_name", &self.server_name)
+            .field("short_id", &self.short_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A Tide relay: it holds no key and no user, only where the egress is.
@@ -2206,6 +2922,7 @@ impl std::fmt::Debug for TideConfig {
             .field("packet_upload", &self.packet_upload)
             .field("datagrams", &self.datagrams)
             .field("rotate", &self.rotate)
+            .field("tuning", &self.tuning)
             .field("identity", &format_args!("{mark:016x}"))
             .finish()
     }
@@ -2239,12 +2956,73 @@ impl std::fmt::Debug for TideUser {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Hysteria2InboundConfig {
     pub passwords: Box<[Box<str>]>,
+    /// Salamander password: every UDP datagram is obfuscated with it, and a
+    /// client without it gets no answer at all.
+    pub obfs_password: Option<Box<str>>,
+    /// What a visitor who is not a Hysteria2 client is shown (Xray's
+    /// `masquerade`); without it, a bare 404.
+    pub masquerade: Option<Hysteria2Masquerade>,
+}
+
+/// The website a Hysteria2 server pretends to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hysteria2Masquerade {
+    /// One fixed response to every request (`type: "string"`).
+    Text {
+        status: u16,
+        headers: Vec<(Box<str>, Box<str>)>,
+        content: Box<str>,
+    },
+    /// A directory of static files (`type: "file"`, `dir`).
+    Files { dir: Box<str> },
+    /// Another site's pages, GET and HEAD only (`type: "proxy"`, `url`).
+    Proxy { url: Box<str> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuicInboundConfig {
     pub uuid: [u8; 16],
     pub password: Box<str>,
+}
+
+/// The WireGuard inbound (Xray's `wireguard` with `settings.peers`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct WireGuardInboundConfig {
+    pub secret_key: [u8; 32],
+    /// The userspace stack's MTU: the packet size inside the tunnel.
+    pub mtu: usize,
+    pub peers: Box<[WireGuardPeer]>,
+}
+
+// The secret key is left out of the debug form, so a log line that prints a
+// config does not print it.
+impl std::fmt::Debug for WireGuardInboundConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireGuardInboundConfig")
+            .field("mtu", &self.mtu)
+            .field("peers", &self.peers.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct WireGuardPeer {
+    pub public_key: [u8; 32],
+    pub preshared_key: Option<[u8; 32]>,
+    /// Addresses the peer may send from and be sent to (Xray's `allowedIPs`,
+    /// all addresses when it is absent).
+    pub allowed_ips: Box<[crate::routing::ipnet_lite::Cidr]>,
+    pub keepalive: Option<u16>,
+    pub email: Option<Arc<str>>,
+}
+
+impl std::fmt::Debug for WireGuardPeer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireGuardPeer")
+            .field("allowed_ips", &self.allowed_ips)
+            .field("email", &self.email)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2289,6 +3067,13 @@ pub struct Inbound {
     pub security: InboundSecurity,
     pub sniffing: Sniffing,
     pub socks_auth: SocksAuth,
+    /// The listener's socket settings and what is done to each connection it
+    /// accepts (Xray's `streamSettings.sockopt` on an inbound).
+    pub sockopt: Sockopt,
+    /// Expect a PROXY protocol header (version 1 or 2) at the start of every
+    /// connection, from a load balancer in front of this inbound, and take
+    /// the client's address from it.
+    pub accept_proxy_protocol: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -2315,11 +3100,20 @@ pub enum InboundSecurity {
     Reality(InboundRealityConfig),
 }
 
+/// A certificate chain and its private key, as the bytes read from the config.
+pub type CertificateAndKey = (Box<[u8]>, Box<[u8]>);
+
 #[derive(Debug, Clone)]
 pub struct InboundTlsConfig {
     pub certificate: Box<[u8]>,
     pub private_key: Box<[u8]>,
     pub alpn: Box<[Box<str>]>,
+    /// More certificates and keys, one of which is chosen by the server name
+    /// the client asks for; the first pair above is the default.
+    pub extra_identities: Box<[CertificateAndKey]>,
+    /// Xray's `rejectUnknownSni`: a hello naming something none of the
+    /// certificates is valid for (or naming nothing) fails the handshake.
+    pub reject_unknown_sni: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2328,6 +3122,48 @@ pub struct InboundRealityConfig {
     pub private_key: [u8; 32],
     pub short_ids: Box<[Box<[u8]>]>,
     pub target: Option<(Address, u16)>,
+    /// Xray's `mldsa65Seed`: the server signs every handshake with an
+    /// ML-DSA-65 key made from this seed, so a client holding the matching
+    /// `mldsa65Verify` key can tell the real server from one that merely
+    /// knows the x25519 key. A secret: it is never printed.
+    pub mldsa65_seed: Option<Secret32>,
+    /// How far the client's clock may differ from this server's, in
+    /// milliseconds, before the handshake is treated as not REALITY (a
+    /// replayed hello is the case this stops). 0 means no check.
+    pub max_time_diff_ms: u64,
+    /// The oldest and newest client versions accepted, as `[major, minor,
+    /// patch]` from the session id. Unset means any.
+    pub min_client_ver: Option<[u8; 3]>,
+    pub max_client_ver: Option<[u8; 3]>,
+    /// The PROXY protocol version (1 or 2) to send to the target when a
+    /// connection is handed to it, so the target sees the real client; 0
+    /// sends none.
+    pub fallback_xver: u8,
+    /// Limits on what an unauthenticated client may move through the
+    /// fallback: a rate-limited probe cannot be used to read a lot from
+    /// the target or to feed it traffic.
+    pub fallback_limit_up: FallbackLimit,
+    pub fallback_limit_down: FallbackLimit,
+}
+
+/// Xray's `limitFallbackUpload` / `limitFallbackDownload`: after
+/// `after_bytes`, the flow is held to `bytes_per_sec` (with a burst of
+/// `burst_bytes_per_sec`). Zero in `bytes_per_sec` means unlimited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FallbackLimit {
+    pub after_bytes: u64,
+    pub bytes_per_sec: u64,
+    pub burst_bytes_per_sec: u64,
+}
+
+/// 32 secret bytes that print as nothing.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret32(pub [u8; 32]);
+
+impl std::fmt::Debug for Secret32 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret32(..)")
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2341,12 +3177,81 @@ pub struct Sniffing {
     /// When set, a sniffed domain informs routing but does not rewrite the
     /// destination.
     pub route_only: bool,
+    /// Names that never steer a connection when sniffed (Xray's
+    /// `domainsExcluded`): push services and the like that break if their
+    /// address is replaced by what their TLS name resolves to. Same syntax
+    /// as a routing rule's `domain`.
+    pub domains_excluded: Box<[crate::routing::DomainPattern]>,
+    /// Sniff only what is already known about the connection (Xray's
+    /// `metadataOnly`): no bytes are read, so only FakeDNS can supply a name.
+    pub metadata_only: bool,
+}
+
+impl Sniffing {
+    /// What the first bytes of a connection say, with an excluded name
+    /// dropped: the protocol label stays (a `bittorrent` or `tls` rule still
+    /// matches) but the name never steers the connection.
+    pub fn inspect(&self, bytes: &[u8]) -> zero_core::Sniffed {
+        let mut sniffed = zero_core::sniff::inspect(bytes, self.sniff_http, self.sniff_tls);
+        if sniffed.domain.as_deref().is_some_and(|d| self.excludes(d)) {
+            sniffed.domain = None;
+        }
+        sniffed
+    }
+
+    /// Whether `domain` is on the `domainsExcluded` list. Geosite patterns
+    /// are not evaluated here (no geodata at this layer) and never exclude.
+    pub fn excludes(&self, domain: &str) -> bool {
+        use crate::routing::DomainPattern as P;
+        let domain = domain.to_ascii_lowercase();
+        self.domains_excluded.iter().any(|pattern| match pattern {
+            P::Full(name) => domain == **name,
+            P::Suffix(name) => {
+                domain == **name
+                    || domain
+                        .strip_suffix(&**name)
+                        .is_some_and(|rest| rest.ends_with('.'))
+            }
+            P::Keyword(word) => domain.contains(&**word),
+            P::Regex(_) | P::Geosite(_) => false,
+        })
+    }
+}
+
+// ------------------------------------------------------------------ policy
+
+/// Xray's connection policy for level 0, the only level accounts here have.
+/// Every value defaults to what the runtime already did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Policy {
+    /// Everything a client does before its first proxied byte: the TLS
+    /// handshake, the transport upgrade, the request header.
+    pub handshake: Duration,
+    /// A connection that moves no byte in either direction this long is closed.
+    pub conn_idle: Duration,
+    /// After one direction has finished, how long the other may stay silent.
+    /// Xray names the two cases `uplinkOnly` and `downlinkOnly`; here the
+    /// longer of the two is used for both.
+    pub half_close: Duration,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            handshake: Duration::from_secs(60),
+            conn_idle: Duration::from_secs(300),
+            half_close: Duration::from_secs(1),
+        }
+    }
 }
 
 // ------------------------------------------------------------------ runtime
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
+    /// How long a connection may sit idle, and how long a client may take to
+    /// start talking (Xray's `policy.levels."0"`).
+    pub policy: Policy,
     pub inbounds: Box<[Inbound]>,
     pub outbounds: Box<[Outbound]>,
     pub routing: crate::routing::Routing,
@@ -2356,6 +3261,20 @@ pub struct RuntimeConfig {
     /// application supplies geodata itself.
     pub assets: Option<AssetsConfig>,
     pub log_level: Box<str>,
+    /// Reverse-proxy bridges (Xray's `reverse.bridges`): each keeps a
+    /// connection open to its portal and serves what comes back down it.
+    pub bridges: Box<[ReverseBridge]>,
+}
+
+/// One reverse-proxy bridge. Its connections to the portal are routed as if
+/// they had arrived on an inbound called `tag`, addressed to `domain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReverseBridge {
+    pub tag: Arc<str>,
+    pub domain: Arc<str>,
+    /// For a VLESS account's `reverse`: the outbound that dials the portal
+    /// with the reverse command. Without it the dial is routed (`domain`).
+    pub via: Option<Arc<str>>,
 }
 
 /// Where routing rule sets come from and how often they are refreshed.
@@ -2518,7 +3437,7 @@ impl RuntimeConfig {
             .filter(|(_, o)| {
                 !matches!(
                     &o.protocol,
-                    OutboundProtocol::Dns | OutboundProtocol::Blackhole
+                    OutboundProtocol::Dns { .. } | OutboundProtocol::Blackhole { .. }
                 ) && b.selector.iter().any(|sel| o.tag.starts_with(sel.as_ref()))
             })
             .map(|(i, _)| OutboundId(i as u32))
@@ -2571,6 +3490,14 @@ impl RuntimeConfig {
             }
         }
         for b in self.routing.balancers.iter() {
+            if let Some(fallback) = &b.fallback {
+                if self.outbound_by_tag(fallback).is_none() {
+                    return Err(format!(
+                        "balancer {:?} has an unknown fallbackTag {fallback:?}",
+                        b.tag
+                    ));
+                }
+            }
             if self.expand_balancer(b).is_empty() {
                 return Err(format!(
                     "balancer {:?} selects no outbound (selector {:?})",
@@ -2634,5 +3561,72 @@ mod tests {
         assert_eq!(Flow::parse("xtls-rprx-vision"), Some(Flow::Vision));
         assert!(Flow::parse("xtls-rprx-vision").unwrap().is_vision());
         assert_eq!(Flow::parse(""), Some(Flow::None));
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    fn rule(name: Option<&str>, alpn: Option<&str>, path: Option<&str>, port: u16) -> FallbackRule {
+        FallbackRule {
+            name: name.map(Box::from),
+            alpn: alpn.map(Box::from),
+            path: path.map(Box::from),
+            dest: (Address::parse_host("127.0.0.1"), port),
+            xver: 0,
+        }
+    }
+
+    fn pick(
+        rules: &[FallbackRule],
+        sni: Option<&str>,
+        alpn: Option<&[u8]>,
+        first: &[u8],
+    ) -> Option<u16> {
+        select_fallback(
+            rules,
+            &FallbackProbe {
+                server_name: sni,
+                alpn,
+                first_bytes: first,
+            },
+        )
+        .map(|rule| rule.dest.1)
+    }
+
+    #[test]
+    fn the_most_particular_rule_that_holds_wins() {
+        let rules = [
+            rule(None, None, None, 1),
+            rule(None, None, Some("/ws"), 2),
+            rule(None, Some("h2"), None, 3),
+            rule(Some("a.example"), None, None, 4),
+        ];
+        let http = |path: &str| format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").into_bytes();
+        // Nothing particular: the default.
+        assert_eq!(pick(&rules, None, None, &http("/")), Some(1));
+        // The path.
+        assert_eq!(pick(&rules, None, Some(b"http/1.1"), &http("/ws")), Some(2));
+        // The ALPN beats the path; the name beats both.
+        assert_eq!(pick(&rules, None, Some(b"h2"), &http("/ws")), Some(3));
+        assert_eq!(
+            pick(&rules, Some("A.Example"), Some(b"h2"), &http("/ws")),
+            Some(4)
+        );
+        // A name that is not the one asked for does not apply.
+        assert_eq!(pick(&rules, Some("b.example"), None, &http("/")), Some(1));
+    }
+
+    #[test]
+    fn without_a_default_an_unmatched_connection_has_nowhere_to_go() {
+        let rules = [rule(None, None, Some("/ws"), 2)];
+        assert_eq!(pick(&rules, None, None, b"GET / HTTP/1.1\r\n\r\n"), None);
+        assert_eq!(pick(&rules, None, None, b"not http"), None);
+        assert_eq!(
+            pick(&rules, None, None, b"GET /ws HTTP/1.1\r\n\r\n"),
+            Some(2)
+        );
+        assert_eq!(pick(&[], None, None, b"GET / HTTP/1.1\r\n\r\n"), None);
     }
 }
