@@ -25,7 +25,7 @@ use crate::facts::{Facts, Problem};
 use crate::guide;
 use crate::keys;
 use crate::layout::{self, MasterDnsServer, RealityInbound};
-use crate::record::{self, MasterDns, Reality, ServerRecord, Service, User, Xhttp};
+use crate::record::{self, MasterDns, Reality, ServerRecord, Service, User, Xhttp, Zerov1};
 use crate::release;
 use crate::scripts;
 use crate::ssh::{self, Auth, Connection, HostKey, Login};
@@ -36,6 +36,7 @@ use crate::ssh::{self, Auth, Connection, HostKey, Login};
 pub enum Preset {
     Reality,
     Xhttp,
+    Zerov1,
     MasterDns,
 }
 
@@ -94,6 +95,17 @@ pub struct XhttpRequest {
     pub port: Option<u16>,
 }
 
+/// ZeroV1 inside REALITY: the same server program, keys and users as
+/// [`RealityRequest`], on its own port.
+pub struct Zerov1Request {
+    /// The real website the server impersonates (used when neither REALITY
+    /// nor XHTTP is installed too; otherwise their site is shared).
+    pub sni: String,
+    /// `None` picks 443 when it is the only service, else the first free
+    /// fallback.
+    pub port: Option<u16>,
+}
+
 pub struct MasterDnsRequest {
     /// The tunnel domain, as [`guide::clean_domain`] returns it.
     pub domain: String,
@@ -106,6 +118,7 @@ pub struct Request {
     pub first_user: String,
     pub reality: Option<RealityRequest>,
     pub xhttp: Option<XhttpRequest>,
+    pub zerov1: Option<Zerov1Request>,
     pub masterdns: Option<MasterDnsRequest>,
     pub binary: BinarySource,
     /// Install the app's own key so it can come back without the password.
@@ -299,8 +312,9 @@ pub async fn install(
     request: &Request,
     on: &(dyn Fn(Event) + Sync),
 ) -> Result<Outcome, Error> {
-    // REALITY and XHTTP share one server program, so they count as one preset.
-    let zray = request.reality.is_some() || request.xhttp.is_some();
+    // REALITY, XHTTP and ZeroV1 share one server program, so they count as one
+    // preset.
+    let zray = request.reality.is_some() || request.xhttp.is_some() || request.zerov1.is_some();
     let presets = usize::from(zray) + usize::from(request.masterdns.is_some());
     if presets == 0 {
         return Err(Error::NothingToInstall);
@@ -378,7 +392,7 @@ pub async fn install(
     let mut management = 0;
 
     if zray {
-        let (vision, xhttp, deployed) =
+        let (vision, xhttp, zerov1, deployed) =
             deploy_zray(&conn, &facts, request, arch, &mut progress, &mut notes).await?;
         verified = deployed.verified;
         version = deployed.version;
@@ -390,6 +404,10 @@ pub async fn install(
         if let Some(service) = xhttp {
             tcp_ports.push(service.port);
             services.push(Service::Xhttp(service));
+        }
+        if let Some(service) = zerov1 {
+            tcp_ports.push(service.port);
+            services.push(Service::Zerov1(service));
         }
     }
 
@@ -486,8 +504,9 @@ struct Deployed {
 }
 
 /// Download, install, configure and start the Zray server with the REALITY
-/// (Vision) and XHTTP inbounds the request asks for. Both share one key pair
-/// and one user list. Returns the services and facts for the record.
+/// (Vision), XHTTP and ZeroV1 inbounds the request asks for. They share one
+/// REALITY key pair and one user list. Returns the services and facts for the
+/// record.
 async fn deploy_zray(
     conn: &Connection,
     facts: &Facts,
@@ -495,11 +514,13 @@ async fn deploy_zray(
     arch: &str,
     progress: &mut Progress<'_>,
     notes: &mut Vec<Note>,
-) -> Result<(Option<Reality>, Option<Xhttp>, Deployed), Error> {
+) -> Result<(Option<Reality>, Option<Xhttp>, Option<Zerov1>, Deployed), Error> {
     let preset = Some(if request.reality.is_some() {
         Preset::Reality
-    } else {
+    } else if request.xhttp.is_some() {
         Preset::Xhttp
+    } else {
+        Preset::Zerov1
     });
 
     progress.step(Step::Download, preset);
@@ -602,12 +623,26 @@ async fn deploy_zray(
         let default = if vision_port.is_some() { 8443 } else { 443 };
         pick_port(facts, w.port.unwrap_or(default), &chosen, notes)
     });
-    let sni = match (&request.reality, &request.xhttp) {
-        (Some(w), _) => w.sni.clone(),
-        (None, Some(w)) => w.sni.clone(),
-        (None, None) => unreachable!("deploy_zray runs only when one of them is asked for"),
+    let zerov1_port = request.zerov1.as_ref().map(|w| {
+        let default = if chosen.is_empty() && xhttp_port.is_none() {
+            443
+        } else {
+            2083
+        };
+        let taken: Vec<u16> = chosen.iter().copied().chain(xhttp_port).collect();
+        pick_port(facts, w.port.unwrap_or(default), &taken, notes)
+    });
+    let sni = match (&request.reality, &request.xhttp, &request.zerov1) {
+        (Some(w), _, _) => w.sni.clone(),
+        (None, Some(w), _) => w.sni.clone(),
+        (None, None, Some(w)) => w.sni.clone(),
+        (None, None, None) => unreachable!("deploy_zray runs only when one of them is asked for"),
     };
     let path = format!("/{}", keys::random_hex(4));
+    // ZeroV1 has its own key pair and path; REALITY's keys are not reused.
+    let zerov1_secret = zero_protocol::tide::generate_keypair();
+    let zerov1_path = format!("/static/{}", keys::random_hex(6));
+    let zerov1_secret_text = zero_protocol::tide::encode_key(&zerov1_secret.0);
     let keys = keys::new_reality_keys();
     let short_id = keys::random_hex(8);
     let users = vec![(request.first_user.clone(), keys::new_uuid())];
@@ -619,6 +654,11 @@ async fn deploy_zray(
             users: &users,
             vision_port,
             xhttp: xhttp_port.map(|port| (port, path.as_str())),
+            zerov1: zerov1_port.map(|port| layout::Zerov1Inbound {
+                port,
+                path: &zerov1_path,
+                secret_key: &zerov1_secret_text,
+            }),
         },
         facts.ipv6,
     );
@@ -667,7 +707,7 @@ async fn deploy_zray(
     if !out.ok() {
         return Err(fail(Step::Start, &out));
     }
-    for port in vision_port.iter().chain(&xhttp_port) {
+    for port in vision_port.iter().chain(&xhttp_port).chain(&zerov1_port) {
         let port_text = port.to_string();
         let env = [("PORT", port_text.as_str()), ("PROTO", "tcp")];
         let out = conn.script(&env, scripts::WAIT_PORT, QUICK).await?;
@@ -702,9 +742,20 @@ async fn deploy_zray(
         path: path.clone(),
         users: user_list(),
     });
+    let zerov1 = zerov1_port.map(|port| Zerov1 {
+        tag: layout::ZEROV1_TAG.into(),
+        port,
+        sni: sni.clone(),
+        public_key: keys.public.clone(),
+        short_id: short_id.clone(),
+        server_key: zero_protocol::tide::encode_key(&zerov1_secret.1),
+        path: zerov1_path.clone(),
+        users: user_list(),
+    });
     Ok((
         vision,
         xhttp,
+        zerov1,
         Deployed {
             verified,
             version,

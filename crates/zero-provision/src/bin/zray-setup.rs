@@ -25,7 +25,7 @@ use zero_provision::ssh::{self, Auth, Login};
 
 const USAGE: &str = "usage:\n  zray-setup fingerprint --host H [--port 22]\n  \
 zray-setup install --host H --trust SHA256:.. [--port 22] [--user root] [--key-file F] \
-[--name N] [--sni SITE] [--reality-port P] [--no-reality] [--xhttp] [--xhttp-port P] [--masterdns-domain t.example.com] [--local-binary FILE] [--release TAG] [--no-key] \
+[--name N] [--sni SITE] [--reality-port P] [--no-reality] [--xhttp] [--xhttp-port P] [--zerov1] [--zerov1-port P] [--masterdns-domain t.example.com] [--local-binary FILE] [--release TAG] [--no-key] \
 [--save FILE]\n  \
 zray-setup links --record FILE\n  zray-setup usage --record FILE\n  \
 zray-setup remove --record FILE --yes\n\n\
@@ -217,6 +217,19 @@ async fn install_command(args: &Args) -> Result<(), String> {
                     .unwrap_or_else(|| "www.microsoft.com".into()),
                 port: match args.value("--xhttp-port") {
                     Some(p) => Some(p.parse().map_err(|_| "--xhttp-port is not a port")?),
+                    None => None,
+                },
+            })
+        } else {
+            None
+        },
+        zerov1: if args.flag("--zerov1") {
+            Some(install::Zerov1Request {
+                sni: args
+                    .value("--sni")
+                    .unwrap_or_else(|| "www.microsoft.com".into()),
+                port: match args.value("--zerov1-port") {
+                    Some(p) => Some(p.parse().map_err(|_| "--zerov1-port is not a port")?),
                     None => None,
                 },
             })

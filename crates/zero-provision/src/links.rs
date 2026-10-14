@@ -66,6 +66,38 @@ pub fn vless_xhttp_reality(
     )
 }
 
+/// A ZeroV1 user id from a VLESS UUID: its sixteen bytes, unpadded URL-safe
+/// base64, the form ZeroV1 links and server configs use. `None` for text that
+/// is not a UUID.
+pub fn zerov1_user_id(uuid: &str) -> Option<String> {
+    let bytes: [u8; 16] = hex::decode(uuid.replace('-', "")).ok()?.try_into().ok()?;
+    Some(zero_protocol::tide::encode_key(&bytes))
+}
+
+/// ZeroV1 inside REALITY. `uuid` is the user's VLESS UUID (their ZeroV1 id is
+/// made from it); `server_key` is ZeroV1's public key, `public_key` REALITY's.
+#[allow(clippy::too_many_arguments)]
+pub fn zerov1_reality(
+    host: &str,
+    port: u16,
+    uuid: &str,
+    server_key: &str,
+    path: &str,
+    sni: &str,
+    public_key: &str,
+    short_id: &str,
+    label: &str,
+) -> String {
+    format!(
+        "zerov1://{}@{}?key={server_key}&path={}&security=reality&sni={sni}&pbk={public_key}\
+         &sid={short_id}&fp=chrome&dg=1#{}",
+        zerov1_user_id(uuid).unwrap_or_default(),
+        authority(host, port),
+        utf8_percent_encode(path, NON_ALPHANUMERIC),
+        name(label)
+    )
+}
+
 /// Resolvers the upstream client starts with: well-known public ones. People
 /// whose network blocks them add their own provider's, which is why the text
 /// says so.
@@ -190,6 +222,48 @@ mod tests {
             panic!("expected xhttp, got {:?}", parsed.outbound.stream.transport);
         };
         assert_eq!(&*x.path, "/a1b2c3d4");
+    }
+
+    #[test]
+    fn a_zerov1_link_is_read_back_as_zerov1_over_reality_with_the_users_uuid_bytes() {
+        let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        let (_, server_public) = zero_protocol::tide::generate_keypair();
+        let server_key = zero_protocol::tide::encode_key(&server_public);
+        let link = zerov1_reality(
+            "203.0.113.7",
+            2083,
+            uuid,
+            &server_key,
+            "/static/9f8e7d6c5b4a",
+            "www.microsoft.com",
+            "JZoEjtfm1Zv3zGd2nGJmGCVZU8EbIn0Wg2EvrQ3VXTA",
+            "0123456789abcdef",
+            "My server / ZeroV1",
+        );
+        let parsed = zero_config::parse_link(&link).expect("the apps read it");
+        let OutboundProtocol::Tide(tide) = &parsed.outbound.protocol else {
+            panic!("expected zerov1, got {link}");
+        };
+        assert_eq!(&*tide.path, "/static/9f8e7d6c5b4a");
+        assert_eq!(tide.port, 2083);
+        assert_eq!(tide.server_key, server_public);
+        let uuid_bytes: [u8; 16] = hex::decode(uuid.replace('-', ""))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            tide.user, uuid_bytes,
+            "the same sixteen bytes as the VLESS id"
+        );
+        let Security::Reality(reality) = &parsed.outbound.stream.security else {
+            panic!("expected REALITY");
+        };
+        assert_eq!(&*reality.server_name, "www.microsoft.com");
+        assert_eq!(
+            reality.short_id,
+            [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
+        );
+        assert_eq!(zerov1_user_id("not a uuid"), None);
     }
 
     fn masterdns_service() -> crate::record::MasterDns {

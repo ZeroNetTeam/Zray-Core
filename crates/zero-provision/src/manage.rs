@@ -83,11 +83,12 @@ pub async fn usage(conn: &Connection, record: &ServerRecord) -> Result<Usage, Us
         window_secs: crate::manage::WINDOW,
         inbounds: Vec::new(),
     };
-    if record
-        .services
-        .iter()
-        .any(|s| matches!(s, Service::Reality(_) | Service::Xhttp(_)))
-    {
+    if record.services.iter().any(|s| {
+        matches!(
+            s,
+            Service::Reality(_) | Service::Xhttp(_) | Service::Zerov1(_)
+        )
+    }) {
         let port = record.management_port.to_string();
         let env = [
             ("TOKEN_FILE", layout::ZRAY_TOKEN),
@@ -182,6 +183,7 @@ fn ports_of(record: &ServerRecord) -> (Vec<u16>, Vec<u16>) {
         match service {
             Service::Reality(r) => tcp.push(r.port),
             Service::Xhttp(x) => tcp.push(x.port),
+            Service::Zerov1(z) => tcp.push(z.port),
             Service::MasterDns(_) => udp.push(53),
         }
     }

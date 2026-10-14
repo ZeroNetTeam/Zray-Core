@@ -29,7 +29,9 @@ use tokio_util::sync::CancellationToken;
 use zero_discovery::discover::EndReason;
 use zero_discovery::events::EventSink;
 
-use crate::install::{self, BinarySource, MasterDnsRequest, RealityRequest, XhttpRequest};
+use crate::install::{
+    self, BinarySource, MasterDnsRequest, RealityRequest, XhttpRequest, Zerov1Request,
+};
 use crate::record::{ServerRecord, Service};
 use crate::ssh::{Auth, HostKey, Login};
 use crate::{manage, probe, ssh};
@@ -71,6 +73,9 @@ pub struct InstallArgs {
     /// Also (or only) install VLESS over XHTTP inside REALITY.
     #[serde(default)]
     pub xhttp: bool,
+    /// Also (or only) install ZeroV1 inside REALITY.
+    #[serde(default)]
+    pub zerov1: bool,
     /// The website a REALITY server pretends to be; a default when absent.
     pub sni: Option<String>,
     /// Set to install MasterDNS for this tunnel domain.
@@ -255,6 +260,10 @@ async fn install_job(args: InstallArgs, sink: &EventSink) -> EndReason {
             port: None,
         }),
         xhttp: args.xhttp.then(|| XhttpRequest {
+            sni: args.sni.clone().unwrap_or_else(|| DEFAULT_SNI.into()),
+            port: None,
+        }),
+        zerov1: args.zerov1.then(|| Zerov1Request {
             sni: args.sni.clone().unwrap_or_else(|| DEFAULT_SNI.into()),
             port: None,
         }),

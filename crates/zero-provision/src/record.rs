@@ -48,6 +48,23 @@ pub struct Xhttp {
     pub users: Vec<User>,
 }
 
+/// ZeroV1 wrapped in REALITY like [`Reality`], sharing its keys and its user
+/// list: a user's ZeroV1 id is their VLESS UUID's sixteen bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Zerov1 {
+    pub tag: String,
+    pub port: u16,
+    pub sni: String,
+    /// REALITY's public key (the private half stays in the server's config).
+    pub public_key: String,
+    pub short_id: String,
+    /// ZeroV1's own public key, which every link carries.
+    pub server_key: String,
+    /// The path the server answers ZeroV1 requests on.
+    pub path: String,
+    pub users: Vec<User>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MasterDns {
     /// The tunnel domain, delegated to the server.
@@ -67,6 +84,7 @@ pub struct MasterDns {
 pub enum Service {
     Reality(Reality),
     Xhttp(Xhttp),
+    Zerov1(Zerov1),
     MasterDns(MasterDns),
 }
 
@@ -76,6 +94,7 @@ impl Service {
         match self {
             Service::Reality(r) => &r.tag,
             Service::Xhttp(x) => &x.tag,
+            Service::Zerov1(z) => &z.tag,
             Service::MasterDns(_) => "masterdns",
         }
     }
@@ -84,6 +103,7 @@ impl Service {
         match self {
             Service::Reality(_) => "VLESS + REALITY",
             Service::Xhttp(_) => "VLESS + XHTTP + REALITY",
+            Service::Zerov1(_) => "ZeroV1 + REALITY",
             Service::MasterDns(_) => "MasterDnsVPN",
         }
     }
@@ -167,6 +187,26 @@ impl ServerRecord {
                                 &x.short_id,
                                 &x.path,
                                 &format!("{} · XHTTP · {}", self.name, user.name),
+                            )),
+                            files: Vec::new(),
+                        });
+                    }
+                }
+                Service::Zerov1(z) => {
+                    for user in &z.users {
+                        out.push(ClientConfig {
+                            service: "zerov1",
+                            user: user.name.clone(),
+                            link: Some(links::zerov1_reality(
+                                &self.host,
+                                z.port,
+                                &user.id,
+                                &z.server_key,
+                                &z.path,
+                                &z.sni,
+                                &z.public_key,
+                                &z.short_id,
+                                &format!("{} · ZeroV1 · {}", self.name, user.name),
                             )),
                             files: Vec::new(),
                         });

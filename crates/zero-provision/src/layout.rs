@@ -167,6 +167,15 @@ pub fn zray_unit(management_port: u16) -> String {
 /// Inbound tags the usage figures are reported under.
 pub const VISION_TAG: &str = "reality-in";
 pub const XHTTP_TAG: &str = "xhttp-in";
+pub const ZEROV1_TAG: &str = "zerov1-in";
+
+/// The ZeroV1 inbound: its port, the path it answers on and its secret key.
+/// Its users are the REALITY users, by the sixteen bytes of their UUIDs.
+pub struct Zerov1Inbound<'a> {
+    pub port: u16,
+    pub path: &'a str,
+    pub secret_key: &'a str,
+}
 
 /// What the REALITY inbounds need. One key pair, short id and user list are
 /// shared by both inbounds, so a person can hold either config.
@@ -181,6 +190,8 @@ pub struct RealityInbound<'a> {
     pub vision_port: Option<u16>,
     /// Port and request path of the XHTTP inbound, when it is installed.
     pub xhttp: Option<(u16, &'a str)>,
+    /// The ZeroV1 inbound, when it is installed.
+    pub zerov1: Option<Zerov1Inbound<'a>>,
 }
 
 /// The server's whole configuration. Clients may reach any public address and
@@ -244,6 +255,25 @@ pub fn zray_config(reality: &RealityInbound, ipv6: bool) -> Value {
             json!({"network": "xhttp", "xhttpSettings": {"path": path, "mode": "auto"}}),
         ));
     }
+    if let Some(zerov1) = &reality.zerov1 {
+        let users: Vec<Value> = reality
+            .users
+            .iter()
+            .filter_map(|(name, id)| {
+                crate::links::zerov1_user_id(id).map(|id| json!({"id": id, "name": name}))
+            })
+            .collect();
+        let mut stream = security.clone();
+        stream["network"] = json!("tcp");
+        inbounds.push(json!({
+            "tag": ZEROV1_TAG,
+            "listen": "0.0.0.0",
+            "port": zerov1.port,
+            "protocol": "zerov1",
+            "settings": {"path": zerov1.path, "secretKey": zerov1.secret_key, "users": users},
+            "streamSettings": stream,
+        }));
+    }
     json!({
         "log": {"loglevel": "warning"},
         // The machine's own resolver: the hosting provider's DNS is the one
@@ -277,6 +307,7 @@ mod tests {
             users,
             vision_port: Some(443),
             xhttp: None,
+            zerov1: None,
         }
     }
 
@@ -328,6 +359,52 @@ mod tests {
         assert_eq!(config["inbounds"].as_array().unwrap().len(), 1);
         zero_config::compile_config(&config, zero_core::GenerationId(1))
             .expect("XHTTP alone is accepted");
+    }
+
+    /// VLESS, XHTTP and ZeroV1 on one server: three inbounds, one REALITY
+    /// setup and one user list, each user's ZeroV1 id being their UUID's bytes.
+    #[test]
+    fn zerov1_sits_beside_vless_and_xhttp_on_the_same_keys_and_users() {
+        let users = vec![("Main".to_string(), crate::keys::new_uuid())];
+        let (secret, _) = zero_protocol::tide::generate_keypair();
+        let secret = zero_protocol::tide::encode_key(&secret);
+        let mut all = inbound(&users);
+        all.xhttp = Some((8443, "/a1b2c3d4"));
+        all.zerov1 = Some(Zerov1Inbound {
+            port: 2083,
+            path: "/static/9f8e7d",
+            secret_key: &secret,
+        });
+        let config = zray_config(&all, false);
+        let inbounds = config["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 3);
+        let zerov1 = &inbounds[2];
+        assert_eq!(zerov1["tag"], ZEROV1_TAG);
+        assert_eq!(zerov1["protocol"], "zerov1");
+        assert_eq!(zerov1["port"], 2083);
+        assert_eq!(
+            zerov1["streamSettings"]["realitySettings"],
+            inbounds[0]["streamSettings"]["realitySettings"],
+            "one REALITY setup for all of them"
+        );
+        let id = crate::links::zerov1_user_id(&users[0].1).unwrap();
+        assert_eq!(zerov1["settings"]["users"][0]["id"], id);
+        assert_eq!(zerov1["settings"]["users"][0]["name"], "Main");
+        let (generation, _) = zero_config::compile_config(&config, zero_core::GenerationId(1))
+            .expect("the engine accepts all three inbounds");
+        assert_eq!(generation.config.inbounds.len(), 3);
+
+        let mut only = inbound(&users);
+        only.vision_port = None;
+        only.zerov1 = Some(Zerov1Inbound {
+            port: 443,
+            path: "/static/9f8e7d",
+            secret_key: &secret,
+        });
+        let config = zray_config(&only, false);
+        assert_eq!(config["inbounds"].as_array().unwrap().len(), 1);
+        zero_config::compile_config(&config, zero_core::GenerationId(1))
+            .expect("ZeroV1 alone is accepted");
     }
 
     #[test]
