@@ -102,15 +102,12 @@ async fn authenticate(
     Ok(())
 }
 
+/// Read a client's AUTH and check it against `users`. Returns the UUID that
+/// logged in.
 async fn authenticate_server(
     connection: &h3_quinn::quinn::Connection,
-    uuid: &[u8; 16],
-    password: &str,
-) -> Result<(), String> {
-    let mut expected = [0u8; 32];
-    connection
-        .export_keying_material(&mut expected, uuid, password.as_bytes())
-        .map_err(|error| format!("TUIC key export: {error:?}"))?;
+    users: &[([u8; 16], Box<str>)],
+) -> Result<[u8; 16], String> {
     let mut stream = connection
         .accept_uni()
         .await
@@ -128,9 +125,13 @@ async fn authenticate_server(
         .read_exact(&mut specified_uuid)
         .await
         .map_err(|error| format!("TUIC auth UUID: {error}"))?;
-    if &specified_uuid != uuid {
+    let Some((uuid, password)) = users.iter().find(|(uuid, _)| *uuid == specified_uuid) else {
         return Err("TUIC UUID authentication failed".into());
-    }
+    };
+    let mut expected = [0u8; 32];
+    connection
+        .export_keying_material(&mut expected, uuid, password.as_bytes())
+        .map_err(|error| format!("TUIC key export: {error:?}"))?;
     let mut token = [0u8; 32];
     stream
         .read_exact(&mut token)
@@ -139,7 +140,7 @@ async fn authenticate_server(
     if token != expected {
         return Err("TUIC token authentication failed".into());
     }
-    Ok(())
+    Ok(*uuid)
 }
 
 fn encode_address(destination: &Destination) -> Result<Vec<u8>, String> {
@@ -399,11 +400,15 @@ impl PacketReassembler {
     }
 }
 
+/// A CONNECT stream or PACKET, with the UUID its connection logged in with:
+/// the server checks that it is still a valid one, since a connection
+/// outlives any change to the accounts.
 pub enum Accepted {
     Tcp {
         stream: BoxStream,
         destination: Destination,
         peer: SocketAddr,
+        uuid: [u8; 16],
     },
     Udp {
         connection: h3_quinn::quinn::Connection,
@@ -412,6 +417,7 @@ pub enum Accepted {
         destination: Destination,
         payload: Vec<u8>,
         peer: SocketAddr,
+        uuid: [u8; 16],
     },
 }
 
@@ -723,14 +729,13 @@ impl Acceptor {
 
     /// Wait for the next CONNECT stream or PACKET. `Err` reports one rejected
     /// connection or request and is not fatal; `Ok(None)` means the endpoint
-    /// closed. The credentials apply to connections accepted from this call
-    /// on.
+    /// closed. `users` (UUID and password each) apply to connections accepted
+    /// from this call on.
     pub async fn accept(
         &mut self,
-        uuid: &[u8; 16],
-        password: &str,
+        users: &Arc<[([u8; 16], Box<str>)]>,
     ) -> Result<Option<Accepted>, String> {
-        let credentials: Arc<([u8; 16], Box<str>)> = Arc::new((*uuid, password.into()));
+        let credentials = Arc::clone(users);
         loop {
             tokio::select! {
                 biased;
@@ -757,20 +762,20 @@ impl Acceptor {
 
 async fn serve_connection(
     incoming: h3_quinn::quinn::Incoming,
-    credentials: Arc<([u8; 16], Box<str>)>,
+    credentials: Arc<[([u8; 16], Box<str>)]>,
     out: tokio::sync::mpsc::Sender<Result<Accepted, String>>,
 ) {
     let authenticated = timeout(SERVER_AUTH_TIMEOUT, async {
         let connection = incoming
             .await
             .map_err(|error| format!("TUIC QUIC handshake: {error}"))?;
-        authenticate_server(&connection, &credentials.0, &credentials.1).await?;
-        Ok::<_, String>(connection)
+        let uuid = authenticate_server(&connection, &credentials).await?;
+        Ok::<_, String>((connection, uuid))
     })
     .await
     .unwrap_or_else(|_| Err("TUIC handshake or authentication timed out".into()));
-    let connection = match authenticated {
-        Ok(connection) => connection,
+    let (connection, uuid) = match authenticated {
+        Ok(authenticated) => authenticated,
         Err(error) => {
             let _ = out.send(Err(error)).await;
             return;
@@ -787,10 +792,12 @@ async fn serve_connection(
                 };
                 let out = out.clone();
                 tokio::spawn(async move {
-                    let accepted =
-                        timeout(SERVER_REQUEST_TIMEOUT, accept_connect_stream(send, recv, peer))
-                            .await
-                            .unwrap_or_else(|_| Err("TUIC CONNECT header timed out".into()));
+                    let accepted = timeout(
+                        SERVER_REQUEST_TIMEOUT,
+                        accept_connect_stream(send, recv, peer, uuid),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err("TUIC CONNECT header timed out".into()));
                     let _ = out.send(accepted).await;
                 });
             }
@@ -825,6 +832,7 @@ async fn serve_connection(
                     destination,
                     payload,
                     peer,
+                    uuid,
                 };
                 if out.send(Ok(accepted)).await.is_err() {
                     return;
@@ -894,6 +902,7 @@ async fn accept_connect_stream(
     send: h3_quinn::quinn::SendStream,
     mut recv: h3_quinn::quinn::RecvStream,
     peer: SocketAddr,
+    uuid: [u8; 16],
 ) -> Result<Accepted, String> {
     let mut command = [0u8; 2];
     recv.read_exact(&mut command)
@@ -915,6 +924,7 @@ async fn accept_connect_stream(
         stream: boxed(app),
         destination,
         peer,
+        uuid,
     })
 }
 

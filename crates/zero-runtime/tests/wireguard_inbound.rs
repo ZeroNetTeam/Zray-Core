@@ -65,7 +65,11 @@ fn free_udp_port() -> u16 {
         .port()
 }
 
-async fn start_server(port: u16, secret: [u8; 32], peers: serde_json::Value) {
+async fn start_server(
+    port: u16,
+    secret: [u8; 32],
+    peers: serde_json::Value,
+) -> Arc<zero_runtime::Server> {
     let config = json!({
         "inbounds": [{"tag": "wg", "protocol": "wireguard", "listen": "127.0.0.1", "port": port,
             "settings": {"secretKey": b64(&secret), "peers": peers}}],
@@ -80,6 +84,7 @@ async fn start_server(port: u16, secret: [u8; 32], peers: serde_json::Value) {
     let running = Arc::clone(&server);
     tokio::spawn(async move { running.run().await });
     server.wait_until_listening().await;
+    server
 }
 
 fn client(port: u16, secret: [u8; 32], server_public: [u8; 32], address: &str) -> WgStack {
@@ -104,10 +109,10 @@ async fn a_peer_reaches_tcp_and_udp_through_the_inbound() {
     let (server_secret, server_public) = key_pair(1);
     let (client_secret, client_public) = key_pair(2);
     let port = free_udp_port();
-    start_server(
+    let server = start_server(
         port,
         server_secret,
-        json!([{"publicKey": b64(&client_public), "allowedIPs": ["10.7.0.2/32"]}]),
+        json!([{"publicKey": b64(&client_public), "allowedIPs": ["10.7.0.2/32"], "email": "wg@panel"}]),
     )
     .await;
     let (tcp, udp) = (tcp_echo().await, udp_echo().await);
@@ -128,6 +133,15 @@ async fn a_peer_reaches_tcp_and_udp_through_the_inbound() {
     let (from, reply) = peer.exchange_udp(udp, b"ping").await.expect("udp");
     assert_eq!(from, udp);
     assert_eq!(reply, b"udp:ping");
+
+    // The peer's packets, both ways, counted under its email.
+    let traffic = server.stats.accounts.traffic(false);
+    assert_eq!(traffic.len(), 1, "{traffic:?}");
+    assert_eq!(traffic[0].email, "wg@panel");
+    assert!(
+        traffic[0].uplink > 9 && traffic[0].downlink > 13,
+        "{traffic:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

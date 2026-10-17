@@ -1141,7 +1141,7 @@ async fn zero_rtt_hysteria2_server(echo: SocketAddr) -> SocketAddr {
     let address = endpoint.local_addr().unwrap();
     let mut acceptor = zero_transport::hysteria2::Acceptor::new(endpoint);
     tokio::spawn(async move {
-        let passwords: Vec<Box<str>> = vec![PASSWORD.into()];
+        let passwords: Arc<[Box<str>]> = vec![PASSWORD.into()].into();
         while let Ok(Some(accepted)) = acceptor.accept(&passwords).await {
             if let zero_transport::hysteria2::Accepted::Tcp { mut stream, .. } = accepted {
                 tokio::spawn(async move {

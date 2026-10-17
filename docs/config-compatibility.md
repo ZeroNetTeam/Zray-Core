@@ -296,3 +296,128 @@ engine, the links parse with the apps' own parser), `zero-runtime`
 against an Ubuntu 24.04 container with systemd: both inbounds installed, a
 client connected through each link, usage counted on the right inbound, and
 removal left the machine clean.
+
+## Per-account figures and the account API
+
+**What differs.** Xray serves `StatsService` and `HandlerService` over gRPC;
+Zray serves the same operations over its own management API
+(`zray run --management ADDR`), as JSON:
+
+| Request | What it does |
+|---|---|
+| `GET /stats/traffic` | Also lists `user>>>{email}>>>traffic>>>uplink` / `downlink`, Xray's names, for every account with an `email`. `?reset=true` zeroes them as they are read and forgets accounts with no open session. |
+| `GET /accounts/online` | The accounts with a session open now, with the number of sessions, and their addresses when the server was started with `--account-addresses`. |
+| `POST /accounts/end` | `{"email": …}`: ends every open session of that account. |
+| `POST /accounts/add` | `{"inbound": tag, "clients": [...]}`, each client in the inbound's `settings.clients` shape: adds them, or replaces the account with the same `email`. |
+| `POST /accounts/remove` | `{"inbound": tag, "emails": [...]}`: removes them and ends their sessions on that inbound. |
+| `POST /accounts/limit` | `{"email": …, "uplink": B/s, "downlink": B/s}`: a speed limit shared by all the account's sessions; 0 or absent lifts that direction. |
+| `GET /accounts/limits` | The accounts with a speed limit. |
+| `GET /events` | Server-sent events, one JSON object per `data:` line: sessions opened and closed, refused connections, account and limit changes, reloads and inbound changes (`zero_runtime::events`). |
+
+The same operations are methods on `zero_runtime::Server` (`add_accounts`,
+`remove_accounts`, `parse_account`, `stats.accounts`, `stats.events()`) for a
+host that embeds the engine, and `zero_runtime::keys` makes the keys an
+inbound needs (REALITY, ML-DSA-65, WireGuard, VLESS Encryption, UUIDs, short
+ids), as `zray x25519` and its siblings print them.
+
+Three behaviours go further than Xray's:
+
+- **Bytes are counted while they move**, not when the connection closes, so a
+  quota is enforceable against a single long download.
+- **A removed account's sessions end.** Removing it (over the API or with a
+  `/reload` that no longer lists it on that inbound) ends the sessions it
+  already had there; in Xray they run on until they close. Replacing an
+  account with a different credential does the same; re-adding it unchanged
+  does not.
+- **Adding or removing an account rebuilds nothing else.** Routing, DNS
+  caches, TLS session caches and other sessions are untouched, where a
+  `/reload` rebuilds them all.
+
+Accounts can be changed at run time on `vless`, `vmess`, `trojan`,
+`shadowsocks`, `hysteria2`, `tuic` and `anytls` inbounds. An account without an
+`email` (or, for Hysteria2, TUIC and AnyTLS, a sing-box `name`) is not
+metered. One credential cannot belong to
+two accounts on an inbound, since the handshake could not tell them apart.
+Addresses are off by default, keeping the promise of `/usage` that no client
+address is held; with `--account-addresses` only those of sessions open now
+are, never a history.
+
+A speed limit is one token bucket per account and direction, so more
+connections do not buy more speed; at most one second's worth builds up. It
+applies to streams; UDP datagrams of Hysteria2 and TUIC are counted but not
+slowed.
+
+WireGuard peers with an `email` are metered by the addresses they own
+(`allowedIPs`): a packet from a peer counts by its source, one to it by its
+destination, IP headers included. Peers are taken when the listener starts,
+so adding or removing one goes through a `Host` handover (below), not
+`/accounts/add`. ZeroV1 (Tide) keeps its own users and panel and is not
+metered here.
+
+Hysteria2 and TUIC log in once per QUIC connection, which outlives account
+changes, so every stream and datagram is checked against the current
+accounts: a removed account's connection opens nothing more.
+
+**Pinned by.** `zero-runtime/src/accounts.rs` (live counting, reset, ending a
+parked session, shared speed limits), the `api` tests `accounts_are_reported_and_their_sessions_ended`
+and `accounts_are_added_and_removed_over_the_api`, and
+`zero-runtime/tests/account_metering.rs`, which drives real VLESS, VMess and
+Trojan inbounds: bytes visible before the session closes, a reload or a
+removal ending the session, a re-added account connecting again with no
+reload, and a shared credential refused; the same for multi-user
+Shadowsocks (legacy and 2022), plus events and a speed limit on a real
+session. `zero-runtime/tests/account_metering_tls.rs` does it for Hysteria2,
+TUIC and AnyTLS, including a removed account refused on a QUIC connection
+that is still up.
+
+## Multi-user Shadowsocks
+
+`settings.clients` on a Shadowsocks inbound, as in Xray:
+
+- **Legacy AEAD** (`aes-*-gcm`, `chacha20-ietf-poly1305`): each client has a
+  `password`; the method is the inbound's (or the first client's) and every
+  client must share it. The server finds the user by trying each key on the
+  first chunk, as Xray does, so the cost grows with the number of users.
+- **Shadowsocks 2022** (`2022-blake3-aes-*-gcm`): `settings.password` is the
+  server key and each client's `password` its own key; clients connect with
+  `serverKey:userKey`, and the server reads which user it is from the identity
+  header (SIP023). `2022-blake3-chacha20-poly1305` has no multi-user form.
+
+An inbound given `settings.clients`, even an empty list, serves accounts
+only: with none left it admits nobody, rather than falling back to
+`settings.password`, which in 2022 every user's key also holds.
+
+**Pinned by.** `zero-protocol` (`identify_user`,
+`a_multi_user_server_knows_which_user_connected`) and
+`zero-runtime/tests/account_metering.rs` (`an_emptied_multi_user_inbound_admits_nobody`).
+
+## Changing inbounds without a restart
+
+`zero_runtime::host::Host` runs a server through any configuration change.
+When the new configuration only changes what `/reload` can, it reloads. When
+it adds, removes or re-binds an inbound, or changes what a listener took when
+it started (a QUIC certificate, Hysteria2 obfuscation, WireGuard peers, socket
+options), it hands over: the listeners close, a successor server binds the
+new ones and carries on the same figures, accounts, limits and event
+subscribers. TCP sessions already open run on to their end; QUIC connections
+of the inbounds close, since their socket must be released. A port the change
+newly needs that is taken refuses the change before anything closes; a
+successor that fails later is replaced by the previous configuration. `zray
+run --management` serves through a host, so `POST /reload` can do all of this
+and answers with `"applied": "reloaded"` or `"restarted"`.
+
+Between the old listeners closing and the new ones binding, new connections
+are refused for a moment.
+
+**Pinned by.** `zero-runtime/tests/host_handover.rs`: an inbound added and
+removed with an open session kept and the figures carried on, a reloadable
+change staying a reload, both rollbacks, and the management API adding an
+inbound.
+
+## Legacy Shadowsocks salt length
+
+The salt of `aes-128-gcm` is 16 bytes, as SIP004 has it (the salt is as long
+as the key); `aes-256-gcm` and `chacha20-ietf-poly1305` keep 32. Zray used to
+send and expect 32 for every method, which only worked between two Zray ends.
+
+**Pinned by.** `zero-protocol` `the_salt_is_as_long_as_the_key`.

@@ -58,6 +58,8 @@ fn print_usage() {
          zray run <file> -i N  Run config number N from a config array\n  \
          zray run <file> --management ADDR\n  \
                               Expose the authenticated management API\n  \
+         zray run <file> --account-addresses\n  \
+                              List the addresses of online accounts in the API\n  \
          zray run <file> --drain-timeout N\n  \
                               Seconds to finish live sessions on shutdown (default 10, 0 = off)\n  \
          zray preset iran <link|file> [options]\n  \
@@ -598,6 +600,10 @@ fn cmd_run(args: &[String]) -> Result<()> {
         .context("--drain-timeout must be a number of seconds")?
         .unwrap_or(10);
 
+    // Off unless asked: the usage figures promise that no client address is
+    // kept, and a panel enforcing address limits has to opt in to them.
+    let account_addresses = args.iter().any(|a| a == "--account-addresses");
+
     let text = load_config_text(&files)?;
 
     let mut configs = zero_config::parse_config_array(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -623,10 +629,15 @@ fn cmd_run(args: &[String]) -> Result<()> {
 
     runtime.block_on(async move {
         use std::sync::Arc;
-        let server = Arc::new(zero_runtime::Server::new(zero_runtime::ServerConfig {
-            config: Arc::clone(&generation.config),
-            generation: generation.id,
-        }));
+        // A host, so that `POST /reload` can add, remove and re-bind
+        // inbounds as well (see `zero_runtime::host`).
+        let stats = Arc::new(zero_runtime::server::Stats::default());
+        stats.accounts.set_track_addresses(account_addresses);
+        let host = Arc::new(
+            zero_runtime::host::Host::start_with(Arc::clone(&generation.config), stats)
+                .await
+                .context("server stopped")?,
+        );
 
         let management_task = if let Some(listen) = management {
             let bearer_token = if let Some(path) = token_file.as_ref() {
@@ -645,10 +656,10 @@ fn cmd_run(args: &[String]) -> Result<()> {
             };
             let management = zero_runtime::api::ManagementServer::new(config)
                 .map_err(|error| anyhow::anyhow!("management API rejected: {error}"))?;
-            let api_server = Arc::clone(&server);
+            let api_host = Arc::clone(&host);
             Some(tokio::spawn(async move {
                 management
-                    .run(api_server)
+                    .run_host(api_host)
                     .await
                     .context("management API stopped")
             }))
@@ -656,7 +667,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
             None
         };
 
-        let stats = Arc::clone(&server.stats);
+        let stats = Arc::clone(host.stats());
         tokio::spawn(async move {
             let mut last = stats.snapshot();
             loop {
@@ -676,9 +687,8 @@ fn cmd_run(args: &[String]) -> Result<()> {
             }
         });
 
-        let run = Arc::clone(&server);
         tokio::select! {
-            r = run.run() => {
+            r = host.finished() => {
                 r.context("server stopped")?;
             }
             r = async {
@@ -695,7 +705,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("shutting down (SIGINT)");
-                drain_before_exit(&server, drain_timeout).await;
+                drain_before_exit(&host, drain_timeout).await;
             }
             _ = async {
                 #[cfg(unix)]
@@ -716,7 +726,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
                 }
             } => {
                 tracing::info!("shutting down (SIGTERM)");
-                drain_before_exit(&server, drain_timeout).await;
+                drain_before_exit(&host, drain_timeout).await;
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -728,17 +738,15 @@ fn cmd_run(args: &[String]) -> Result<()> {
 /// Wait for in-flight sessions to finish before returning from a shutdown
 /// signal. The accept loops stop being polled once `run()`'s future is
 /// dropped, so no new sessions start while this counts down.
-async fn drain_before_exit(server: &std::sync::Arc<zero_runtime::Server>, timeout_secs: u64) {
-    if timeout_secs == 0 {
-        return;
-    }
-    let active = server.active_sessions();
-    if active == 0 {
+async fn drain_before_exit(host: &zero_runtime::host::Host, timeout_secs: u64) {
+    let active = host.server().active_sessions();
+    if timeout_secs == 0 || active == 0 {
+        host.stop(std::time::Duration::ZERO).await;
         return;
     }
     tracing::info!(active, timeout_secs, "draining active sessions before exit");
-    let remaining = server
-        .drain(std::time::Duration::from_secs(timeout_secs))
+    let remaining = host
+        .stop(std::time::Duration::from_secs(timeout_secs))
         .await;
     if remaining == 0 {
         tracing::info!("all sessions drained");

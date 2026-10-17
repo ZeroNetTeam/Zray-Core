@@ -2827,15 +2827,70 @@ pub struct VmessInboundUser {
     pub email: Option<Arc<str>>,
 }
 
+/// One account of a server inbound, as a host adds it to a running server
+/// ([`crate::parse_inbound_client`]) instead of reloading the configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundClient {
+    Vless(VlessInboundUser),
+    Vmess(VmessInboundUser),
+    Trojan {
+        password_hash: [u8; 56],
+        email: Option<Arc<str>>,
+    },
+    Shadowsocks(ShadowsocksInboundUser),
+    /// A Hysteria2 or AnyTLS account: a password and its name.
+    Password {
+        password: Box<str>,
+        email: Option<Arc<str>>,
+    },
+    Tuic(TuicInboundUser),
+}
+
+impl InboundClient {
+    /// The account's name, which is how it is found again to be replaced or
+    /// removed.
+    pub fn email(&self) -> Option<&Arc<str>> {
+        match self {
+            InboundClient::Vless(user) => user.email.as_ref(),
+            InboundClient::Vmess(user) => user.email.as_ref(),
+            InboundClient::Trojan { email, .. } => email.as_ref(),
+            InboundClient::Shadowsocks(user) => user.email.as_ref(),
+            InboundClient::Password { email, .. } => email.as_ref(),
+            InboundClient::Tuic(user) => user.email.as_ref(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowsocksInboundConfig {
     pub method: ShadowsocksMethod,
+    /// The one password of a single-user inbound, or, for a Shadowsocks 2022
+    /// inbound with users, the server's own key (clients send
+    /// `serverKey:userKey`). Empty for a legacy multi-user inbound.
     pub password: Box<str>,
+    /// The accounts of a multi-user inbound (`settings.clients`).
+    pub users: Box<[ShadowsocksInboundUser]>,
+    /// Whether the inbound serves accounts (`settings.clients` was given, or
+    /// one was added at run time) rather than its one password. A multi-user
+    /// inbound with no account left admits nobody: it never falls back to the
+    /// password, which in Shadowsocks 2022 every user's key also holds.
+    pub multi_user: bool,
+    /// The single password's account name (`settings.email`).
+    pub email: Option<Arc<str>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowsocksInboundUser {
+    /// A legacy method's password, or a Shadowsocks 2022 user key (base64).
+    pub password: Box<str>,
+    pub email: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AnyTlsInboundConfig {
     pub passwords: Box<[Box<str>]>,
+    /// The `email` (or sing-box `name`) of each password, in the same order.
+    pub emails: Box<[Option<Arc<str>>]>,
 }
 
 #[derive(Clone, PartialEq, Eq, Default)]
@@ -2956,6 +3011,8 @@ impl std::fmt::Debug for TideUser {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Hysteria2InboundConfig {
     pub passwords: Box<[Box<str>]>,
+    /// The `email` (or sing-box `name`) of each password, in the same order.
+    pub emails: Box<[Option<Arc<str>>]>,
     /// Salamander password: every UDP datagram is obfuscated with it, and a
     /// client without it gets no answer at all.
     pub obfs_password: Option<Box<str>>,
@@ -2981,8 +3038,14 @@ pub enum Hysteria2Masquerade {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuicInboundConfig {
+    pub users: Box<[TuicInboundUser]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuicInboundUser {
     pub uuid: [u8; 16],
     pub password: Box<str>,
+    pub email: Option<Arc<str>>,
 }
 
 /// The WireGuard inbound (Xray's `wireguard` with `settings.peers`).

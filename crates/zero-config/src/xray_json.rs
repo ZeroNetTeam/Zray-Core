@@ -1109,6 +1109,18 @@ fn read_key_blob(certificate: &Value, path: &str) -> R<Vec<u8>> {
 }
 
 /// A client's `email`, the name Xray's `user` rules and statistics use.
+/// An account's name: Xray's `email`, or the `name` sing-box gives users.
+fn account_name(client: &Value) -> Option<Arc<str>> {
+    client_email(client).or_else(|| {
+        client
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(Arc::from)
+    })
+}
+
 fn client_email(client: &Value) -> Option<Arc<str>> {
     client
         .get("email")
@@ -1116,6 +1128,47 @@ fn client_email(client: &Value) -> Option<Arc<str>> {
         .map(str::trim)
         .filter(|email| !email.is_empty())
         .map(Arc::from)
+}
+
+/// One entry of an inbound's `settings.clients`, in Xray's shape, for the
+/// inbound `protocol` (`vless`, `vmess` or `trojan`). It is read exactly as
+/// the same entry in a configuration would be, so an account added to a
+/// running server cannot differ from one written in the file.
+pub fn parse_inbound_client(protocol: &str, client: &Value) -> R<InboundClient> {
+    let settings = serde_json::json!({ "clients": [client] });
+    let path = "client";
+    match protocol {
+        "vless" => {
+            let mut users = parse_vless_inbound(Some(&settings), path)?.users.into_vec();
+            Ok(InboundClient::Vless(users.remove(0)))
+        }
+        "vmess" => {
+            let mut users = parse_vmess_inbound(Some(&settings), path)?.users.into_vec();
+            Ok(InboundClient::Vmess(users.remove(0)))
+        }
+        "trojan" => {
+            let trojan = parse_trojan_inbound(Some(&settings), path)?;
+            Ok(InboundClient::Trojan {
+                password_hash: trojan.password_hashes[0],
+                email: trojan.emails[0].clone(),
+            })
+        }
+        "hysteria2" | "anytls" => parse_password_account(client, path),
+        "tuic" => parse_tuic_user(client, path).map(InboundClient::Tuic),
+        "shadowsocks" => Err(
+            "a shadowsocks account depends on the inbound's method; use parse_shadowsocks_client"
+                .into(),
+        ),
+        other => Err(format!(
+            "accounts cannot be added to a {other} inbound; only vless, vmess, trojan, shadowsocks, hysteria2, tuic and anytls"
+        )),
+    }
+}
+
+/// One entry of a Shadowsocks inbound's `settings.clients`, for an inbound
+/// of `method` (see [`parse_inbound_client`]).
+pub fn parse_shadowsocks_client(method: ShadowsocksMethod, client: &Value) -> R<InboundClient> {
+    parse_shadowsocks_user(method, client, "client").map(InboundClient::Shadowsocks)
 }
 
 fn parse_vless_inbound(settings: Option<&Value>, path: &str) -> R<VlessInboundConfig> {
@@ -1154,9 +1207,8 @@ fn parse_vless_inbound(settings: Option<&Value>, path: &str) -> R<VlessInboundCo
                 .map(Arc::from),
         });
     }
-    if users.is_empty() {
-        return Err(format!("{path}.settings.clients must not be empty"));
-    }
+    // No account yet is a normal state for a server a panel manages:
+    // nobody gets in until one is added.
     let decryption = match settings
         .and_then(|s| s.get("decryption"))
         .and_then(Value::as_str)
@@ -1276,9 +1328,8 @@ fn parse_trojan_inbound(settings: Option<&Value>, path: &str) -> R<TrojanInbound
         password_hashes.push(crate::trojan_hash(password));
         emails.push(client_email(client));
     }
-    if password_hashes.is_empty() {
-        return Err(format!("{path}.settings.clients must not be empty"));
-    }
+    // No account yet is a normal state for a server a panel manages:
+    // nobody gets in until one is added.
     Ok(TrojanInboundConfig {
         password_hashes: password_hashes.into_boxed_slice(),
         emails: emails.into_boxed_slice(),
@@ -1318,9 +1369,8 @@ fn parse_vmess_inbound(settings: Option<&Value>, path: &str) -> R<VmessInboundCo
             })
         })
         .collect::<R<Vec<_>>>()?;
-    if users.is_empty() {
-        return Err(format!("{path}.settings.clients must not be empty"));
-    }
+    // No account yet is a normal state for a server a panel manages:
+    // nobody gets in until one is added.
     Ok(VmessInboundConfig {
         users: users.into_boxed_slice(),
     })
@@ -1328,23 +1378,102 @@ fn parse_vmess_inbound(settings: Option<&Value>, path: &str) -> R<VmessInboundCo
 
 fn parse_shadowsocks_inbound(settings: Option<&Value>, path: &str) -> R<ShadowsocksInboundConfig> {
     let settings = settings.ok_or_else(|| format!("{path}.settings is required"))?;
-    let method = settings
+    let listed = settings.get("clients").and_then(Value::as_array);
+    let clients = listed.map(Vec::as_slice).unwrap_or_default();
+    // Xray's legacy multi-user form names the method on each client and not
+    // on the inbound; all of them must agree, since one listener serves one.
+    let method_text = settings
         .get("method")
+        .or_else(|| clients.first().and_then(|client| client.get("method")))
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("{path}.settings.method is required"))
-        .and_then(|value| {
-            ShadowsocksMethod::parse(value)
-                .ok_or_else(|| format!("{path}.settings.method {value:?} is unsupported"))
-        })?;
+        .ok_or_else(|| format!("{path}.settings.method is required"))?;
+    let method = ShadowsocksMethod::parse(method_text)
+        .ok_or_else(|| format!("{path}.settings.method {method_text:?} is unsupported"))?;
     let password = settings
         .get("password")
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("{path}.settings.password is required"))?;
+        .filter(|value| !value.is_empty());
+    let mut users = Vec::with_capacity(clients.len());
+    for (idx, client) in clients.iter().enumerate() {
+        let client_path = format!("{path}.settings.clients[{idx}]");
+        users.push(parse_shadowsocks_user(method, client, &client_path)?);
+    }
+    if listed.is_none() && password.is_none() {
+        return Err(format!(
+            "{path}.settings.password or settings.clients is required for shadowsocks"
+        ));
+    }
+    if method.is_2022() {
+        let server_key = password.ok_or_else(|| {
+            format!("{path}.settings.password (the server key) is required for a 2022 method")
+        })?;
+        check_2022_key(method, server_key, &format!("{path}.settings.password"))?;
+        if !users.is_empty() && method == ShadowsocksMethod::Blake3Chacha20Poly1305 {
+            return Err(format!(
+                "{path}.settings.clients: 2022-blake3-chacha20-poly1305 has no multi-user form"
+            ));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    if let Some(duplicate) = users.iter().find(|user| !seen.insert(&user.password)) {
+        return Err(format!(
+            "{path}.settings.clients: two clients share the password of {}",
+            duplicate.email.as_deref().unwrap_or("an account")
+        ));
+    }
     Ok(ShadowsocksInboundConfig {
         method,
-        password: password.into(),
+        password: password.unwrap_or_default().into(),
+        users: users.into_boxed_slice(),
+        multi_user: listed.is_some(),
+        email: client_email(settings),
     })
+}
+
+/// One entry of a Shadowsocks inbound's `settings.clients`.
+fn parse_shadowsocks_user(
+    method: ShadowsocksMethod,
+    client: &Value,
+    path: &str,
+) -> R<ShadowsocksInboundUser> {
+    if let Some(own) = client.get("method").and_then(Value::as_str) {
+        if ShadowsocksMethod::parse(own) != Some(method) {
+            return Err(format!(
+                "{path}.method {own:?} differs from the inbound's; one inbound serves one method"
+            ));
+        }
+    }
+    let password = client
+        .get("password")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{path}.password is required"))?;
+    if method.is_2022() {
+        check_2022_key(method, password, &format!("{path}.password"))?;
+    }
+    Ok(ShadowsocksInboundUser {
+        password: password.into(),
+        email: client_email(client),
+    })
+}
+
+/// A Shadowsocks 2022 key is base64 of exactly the method's key length.
+fn check_2022_key(method: ShadowsocksMethod, key: &str, path: &str) -> R<()> {
+    use base64::Engine as _;
+    let want = match method {
+        ShadowsocksMethod::Blake3Aes128Gcm => 16,
+        _ => 32,
+    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(key.trim())
+        .map_err(|_| format!("{path} must be a base64 key of {want} bytes"))?;
+    if decoded.len() != want {
+        return Err(format!(
+            "{path} must be a base64 key of {want} bytes, not {}",
+            decoded.len()
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- outbounds
@@ -2348,33 +2477,86 @@ fn parse_tide_relay(settings: Option<&Value>, path: &str) -> R<TideRelayConfig> 
     })
 }
 
-fn parse_anytls_inbound(settings: Option<&Value>, path: &str) -> R<AnyTlsInboundConfig> {
-    let settings = settings.ok_or_else(|| format!("{path}.settings is required for anytls"))?;
-    let mut passwords = Vec::new();
+/// The password accounts of a Hysteria2 or AnyTLS inbound: `settings.password`
+/// (named by `settings.email`) and each of `settings.users` (Xray's `clients`
+/// too), as parallel lists of passwords and names.
+#[allow(clippy::type_complexity)]
+fn parse_password_accounts(
+    settings: &Value,
+    path: &str,
+    protocol: &str,
+) -> R<(Box<[Box<str>]>, Box<[Option<Arc<str>>]>)> {
+    let mut passwords: Vec<Box<str>> = Vec::new();
+    let mut emails = Vec::new();
     if let Some(password) = settings.get("password").and_then(Value::as_str) {
         if password.is_empty() {
             return Err(format!("{path}.settings.password must not be empty"));
         }
-        passwords.push(Box::<str>::from(password));
+        passwords.push(password.into());
+        emails.push(client_email(settings));
     }
-    if let Some(users) = settings.get("users").and_then(Value::as_array) {
-        for (index, user) in users.iter().enumerate() {
-            let password = user
-                .get("password")
-                .and_then(Value::as_str)
-                .filter(|password| !password.is_empty())
-                .ok_or_else(|| format!("{path}.settings.users[{index}].password is required"))?;
-            passwords.push(password.into());
-        }
+    let users = settings
+        .get("users")
+        .or_else(|| settings.get("clients"))
+        .and_then(Value::as_array);
+    for (index, user) in users.into_iter().flatten().enumerate() {
+        let account = parse_password_account(user, &format!("{path}.settings.users[{index}]"))?;
+        let InboundClient::Password { password, email } = account else {
+            unreachable!("a password account")
+        };
+        passwords.push(password);
+        emails.push(email);
     }
     if passwords.is_empty() {
         return Err(format!(
-            "{path}.settings.password or settings.users is required for anytls"
+            "{path}.settings.password or settings.users is required for {protocol}"
         ));
     }
-    Ok(AnyTlsInboundConfig {
-        passwords: passwords.into_boxed_slice(),
+    let mut seen = std::collections::HashSet::new();
+    if passwords.iter().any(|password| !seen.insert(password)) {
+        return Err(format!("{path}.settings: two accounts share a password"));
+    }
+    Ok((passwords.into_boxed_slice(), emails.into_boxed_slice()))
+}
+
+/// One Hysteria2 or AnyTLS account: `{"password": ..., "email": ...}`.
+fn parse_password_account(user: &Value, path: &str) -> R<InboundClient> {
+    let password = user
+        .get("password")
+        .and_then(Value::as_str)
+        .filter(|password| !password.is_empty())
+        .ok_or_else(|| format!("{path}.password is required"))?;
+    Ok(InboundClient::Password {
+        password: password.into(),
+        email: account_name(user),
     })
+}
+
+/// One TUIC account: `{"uuid": ..., "password": ..., "email": ...}`.
+fn parse_tuic_user(user: &Value, path: &str) -> R<TuicInboundUser> {
+    let uuid = user
+        .get("uuid")
+        .or_else(|| user.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{path}.uuid is required for tuic"))
+        .and_then(crate::share_link::parse_uuid)
+        .map_err(|error| format!("{path}.uuid: {error}"))?;
+    let password = user
+        .get("password")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{path}.password is required for tuic"))?;
+    Ok(TuicInboundUser {
+        uuid,
+        password: password.into(),
+        email: account_name(user),
+    })
+}
+
+fn parse_anytls_inbound(settings: Option<&Value>, path: &str) -> R<AnyTlsInboundConfig> {
+    let settings = settings.ok_or_else(|| format!("{path}.settings is required for anytls"))?;
+    let (passwords, emails) = parse_password_accounts(settings, path, "anytls")?;
+    Ok(AnyTlsInboundConfig { passwords, emails })
 }
 
 /// Xray's `hysteria` outbound as the Hysteria 2 outbound Zray has. Xray
@@ -2427,7 +2609,7 @@ fn xray_hysteria_inbound(v: &Value, path: &str) -> R<Value> {
             user.get("auth")
                 .and_then(Value::as_str)
                 .filter(|auth| !auth.is_empty())
-                .map(|auth| serde_json::json!({ "password": auth }))
+                .map(|auth| serde_json::json!({ "password": auth, "email": user.get("email") }))
                 .ok_or_else(|| format!("{path}.settings.users[{index}].auth is required"))
         })
         .collect::<R<_>>()?;
@@ -3464,28 +3646,7 @@ fn parse_amnezia_header(
 
 fn parse_hysteria2_inbound(settings: Option<&Value>, path: &str) -> R<Hysteria2InboundConfig> {
     let settings = settings.ok_or_else(|| format!("{path}.settings is required for hysteria2"))?;
-    let mut passwords = Vec::new();
-    if let Some(password) = settings.get("password").and_then(Value::as_str) {
-        if password.is_empty() {
-            return Err(format!("{path}.settings.password must not be empty"));
-        }
-        passwords.push(password.into());
-    }
-    if let Some(users) = settings.get("users").and_then(Value::as_array) {
-        for (index, user) in users.iter().enumerate() {
-            let password = user
-                .get("password")
-                .and_then(Value::as_str)
-                .filter(|password| !password.is_empty())
-                .ok_or_else(|| format!("{path}.settings.users[{index}].password is required"))?;
-            passwords.push(password.into());
-        }
-    }
-    if passwords.is_empty() {
-        return Err(format!(
-            "{path}.settings.password or settings.users is required for hysteria2"
-        ));
-    }
+    let (passwords, emails) = parse_password_accounts(settings, path, "hysteria2")?;
     let obfs_password = match settings.get("obfs").filter(|obfs| !obfs.is_null()) {
         Some(obfs) => {
             let kind = obfs
@@ -3507,7 +3668,8 @@ fn parse_hysteria2_inbound(settings: Option<&Value>, path: &str) -> R<Hysteria2I
         None => None,
     };
     Ok(Hysteria2InboundConfig {
-        passwords: passwords.into_boxed_slice(),
+        passwords,
+        emails,
         obfs_password,
         masquerade: parse_hysteria_masquerade(settings.get("masquerade"), path)?,
     })
@@ -3575,20 +3737,32 @@ fn parse_hysteria_masquerade(value: Option<&Value>, path: &str) -> R<Option<Hyst
 
 fn parse_tuic_inbound(settings: Option<&Value>, path: &str) -> R<TuicInboundConfig> {
     let settings = settings.ok_or_else(|| format!("{path}.settings is required for tuic"))?;
-    let uuid = settings
-        .get("uuid")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("{path}.settings.uuid is required for tuic"))
-        .and_then(crate::share_link::parse_uuid)
-        .map_err(|error| format!("{path}.settings.uuid: {error}"))?;
-    let password = settings
-        .get("password")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("{path}.settings.password is required for tuic"))?;
+    let mut users = Vec::new();
+    // The one account at the top level, as Zray first read TUIC.
+    if settings.get("uuid").is_some() || settings.get("password").is_some() {
+        users.push(parse_tuic_user(settings, &format!("{path}.settings"))?);
+    }
+    let listed = settings
+        .get("users")
+        .or_else(|| settings.get("clients"))
+        .and_then(Value::as_array);
+    for (index, user) in listed.into_iter().flatten().enumerate() {
+        users.push(parse_tuic_user(
+            user,
+            &format!("{path}.settings.users[{index}]"),
+        )?);
+    }
+    if users.is_empty() {
+        return Err(format!(
+            "{path}.settings.uuid and password, or settings.users, are required for tuic"
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if users.iter().any(|user| !seen.insert(user.uuid)) {
+        return Err(format!("{path}.settings: two TUIC accounts share a uuid"));
+    }
     Ok(TuicInboundConfig {
-        uuid,
-        password: password.into(),
+        users: users.into_boxed_slice(),
     })
 }
 
@@ -6216,6 +6390,31 @@ fn parse_hex(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server inbound with no account yet compiles and admits nobody until
+    /// one is added: the normal state of an inbound a panel just made.
+    #[test]
+    fn server_inbounds_may_start_without_accounts() {
+        for (protocol, settings) in [
+            (
+                "vless",
+                serde_json::json!({"clients": [], "decryption": "none"}),
+            ),
+            ("vmess", serde_json::json!({"clients": []})),
+            ("trojan", serde_json::json!({"clients": []})),
+            (
+                "shadowsocks",
+                serde_json::json!({"method": "aes-256-gcm", "clients": []}),
+            ),
+        ] {
+            let config = serde_json::json!({
+                "inbounds": [{"tag": "in", "listen": "127.0.0.1", "port": 1, "protocol": protocol, "settings": settings}],
+                "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            });
+            compile_config(&config, zero_core::GenerationId(1))
+                .unwrap_or_else(|error| panic!("{protocol}: {error}"));
+        }
+    }
 
     #[test]
     fn hex_with_non_ascii_text_is_an_error_not_a_panic() {

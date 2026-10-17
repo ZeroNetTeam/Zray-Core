@@ -19,6 +19,8 @@ const MAX_REQUEST: usize = 2 * 1024 * 1024;
 /// bounded: handling (a forced asset refresh downloads rule sets) must not be
 /// cancelled half-way by a deadline meant for slow senders.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often an idle `GET /events` stream gets a comment line.
+const EVENTS_KEEPALIVE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct ManagementConfig {
@@ -47,6 +49,17 @@ impl ManagementServer {
     }
 
     pub async fn run(self, server: Arc<Server>) -> std::io::Result<()> {
+        self.serve(Target::Server(server)).await
+    }
+
+    /// [`ManagementServer::run`] for a [`crate::host::Host`]: every request
+    /// goes to the server serving at the time, and `POST /reload` may then
+    /// change inbounds too.
+    pub async fn run_host(self, host: Arc<crate::host::Host>) -> std::io::Result<()> {
+        self.serve(Target::Host(host)).await
+    }
+
+    async fn serve(self, target: Target) -> std::io::Result<()> {
         let addr = self.config.listen;
         let listener = zero_net::prepare_listener(addr)?;
         let mut backoff_ms = 10u64;
@@ -67,9 +80,9 @@ impl ManagementServer {
             };
             let _ = stream.set_nodelay(true);
             let config = self.config.clone();
-            let server = Arc::clone(&server);
+            let target = target.clone();
             tokio::spawn(async move {
-                if let Err(error) = handle_connection(stream, peer, config, server).await {
+                if let Err(error) = handle_target(stream, peer, config, target).await {
                     tracing::debug!(%peer, %error, "management request failed");
                 }
             });
@@ -77,12 +90,33 @@ impl ManagementServer {
     }
 }
 
+/// What the API drives: one server, or a host whose server may be replaced.
+#[derive(Clone)]
+enum Target {
+    Server(Arc<Server>),
+    Host(Arc<crate::host::Host>),
+}
+
+#[cfg(test)]
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     config: ManagementConfig,
     server: Arc<Server>,
 ) -> Result<(), String> {
+    handle_target(stream, peer, config, Target::Server(server)).await
+}
+
+async fn handle_target(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    config: ManagementConfig,
+    target: Target,
+) -> Result<(), String> {
+    let (server, host) = match target {
+        Target::Server(server) => (server, None),
+        Target::Host(host) => (host.server(), Some(host)),
+    };
     let deadline = tokio::time::Instant::now() + REQUEST_READ_TIMEOUT;
     let mut data = Vec::with_capacity(1024);
     let head_end;
@@ -259,6 +293,146 @@ async fn handle_connection(
                 .map_err(|error| format!("encoding refresh report: {error}"))?;
             write_response(&mut stream, 200, "ok", &body).await
         }
+        ("GET", "/accounts/online") => {
+            // Addresses are present only when the host has turned address
+            // tracking on (see `crate::accounts`).
+            let body = serde_json::json!({ "accounts": server.stats.accounts.online() });
+            let body = serde_json::to_vec(&body)
+                .map_err(|error| format!("encoding online accounts: {error}"))?;
+            write_response(&mut stream, 200, "ok", &body).await
+        }
+        ("POST", "/accounts/end") => {
+            // `{"email": "..."}`: end every open session of that account, for
+            // a panel whose account just ran out of quota or time.
+            let body = &data[head_end..head_end + content_length];
+            let email = serde_json::from_slice::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| value.get("email")?.as_str().map(str::to_owned))
+                .filter(|email| !email.is_empty());
+            let Some(email) = email else {
+                return write_response(&mut stream, 400, "body must be {\"email\": ...}", b"")
+                    .await;
+            };
+            let ended = server.stats.accounts.end_sessions(&email);
+            let body = serde_json::to_vec(&serde_json::json!({ "ended": ended }))
+                .map_err(|error| error.to_string())?;
+            write_response(&mut stream, 200, "ok", &body).await
+        }
+        ("GET", "/events") => {
+            // Server-sent events: one `data:` line of JSON per event
+            // (`crate::events`), until the client goes away. A comment line
+            // every few seconds keeps proxies from closing an idle stream and
+            // lets a vanished client be noticed.
+            use tokio::sync::broadcast::error::RecvError;
+            let mut events = server.stats.events().subscribe();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 ok\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .map_err(|error| format!("writing response: {error}"))?;
+            let mut keepalive = tokio::time::interval(EVENTS_KEEPALIVE);
+            keepalive.tick().await;
+            loop {
+                let chunk = tokio::select! {
+                    received = events.recv() => match received {
+                        Ok(record) => format!(
+                            "data: {}\n\n",
+                            serde_json::to_string(&record).map_err(|error| error.to_string())?
+                        ),
+                        Err(RecvError::Lagged(missed)) => {
+                            format!("data: {{\"event\":\"lagged\",\"missed\":{missed}}}\n\n")
+                        }
+                        Err(RecvError::Closed) => return Ok(()),
+                    },
+                    _ = keepalive.tick() => ": keepalive\n\n".to_string(),
+                };
+                if stream.write_all(chunk.as_bytes()).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        ("GET", "/accounts/limits") => {
+            let body = serde_json::json!({ "limits": server.stats.accounts.limits() });
+            let body =
+                serde_json::to_vec(&body).map_err(|error| format!("encoding limits: {error}"))?;
+            write_response(&mut stream, 200, "ok", &body).await
+        }
+        ("POST", "/accounts/limit") => {
+            // `{"email": ..., "uplink": B/s, "downlink": B/s}`, shared by all
+            // the account's sessions; 0 or absent lifts that direction.
+            let body = &data[head_end..head_end + content_length];
+            let result = serde_json::from_slice::<serde_json::Value>(body)
+                .map_err(|_| "body is not JSON".to_string())
+                .and_then(|request| {
+                    let email = request["email"]
+                        .as_str()
+                        .filter(|email| !email.is_empty())
+                        .ok_or("body must name the \"email\"")?;
+                    let rate = |key: &str| match &request[key] {
+                        serde_json::Value::Null => Ok(0),
+                        value => value
+                            .as_u64()
+                            .ok_or(format!("\"{key}\" must be bytes per second")),
+                    };
+                    let (uplink, downlink) = (rate("uplink")?, rate("downlink")?);
+                    server.stats.accounts.set_limit(email, uplink, downlink);
+                    Ok(serde_json::json!({ "uplink": uplink, "downlink": downlink }))
+                });
+            account_reply(&mut stream, result).await
+        }
+        ("POST", "/accounts/add") => {
+            // `{"inbound": tag, "clients": [...]}`, each client in the shape
+            // of the inbound's `settings.clients`. Applied without a reload.
+            let body = &data[head_end..head_end + content_length];
+            let request: serde_json::Value = match serde_json::from_slice(body) {
+                Ok(value) => value,
+                Err(_) => return write_response(&mut stream, 400, "body is not JSON", b"").await,
+            };
+            let result = (|| {
+                let tag = request["inbound"]
+                    .as_str()
+                    .ok_or("body must name the \"inbound\"")?;
+                let clients = request["clients"]
+                    .as_array()
+                    .ok_or("body must carry a \"clients\" array")?
+                    .iter()
+                    .map(|client| server.parse_account(tag, client))
+                    .collect::<Result<Vec<_>, String>>()?;
+                server.add_accounts(tag, &clients)?;
+                Ok::<usize, String>(clients.len())
+            })();
+            account_reply(
+                &mut stream,
+                result.map(|added| serde_json::json!({ "added": added })),
+            )
+            .await
+        }
+        ("POST", "/accounts/remove") => {
+            // `{"inbound": tag, "emails": [...]}`. Their sessions there end.
+            let body = &data[head_end..head_end + content_length];
+            let request: serde_json::Value = match serde_json::from_slice(body) {
+                Ok(value) => value,
+                Err(_) => return write_response(&mut stream, 400, "body is not JSON", b"").await,
+            };
+            let result = (|| {
+                let tag = request["inbound"]
+                    .as_str()
+                    .ok_or("body must name the \"inbound\"")?;
+                let emails: Vec<&str> = request["emails"]
+                    .as_array()
+                    .ok_or("body must carry an \"emails\" array")?
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect();
+                server.remove_accounts(tag, &emails)
+            })();
+            account_reply(
+                &mut stream,
+                result.map(|removed| serde_json::json!({ "removed": removed })),
+            )
+            .await
+        }
         ("POST", "/reload") => {
             let body = &data[head_end..head_end + content_length];
             let value: serde_json::Value = serde_json::from_slice(body)
@@ -267,17 +441,52 @@ async fn handle_connection(
             let (generation, diagnostics) =
                 zero_config::compile_config(&value, zero_core::GenerationId(next))
                     .map_err(|error| format!("reload config rejected: {error}"))?;
-            server
-                .reload(Arc::clone(&generation.config), generation.id)
-                .map_err(|error| format!("reload rejected: {error}"))?;
+            let applied = match &host {
+                // A host can also add, remove and re-bind inbounds.
+                Some(host) => match host.apply(Arc::clone(&generation.config)).await {
+                    Ok(crate::host::Applied::Reloaded) => "reloaded",
+                    Ok(crate::host::Applied::Restarted) => "restarted",
+                    Err(error) => {
+                        let body = serde_json::to_vec(&serde_json::json!({ "error": error }))
+                            .map_err(|error| error.to_string())?;
+                        return write_response(&mut stream, 400, "reload rejected", &body).await;
+                    }
+                },
+                None => {
+                    server
+                        .reload(Arc::clone(&generation.config), generation.id)
+                        .map_err(|error| format!("reload rejected: {error}"))?;
+                    "reloaded"
+                }
+            };
             let body = serde_json::json!({
                 "generation": next,
-                "diagnostics": diagnostics.diagnostics.len()
+                "diagnostics": diagnostics.diagnostics.len(),
+                "applied": applied,
             });
             let body = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
             write_response(&mut stream, 200, "ok", &body).await
         }
         _ => write_response(&mut stream, 404, "not found", b"").await,
+    }
+}
+
+/// The reply to an account change: the outcome as JSON, or a 400 whose body
+/// says why the change was refused, so a panel can show it.
+async fn account_reply(
+    stream: &mut TcpStream,
+    result: Result<serde_json::Value, String>,
+) -> Result<(), String> {
+    match result {
+        Ok(body) => {
+            let body = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
+            write_response(stream, 200, "ok", &body).await
+        }
+        Err(error) => {
+            let body = serde_json::to_vec(&serde_json::json!({ "error": error }))
+                .map_err(|error| error.to_string())?;
+            write_response(stream, 400, "account change refused", &body).await
+        }
     }
 }
 
@@ -549,5 +758,273 @@ Content-Length: 2\r\n",
             },
         );
         assert!(stats.traffic_counters(false).is_empty());
+    }
+
+    /// Serve one request on a fresh management listener and return the reply.
+    async fn ask(server: std::sync::Arc<crate::Server>, request: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let config = ManagementConfig {
+            listen,
+            bearer_token: None,
+        };
+        let serving = async move {
+            let (accepted, peer) = listener.accept().await.unwrap();
+            handle_connection(accepted, peer, config, server).await
+        };
+        let client = async {
+            let mut stream = tokio::net::TcpStream::connect(listen).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut reply = Vec::new();
+            stream.read_to_end(&mut reply).await.unwrap();
+            String::from_utf8_lossy(&reply).into_owned()
+        };
+        tokio::join!(client, serving).0
+    }
+
+    fn body_json(reply: &str) -> serde_json::Value {
+        serde_json::from_str(reply.split("\r\n\r\n").nth(1).expect("a body")).expect("JSON")
+    }
+
+    /// A panel reads who is online and per-account bytes, and can end an
+    /// account's sessions, which then fail on their next use.
+    #[tokio::test]
+    async fn accounts_are_reported_and_their_sessions_ended() {
+        use tokio::io::AsyncWriteExt;
+
+        let generation = zero_config::RuntimeGeneration::compile(
+            zero_config::parse_config_array(
+                r#"{"inbounds": [], "outbounds": [{"tag": "direct", "protocol": "freedom"}]}"#,
+            )
+            .expect("a config the engine accepts")
+            .remove(0)
+            .1,
+            zero_core::GenerationId(1),
+        )
+        .expect("compiles");
+        let server = std::sync::Arc::new(crate::Server::new(crate::ServerConfig {
+            config: std::sync::Arc::clone(&generation.config),
+            generation: generation.id,
+        }));
+        let email: std::sync::Arc<str> = std::sync::Arc::from("alice@panel");
+        let tag: std::sync::Arc<str> = std::sync::Arc::from("vless-in");
+        let address: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let (client, _far) = tokio::io::duplex(1024);
+        let mut session = server.stats.accounts.meter(&email, &tag, address, client);
+        session.write_all(b"twelve bytes").await.unwrap();
+
+        let online = body_json(
+            &ask(
+                Arc::clone(&server),
+                "GET /accounts/online HTTP/1.1\r\nHost: x\r\n\r\n".into(),
+            )
+            .await,
+        );
+        assert_eq!(online["accounts"][0]["email"], "alice@panel");
+        assert_eq!(online["accounts"][0]["sessions"], 1);
+        assert_eq!(online["accounts"][0]["addresses"], serde_json::json!([]));
+
+        let traffic = body_json(
+            &ask(
+                Arc::clone(&server),
+                "GET /stats/traffic HTTP/1.1\r\nHost: x\r\n\r\n".into(),
+            )
+            .await,
+        );
+        let downlink = traffic["stat"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stat| stat["name"] == "user>>>alice@panel>>>traffic>>>downlink")
+            .map(|stat| stat["value"].clone());
+        assert_eq!(downlink, Some(serde_json::json!(12)));
+
+        let body = r#"{"email": "alice@panel"}"#;
+        let request = format!(
+            "POST /accounts/end HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let ended = body_json(&ask(Arc::clone(&server), request).await);
+        assert_eq!(ended["ended"], 1);
+        assert!(session.write_all(b"more").await.is_err());
+
+        let body = r#"{"email": "alice@panel", "downlink": 1000000}"#;
+        let request = format!(
+            "POST /accounts/limit HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(
+            body_json(&ask(Arc::clone(&server), request).await)["downlink"],
+            1_000_000
+        );
+        let limits = body_json(
+            &ask(
+                Arc::clone(&server),
+                "GET /accounts/limits HTTP/1.1\r\nHost: x\r\n\r\n".into(),
+            )
+            .await,
+        );
+        assert_eq!(limits["limits"][0]["email"], "alice@panel");
+        assert_eq!(limits["limits"][0]["uplink"], 0);
+        let body = r#"{"email": "alice@panel", "uplink": "fast"}"#;
+        let request = format!(
+            "POST /accounts/limit HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert!(ask(Arc::clone(&server), request)
+            .await
+            .starts_with("HTTP/1.1 400"));
+
+        let refused = ask(
+            server,
+            "POST /accounts/end HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}".into(),
+        )
+        .await;
+        assert!(refused.starts_with("HTTP/1.1 400"), "{refused}");
+    }
+
+    /// Accounts are added and removed over the API in the same JSON shape as
+    /// `settings.clients`, and a refused change says why.
+    #[tokio::test]
+    async fn accounts_are_added_and_removed_over_the_api() {
+        let generation = zero_config::RuntimeGeneration::compile(
+            zero_config::parse_config_array(
+                r#"{
+                    "inbounds": [{
+                        "tag": "vless-in", "listen": "127.0.0.1", "port": 1, "protocol": "vless",
+                        "settings": {"clients": [{"id": "5783a3e7-e373-51cd-8642-c83782b807c5", "email": "a@p"}], "decryption": "none"}
+                    }],
+                    "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+                }"#,
+            )
+            .expect("a config the engine accepts")
+            .remove(0)
+            .1,
+            zero_core::GenerationId(1),
+        )
+        .expect("compiles");
+        let server = std::sync::Arc::new(crate::Server::new(crate::ServerConfig {
+            config: std::sync::Arc::clone(&generation.config),
+            generation: generation.id,
+        }));
+        let post = |path: &str, body: serde_json::Value| {
+            let body = body.to_string();
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let users = |server: &crate::Server| match &server.config_for_tests().inbounds[0].protocol {
+            zero_config::InboundProtocol::Vless(vless) => vless
+                .users
+                .iter()
+                .map(|user| user.email.as_deref().unwrap_or("").to_string())
+                .collect::<Vec<_>>(),
+            other => panic!("not vless: {other:?}"),
+        };
+
+        let added = ask(
+            Arc::clone(&server),
+            post(
+                "/accounts/add",
+                serde_json::json!({"inbound": "vless-in", "clients": [
+                    {"id": "0f3c2a10-8b5e-4d7a-9c21-6e4b8f0a1d33", "email": "b@p", "flow": "xtls-rprx-vision"}
+                ]}),
+            ),
+        )
+        .await;
+        assert_eq!(body_json(&added)["added"], 1, "{added}");
+        assert_eq!(users(&server), ["a@p", "b@p"]);
+
+        let refused = ask(
+            Arc::clone(&server),
+            post(
+                "/accounts/add",
+                serde_json::json!({"inbound": "vless-in", "clients": [{"id": "1b1d3a6e-5d0f-4c8e-9f6a-2a7c3e9b8d41", "email": "c@p", "flow": "no-such-flow"}]}),
+            ),
+        )
+        .await;
+        assert!(refused.starts_with("HTTP/1.1 400"), "{refused}");
+        assert!(body_json(&refused)["error"]
+            .as_str()
+            .unwrap()
+            .contains("client"));
+
+        let removed = ask(
+            Arc::clone(&server),
+            post(
+                "/accounts/remove",
+                serde_json::json!({"inbound": "vless-in", "emails": ["a@p", "nobody@p"]}),
+            ),
+        )
+        .await;
+        assert_eq!(body_json(&removed)["removed"], 1, "{removed}");
+        assert_eq!(users(&server), ["b@p"]);
+
+        let unknown = ask(
+            server,
+            post(
+                "/accounts/remove",
+                serde_json::json!({"inbound": "nope", "emails": []}),
+            ),
+        )
+        .await;
+        assert!(unknown.starts_with("HTTP/1.1 400"), "{unknown}");
+    }
+
+    /// `GET /events` streams what happens as server-sent events.
+    #[tokio::test]
+    async fn events_are_streamed_as_they_happen() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let generation = zero_config::RuntimeGeneration::compile(
+            zero_config::parse_config_array(
+                r#"{"inbounds": [], "outbounds": [{"tag": "direct", "protocol": "freedom"}]}"#,
+            )
+            .expect("a config the engine accepts")
+            .remove(0)
+            .1,
+            zero_core::GenerationId(1),
+        )
+        .expect("compiles");
+        let server = std::sync::Arc::new(crate::Server::new(crate::ServerConfig {
+            config: std::sync::Arc::clone(&generation.config),
+            generation: generation.id,
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let config = ManagementConfig {
+            listen,
+            bearer_token: None,
+        };
+        let serving = Arc::clone(&server);
+        tokio::spawn(async move {
+            let (accepted, peer) = listener.accept().await.unwrap();
+            let _ = handle_connection(accepted, peer, config, serving).await;
+        });
+        let mut stream = tokio::net::TcpStream::connect(listen).await.unwrap();
+        stream
+            .write_all(b"GET /events HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut lines = tokio::io::BufReader::new(stream).lines();
+        let status = lines.next_line().await.unwrap().unwrap();
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        while !lines.next_line().await.unwrap().unwrap().is_empty() {}
+
+        // Subscribed once the head is out; now something happens.
+        server.stats.accounts.set_limit("g@p", 5, 6);
+        let data = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+            .await
+            .expect("an event in time")
+            .unwrap()
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(data.strip_prefix("data: ").expect("an SSE data line")).unwrap();
+        assert_eq!(json["event"], "limit_changed");
+        assert_eq!(json["email"], "g@p");
+        assert_eq!(json["downlink"], 6);
     }
 }

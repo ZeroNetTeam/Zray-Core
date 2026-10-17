@@ -550,11 +550,15 @@ pub async fn connect(
     Ok(boxed(app))
 }
 
+/// A proxy stream or datagram, with the password its connection logged in
+/// with: the server checks that it is still a valid one, since a connection
+/// outlives any change to the accounts.
 pub enum Accepted {
     Tcp {
         stream: BoxStream,
         destination: Destination,
         peer: SocketAddr,
+        password: Arc<str>,
     },
     Udp {
         connection: h3_quinn::quinn::Connection,
@@ -563,6 +567,7 @@ pub enum Accepted {
         destination: Destination,
         payload: Vec<u8>,
         peer: SocketAddr,
+        password: Arc<str>,
     },
 }
 
@@ -613,9 +618,12 @@ impl Acceptor {
 
     /// Wait for the next proxy stream or datagram. `Err` reports one rejected
     /// connection or request and is not fatal; `Ok(None)` means the endpoint
-    /// closed. `passwords` applies to connections accepted from this call on.
-    pub async fn accept(&mut self, passwords: &[Box<str>]) -> Result<Option<Accepted>, String> {
-        let passwords: Arc<[Box<str>]> = passwords.into();
+    /// closed. `passwords` applies to connections accepted from this call on;
+    /// it is shared, not copied, so a caller keeps one per configuration.
+    pub async fn accept(
+        &mut self,
+        passwords: &Arc<[Box<str>]>,
+    ) -> Result<Option<Accepted>, String> {
         loop {
             tokio::select! {
                 biased;
@@ -633,7 +641,7 @@ impl Acceptor {
                     };
                     tokio::spawn(serve_connection(
                         incoming,
-                        Arc::clone(&passwords),
+                        Arc::clone(passwords),
                         self.masquerade.clone(),
                         self.sender.clone(),
                     ));
@@ -655,8 +663,8 @@ async fn serve_connection(
     )
     .await
     .unwrap_or_else(|_| Err("Hysteria2 handshake or authentication timed out".into()));
-    let connection = match authenticated {
-        Ok(connection) => connection,
+    let (connection, password) = match authenticated {
+        Ok(authenticated) => authenticated,
         Err(error) => {
             let _ = out.send(Err(error)).await;
             return;
@@ -671,11 +679,14 @@ async fn serve_connection(
                     return;
                 };
                 let out = out.clone();
+                let password = Arc::clone(&password);
                 tokio::spawn(async move {
-                    let accepted =
-                        timeout(SERVER_REQUEST_TIMEOUT, accept_tcp_stream(send, recv, peer))
-                            .await
-                            .unwrap_or_else(|_| Err("Hysteria2 TCP request timed out".into()));
+                    let accepted = timeout(
+                        SERVER_REQUEST_TIMEOUT,
+                        accept_tcp_stream(send, recv, peer, password),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err("Hysteria2 TCP request timed out".into()));
                     let _ = out.send(accepted).await;
                 });
             }
@@ -691,6 +702,7 @@ async fn serve_connection(
                         destination,
                         payload,
                         peer,
+                        password: Arc::clone(&password),
                     },
                 );
                 if out.send(accepted).await.is_err() {
@@ -710,7 +722,7 @@ async fn authenticate_connection(
     incoming: h3_quinn::quinn::Incoming,
     passwords: &[Box<str>],
     masquerade: Option<Arc<crate::masquerade::Masquerade>>,
-) -> Result<h3_quinn::quinn::Connection, String> {
+) -> Result<(h3_quinn::quinn::Connection, Arc<str>), String> {
     let connection = incoming
         .await
         .map_err(|error| format!("Hysteria2 QUIC handshake: {error}"))?;
@@ -728,13 +740,18 @@ async fn authenticate_connection(
         .resolve_request()
         .await
         .map_err(|error| format!("Hysteria2 auth request: {error}"))?;
-    let valid = request.method() == http::Method::POST
-        && request.uri() == AUTH_URI
-        && request
-            .headers()
-            .get("hysteria-auth")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| passwords.iter().any(|password| password.as_ref() == value));
+    let matched: Option<Arc<str>> = (request.method() == http::Method::POST
+        && request.uri() == AUTH_URI)
+        .then(|| {
+            request
+                .headers()
+                .get("hysteria-auth")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| passwords.iter().find(|password| password.as_ref() == value))
+                .map(|password| Arc::from(&**password))
+        })
+        .flatten();
+    let valid = matched.is_some();
     // Not a login: with a masquerade set, this is a visitor to a website, and
     // is served as one on its own task, however long it stays.
     if let (false, Some(masquerade)) = (valid, masquerade) {
@@ -773,7 +790,7 @@ async fn authenticate_connection(
         let _h3_conn = h3_conn;
         h3_hold.closed().await;
     });
-    Ok(connection)
+    Ok((connection, matched.expect("checked valid above")))
 }
 
 /// Read one TCP request from a freshly accepted stream and answer it.
@@ -781,6 +798,7 @@ async fn accept_tcp_stream(
     mut send: h3_quinn::quinn::SendStream,
     mut recv: h3_quinn::quinn::RecvStream,
     peer: SocketAddr,
+    password: Arc<str>,
 ) -> Result<Accepted, String> {
     if read_varint(&mut recv).await? != TCP_REQUEST {
         return Err("invalid Hysteria2 TCP request type".into());
@@ -822,6 +840,7 @@ async fn accept_tcp_stream(
         stream: boxed(app),
         destination,
         peer,
+        password,
     })
 }
 

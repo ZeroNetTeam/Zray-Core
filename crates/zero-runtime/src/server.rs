@@ -50,6 +50,8 @@ pub struct Stats {
     pub tun: AtomicU8,
     /// Who is connected, as counts only ([`crate::usage`]).
     pub usage: Arc<crate::usage::UsageTracker>,
+    /// Per-account bytes and sessions, by `email` ([`crate::accounts`]).
+    pub accounts: Arc<crate::accounts::Accounts>,
 }
 
 /// [`Stats::tun`]: this runtime has no TUN device.
@@ -80,6 +82,19 @@ impl Stats {
 
     pub fn cdn_condition(&self) -> crate::cdn_check::CdnCondition {
         crate::cdn_check::CdnCondition::from_u8(self.cdn.load(Ordering::Relaxed))
+    }
+
+    /// The server's live events ([`crate::events`]).
+    pub fn events(&self) -> &crate::events::Events {
+        self.accounts.events()
+    }
+
+    /// Tell event subscribers that a session on `inbound` failed.
+    pub fn report_failure(&self, inbound: &str, error: &str) {
+        self.events().emit(|| crate::events::Event::SessionFailed {
+            inbound: inbound.to_string(),
+            error: error.to_string(),
+        });
     }
 
     /// Accumulate one relay's bytes against its inbound tag and, when the
@@ -117,7 +132,8 @@ impl Stats {
         }
     }
 
-    /// Xray-style `{name, value}` counters, sorted by name for stable output.
+    /// Xray-style `{name, value}` counters, sorted by name for stable output:
+    /// per tag, and per account (`user>>>{email}>>>traffic>>>uplink`).
     /// `reset` zeroes each counter as it is read, matching the semantics of
     /// Xray's `QueryStats reset=true`.
     pub fn traffic_counters(&self, reset: bool) -> Vec<(String, u64)> {
@@ -133,6 +149,15 @@ impl Stats {
             for value in traffic.values_mut() {
                 *value = 0;
             }
+        }
+        drop(traffic);
+        for account in self.accounts.traffic(reset) {
+            let email = &account.email;
+            counters.push((format!("user>>>{email}>>>traffic>>>uplink"), account.uplink));
+            counters.push((
+                format!("user>>>{email}>>>traffic>>>downlink"),
+                account.downlink,
+            ));
         }
         counters.sort_by(|a, b| a.0.cmp(&b.0));
         counters
@@ -329,7 +354,7 @@ struct ServerState {
 /// key and allocates a fresh session cache and ticketer. Doing that per
 /// connection cost CPU on every accept and, worse, made TLS session resumption
 /// impossible, since no two connections ever shared a cache.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct InboundRuntime {
     tls: Option<Result<Arc<rustls::ServerConfig>, String>>,
     reality: Option<zero_security::tls13::server::RealityServerParams>,
@@ -341,6 +366,9 @@ struct InboundRuntime {
     /// or why its setting is unusable. Made once per inbound, because its
     /// 0-RTT tickets must outlive any one connection.
     vless_encryption: Option<Result<Arc<zero_protocol::vless_encryption::Server>, String>>,
+    /// The user table of a multi-user Shadowsocks 2022 inbound, or why its
+    /// keys are unusable. Rebuilt when its accounts change at run time.
+    shadowsocks_users: Option<Result<Arc<zero_protocol::shadowsocks2022::ServerUsers>, String>>,
 }
 
 /// A Tide inbound's server. It outlives any one connection: a session's
@@ -452,6 +480,7 @@ impl InboundRuntime {
             reality,
             transport,
             vless_encryption,
+            shadowsocks_users: shadowsocks_users(&inbound.protocol),
             tide: match &inbound.protocol {
                 InboundProtocol::Tide(config) => Some(TideInbound::new(config)),
                 _ => None,
@@ -482,6 +511,83 @@ impl InboundRuntime {
                 .map(outbound::raw_http_header_config),
         }
     }
+}
+
+/// Which named WireGuard peer owns an address, by its `allowedIPs`, for
+/// metering a peer's packets under its `email`.
+struct WireGuardOwners(Vec<(zero_config::routing::ipnet_lite::Cidr, Arc<str>)>);
+
+impl WireGuardOwners {
+    /// `None` when no peer has an `email`: then nothing is metered.
+    fn of(config: &zero_config::WireGuardInboundConfig) -> Option<Arc<Self>> {
+        let mut owned: Vec<_> = config
+            .peers
+            .iter()
+            .filter_map(|peer| Some((peer, peer.email.clone()?)))
+            .flat_map(|(peer, email)| {
+                peer.allowed_ips
+                    .iter()
+                    .map(move |cidr| (cidr.clone(), Arc::clone(&email)))
+            })
+            .collect();
+        // Longest prefix first, so the most specific owner wins.
+        owned.sort_by(|a, b| b.0.prefix.cmp(&a.0.prefix));
+        (!owned.is_empty()).then(|| Arc::new(Self(owned)))
+    }
+
+    fn owner(&self, ip: std::net::IpAddr) -> Option<&Arc<str>> {
+        self.0
+            .iter()
+            .find(|(cidr, _)| cidr.contains(ip))
+            .map(|(_, email)| email)
+    }
+
+    fn of_source(&self, packet: &[u8]) -> Option<&Arc<str>> {
+        self.owner(packet_address(packet, true)?)
+    }
+
+    fn of_destination(&self, packet: &[u8]) -> Option<&Arc<str>> {
+        self.owner(packet_address(packet, false)?)
+    }
+}
+
+/// The source (or destination) address of an IPv4 or IPv6 packet.
+fn packet_address(packet: &[u8], source: bool) -> Option<std::net::IpAddr> {
+    match packet.first()? >> 4 {
+        4 => {
+            let at = if source { 12 } else { 16 };
+            let bytes: [u8; 4] = packet.get(at..at + 4)?.try_into().ok()?;
+            Some(std::net::IpAddr::from(bytes))
+        }
+        6 => {
+            let at = if source { 8 } else { 24 };
+            let bytes: [u8; 16] = packet.get(at..at + 16)?.try_into().ok()?;
+            Some(std::net::IpAddr::from(bytes))
+        }
+        _ => None,
+    }
+}
+
+/// The SIP023 user table of a multi-user Shadowsocks 2022 inbound.
+fn shadowsocks_users(
+    protocol: &InboundProtocol,
+) -> Option<Result<Arc<zero_protocol::shadowsocks2022::ServerUsers>, String>> {
+    let InboundProtocol::Shadowsocks(config) = protocol else {
+        return None;
+    };
+    if !config.method.is_2022() || !config.multi_user {
+        return None;
+    }
+    let keys: Vec<&str> = config.users.iter().map(|user| &*user.password).collect();
+    Some(
+        zero_protocol::shadowsocks2022::ServerUsers::new(
+            ss2022_method(config.method),
+            &config.password,
+            &keys,
+        )
+        .map(Arc::new)
+        .map_err(|error| format!("Shadowsocks 2022 users: {error}")),
+    )
 }
 
 /// A Hysteria2 inbound's masquerade, in the form the transport serves.
@@ -757,8 +863,279 @@ struct AssetStatus {
     at: std::time::SystemTime,
 }
 
+/// The password and name lists without the accounts `named` picks, and how
+/// many those were.
+#[allow(clippy::type_complexity)]
+fn remove_passwords(
+    passwords: &[Box<str>],
+    emails: &[Option<Arc<str>>],
+    named: impl Fn(Option<&Arc<str>>) -> bool,
+) -> (Box<[Box<str>]>, Box<[Option<Arc<str>>]>, usize) {
+    let (kept, names): (Vec<_>, Vec<_>) = passwords
+        .iter()
+        .cloned()
+        .zip(emails.iter().cloned().chain(std::iter::repeat(None)))
+        .filter(|(_, email)| !named(email.as_ref()))
+        .unzip();
+    let removed = passwords.len() - kept.len();
+    (kept.into_boxed_slice(), names.into_boxed_slice(), removed)
+}
+
+fn accounts_unsupported(tag: &str) -> String {
+    format!(
+        "inbound {tag:?} does not take accounts at run time; only vless, vmess, trojan, shadowsocks, hysteria2, tuic and anytls do"
+    )
+}
+
+/// [`add_account`] for the parallel password and name lists of a Hysteria2 or
+/// AnyTLS inbound: the new lists, and the name of a replaced account whose
+/// password changed.
+#[allow(clippy::type_complexity)]
+fn place_password(
+    passwords: &[Box<str>],
+    emails: &[Option<Arc<str>>],
+    password: &str,
+    email: &Option<Arc<str>>,
+) -> Result<((Box<[Box<str>]>, Option<Arc<str>>), Box<[Option<Arc<str>>]>), String> {
+    let mut accounts: Vec<(Box<str>, Option<Arc<str>>)> = passwords
+        .iter()
+        .cloned()
+        .zip(emails.iter().cloned().chain(std::iter::repeat(None)))
+        .collect();
+    let existing = email
+        .as_ref()
+        .and_then(|name| accounts.iter().position(|(_, e)| e.as_ref() == Some(name)));
+    if accounts
+        .iter()
+        .enumerate()
+        .any(|(index, (other, _))| Some(index) != existing && &**other == password)
+    {
+        return Err(format!(
+            "the credential of {} is already used by another account",
+            email.as_deref().unwrap_or("this account")
+        ));
+    }
+    let replaced = match existing {
+        Some(index) => {
+            let changed = &*accounts[index].0 != password;
+            accounts[index] = (password.into(), email.clone());
+            changed.then(|| email.clone()).flatten()
+        }
+        None => {
+            accounts.push((password.into(), email.clone()));
+            None
+        }
+    };
+    let (passwords, emails): (Vec<_>, Vec<_>) = accounts.into_iter().unzip();
+    Ok((
+        (passwords.into_boxed_slice(), replaced),
+        emails.into_boxed_slice(),
+    ))
+}
+
+/// Put `client` on `protocol`, replacing the account with the same `email`.
+/// Returns that `email` when an account was replaced with a different
+/// credential, whose sessions must then end.
+fn add_account(
+    protocol: &mut InboundProtocol,
+    client: &zero_config::InboundClient,
+) -> Result<Option<Arc<str>>, String> {
+    use zero_config::InboundClient;
+
+    /// Where `new` goes in `list`: over the account with its email, or at
+    /// the end. A credential held by another account is refused.
+    fn place<U: PartialEq>(
+        list: &mut Vec<U>,
+        new: U,
+        email: impl Fn(&U) -> Option<&Arc<str>>,
+        same_credential: impl Fn(&U, &U) -> bool,
+    ) -> Result<Option<Arc<str>>, String> {
+        let name = email(&new).cloned();
+        let existing = name
+            .as_ref()
+            .and_then(|name| list.iter().position(|u| email(u) == Some(name)));
+        if list
+            .iter()
+            .enumerate()
+            .any(|(index, user)| Some(index) != existing && same_credential(user, &new))
+        {
+            return Err(format!(
+                "the credential of {} is already used by another account",
+                name.as_deref().unwrap_or("this account")
+            ));
+        }
+        match existing {
+            Some(index) => {
+                let changed = !same_credential(&list[index], &new);
+                list[index] = new;
+                Ok(changed.then_some(name).flatten())
+            }
+            None => {
+                list.push(new);
+                Ok(None)
+            }
+        }
+    }
+
+    match (protocol, client) {
+        (InboundProtocol::Vless(vless), InboundClient::Vless(user)) => {
+            let mut users = vless.users.to_vec();
+            let replaced = place(
+                &mut users,
+                user.clone(),
+                |u| u.email.as_ref(),
+                |a, b| a.uuid == b.uuid,
+            )?;
+            vless.users = users.into_boxed_slice();
+            Ok(replaced)
+        }
+        (InboundProtocol::Vmess(vmess), InboundClient::Vmess(user)) => {
+            let mut users = vmess.users.to_vec();
+            let replaced = place(
+                &mut users,
+                user.clone(),
+                |u| u.email.as_ref(),
+                |a, b| a.uuid == b.uuid,
+            )?;
+            vmess.users = users.into_boxed_slice();
+            Ok(replaced)
+        }
+        (
+            InboundProtocol::Trojan(trojan),
+            InboundClient::Trojan {
+                password_hash,
+                email,
+            },
+        ) => {
+            let mut users: Vec<([u8; 56], Option<Arc<str>>)> = trojan
+                .password_hashes
+                .iter()
+                .copied()
+                .zip(trojan.emails.iter().cloned())
+                .collect();
+            let replaced = place(
+                &mut users,
+                (*password_hash, email.clone()),
+                |(_, email)| email.as_ref(),
+                |a, b| a.0 == b.0,
+            )?;
+            let (hashes, emails): (Vec<_>, Vec<_>) = users.into_iter().unzip();
+            trojan.password_hashes = hashes.into_boxed_slice();
+            trojan.emails = emails.into_boxed_slice();
+            Ok(replaced)
+        }
+        (InboundProtocol::Shadowsocks(ss), InboundClient::Shadowsocks(user)) => {
+            if !ss.multi_user && !ss.method.is_2022() {
+                return Err(
+                    "a single-password Shadowsocks inbound takes no accounts; give it settings.clients"
+                        .into(),
+                );
+            }
+            if ss.method == zero_config::ShadowsocksMethod::Blake3Chacha20Poly1305 {
+                return Err("2022-blake3-chacha20-poly1305 has no multi-user form".into());
+            }
+            let mut users = ss.users.to_vec();
+            let replaced = place(&mut users, user.clone(), |u| u.email.as_ref(), |a, b| {
+                a.password == b.password
+            })?;
+            ss.users = users.into_boxed_slice();
+            // A 2022 inbound given its first account serves accounts from now
+            // on; its key becomes the identity key they all send.
+            ss.multi_user = true;
+            Ok(replaced)
+        }
+        (InboundProtocol::Hysteria2(hy), InboundClient::Password { password, email }) => {
+            let (passwords, emails) =
+                place_password(&hy.passwords, &hy.emails, password, email)?;
+            (hy.passwords, hy.emails) = (passwords.0, emails);
+            Ok(passwords.1)
+        }
+        (InboundProtocol::AnyTls(any), InboundClient::Password { password, email }) => {
+            let (passwords, emails) =
+                place_password(&any.passwords, &any.emails, password, email)?;
+            (any.passwords, any.emails) = (passwords.0, emails);
+            Ok(passwords.1)
+        }
+        (InboundProtocol::Tuic(tuic), InboundClient::Tuic(user)) => {
+            let mut users = tuic.users.to_vec();
+            let replaced = place(&mut users, user.clone(), |u| u.email.as_ref(), |a, b| {
+                a.uuid == b.uuid
+            })?;
+            // A changed password under the same uuid is a changed credential.
+            let replaced = replaced.or_else(|| {
+                let email = user.email.as_ref()?;
+                tuic.users
+                    .iter()
+                    .find(|old| old.email.as_ref() == Some(email))
+                    .filter(|old| old.password != user.password)
+                    .map(|_| Arc::clone(email))
+            });
+            tuic.users = users.into_boxed_slice();
+            Ok(replaced)
+        }
+        (
+            InboundProtocol::Vless(_)
+            | InboundProtocol::Vmess(_)
+            | InboundProtocol::Trojan(_)
+            | InboundProtocol::Shadowsocks(_)
+            | InboundProtocol::Hysteria2(_)
+            | InboundProtocol::AnyTls(_)
+            | InboundProtocol::Tuic(_),
+            _,
+        ) => {
+            Err("the account is for a different protocol than the inbound".into())
+        }
+        _ => Err(
+            "this inbound does not take accounts at run time; only vless, vmess, trojan, shadowsocks, hysteria2, tuic and anytls do"
+                .into(),
+        ),
+    }
+}
+
+/// Every `(inbound tag, email)` pair that `config` meters.
+pub(crate) fn metered_accounts(config: &RuntimeConfig) -> HashSet<(Arc<str>, Arc<str>)> {
+    let mut accounts = HashSet::new();
+    for inbound in config.inbounds.iter() {
+        let emails: Vec<&Arc<str>> = match &inbound.protocol {
+            InboundProtocol::Vless(vless) => vless
+                .users
+                .iter()
+                .filter_map(|u| u.email.as_ref())
+                .collect(),
+            InboundProtocol::Vmess(vmess) => vmess
+                .users
+                .iter()
+                .filter_map(|u| u.email.as_ref())
+                .collect(),
+            InboundProtocol::Trojan(trojan) => trojan.emails.iter().flatten().collect(),
+            InboundProtocol::Shadowsocks(ss) => ss
+                .users
+                .iter()
+                .filter_map(|u| u.email.as_ref())
+                .chain(ss.email.as_ref())
+                .collect(),
+            InboundProtocol::Hysteria2(hy) => hy.emails.iter().flatten().collect(),
+            InboundProtocol::AnyTls(any) => any.emails.iter().flatten().collect(),
+            InboundProtocol::Tuic(tuic) => {
+                tuic.users.iter().filter_map(|u| u.email.as_ref()).collect()
+            }
+            _ => Vec::new(),
+        };
+        for email in emails {
+            accounts.insert((Arc::clone(&inbound.tag), Arc::clone(email)));
+        }
+    }
+    accounts
+}
+
 impl Server {
     pub fn new(cfg: ServerConfig) -> Self {
+        Self::with_stats(cfg, Arc::new(Stats::default()))
+    }
+
+    /// A server that carries on `stats` (the figures, accounts, speed limits
+    /// and event subscribers) of the one it replaces ([`crate::host`]).
+    pub fn with_stats(cfg: ServerConfig, stats: Arc<Stats>) -> Self {
         let geodata = Arc::new(arc_swap::ArcSwap::from_pointee(Self::initial_geodata(
             &cfg.config,
         )));
@@ -786,7 +1163,7 @@ impl Server {
             warm: Arc::default(),
             portals: StdMutex::new(HashMap::new()),
             planner_flow_lifetime_ms: AtomicU64::new(0),
-            stats: Arc::new(Stats::default()),
+            stats,
         }
     }
 
@@ -961,7 +1338,20 @@ impl Server {
             next.resolver = Arc::new(adopted.without_fake());
             next.client_resolver = Arc::new(adopted);
         }
+        let accounts = metered_accounts(&next.config);
         self.state.store(Arc::new(next));
+        // An account the new configuration no longer lists on an inbound has
+        // no business keeping the sessions it opened there.
+        let ended = self.stats.accounts.end_where(|email, inbound| {
+            !accounts.contains(&(Arc::<str>::from(inbound), Arc::<str>::from(email)))
+        });
+        if ended > 0 {
+            info!(ended, "reload ended the sessions of removed accounts");
+        }
+        self.stats.events().emit(|| crate::events::Event::Reloaded {
+            generation: generation.0,
+            ended,
+        });
         // Wake the idle background tasks now that the new state is visible.
         // The store above happens first on purpose: a task woken here re-reads
         // `config()` and must see the generation that triggered the wake, not
@@ -984,6 +1374,178 @@ impl Server {
     /// `rcu` rather than load-then-store: a reload landing in between must
     /// not be overwritten by a router compiled for the configuration it
     /// replaced.
+    /// Add accounts to the inbound tagged `tag` of the running server.
+    ///
+    /// Unlike [`Server::reload`], nothing else is rebuilt: routing, the DNS
+    /// caches, the TLS session caches and every open session are left as they
+    /// are, and the next handshake on the inbound sees the new list. An
+    /// account whose `email` is already on the inbound is replaced; if its
+    /// credential changed, its open sessions there are ended, since they were
+    /// opened with a credential that no longer exists. A credential another
+    /// account already holds is refused: the handshake could not tell the two
+    /// apart.
+    pub fn add_accounts(
+        &self,
+        tag: &str,
+        clients: &[zero_config::InboundClient],
+    ) -> Result<(), String> {
+        let replaced = self.edit_inbound_accounts(tag, |protocol| {
+            let mut replaced = Vec::new();
+            for client in clients {
+                if let Some(email) = add_account(protocol, client)? {
+                    replaced.push(email);
+                }
+            }
+            Ok(replaced)
+        })?;
+        if !replaced.is_empty() {
+            self.stats.accounts.end_where(|email, inbound| {
+                inbound == tag && replaced.iter().any(|r| &**r == email)
+            });
+        }
+        self.stats
+            .events()
+            .emit(|| crate::events::Event::AccountsAdded {
+                inbound: tag.to_string(),
+                emails: clients
+                    .iter()
+                    .filter_map(|client| client.email().map(|email| email.to_string()))
+                    .collect(),
+            });
+        Ok(())
+    }
+
+    /// Remove the accounts named `emails` from the inbound tagged `tag` of the
+    /// running server, without a reload (see [`Server::add_accounts`]), and
+    /// end their open sessions there. Returns how many accounts were removed;
+    /// a name that is not on the inbound is not an error.
+    pub fn remove_accounts(&self, tag: &str, emails: &[&str]) -> Result<usize, String> {
+        let removed = self.edit_inbound_accounts(tag, |protocol| {
+            let named = |email: Option<&Arc<str>>| email.is_some_and(|e| emails.contains(&&**e));
+            Ok(match protocol {
+                InboundProtocol::Vless(vless) => {
+                    let mut users = vless.users.to_vec();
+                    let before = users.len();
+                    users.retain(|user| !named(user.email.as_ref()));
+                    vless.users = users.into_boxed_slice();
+                    before - vless.users.len()
+                }
+                InboundProtocol::Vmess(vmess) => {
+                    let mut users = vmess.users.to_vec();
+                    let before = users.len();
+                    users.retain(|user| !named(user.email.as_ref()));
+                    vmess.users = users.into_boxed_slice();
+                    before - vmess.users.len()
+                }
+                InboundProtocol::Trojan(trojan) => {
+                    let (hashes, kept): (Vec<_>, Vec<_>) = trojan
+                        .password_hashes
+                        .iter()
+                        .zip(trojan.emails.iter())
+                        .filter(|(_, email)| !named(email.as_ref()))
+                        .map(|(hash, email)| (*hash, email.clone()))
+                        .unzip();
+                    let removed = trojan.password_hashes.len() - hashes.len();
+                    trojan.password_hashes = hashes.into_boxed_slice();
+                    trojan.emails = kept.into_boxed_slice();
+                    removed
+                }
+                InboundProtocol::Shadowsocks(ss) => {
+                    let mut users = ss.users.to_vec();
+                    let before = users.len();
+                    users.retain(|user| !named(user.email.as_ref()));
+                    ss.users = users.into_boxed_slice();
+                    before - ss.users.len()
+                }
+                InboundProtocol::Tuic(tuic) => {
+                    let mut users = tuic.users.to_vec();
+                    let before = users.len();
+                    users.retain(|user| !named(user.email.as_ref()));
+                    tuic.users = users.into_boxed_slice();
+                    before - tuic.users.len()
+                }
+                InboundProtocol::Hysteria2(hy) => {
+                    let removed;
+                    (hy.passwords, hy.emails, removed) =
+                        remove_passwords(&hy.passwords, &hy.emails, named);
+                    removed
+                }
+                InboundProtocol::AnyTls(any) => {
+                    let removed;
+                    (any.passwords, any.emails, removed) =
+                        remove_passwords(&any.passwords, &any.emails, named);
+                    removed
+                }
+                _ => return Err(accounts_unsupported(tag)),
+            })
+        })?;
+        self.stats
+            .accounts
+            .end_where(|email, inbound| inbound == tag && emails.contains(&email));
+        self.stats
+            .events()
+            .emit(|| crate::events::Event::AccountsRemoved {
+                inbound: tag.to_string(),
+                emails: emails.iter().map(|email| email.to_string()).collect(),
+            });
+        Ok(removed)
+    }
+
+    /// Apply `edit` to the protocol settings of the inbound tagged `tag` and
+    /// install the result, keeping everything else of the current state. Runs
+    /// as a read-copy-update, so an edit racing a reload or another edit is
+    /// redone on whichever state won rather than overwriting it.
+    fn edit_inbound_accounts<T>(
+        &self,
+        tag: &str,
+        mut edit: impl FnMut(&mut InboundProtocol) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut outcome = None;
+        self.state.rcu(|current| {
+            let mut config = (*current.config).clone();
+            let mut inbounds = std::mem::take(&mut config.inbounds).into_vec();
+            let index = inbounds.iter().position(|inbound| &*inbound.tag == tag);
+            let edited = match index {
+                Some(index) => edit(&mut inbounds[index].protocol),
+                None => Err(format!("there is no inbound tagged {tag:?}")),
+            };
+            // What is compiled from the accounts (a Shadowsocks 2022 user
+            // table) is rebuilt for the edited inbound; nothing else is.
+            let compiled = match (&edited, index) {
+                (Ok(_), Some(index)) => {
+                    let users = shadowsocks_users(&inbounds[index].protocol);
+                    if users.is_some() || current.inbounds[index].shadowsocks_users.is_some() {
+                        let mut compiled = current.inbounds.to_vec();
+                        compiled[index].shadowsocks_users = users;
+                        Arc::from(compiled)
+                    } else {
+                        Arc::clone(&current.inbounds)
+                    }
+                }
+                _ => Arc::clone(&current.inbounds),
+            };
+            config.inbounds = inbounds.into_boxed_slice();
+            match edited.and_then(|value| config.validate().map(|()| value)) {
+                Ok(value) => {
+                    outcome = Some(Ok(value));
+                    Arc::new(ServerState {
+                        config: Arc::new(config),
+                        router: Arc::clone(&current.router),
+                        client_resolver: Arc::clone(&current.client_resolver),
+                        resolver: Arc::clone(&current.resolver),
+                        generation: current.generation,
+                        inbounds: compiled,
+                    })
+                }
+                Err(error) => {
+                    outcome = Some(Err(error));
+                    Arc::clone(current)
+                }
+            }
+        });
+        outcome.expect("rcu runs its closure at least once")
+    }
+
     fn rebuild_router_for_new_geodata(&self) {
         let geodata = self.geodata.load_full();
         self.state.rcu(|current| ServerState {
@@ -1910,6 +2472,9 @@ impl Server {
                 acceptor = acceptor.with_masquerade(masquerade);
             }
         }
+        // Rebuilt only when the configuration changes, not per stream.
+        #[allow(clippy::type_complexity)]
+        let mut passwords: Option<(Arc<RuntimeConfig>, Arc<[Box<str>]>)> = None;
         loop {
             let state = self.state.load_full();
             let Some(inbound) = state.config.inbounds.get(id.0 as usize) else {
@@ -1918,7 +2483,14 @@ impl Server {
             let InboundProtocol::Hysteria2(config) = &inbound.protocol else {
                 return;
             };
-            let accepted = match acceptor.accept(&config.passwords).await {
+            if !passwords
+                .as_ref()
+                .is_some_and(|(seen, _)| Arc::ptr_eq(seen, &state.config))
+            {
+                passwords = Some((Arc::clone(&state.config), config.passwords.clone().into()));
+            }
+            let current = &passwords.as_ref().expect("set above").1;
+            let accepted = match acceptor.accept(current).await {
                 Ok(Some(value)) => value,
                 Ok(None) => return,
                 Err(error) => {
@@ -1935,17 +2507,27 @@ impl Server {
                         stream,
                         destination,
                         peer,
+                        password,
                     } => {
                         me.stats.accepted.fetch_add(1, Ordering::Relaxed);
                         // Accepted here means the QUIC layer already
                         // authenticated the client, so it counts as a user.
                         let _usage = me.stats.usage.open(&tag, peer.ip());
-                        if let Err(error) = Arc::clone(&me)
-                            .handle_hysteria2(stream, peer, id, tag, destination)
-                            .await
-                        {
+                        let failed_tag = Arc::clone(&tag);
+                        let result = match me.password_account(id, &password) {
+                            Ok(email) => {
+                                let stream =
+                                    me.meter_account(email.as_ref(), &tag, peer, stream, 0);
+                                Arc::clone(&me)
+                                    .handle_hysteria2(stream, peer, id, tag, destination, email)
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = result {
                             me.stats.failed.fetch_add(1, Ordering::Relaxed);
                             debug!(%error, "Hysteria2 session failed");
+                            me.stats.report_failure(&failed_tag, &error);
                         }
                     }
                     zero_transport::hysteria2::Accepted::Udp {
@@ -1955,28 +2537,37 @@ impl Server {
                         destination,
                         payload,
                         peer,
+                        password,
                     } => {
                         me.stats.accepted.fetch_add(1, Ordering::Relaxed);
                         // Accepted here means the QUIC layer already
                         // authenticated the client, so it counts as a user.
                         let _usage = me.stats.usage.open(&tag, peer.ip());
-                        if let Err(error) = Arc::clone(&me)
-                            .handle_hysteria2_udp(
-                                Hysteria2UdpSession {
-                                    connection,
-                                    session_id,
-                                    packet_id,
-                                    peer,
-                                    destination,
-                                    payload,
-                                },
-                                id,
-                                tag,
-                            )
-                            .await
-                        {
+                        let failed_tag = Arc::clone(&tag);
+                        let result = match me.password_account(id, &password) {
+                            Ok(email) => {
+                                Arc::clone(&me)
+                                    .handle_hysteria2_udp(
+                                        Hysteria2UdpSession {
+                                            connection,
+                                            session_id,
+                                            packet_id,
+                                            peer,
+                                            destination,
+                                            payload,
+                                        },
+                                        id,
+                                        tag,
+                                        email,
+                                    )
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = result {
                             me.stats.failed.fetch_add(1, Ordering::Relaxed);
                             debug!(%error, "Hysteria2 UDP session failed");
+                            me.stats.report_failure(&failed_tag, &error);
                         }
                     }
                 }
@@ -1986,6 +2577,9 @@ impl Server {
 
     async fn accept_tuic_loop(self: Arc<Self>, endpoint: h3_quinn::quinn::Endpoint, id: InboundId) {
         let mut acceptor = zero_transport::tuic::Acceptor::new(endpoint);
+        // Rebuilt only when the configuration changes, not per request.
+        #[allow(clippy::type_complexity)]
+        let mut users: Option<(Arc<RuntimeConfig>, Arc<[([u8; 16], Box<str>)]>)> = None;
         loop {
             let state = self.state.load_full();
             let Some(inbound) = state.config.inbounds.get(id.0 as usize) else {
@@ -1994,7 +2588,19 @@ impl Server {
             let InboundProtocol::Tuic(config) = &inbound.protocol else {
                 return;
             };
-            let accepted = match acceptor.accept(&config.uuid, &config.password).await {
+            if !users
+                .as_ref()
+                .is_some_and(|(seen, _)| Arc::ptr_eq(seen, &state.config))
+            {
+                let list: Vec<([u8; 16], Box<str>)> = config
+                    .users
+                    .iter()
+                    .map(|user| (user.uuid, user.password.clone()))
+                    .collect();
+                users = Some((Arc::clone(&state.config), list.into()));
+            }
+            let current = &users.as_ref().expect("set above").1;
+            let accepted = match acceptor.accept(current).await {
                 Ok(Some(value)) => value,
                 Ok(None) => return,
                 Err(error) => {
@@ -2011,17 +2617,27 @@ impl Server {
                         stream,
                         destination,
                         peer,
+                        uuid,
                     } => {
                         me.stats.accepted.fetch_add(1, Ordering::Relaxed);
                         // Accepted here means the QUIC layer already
                         // authenticated the client, so it counts as a user.
                         let _usage = me.stats.usage.open(&tag, peer.ip());
-                        if let Err(error) = Arc::clone(&me)
-                            .handle_hysteria2(stream, peer, id, tag, destination)
-                            .await
-                        {
+                        let failed_tag = Arc::clone(&tag);
+                        let result = match me.tuic_account(id, &uuid) {
+                            Ok(email) => {
+                                let stream =
+                                    me.meter_account(email.as_ref(), &tag, peer, stream, 0);
+                                Arc::clone(&me)
+                                    .handle_hysteria2(stream, peer, id, tag, destination, email)
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = result {
                             me.stats.failed.fetch_add(1, Ordering::Relaxed);
                             debug!(%error, "TUIC session failed");
+                            me.stats.report_failure(&failed_tag, &error);
                         }
                     }
                     zero_transport::tuic::Accepted::Udp {
@@ -2031,26 +2647,35 @@ impl Server {
                         destination,
                         payload,
                         peer,
+                        uuid,
                     } => {
                         me.stats.accepted.fetch_add(1, Ordering::Relaxed);
                         // Accepted here means the QUIC layer already
                         // authenticated the client, so it counts as a user.
                         let _usage = me.stats.usage.open(&tag, peer.ip());
-                        if let Err(error) = Arc::clone(&me)
-                            .handle_tuic_udp(
-                                connection,
-                                association,
-                                packet,
-                                peer,
-                                destination,
-                                payload,
-                                id,
-                                tag,
-                            )
-                            .await
-                        {
+                        let failed_tag = Arc::clone(&tag);
+                        let result = match me.tuic_account(id, &uuid) {
+                            Ok(email) => {
+                                Arc::clone(&me)
+                                    .handle_tuic_udp(
+                                        connection,
+                                        association,
+                                        packet,
+                                        peer,
+                                        destination,
+                                        payload,
+                                        id,
+                                        tag,
+                                        email,
+                                    )
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = result {
                             me.stats.failed.fetch_add(1, Ordering::Relaxed);
                             debug!(%error, "TUIC UDP session failed");
+                            me.stats.report_failure(&failed_tag, &error);
                         }
                     }
                 }
@@ -2060,6 +2685,89 @@ impl Server {
 
     fn config(&self) -> Arc<RuntimeConfig> {
         Arc::clone(&self.state.load_full().config)
+    }
+
+    /// The configuration being served now.
+    pub fn config_snapshot(&self) -> Arc<RuntimeConfig> {
+        self.config()
+    }
+
+    /// The account a QUIC connection of the Hysteria2 inbound `id` logged in
+    /// as with `password`, checked against the current accounts: the
+    /// connection may have outlived its account, and must then open nothing.
+    fn password_account(&self, id: InboundId, password: &str) -> Result<Option<Arc<str>>, String> {
+        let state = self.state.load();
+        let Some(InboundProtocol::Hysteria2(config)) = state
+            .config
+            .inbounds
+            .get(id.0 as usize)
+            .map(|inbound| &inbound.protocol)
+        else {
+            return Err("the Hysteria2 inbound is gone".into());
+        };
+        let index = config
+            .passwords
+            .iter()
+            .position(|candidate| &**candidate == password)
+            .ok_or_else(|| "the Hysteria2 account is no longer authorised".to_string())?;
+        Ok(config.emails.get(index).cloned().flatten())
+    }
+
+    /// [`Server::password_account`] for a TUIC connection's `uuid`.
+    fn tuic_account(&self, id: InboundId, uuid: &[u8; 16]) -> Result<Option<Arc<str>>, String> {
+        let state = self.state.load();
+        let Some(InboundProtocol::Tuic(config)) = state
+            .config
+            .inbounds
+            .get(id.0 as usize)
+            .map(|inbound| &inbound.protocol)
+        else {
+            return Err("the TUIC inbound is gone".into());
+        };
+        config
+            .users
+            .iter()
+            .find(|user| &user.uuid == uuid)
+            .map(|user| user.email.clone())
+            .ok_or_else(|| "the TUIC account is no longer authorised".to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn config_for_tests(&self) -> Arc<RuntimeConfig> {
+        self.config()
+    }
+
+    /// Read `client`, in the shape of an entry of `settings.clients`, as an
+    /// account for the inbound tagged `tag`, ready for [`Server::add_accounts`].
+    pub fn parse_account(
+        &self,
+        tag: &str,
+        client: &serde_json::Value,
+    ) -> Result<zero_config::InboundClient, String> {
+        let state = self.state.load();
+        let inbound = state
+            .config
+            .inbounds
+            .iter()
+            .find(|inbound| &*inbound.tag == tag)
+            .ok_or_else(|| format!("there is no inbound tagged {tag:?}"))?;
+        match &inbound.protocol {
+            InboundProtocol::Shadowsocks(ss) => {
+                zero_config::parse_shadowsocks_client(ss.method, client)
+            }
+            protocol => zero_config::parse_inbound_client(protocol.kind(), client),
+        }
+    }
+
+    /// The protocol of the inbound tagged `tag` (`"vless"`, …), if there is one.
+    pub fn inbound_kind(&self, tag: &str) -> Option<&'static str> {
+        self.state
+            .load()
+            .config
+            .inbounds
+            .iter()
+            .find(|inbound| &*inbound.tag == tag)
+            .map(|inbound| inbound.protocol.kind())
     }
 
     async fn restore_fake_destination(&self, destination: &Destination) -> Destination {
@@ -2090,6 +2798,29 @@ impl Server {
     /// `local` is the inbound's own address as configured (a wildcard bind
     /// has no single address, so only the port is known then); it is what
     /// `localIP` and `localPort` routing rules are matched against.
+    /// The client stream of an authenticated account, metered for it
+    /// ([`crate::accounts`]); an account with no `email` is passed through.
+    /// `early_payload` is what the handshake already read past the request
+    /// header, which reaches the relay without passing through the meter.
+    fn meter_account(
+        &self,
+        email: Option<&Arc<str>>,
+        tag: &Arc<str>,
+        peer: SocketAddr,
+        stream: zero_core::BoxStream,
+        early_payload: usize,
+    ) -> zero_core::BoxStream {
+        match email {
+            Some(email) => boxed(
+                self.stats
+                    .accounts
+                    .meter(email, tag, peer.ip(), stream)
+                    .with_early_payload(early_payload),
+            ),
+            None => stream,
+        }
+    }
+
     fn new_context(
         &self,
         id: InboundId,
@@ -2259,11 +2990,16 @@ impl Server {
         let pending = crate::usage::PendingSession::new(&self.stats.usage, &tag, peer.ip());
         // Boxed: the session future is large, and holding it in this frame
         // as well would double the stack a chain of dialers needs in debug builds.
-        crate::usage::scope(
+        let stats = Arc::clone(&self.stats);
+        let result = crate::usage::scope(
             pending,
             Box::pin(self.handle_session(stream, peer, id, session)),
         )
-        .await
+        .await;
+        if let Err(error) = &result {
+            stats.report_failure(&tag, error);
+        }
+        result
     }
 
     async fn handle_session(
@@ -2314,7 +3050,14 @@ impl Server {
                 return self.handle_vmess(stream, peer, id, tag, config).await;
             }
             InboundProtocol::Shadowsocks(config) => {
-                return self.handle_shadowsocks(stream, peer, id, tag, config).await;
+                let users = session
+                    .state
+                    .inbounds
+                    .get(id.0 as usize)
+                    .and_then(|compiled| compiled.shadowsocks_users.clone());
+                return self
+                    .handle_shadowsocks(stream, peer, id, tag, config, users)
+                    .await;
             }
             InboundProtocol::AnyTls(config) => {
                 return self.handle_anytls(stream, peer, id, tag, config).await;
@@ -3055,6 +3798,33 @@ impl Server {
             })
             .collect();
         let mut link = zero_protocol::wg_server::serve(Arc::new(socket), config.secret_key, peers);
+        // Peers with an `email` are metered by the addresses they own: a
+        // packet from a peer is counted by its source, one to it by its
+        // destination. Everything to the peers then passes one counting
+        // queue; with no named peer nothing is added to the path.
+        let owners = WireGuardOwners::of(&config);
+        let to_peers = match &owners {
+            None => link.to_peers.clone(),
+            Some(owners) => {
+                let (sender, mut queue) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+                let (owners, accounts, upstream) = (
+                    Arc::clone(owners),
+                    Arc::clone(&self.stats.accounts),
+                    link.to_peers.clone(),
+                );
+                tokio::spawn(async move {
+                    while let Some(packet) = queue.recv().await {
+                        if let Some(email) = owners.of_destination(&packet) {
+                            accounts.count(email, 0, packet.len());
+                        }
+                        if upstream.send(packet).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                sender
+            }
+        };
         let (mut sink, mut stream) = parts.stack.split();
         if let Some(runner) = parts.runner {
             tokio::spawn(async move {
@@ -3064,8 +3834,12 @@ impl Server {
             });
         }
         // Peers to stack.
+        let (from_owners, accounts) = (owners.clone(), Arc::clone(&self.stats.accounts));
         tokio::spawn(async move {
             while let Some(packet) = link.from_peers.recv().await {
+                if let Some(email) = from_owners.as_ref().and_then(|o| o.of_source(&packet)) {
+                    accounts.count(email, packet.len(), 0);
+                }
                 match sink.send(packet).await {
                     Ok(()) => {}
                     // A packet the stack cannot parse is dropped; only a
@@ -3076,10 +3850,10 @@ impl Server {
             }
         });
         // Stack to peers.
-        let to_peers = link.to_peers.clone();
+        let stack_out = to_peers.clone();
         tokio::spawn(async move {
             while let Some(Ok(packet)) = stream.next().await {
-                if to_peers.send(packet).await.is_err() {
+                if stack_out.send(packet).await.is_err() {
                     return;
                 }
             }
@@ -3087,7 +3861,7 @@ impl Server {
         if let Some(udp) = parts.udp {
             let me = Arc::clone(&self);
             let udp_tag = tag.clone();
-            let out: Arc<dyn PacketOut> = Arc::new(link.to_peers.clone());
+            let out: Arc<dyn PacketOut> = Arc::new(to_peers.clone());
             tokio::spawn(async move {
                 me.serve_tun_udp(udp, id, udp_tag, out).await;
             });
@@ -3285,25 +4059,22 @@ impl Server {
         let accepted = within_handshake(zero_protocol::vmess::server_handshake(stream, &users))
             .await?
             .map_err(|error| format!("reading VMess request: {error}"))?;
+        let email = config
+            .users
+            .get(accepted.user)
+            .and_then(|user| user.email.clone());
+        let stream = self.meter_account(email.as_ref(), &tag, peer, boxed(accepted.stream), 0);
         if accepted.destination.network != Network::Tcp {
             return self
-                .handle_vmess_udp(accepted.stream, peer, id, tag, accepted.destination)
+                .handle_vmess_udp(stream, peer, id, tag, accepted.destination)
                 .await;
         }
         let mut destination = self.restore_fake_destination(&accepted.destination).await;
         let mut ctx = self.new_context(id, tag, destination.clone(), peer);
-        ctx.user = config
-            .users
-            .get(accepted.user)
-            .and_then(|user| user.email.clone());
+        ctx.user = email;
         let sniffing = self.sniffing_of(id);
         let client = self
-            .sniff_client(
-                &mut ctx,
-                &mut destination,
-                boxed(accepted.stream),
-                &sniffing,
-            )
+            .sniff_client(&mut ctx, &mut destination, stream, &sniffing)
             .await;
         let decision = self.route(&ctx).await;
         let Some((health, remote)) = self
@@ -3430,7 +4201,7 @@ impl Server {
                     }
                     tokio::spawn(async move {
                         if let Err(error) = server
-                            .handle_hysteria2(boxed(stream), peer, id, tag, destination)
+                            .handle_hysteria2(boxed(stream), peer, id, tag, destination, None)
                             .await
                         {
                             debug!(%error, "Tide stream ended with an error");
@@ -3510,15 +4281,18 @@ impl Server {
                 hash
             })
             .collect();
-        let (stream, announced) =
+        let (stream, announced, user) =
             within_handshake(zero_protocol::anytls::server_handshake(stream, &passwords))
                 .await?
                 .map_err(|error| format!("AnyTLS handshake: {error}"))?;
+        let email = config.emails.get(user).cloned().flatten();
+        let stream = self.meter_account(email.as_ref(), &tag, peer, boxed(stream), 0);
         let mut destination = self.restore_fake_destination(&announced).await;
         let mut ctx = self.new_context(id, tag, destination.clone(), peer);
+        ctx.user = email;
         let sniffing = self.sniffing_of(id);
         let client = self
-            .sniff_client(&mut ctx, &mut destination, boxed(stream), &sniffing)
+            .sniff_client(&mut ctx, &mut destination, stream, &sniffing)
             .await;
         let decision = self.route(&ctx).await;
         let Some((health, remote)) = self
@@ -3561,9 +4335,11 @@ impl Server {
         id: InboundId,
         tag: Arc<str>,
         destination: Destination,
+        email: Option<Arc<str>>,
     ) -> Result<(), String> {
         let mut destination = self.restore_fake_destination(&destination).await;
         let mut ctx = self.new_context(id, tag, destination.clone(), peer);
+        ctx.user = email;
         let sniffing = self.sniffing_of(id);
         let client = self
             .sniff_client(&mut ctx, &mut destination, boxed(stream), &sniffing)
@@ -3607,6 +4383,7 @@ impl Server {
         session: Hysteria2UdpSession,
         id: InboundId,
         tag: Arc<str>,
+        email: Option<Arc<str>>,
     ) -> Result<(), String> {
         let Hysteria2UdpSession {
             connection,
@@ -3621,7 +4398,8 @@ impl Server {
             destination: destination.clone(),
             payload,
         };
-        let ctx = self.new_context(id, tag, destination.clone(), peer);
+        let mut ctx = self.new_context(id, tag, destination.clone(), peer);
+        ctx.user = email.clone();
         let decision = self.route(&ctx).await;
         let resolver = match &decision {
             Decision::DirectVia { resolver } => Arc::new(self.resolver().for_tag(resolver)),
@@ -3658,6 +4436,11 @@ impl Server {
         connection
             .send_datagram(bytes::Bytes::from(frame))
             .map_err(|error| format!("sending Hysteria2 UDP response: {error}"))?;
+        if let Some(email) = &email {
+            self.stats
+                .accounts
+                .count(email, datagram.payload.len(), response.len());
+        }
         self.stats
             .uploaded
             .fetch_add(datagram.payload.len() as u64, Ordering::Relaxed);
@@ -3679,13 +4462,15 @@ impl Server {
         payload: Vec<u8>,
         id: InboundId,
         tag: Arc<str>,
+        email: Option<Arc<str>>,
     ) -> Result<(), String> {
         let destination = self.restore_fake_destination(&destination).await;
         let datagram = socks::UdpDatagram {
             destination: destination.clone(),
             payload,
         };
-        let ctx = self.new_context(id, tag, destination.clone(), peer);
+        let mut ctx = self.new_context(id, tag, destination.clone(), peer);
+        ctx.user = email.clone();
         let decision = self.route(&ctx).await;
         let resolver = match &decision {
             Decision::DirectVia { resolver } => Arc::new(self.resolver().for_tag(resolver)),
@@ -3726,6 +4511,11 @@ impl Server {
                 .send_datagram(bytes::Bytes::from(frame))
                 .map_err(|error| format!("sending TUIC UDP response: {error}"))?;
         }
+        if let Some(email) = &email {
+            self.stats
+                .accounts
+                .count(email, datagram.payload.len(), response.len());
+        }
         self.stats
             .uploaded
             .fetch_add(datagram.payload.len() as u64, Ordering::Relaxed);
@@ -3747,7 +4537,7 @@ impl Server {
 
     async fn handle_vmess_udp(
         self: Arc<Self>,
-        mut stream: zero_protocol::vmess::Stream<zero_core::BoxStream>,
+        mut stream: zero_core::BoxStream,
         peer: SocketAddr,
         id: InboundId,
         tag: Arc<str>,
@@ -3811,7 +4601,7 @@ impl Server {
 
     async fn relay_vmess_udp_direct(
         &self,
-        stream: &mut zero_protocol::vmess::Stream<zero_core::BoxStream>,
+        stream: &mut zero_core::BoxStream,
         destination: &Destination,
     ) -> Result<(), String> {
         let addrs = self
@@ -3905,6 +4695,9 @@ impl Server {
         if request_is_vision != user_is_vision {
             return Err("VLESS Vision flow does not match the authorised user".into());
         }
+        // Every path below (TCP, UDP, Mux, reverse) carries this account.
+        let early = buffered.len().saturating_sub(consumed);
+        let stream = self.meter_account(user.email.as_ref(), &tag, peer, stream, early);
 
         if request.mux {
             if user_is_vision {
@@ -4319,6 +5112,9 @@ impl Server {
                 .fall_back(fallbacks, conn, stream, buffered, peer, reason)
                 .await;
         };
+        let email = config.emails.get(account).cloned().flatten();
+        let early = buffered.len().saturating_sub(consumed);
+        let stream = self.meter_account(email.as_ref(), &tag, peer, stream, early);
         request.destination = self.restore_fake_destination(&request.destination).await;
         if request.destination.network == Network::Udp {
             return self
@@ -4327,7 +5123,7 @@ impl Server {
         }
         let mut destination = request.destination.clone();
         let mut ctx = self.new_context(id, tag, destination.clone(), peer);
-        ctx.user = config.emails.get(account).cloned().flatten();
+        ctx.user = email;
         let client = boxed(ChainedStream::new(buffered[consumed..].to_vec(), stream));
         let sniffing = self.sniffing_of(id);
         let client = self
@@ -4363,34 +5159,77 @@ impl Server {
 
     async fn handle_shadowsocks(
         self: Arc<Self>,
-        stream: zero_core::BoxStream,
+        mut stream: zero_core::BoxStream,
         peer: SocketAddr,
         id: InboundId,
         tag: Arc<str>,
         config: &zero_config::ShadowsocksInboundConfig,
+        users: Option<Result<Arc<zero_protocol::shadowsocks2022::ServerUsers>, String>>,
     ) -> Result<(), String> {
+        let email_of = |user: usize| config.users.get(user).and_then(|u| u.email.clone());
+        if config.multi_user && config.users.is_empty() {
+            // Never the password instead: see `multi_user`.
+            return Err("this Shadowsocks inbound has no account".into());
+        }
         if config.method.is_2022() {
-            let (stream, destination) =
-                within_handshake(zero_protocol::shadowsocks2022::Stream::server(
-                    stream,
-                    ss2022_method(config.method),
-                    &config.password,
-                ))
-                .await?
-                .map_err(|error| format!("reading Shadowsocks 2022 destination: {error}"))?;
+            let (stream, destination, email) = match users {
+                Some(users) => {
+                    let users = users?;
+                    let (stream, destination, user) = within_handshake(
+                        zero_protocol::shadowsocks2022::Stream::server_multi(stream, &users),
+                    )
+                    .await?
+                    .map_err(|error| format!("reading Shadowsocks 2022 destination: {error}"))?;
+                    (stream, destination, email_of(user))
+                }
+                None => {
+                    let (stream, destination) = within_handshake(
+                        zero_protocol::shadowsocks2022::Stream::server(
+                            stream,
+                            ss2022_method(config.method),
+                            &config.password,
+                        ),
+                    )
+                    .await?
+                    .map_err(|error| format!("reading Shadowsocks 2022 destination: {error}"))?;
+                    (stream, destination, config.email.clone())
+                }
+            };
+            let stream = self.meter_account(email.as_ref(), &tag, peer, boxed(stream), 0);
             return self
-                .complete_shadowsocks(boxed(stream), destination, peer, id, tag)
+                .complete_shadowsocks(stream, destination, peer, id, tag, email)
                 .await;
         }
-        let mut stream = zero_protocol::shadowsocks::Stream::new_server(
-            stream,
-            shadowsocks_method(config.method),
-            config.password.as_bytes(),
-        );
+        let method = shadowsocks_method(config.method);
+        let (stream, password, email): (zero_core::BoxStream, &str, _) = if !config.multi_user {
+            (stream, &config.password, config.email.clone())
+        } else {
+            // Whose key sealed it shows only once the first chunk's length
+            // opens; those bytes are then replayed to the stream that reads it.
+            let mut head = vec![0u8; zero_protocol::shadowsocks::identify_len(method)];
+            within_handshake(stream.read_exact(&mut head))
+                .await?
+                .map_err(|error| format!("reading Shadowsocks request: {error}"))?;
+            let passwords: Vec<&[u8]> = config
+                .users
+                .iter()
+                .map(|user| user.password.as_bytes())
+                .collect();
+            let user = zero_protocol::shadowsocks::identify_user(method, &head, &passwords)
+                .ok_or_else(|| "Shadowsocks key is not authorised".to_string())?;
+            (
+                boxed(ChainedStream::new(head, stream)),
+                &config.users[user].password,
+                email_of(user),
+            )
+        };
+        let mut stream =
+            zero_protocol::shadowsocks::Stream::new_server(stream, method, password.as_bytes());
         let (destination, _) = within_handshake(stream.read_destination())
             .await?
             .map_err(|error| format!("reading Shadowsocks destination: {error}"))?;
-        self.complete_shadowsocks(boxed(stream), destination, peer, id, tag)
+        let stream = self.meter_account(email.as_ref(), &tag, peer, boxed(stream), 0);
+        self.complete_shadowsocks(stream, destination, peer, id, tag, email)
             .await
     }
 
@@ -4401,9 +5240,11 @@ impl Server {
         peer: SocketAddr,
         id: InboundId,
         tag: Arc<str>,
+        email: Option<Arc<str>>,
     ) -> Result<(), String> {
         let mut destination = self.restore_fake_destination(&destination).await;
         let mut ctx = self.new_context(id, tag, destination.clone(), peer);
+        ctx.user = email;
         let sniffing = self.sniffing_of(id);
         let client = self
             .sniff_client(&mut ctx, &mut destination, boxed(stream), &sniffing)

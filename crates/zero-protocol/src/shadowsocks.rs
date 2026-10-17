@@ -21,7 +21,9 @@ use zero_core::{Address, BoxStream, Destination, Network};
 
 use crate::io_util::{ReadBuffer, WriteBuffer, DEFAULT_READ_CAPACITY};
 
-const SALT_LEN: usize = 32;
+/// The longest salt: SIP004 makes the salt as long as the method's key, so
+/// 16 bytes for `aes-128-gcm` and 32 for the others.
+const MAX_SALT_LEN: usize = 32;
 const TAG_LEN: usize = 16;
 const MAX_CHUNK: usize = 0x3fff;
 const LENGTH_LEN: usize = 2;
@@ -97,7 +99,7 @@ struct CipherState {
 }
 
 impl CipherState {
-    fn new(method: Method, master_key: &[u8], salt: &[u8; SALT_LEN]) -> Self {
+    fn new(method: Method, master_key: &[u8], salt: &[u8]) -> Self {
         let hk = Hkdf::<Sha1>::new(Some(salt), master_key);
         let mut key = [0u8; 32];
         let key = &mut key[..method.key_len()];
@@ -272,10 +274,11 @@ impl<S> Stream<S> {
     fn seal_batch(&mut self, src: &[u8]) -> Result<usize, Error> {
         let out = self.write_buf.buf_mut();
         if self.send.is_none() {
-            let mut salt = [0u8; SALT_LEN];
-            rand::rngs::OsRng.fill_bytes(&mut salt);
-            self.send = Some(CipherState::new(self.method, &self.master_key, &salt));
-            out.extend_from_slice(&salt);
+            let mut salt = [0u8; MAX_SALT_LEN];
+            let salt = &mut salt[..self.method.key_len()];
+            rand::rngs::OsRng.fill_bytes(salt);
+            self.send = Some(CipherState::new(self.method, &self.master_key, salt));
+            out.extend_from_slice(salt);
         }
         let send = self.send.as_mut().expect("send cipher initialised above");
         let accepted = src.len().min(MAX_WRITE_BATCH);
@@ -348,17 +351,16 @@ impl<S: AsyncRead + Unpin> AsyncRead for Stream<S> {
             let delivered = dst.filled().len() > initial;
 
             if this.recv.is_none() {
-                match this.poll_need(cx, SALT_LEN, delivered, true) {
+                let salt_len = this.method.key_len();
+                match this.poll_need(cx, salt_len, delivered, true) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                     Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
                     Poll::Ready(Ok(true)) => {}
                 }
-                let salt: [u8; SALT_LEN] = this.read_buf.data()[..SALT_LEN]
-                    .try_into()
-                    .expect("salt length checked");
-                this.recv = Some(CipherState::new(this.method, &this.master_key, &salt));
-                this.read_buf.consume(SALT_LEN);
+                let salt = &this.read_buf.data()[..salt_len];
+                this.recv = Some(CipherState::new(this.method, &this.master_key, salt));
+                this.read_buf.consume(salt_len);
                 continue;
             }
 
@@ -463,6 +465,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Stream<S> {
     }
 }
 
+/// The bytes a multi-user server reads before it knows whose key a stream of
+/// `method` is sealed with: the salt and the sealed length of the first chunk.
+pub fn identify_len(method: Method) -> usize {
+    method.key_len() + LENGTH_LEN + TAG_LEN
+}
+
+/// Which of `passwords` sealed the stream of `method` that starts with
+/// `head` (its first [`identify_len`] bytes). Each is tried in turn, as Xray
+/// serves a multi-user AEAD inbound, so the cost grows with the number of
+/// users; `None` when no key opens the chunk.
+pub fn identify_user<P: AsRef<[u8]>>(
+    method: Method,
+    head: &[u8],
+    passwords: &[P],
+) -> Option<usize> {
+    let salt = head.get(..method.key_len())?;
+    let sealed = head.get(method.key_len()..identify_len(method))?;
+    passwords.iter().position(|password| {
+        let master = evp_bytes_to_key(password.as_ref(), method.key_len());
+        let mut chunk = sealed.to_vec();
+        CipherState::new(method, &master, &salt)
+            .open_in_place(&mut chunk)
+            .is_ok()
+    })
+}
+
 fn evp_bytes_to_key(password: &[u8], length: usize) -> Vec<u8> {
     let mut key = Vec::with_capacity(length);
     let mut previous = Vec::new();
@@ -547,6 +575,53 @@ async fn decode_address<S: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SIP004: the salt is as long as the key. A 32-byte salt on
+    /// `aes-128-gcm` worked only between two Zray ends.
+    #[tokio::test]
+    async fn the_salt_is_as_long_as_the_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (method, salt_len) in [
+            (Method::Aes128Gcm, 16),
+            (Method::Aes256Gcm, 32),
+            (Method::Chacha20Poly1305, 32),
+        ] {
+            let (near, mut far) = tokio::io::duplex(64 * 1024);
+            let mut client = Stream::new_client(near, method, "password");
+            client.write_all(b"x").await.unwrap();
+            client.flush().await.unwrap();
+            drop(client);
+            let mut wire = Vec::new();
+            far.read_to_end(&mut wire).await.unwrap();
+            // salt, sealed length (2 + 16), sealed payload (1 + 16)
+            assert_eq!(wire.len(), salt_len + 18 + 17, "{method:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_key_that_sealed_a_stream_is_found_among_many() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (near, mut far) = tokio::io::duplex(64 * 1024);
+        let mut client = Stream::new_client(near, Method::Chacha20Poly1305, "bob-password");
+        client.write_all(b"hello").await.unwrap();
+        client.flush().await.unwrap();
+        let mut head = vec![0u8; identify_len(Method::Chacha20Poly1305)];
+        far.read_exact(&mut head).await.unwrap();
+        let users = ["alice-password", "bob-password", "carol-password"];
+        assert_eq!(
+            identify_user(Method::Chacha20Poly1305, &head, &users),
+            Some(1)
+        );
+        assert_eq!(
+            identify_user(Method::Chacha20Poly1305, &head, &users[..1]),
+            None
+        );
+        assert_eq!(identify_user(Method::Aes256Gcm, &head, &users), None);
+        assert_eq!(
+            identify_user(Method::Chacha20Poly1305, &head[..10], &users),
+            None
+        );
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -566,14 +641,14 @@ mod tests {
         assert_eq!(stream.inner.writes.len(), 1);
         assert_eq!(
             stream.inner.writes[0].len(),
-            SALT_LEN + (2 + 16) + (address.len() + 300 + 16)
+            32 + (2 + 16) + (address.len() + 300 + 16)
         );
     }
 
     #[test]
     fn the_nonce_is_a_little_endian_counter() {
         let master = evp_bytes_to_key(b"password", Method::Aes256Gcm.key_len());
-        let mut state = CipherState::new(Method::Aes256Gcm, &master, &[0u8; SALT_LEN]);
+        let mut state = CipherState::new(Method::Aes256Gcm, &master, &[0u8; 32]);
         assert_eq!(state.nonce(), [0u8; 12]);
         state.counter = 1;
         assert_eq!(state.nonce(), [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -637,7 +712,7 @@ mod tests {
 
         let (mut raw, server) = tokio::io::duplex(64 * 1024);
         let mut server = Stream::new_server(server, Method::Aes128Gcm, "secret");
-        raw.write_all(&[7u8; SALT_LEN + 5]).await.unwrap();
+        raw.write_all(&[7u8; 16 + 5]).await.unwrap();
         drop(raw);
         let mut got = Vec::new();
         let error = server.read_to_end(&mut got).await.unwrap_err();

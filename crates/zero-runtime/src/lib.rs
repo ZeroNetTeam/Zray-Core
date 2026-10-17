@@ -3,10 +3,14 @@
 //! Everything below this crate is independently testable and unaware of the
 //! others. This is where a session becomes a stacked connection.
 
+pub mod accounts;
 pub mod api;
 pub mod cdn_check;
 mod dns_out;
+pub mod events;
 mod google_front;
+pub mod host;
+pub mod keys;
 mod masterdns;
 pub mod outbound;
 pub mod quic_sniff;

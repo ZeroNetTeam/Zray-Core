@@ -188,7 +188,7 @@ where
 pub async fn server_handshake<S>(
     mut stream: S,
     passwords: &[impl AsRef<[u8]>],
-) -> io::Result<(AnyTlsStream<S>, Destination)>
+) -> io::Result<(AnyTlsStream<S>, Destination, usize)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -205,12 +205,16 @@ where
     }
     let mut padding = vec![0u8; padding_len];
     stream.read_exact(&mut padding).await?;
-    if !passwords.iter().any(|candidate| candidate.as_ref() == hash) {
+    // Which of them it is: the account the session belongs to.
+    let Some(user) = passwords
+        .iter()
+        .position(|candidate| candidate.as_ref() == hash)
+    else {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "AnyTLS authentication failed",
         ));
-    }
+    };
 
     let mut target = None;
     let mut stream_id = None;
@@ -240,7 +244,7 @@ where
     let response = encode_frame(CMD_SYN_ACK, stream_id, &[]);
     stream.write_all(&response).await?;
     stream.flush().await?;
-    Ok((AnyTlsStream::new(stream, stream_id), target))
+    Ok((AnyTlsStream::new(stream, stream_id), target, user))
 }
 
 async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<(FrameHeader, Vec<u8>)> {
@@ -490,7 +494,8 @@ mod tests {
         let expected = target.clone();
         let server_task = tokio::spawn(async move {
             let hash = password_hash("secret");
-            let (mut stream, received) = server_handshake(server, &[hash]).await.unwrap();
+            let (mut stream, received, user) = server_handshake(server, &[hash]).await.unwrap();
+            assert_eq!(user, 0);
             assert_eq!(received, expected);
             let mut request = [0u8; 5];
             stream.read_exact(&mut request).await.unwrap();

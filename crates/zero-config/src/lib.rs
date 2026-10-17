@@ -18,7 +18,8 @@ pub use model::*;
 pub use presets::{AntiSanctionDns, IranPreset, LocalDns, RemoteDns, RuleAction, UserRule};
 pub use share_link::{parse_link, parse_subscription, ShareLink};
 pub use xray_json::{
-    compile_config, nested_outbound, parse_config, parse_config_array, Diagnostic, ParseOutput,
+    compile_config, nested_outbound, parse_config, parse_config_array, parse_inbound_client,
+    parse_shadowsocks_client, Diagnostic, ParseOutput,
 };
 
 /// Trojan's wire credential: lowercase hex of SHA-224 over the password.

@@ -2,7 +2,10 @@
 //!
 //! SIP022 wire format. The client also speaks the Extensible Identity Headers
 //! (`iPSK:uPSK` passwords: one 16-byte header per identity key, between the
-//! salt and the first chunk); the server side takes a single PSK. The session subkey is
+//! salt and the first chunk). The server takes a single PSK, or a server PSK
+//! and many users ([`ServerUsers`], SIP023): the one identity header is then
+//! opened with the server PSK to learn which user's key the session uses, the
+//! way Xray and sing-box serve multi-user SS2022. The session subkey is
 //! `BLAKE3::derive_key("shadowsocks 2022 session subkey", PSK || salt)` and
 //! every AEAD chunk uses a 12-byte little-endian counter nonce starting at 0,
 //! matching the reference implementations.
@@ -142,11 +145,7 @@ fn identity_headers(chain: &[Vec<u8>], salt: &[u8]) -> Vec<u8> {
     use aes::cipher::{BlockEncrypt, KeyInit as BlockKeyInit};
     let mut out = Vec::with_capacity(16 * chain.len().saturating_sub(1));
     for pair in chain.windows(2) {
-        let mut hasher = blake3::Hasher::new_derive_key(IDENTITY_SUBKEY_CONTEXT);
-        hasher.update(&pair[0]);
-        hasher.update(salt);
-        let mut subkey = vec![0u8; pair[0].len()];
-        hasher.finalize_xof().fill(&mut subkey);
+        let subkey = identity_subkey(&pair[0], salt);
         let mut block = GenericArray::clone_from_slice(&blake3::hash(&pair[1]).as_bytes()[..16]);
         if subkey.len() == 16 {
             aes::Aes128::new_from_slice(&subkey)
@@ -160,6 +159,78 @@ fn identity_headers(chain: &[Vec<u8>], salt: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&block);
     }
     out
+}
+
+/// `derive_key("shadowsocks 2022 identity subkey", key || salt)`, which seals
+/// the identity header a key's holder sends or opens.
+fn identity_subkey(key: &[u8], salt: &[u8]) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new_derive_key(IDENTITY_SUBKEY_CONTEXT);
+    hasher.update(key);
+    hasher.update(salt);
+    let mut subkey = vec![0u8; key.len()];
+    hasher.finalize_xof().fill(&mut subkey);
+    subkey
+}
+
+/// The users of a multi-user server: the server's own key (the identity key
+/// clients put before their own, `iPSK:uPSK`) and each user's key, found by
+/// the hash a client's identity header carries.
+pub struct ServerUsers {
+    method: Method,
+    identity: Vec<u8>,
+    keys: Vec<Vec<u8>>,
+    by_hash: std::collections::HashMap<[u8; 16], usize>,
+}
+
+impl ServerUsers {
+    /// `server_password` is the server PSK, `users` each user's PSK, all
+    /// base64 keys of the method's length. Only the AES methods carry
+    /// identity headers (SIP023).
+    pub fn new(method: Method, server_password: &str, users: &[&str]) -> Result<Self, Error> {
+        if method == Method::Chacha20Poly1305 {
+            return Err(Error::InvalidFrame(
+                "2022-blake3-chacha20-poly1305 has no multi-user form",
+            ));
+        }
+        let identity = decode_user_key(server_password, method)?;
+        let mut keys = Vec::with_capacity(users.len());
+        let mut by_hash = std::collections::HashMap::with_capacity(users.len());
+        for (index, user) in users.iter().enumerate() {
+            let key = decode_user_key(user, method)?;
+            let hash: [u8; 16] = blake3::hash(&key).as_bytes()[..16]
+                .try_into()
+                .expect("sixteen bytes");
+            if by_hash.insert(hash, index).is_some() {
+                return Err(Error::InvalidFrame("two users share a key"));
+            }
+            keys.push(key);
+        }
+        Ok(Self {
+            method,
+            identity,
+            keys,
+            by_hash,
+        })
+    }
+
+    /// Which user the identity header `eih` of a request with `salt` names.
+    fn identify(&self, salt: &[u8], eih: &[u8; 16]) -> Option<usize> {
+        use aes::cipher::generic_array::GenericArray;
+        use aes::cipher::{BlockDecrypt, KeyInit as BlockKeyInit};
+        let subkey = identity_subkey(&self.identity, salt);
+        let mut block = GenericArray::clone_from_slice(eih);
+        if subkey.len() == 16 {
+            aes::Aes128::new_from_slice(&subkey)
+                .expect("16-byte key")
+                .decrypt_block(&mut block);
+        } else {
+            aes::Aes256::new_from_slice(&subkey)
+                .expect("32-byte key")
+                .decrypt_block(&mut block);
+        }
+        let hash: [u8; 16] = block.into();
+        self.by_hash.get(&hash).copied()
+    }
 }
 
 fn base64_decode(value: &str) -> Result<Vec<u8>, ()> {
@@ -485,15 +556,50 @@ where
     /// returning the requested destination. The response header is emitted
     /// lazily on the first write so it can fold the first payload length.
     pub async fn server(
-        mut inner: S,
+        inner: S,
         method: Method,
         password: &str,
     ) -> Result<(Self, Destination), Error> {
         let psk = decode_user_key(password, method)?;
+        let (stream, destination, _) = Self::accept(inner, method, ServerKeys::Single(psk)).await?;
+        Ok((stream, destination))
+    }
+
+    /// Accept a session of one of `users` (SIP023): also returns which, as an
+    /// index into the users [`ServerUsers::new`] was given.
+    pub async fn server_multi(
+        inner: S,
+        users: &ServerUsers,
+    ) -> Result<(Self, Destination, usize), Error> {
+        let (stream, destination, user) =
+            Self::accept(inner, users.method, ServerKeys::Multi(users)).await?;
+        Ok((
+            stream,
+            destination,
+            user.expect("a multi-user accept names its user"),
+        ))
+    }
+
+    async fn accept(
+        mut inner: S,
+        method: Method,
+        keys: ServerKeys<'_>,
+    ) -> Result<(Self, Destination, Option<usize>), Error> {
         let salt_len = method.key_len();
 
         let mut salt = vec![0u8; salt_len];
         inner.read_exact(&mut salt).await?;
+        let (psk, user) = match keys {
+            ServerKeys::Single(psk) => (psk, None),
+            ServerKeys::Multi(users) => {
+                let mut eih = [0u8; 16];
+                inner.read_exact(&mut eih).await?;
+                let user = users
+                    .identify(&salt, &eih)
+                    .ok_or(Error::InvalidFrame("unknown Shadowsocks 2022 user"))?;
+                (users.keys[user].clone(), Some(user))
+            }
+        };
         let subkey = session_subkey(&psk, &salt, salt_len);
         let mut recv = ChunkState::new(method, &subkey);
 
@@ -552,7 +658,7 @@ where
             ReadStage::Length,
             variable,
         );
-        Ok((stream, destination))
+        Ok((stream, destination, user))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -584,6 +690,11 @@ where
             write_buf: WriteBuffer::default(),
         }
     }
+}
+
+enum ServerKeys<'a> {
+    Single(Vec<u8>),
+    Multi(&'a ServerUsers),
 }
 
 fn random_salt(method: Method) -> Vec<u8> {
@@ -822,6 +933,65 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Stream<S> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A multi-user server tells its users apart by the identity header a
+    /// client with `iPSK:uPSK` sends, answers each under its own key, and
+    /// refuses a key it does not know.
+    #[tokio::test]
+    async fn a_multi_user_server_knows_which_user_connected() {
+        let server_key = "MDEyMzQ1Njc4OWFiY2RlZg==";
+        let alice = "YWxpY2UtYWxpY2UtYWxpYw==";
+        let bob = "Ym9iLWJvYi1ib2ItYm9iLQ==";
+        let users = ServerUsers::new(Method::Aes128Gcm, server_key, &[alice, bob]).unwrap();
+        let destination = Destination::tcp(Address::domain("example.com"), 443);
+        for (index, key) in [alice, bob].into_iter().enumerate() {
+            let (near, far) = tokio::io::duplex(64 * 1024);
+            let password = format!("{server_key}:{key}");
+            let client = tokio::spawn({
+                let destination = destination.clone();
+                async move {
+                    let mut client =
+                        Stream::client(near, Method::Aes128Gcm, &password, &destination)
+                            .await
+                            .unwrap();
+                    client.write_all(b"hello").await.unwrap();
+                    client.flush().await.unwrap();
+                    let mut reply = [0u8; 5];
+                    client.read_exact(&mut reply).await.unwrap();
+                    reply
+                }
+            });
+            let (mut served, asked, user) = Stream::server_multi(far, &users).await.unwrap();
+            assert_eq!(user, index);
+            assert_eq!(asked, destination);
+            let mut hello = [0u8; 5];
+            served.read_exact(&mut hello).await.unwrap();
+            assert_eq!(&hello, b"hello");
+            served.write_all(b"world").await.unwrap();
+            served.flush().await.unwrap();
+            assert_eq!(&client.await.unwrap(), b"world");
+        }
+
+        let (near, far) = tokio::io::duplex(64 * 1024);
+        let stranger = format!("{server_key}:c3RyYW5nZXItc3RyYW5nZQ==");
+        tokio::spawn(async move {
+            let mut client = Stream::client(near, Method::Aes128Gcm, &stranger, &destination)
+                .await
+                .unwrap();
+            let _ = client.write_all(b"let me in").await;
+            let _ = client.flush().await;
+        });
+        assert!(Stream::server_multi(far, &users).await.is_err());
+    }
+
+    #[test]
+    fn users_need_distinct_keys_of_the_right_length() {
+        let server_key = "MDEyMzQ1Njc4OWFiY2RlZg==";
+        let alice = "YWxpY2UtYWxpY2UtYWxpYw==";
+        assert!(ServerUsers::new(Method::Aes128Gcm, server_key, &[alice, alice]).is_err());
+        assert!(ServerUsers::new(Method::Aes128Gcm, server_key, &["c2hvcnQ="]).is_err());
+        assert!(ServerUsers::new(Method::Chacha20Poly1305, server_key, &[alice]).is_err());
+    }
 
     #[tokio::test]
     async fn the_request_header_and_the_first_chunk_are_one_carrier_write() {

@@ -5,6 +5,7 @@
 //! ordinary TLS (RESEARCH-01 §13).
 
 pub mod fingerprint;
+pub mod keys;
 pub mod reality;
 pub mod reality_compat;
 pub mod server;
