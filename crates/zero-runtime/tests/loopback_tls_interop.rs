@@ -1339,3 +1339,102 @@ async fn tide_datagrams_follow_a_dialer_proxy_hop() {
         "Tide did not connect through the hop: {accepted}"
     );
 }
+
+/// A ZeroV1 inbound that starts with no users gets one at run time, meters
+/// its streams under its name, and refuses it once it is removed: what a
+/// panel selling ZeroV1 accounts needs. The user id is the account's UUID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn tide_accounts_come_and_go_and_are_metered() {
+    use base64::Engine as _;
+    use zero_protocol::tide::{encode_key, generate_keypair};
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let reality_secret = x25519_dalek::StaticSecret::from([31u8; 32]);
+    let reality_public = x25519_dalek::PublicKey::from(&reality_secret);
+    let echo = echo_service().await;
+    let (server_port, socks_port) = (free_tcp_port(), free_tcp_port());
+    let (secret, public) = generate_keypair();
+    let user = zero_config::share_link::parse_uuid(UUID).unwrap();
+    let server = spawn(json!({
+        "inbounds": [{
+            "tag": "zerov1-in", "listen": "127.0.0.1", "port": server_port, "protocol": "zerov1",
+            "settings": {"path": "/assets/app", "secretKey": encode_key(&secret), "users": []},
+            "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {
+                "dest": echo.to_string(), "serverNames": ["www.example.test"],
+                "privateKey": encode(&reality_secret.to_bytes()), "shortIds": ["ab12cd34ef56ab12"],
+            }},
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }));
+    let client = spawn(json!({
+        "inbounds": [{"tag": "socks-in", "listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {}}],
+        "outbounds": [{
+            "tag": "proxy", "protocol": "zerov1",
+            "settings": {"address": "127.0.0.1", "port": server_port, "path": "/assets/app",
+                "serverKey": encode_key(&public), "user": encode_key(&user)},
+            "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {
+                "serverName": "www.example.test", "publicKey": encode(reality_public.as_bytes()),
+                "shortId": "ab12cd34ef56ab12", "fingerprint": "chrome",
+            }},
+        }],
+    }));
+    wait_until_listening(&server).await;
+    wait_until_listening(&client).await;
+    let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    let reaches = || async move {
+        // `socks_connect` panics on a refusal, which is the answer here.
+        let attempt = async {
+            let mut stream = TcpStream::connect(socks).await.ok()?;
+            stream.write_all(&[5, 1, 0]).await.ok()?;
+            let mut method = [0u8; 2];
+            stream.read_exact(&mut method).await.ok()?;
+            let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+            request.extend_from_slice(&echo.port().to_be_bytes());
+            stream.write_all(&request).await.ok()?;
+            let mut reply = [0u8; 10];
+            stream.read_exact(&mut reply).await.ok()?;
+            if reply[1] != 0 {
+                return Some(false);
+            }
+            stream.write_all(b"ping").await.ok()?;
+            let mut back = [0u8; 4];
+            stream.read_exact(&mut back).await.ok()?;
+            Some(&back == b"ping")
+        };
+        tokio::time::timeout(Duration::from_secs(8), attempt)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    };
+    assert!(!reaches().await, "no user yet");
+
+    let account = server
+        .parse_account("zerov1-in", &json!({"id": UUID, "name": "alice@panel"}))
+        .expect("a ZeroV1 account");
+    server.add_accounts("zerov1-in", &[account]).unwrap();
+    let mut stream = socks_connect(socks, echo).await.unwrap();
+    round_trip(&mut stream, &payload(4, 128 * 1024)).await;
+    let traffic = server.stats.accounts.traffic(false);
+    assert_eq!(traffic.len(), 1, "{traffic:?}");
+    assert_eq!(traffic[0].email, "alice@panel");
+    assert!(
+        traffic[0].uplink >= 128 * 1024 && traffic[0].downlink >= 128 * 1024,
+        "{traffic:?}"
+    );
+    assert_eq!(server.stats.accounts.online()[0].email, "alice@panel");
+
+    assert_eq!(
+        server
+            .remove_accounts("zerov1-in", &["alice@panel"])
+            .unwrap(),
+        1
+    );
+    let _ = stream.write_all(b"anyone?").await;
+    let mut buf = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+    assert!(
+        matches!(read, Ok(Ok(0) | Err(_))),
+        "the removed user's stream stayed open: {read:?}"
+    );
+    assert!(!reaches().await, "a removed user got a stream");
+}

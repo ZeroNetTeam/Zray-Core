@@ -1159,8 +1159,10 @@ pub fn parse_inbound_client(protocol: &str, client: &Value) -> R<InboundClient> 
             "a shadowsocks account depends on the inbound's method; use parse_shadowsocks_client"
                 .into(),
         ),
+        "zerov1" | "tide" => parse_tide_client(client, path),
+        "wireguard" => parse_wireguard_peer(client, path).map(InboundClient::WireGuard),
         other => Err(format!(
-            "accounts cannot be added to a {other} inbound; only vless, vmess, trojan, shadowsocks, hysteria2, tuic and anytls"
+            "accounts cannot be added to a {other} inbound; only vless, vmess, trojan, shadowsocks, hysteria2, tuic, anytls, zerov1 and wireguard"
         )),
     }
 }
@@ -2395,6 +2397,27 @@ fn parse_tide(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
     }))
 }
 
+/// A ZeroV1 account: `id` as a Tide key (16 bytes of URL-safe base64) or a
+/// UUID, whose 16 bytes are the key; `name` (or `email`) is required, as
+/// that is how the account is found again.
+fn parse_tide_client(client: &Value, path: &str) -> R<InboundClient> {
+    let text = client.get("id").and_then(Value::as_str).unwrap_or("");
+    let id = match crate::share_link::parse_uuid(text) {
+        Ok(uuid) => uuid,
+        Err(_) => tide_key(client.get("id"), &format!("{path}.id"))?,
+    };
+    let name = client
+        .get("name")
+        .or_else(|| client.get("email"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("{path}.name is required for a zerov1 account"))?;
+    Ok(InboundClient::Tide {
+        id,
+        name: Arc::from(name),
+    })
+}
+
 fn parse_tide_inbound(settings: Option<&Value>, path: &str) -> R<TideInboundConfig> {
     let settings = settings.ok_or_else(|| format!("{path}.settings is required for tide"))?;
     let mut users = Vec::new();
@@ -3314,6 +3337,50 @@ fn parse_optional_wireguard_key(value: Option<&Value>, path: &str) -> R<Option<[
 
 /// Xray's `wireguard` inbound: `secretKey`, `peers` (`publicKey`,
 /// `preSharedKey`, `allowedIPs`, `keepAlive`, `email`) and `mtu`.
+/// One entry of a WireGuard inbound's `settings.peers`.
+fn parse_wireguard_peer(peer: &Value, peer_path: &str) -> R<WireGuardPeer> {
+    let allowed_ips = match peer.get("allowedIPs").and_then(Value::as_array) {
+        // Xray's default: the peer may use any address.
+        None => ["0.0.0.0/0", "::/0"]
+            .iter()
+            .filter_map(|text| routing::ipnet_lite::Cidr::parse(text))
+            .collect(),
+        Some(list) => list
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .and_then(routing::ipnet_lite::Cidr::parse)
+                    .ok_or_else(|| {
+                        format!("{peer_path}.allowedIPs has {entry} which is not a CIDR")
+                    })
+            })
+            .collect::<R<Vec<_>>>()?,
+    };
+    Ok(WireGuardPeer {
+        public_key: parse_wireguard_key(
+            peer.get("publicKey").and_then(Value::as_str),
+            &format!("{peer_path}.publicKey"),
+        )?,
+        preshared_key: parse_optional_wireguard_key(
+            peer.get("preSharedKey")
+                .or_else(|| peer.get("presharedKey")),
+            &format!("{peer_path}.preSharedKey"),
+        )?,
+        allowed_ips: allowed_ips.into_boxed_slice(),
+        keepalive: peer
+            .get("keepAlive")
+            .and_then(Value::as_u64)
+            .filter(|seconds| *seconds > 0)
+            .and_then(|seconds| u16::try_from(seconds).ok()),
+        email: peer
+            .get("email")
+            .and_then(Value::as_str)
+            .filter(|email| !email.is_empty())
+            .map(Arc::from),
+    })
+}
+
 fn parse_wireguard_inbound(settings: Option<&Value>, path: &str) -> R<WireGuardInboundConfig> {
     let settings = settings.ok_or_else(|| format!("{path}.settings is required for wireguard"))?;
     let secret_key = parse_wireguard_key(
@@ -3334,50 +3401,15 @@ fn parse_wireguard_inbound(settings: Option<&Value>, path: &str) -> R<WireGuardI
         .iter()
         .enumerate()
     {
-        let peer_path = format!("{path}.settings.peers[{index}]");
-        let allowed_ips = match peer.get("allowedIPs").and_then(Value::as_array) {
-            // Xray's default: the peer may use any address.
-            None => ["0.0.0.0/0", "::/0"]
-                .iter()
-                .filter_map(|text| routing::ipnet_lite::Cidr::parse(text))
-                .collect(),
-            Some(list) => list
-                .iter()
-                .map(|entry| {
-                    entry
-                        .as_str()
-                        .and_then(routing::ipnet_lite::Cidr::parse)
-                        .ok_or_else(|| {
-                            format!("{peer_path}.allowedIPs has {entry} which is not a CIDR")
-                        })
-                })
-                .collect::<R<Vec<_>>>()?,
-        };
-        peers.push(WireGuardPeer {
-            public_key: parse_wireguard_key(
-                peer.get("publicKey").and_then(Value::as_str),
-                &format!("{peer_path}.publicKey"),
-            )?,
-            preshared_key: parse_optional_wireguard_key(
-                peer.get("preSharedKey")
-                    .or_else(|| peer.get("presharedKey")),
-                &format!("{peer_path}.preSharedKey"),
-            )?,
-            allowed_ips: allowed_ips.into_boxed_slice(),
-            keepalive: peer
-                .get("keepAlive")
-                .and_then(Value::as_u64)
-                .filter(|seconds| *seconds > 0)
-                .and_then(|seconds| u16::try_from(seconds).ok()),
-            email: peer
-                .get("email")
-                .and_then(Value::as_str)
-                .filter(|email| !email.is_empty())
-                .map(Arc::from),
-        });
+        peers.push(parse_wireguard_peer(
+            peer,
+            &format!("{path}.settings.peers[{index}]"),
+        )?);
     }
-    if peers.is_empty() {
-        return Err(format!("{path}.settings.peers needs at least one peer"));
+    // An inbound that a panel fills with peers later may start with none;
+    // only a missing list is a mistake.
+    if settings.get("peers").and_then(Value::as_array).is_none() {
+        return Err(format!("{path}.settings.peers is required for wireguard"));
     }
     Ok(WireGuardInboundConfig {
         secret_key,
@@ -7886,8 +7918,10 @@ mod tests {
         assert_eq!(wg.peers[1].preshared_key, Some([4; 32]));
         // The key must never reach a log through the debug form.
         assert!(!format!("{wg:?}").contains(&key(1)));
+        // A panel's inbound starts with no peers and gets them at run time.
+        assert!(parse_config(&config(serde_json::json!([]))).is_ok());
         for bad in [
-            serde_json::json!([]),
+            serde_json::Value::Null,
             serde_json::json!([{"publicKey": "not-a-key"}]),
             serde_json::json!([{"publicKey": key(2), "allowedIPs": ["nope"]}]),
         ] {

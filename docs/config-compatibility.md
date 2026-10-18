@@ -334,7 +334,8 @@ Three behaviours go further than Xray's:
   `/reload` rebuilds them all.
 
 Accounts can be changed at run time on `vless`, `vmess`, `trojan`,
-`shadowsocks`, `hysteria2`, `tuic` and `anytls` inbounds. An account without an
+`shadowsocks`, `hysteria2`, `tuic`, `anytls`, `zerov1` and `wireguard`
+inbounds. An account without an
 `email` (or, for Hysteria2, TUIC and AnyTLS, a sing-box `name`) is not
 metered. One credential cannot belong to
 two accounts on an inbound, since the handshake could not tell them apart.
@@ -343,16 +344,28 @@ address is held; with `--account-addresses` only those of sessions open now
 are, never a history.
 
 A speed limit is one token bucket per account and direction, so more
-connections do not buy more speed; at most one second's worth builds up. It
-applies to streams; UDP datagrams of Hysteria2 and TUIC are counted but not
-slowed.
+connections do not buy more speed; at most one second's worth builds up.
+Streams wait for it. A datagram (Hysteria2, TUIC and ZeroV1 UDP, WireGuard
+packets) cannot wait or be split, so one over the limit is dropped and not
+counted, the way a policer drops, and the sender's congestion control slows
+down.
 
 WireGuard peers with an `email` are metered by the addresses they own
 (`allowedIPs`): a packet from a peer counts by its source, one to it by its
-destination, IP headers included. Peers are taken when the listener starts,
-so adding or removing one goes through a `Host` handover (below), not
-`/accounts/add`. ZeroV1 (Tide) keeps its own users and panel and is not
-metered here.
+destination, IP headers included. A peer is an account in the shape of an
+entry of `settings.peers`; adding or removing one changes the running
+server's peers, and the peers that stay keep their tunnels. A named peer is
+online, from the address it last sent from, while it has sent anything in the
+last three minutes (a connected client rekeys every two); ending its session
+drops its packets until it falls quiet. An inbound may start with
+`"peers": []`.
+
+A ZeroV1 (Tide) account is `{"id": …, "name": …}`: the id as a Tide key or a
+UUID, whose 16 bytes are the key, and the name it is metered under. Its
+streams are metered and its UDP flows held to its limit; a session spans
+connections, so it has no client address. A removed user's open session
+opens no more streams. Users from `usersFile` and the Tide panel stay as they
+are.
 
 Hysteria2 and TUIC log in once per QUIC connection, which outlives account
 changes, so every stream and datagram is checked against the current
@@ -368,7 +381,11 @@ reload, and a shared credential refused; the same for multi-user
 Shadowsocks (legacy and 2022), plus events and a speed limit on a real
 session. `zero-runtime/tests/account_metering_tls.rs` does it for Hysteria2,
 TUIC and AnyTLS, including a removed account refused on a QUIC connection
-that is still up.
+that is still up. `zero-runtime/tests/wireguard_inbound.rs`
+(`peers_come_and_go_while_the_inbound_runs`) and
+`zero-runtime/tests/loopback_tls_interop.rs`
+(`tide_accounts_come_and_go_and_are_metered`) do it for WireGuard and ZeroV1
+with real clients.
 
 ## Multi-user Shadowsocks
 

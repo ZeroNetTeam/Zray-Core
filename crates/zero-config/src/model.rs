@@ -2844,6 +2844,12 @@ pub enum InboundClient {
         email: Option<Arc<str>>,
     },
     Tuic(TuicInboundUser),
+    /// A ZeroV1 (Tide) user: its id, which is its password, and its name.
+    Tide {
+        id: [u8; 16],
+        name: Arc<str>,
+    },
+    WireGuard(WireGuardPeer),
 }
 
 impl InboundClient {
@@ -2857,6 +2863,8 @@ impl InboundClient {
             InboundClient::Shadowsocks(user) => user.email.as_ref(),
             InboundClient::Password { email, .. } => email.as_ref(),
             InboundClient::Tuic(user) => user.email.as_ref(),
+            InboundClient::Tide { name, .. } => Some(name),
+            InboundClient::WireGuard(peer) => peer.email.as_ref(),
         }
     }
 }

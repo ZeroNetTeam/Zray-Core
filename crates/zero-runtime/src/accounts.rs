@@ -133,6 +133,19 @@ impl Bucket {
         Ok((*credit as usize).min(want))
     }
 
+    /// Whether a datagram of `bytes` may pass now, charging it if so. Unlike
+    /// a stream, a datagram cannot wait or be split: over the limit it is
+    /// dropped, the way a policer drops, and the sender's congestion control
+    /// slows down.
+    fn admit(&self, bytes: usize) -> bool {
+        if bytes == 0 || self.allowance(bytes).is_ok() {
+            self.charge(bytes);
+            true
+        } else {
+            false
+        }
+    }
+
     fn charge(&self, bytes: usize) {
         if bytes == 0 || self.rate() == 0 {
             return;
@@ -242,9 +255,56 @@ impl Accounts {
         peer: IpAddr,
         stream: S,
     ) -> Metered<S> {
+        let (account, session, id) = self.register(email, inbound, Some(peer));
+        Metered {
+            inner: stream,
+            account,
+            session,
+            id,
+            read_wait: None,
+            write_wait: None,
+            email: Arc::clone(email),
+            events: Arc::clone(&self.events),
+            opened: Instant::now(),
+            uplink: 0,
+            downlink: 0,
+        }
+    }
+
+    /// Hold a session of `email` on `inbound` open, from `address` when it is
+    /// known, for a protocol whose traffic is not one stream: a WireGuard
+    /// peer, which [`Accounts::admit`] meters packet by packet. The session
+    /// counts as open until the guard is dropped; ending it only marks it,
+    /// and the holder checks [`SessionGuard::is_ended`].
+    pub fn open_session(
+        &self,
+        email: &Arc<str>,
+        inbound: &Arc<str>,
+        address: Option<IpAddr>,
+    ) -> SessionGuard {
+        let (account, session, id) = self.register(email, inbound, address);
+        SessionGuard {
+            account,
+            session,
+            id,
+            email: Arc::clone(email),
+            events: Arc::clone(&self.events),
+            opened: Instant::now(),
+        }
+    }
+
+    /// Register a session of `email` and return its account, the session and
+    /// its id. An unspecified address (a protocol whose sessions span
+    /// connections has no one client address) is not an address.
+    fn register(
+        &self,
+        email: &Arc<str>,
+        inbound: &Arc<str>,
+        address: Option<IpAddr>,
+    ) -> (Arc<Account>, Arc<Session>, u64) {
         let session = Arc::new(Session {
             inbound: Arc::clone(inbound),
-            address: self.tracks_addresses().then_some(peer),
+            address: address.filter(|address| self.tracks_addresses() && !address.is_unspecified()),
             ended: AtomicBool::new(false),
             read_waker: AtomicWaker::new(),
             write_waker: AtomicWaker::new(),
@@ -278,19 +338,7 @@ impl Accounts {
             inbound: inbound.to_string(),
             address: session.address,
         });
-        Metered {
-            inner: stream,
-            account,
-            session,
-            id,
-            read_wait: None,
-            write_wait: None,
-            email: Arc::clone(email),
-            events: Arc::clone(&self.events),
-            opened: Instant::now(),
-            uplink: 0,
-            downlink: 0,
-        }
+        (account, session, id)
     }
 
     fn limit_of(&self, email: &Arc<str>) -> Arc<RateLimit> {
@@ -331,6 +379,31 @@ impl Accounts {
     /// Count bytes moved for `email` outside a metered stream: a UDP
     /// datagram and its answer.
     pub fn count(&self, email: &Arc<str>, uplink: usize, downlink: usize) {
+        let account = self.account(email);
+        account.uplink.fetch_add(uplink as u64, Ordering::Relaxed);
+        account
+            .downlink
+            .fetch_add(downlink as u64, Ordering::Relaxed);
+    }
+
+    /// Let a datagram of `email` through its speed limit and count it:
+    /// `uplink` bytes from the client, `downlink` to it. `false` means it is
+    /// over the limit, is not counted, and is to be dropped (see
+    /// [`Bucket::admit`]).
+    pub fn admit(&self, email: &Arc<str>, uplink: usize, downlink: usize) -> bool {
+        let account = self.account(email);
+        if !account.limit.uplink.admit(uplink) || !account.limit.downlink.admit(downlink) {
+            return false;
+        }
+        account.uplink.fetch_add(uplink as u64, Ordering::Relaxed);
+        account
+            .downlink
+            .fetch_add(downlink as u64, Ordering::Relaxed);
+        true
+    }
+
+    /// The account of `email`, made if it has none yet.
+    fn account(&self, email: &Arc<str>) -> Arc<Account> {
         let account = {
             let entries = self.entries.read().unwrap_or_else(|p| p.into_inner());
             entries.get(email).cloned()
@@ -347,10 +420,7 @@ impl Accounts {
                 })
             }))
         });
-        account.uplink.fetch_add(uplink as u64, Ordering::Relaxed);
         account
-            .downlink
-            .fetch_add(downlink as u64, Ordering::Relaxed);
     }
 
     /// Bytes per account, sorted by `email`. `reset` zeroes each counter as it
@@ -494,6 +564,44 @@ impl<S> Drop for Metered<S> {
             inbound: self.session.inbound.to_string(),
             uplink: self.uplink,
             downlink: self.downlink,
+            seconds: self.opened.elapsed().as_secs_f64(),
+            ended: self.session.is_ended(),
+        });
+    }
+}
+
+/// A session held open without a stream (see [`Accounts::open_session`]).
+pub struct SessionGuard {
+    account: Arc<Account>,
+    session: Arc<Session>,
+    id: u64,
+    email: Arc<str>,
+    events: Arc<crate::events::Events>,
+    opened: Instant,
+}
+
+impl SessionGuard {
+    /// Whether the session was ended (its account removed, limited or over
+    /// its addresses): its holder stops carrying its traffic.
+    pub fn is_ended(&self) -> bool {
+        self.session.is_ended()
+    }
+}
+
+impl std::fmt::Debug for SessionGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionGuard { .. }")
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        lock(&self.account.sessions).remove(&self.id);
+        self.events.emit(|| crate::events::Event::SessionClosed {
+            email: self.email.to_string(),
+            inbound: self.session.inbound.to_string(),
+            uplink: 0,
+            downlink: 0,
             seconds: self.opened.elapsed().as_secs_f64(),
             ended: self.session.is_ended(),
         });
@@ -924,5 +1032,48 @@ mod tests {
         assert_eq!(accounts.end_address("nobody", other), 0);
         assert!(there.write_all(b"x").await.is_err());
         assert!(here.write_all(b"x").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn datagrams_over_the_limit_are_dropped_and_not_counted() {
+        let accounts = Accounts::default();
+        let alice = name("alice");
+        assert!(accounts.admit(&alice, 5000, 0), "no limit, no drop");
+        accounts.set_limit("alice", 1000, 0);
+        // A full second's worth to start with, then debt drops what follows.
+        assert!(accounts.admit(&alice, 1200, 0));
+        assert!(!accounts.admit(&alice, 100, 0));
+        assert!(
+            accounts.admit(&alice, 0, 100),
+            "the other direction is apart"
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(accounts.admit(&alice, 100, 0), "the debt was paid back");
+        let traffic = accounts.traffic(false);
+        assert_eq!((traffic[0].uplink, traffic[0].downlink), (6300, 100));
+    }
+
+    #[tokio::test]
+    async fn a_session_without_a_stream_is_online_until_dropped_or_ended() {
+        let accounts = Accounts::default();
+        accounts.set_track_addresses(true);
+        let (bob, inbound) = (name("bob"), name("wg"));
+        let guard = accounts.open_session(&bob, &inbound, Some(PEER));
+        let unknown =
+            accounts.open_session(&bob, &inbound, Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        let online = accounts.online();
+        assert_eq!(
+            (online[0].sessions, online[0].addresses.clone()),
+            (2, vec![PEER])
+        );
+        assert_eq!(accounts.end_address("bob", PEER), 1);
+        assert!(guard.is_ended() && !unknown.is_ended());
+        drop(unknown);
+        assert!(
+            accounts.online().is_empty(),
+            "an ended session is not online"
+        );
+        drop(guard);
+        assert_eq!(accounts.end_sessions("bob"), 0);
     }
 }

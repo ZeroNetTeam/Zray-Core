@@ -185,3 +185,59 @@ async fn a_peer_cannot_use_an_address_it_was_not_given() {
         "packets from outside allowedIPs must be dropped"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peers_come_and_go_while_the_inbound_runs() {
+    let (server_secret, server_public) = key_pair(1);
+    let (client_secret, client_public) = key_pair(2);
+    let (_, other_public) = key_pair(3);
+    let port = free_udp_port();
+    // A panel's inbound starts with no peers and gets them as users come.
+    let server = start_server(port, server_secret, json!([])).await;
+    server.stats.accounts.set_track_addresses(true);
+    let tcp = tcp_echo().await;
+    let add = |public: [u8; 32], address: &str, email: &str| {
+        let peer = json!({"publicKey": b64(&public), "allowedIPs": [address], "email": email});
+        let account = server.parse_account("wg", &peer).expect("a peer account");
+        server.add_accounts("wg", &[account]).expect("added");
+    };
+    add(other_public, "10.7.0.3/32", "other@panel");
+    add(client_public, "10.7.0.2/32", "wg@panel");
+
+    let peer = client(port, client_secret, server_public, "10.7.0.2");
+    let mut stream = tokio::time::timeout(Duration::from_secs(15), peer.connect(tcp))
+        .await
+        .expect("connect timed out")
+        .expect("an added peer connects");
+    stream.write_all(b"hello").await.unwrap();
+    let mut answer = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut answer))
+        .await
+        .expect("no tcp answer")
+        .unwrap();
+    assert_eq!(&answer[..read], b"tcp:hello");
+    let online = server.stats.accounts.online();
+    assert_eq!(online.len(), 1, "{online:?}");
+    assert_eq!(online[0].email, "wg@panel");
+    assert_eq!(
+        online[0].addresses,
+        vec!["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]
+    );
+
+    // Removing another peer leaves this one's tunnel alone.
+    assert_eq!(server.remove_accounts("wg", &["other@panel"]).unwrap(), 1);
+    let again = tokio::time::timeout(Duration::from_secs(10), peer.connect(tcp)).await;
+    assert!(
+        matches!(again, Ok(Ok(_))),
+        "the tunnel survived another peer's removal"
+    );
+
+    // Removed, it is cut off and offline.
+    assert_eq!(server.remove_accounts("wg", &["wg@panel"]).unwrap(), 1);
+    assert!(server.stats.accounts.online().is_empty());
+    let after = tokio::time::timeout(Duration::from_secs(6), peer.connect(tcp)).await;
+    assert!(
+        !matches!(after, Ok(Ok(_))),
+        "a removed peer must not get through"
+    );
+}

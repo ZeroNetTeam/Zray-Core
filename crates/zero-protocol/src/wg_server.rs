@@ -4,9 +4,18 @@
 //! It owns one UDP socket and one `boringtun` tunnel per configured peer, and
 //! shows the rest of the program a plain IP-packet link:
 //!
-//! * [`WgLink::from_peers`] yields the packets peers sent, already decrypted;
+//! * [`WgLink::from_peers`] yields the packets peers sent, already decrypted,
+//!   with where each came from;
 //! * [`WgLink::to_peers`] takes packets to send, and finds the peer that
-//!   should get each one.
+//!   should get each one;
+//! * [`WgLink::peers`] replaces the list of peers while it runs.
+//!
+//! Changing the peers: each peer has a slot whose number is the high bits of
+//! the receiver indexes its tunnel gives out. A peer that stays in the new
+//! list keeps its slot and its tunnel, so its session goes on untouched; a
+//! peer that leaves frees its slot, and a new one takes a free slot or a new
+//! one. A late packet for a peer that left lands on whoever took its slot,
+//! and fails to decrypt there like any forged packet.
 //!
 //! How packets find their peer (WireGuard's "cryptokey routing"):
 //!
@@ -57,10 +66,12 @@ pub struct PeerSpec {
 
 /// The packet side of a running server.
 pub struct WgLink {
-    /// Decrypted IP packets from peers.
-    pub from_peers: mpsc::Receiver<Vec<u8>>,
+    /// Decrypted IP packets from peers, with the address each came from.
+    pub from_peers: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
     /// IP packets to encrypt and send to whichever peer owns the destination.
     pub to_peers: mpsc::Sender<Vec<u8>>,
+    /// A new list of peers, in place of the current one.
+    pub peers: mpsc::UnboundedSender<Vec<PeerSpec>>,
     /// The task that drives the socket; aborting it stops the server.
     pub task: tokio::task::JoinHandle<()>,
 }
@@ -68,10 +79,14 @@ pub struct WgLink {
 struct Peer {
     tunn: Tunn,
     public_key: [u8; 32],
+    preshared_key: Option<[u8; 32]>,
     allowed: Vec<(IpAddr, u8)>,
     /// Where this peer's last authenticated packet came from.
     endpoint: Option<SocketAddr>,
 }
+
+/// The most slots: a receiver index keeps 8 low bits for the tunnel's own use.
+const MAX_PEERS: usize = 1 << 23;
 
 fn in_prefix(network: IpAddr, prefix: u8, ip: IpAddr) -> bool {
     fn bits_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
@@ -91,6 +106,23 @@ fn in_prefix(network: IpAddr, prefix: u8, ip: IpAddr) -> bool {
 }
 
 impl Peer {
+    fn new(secret: &StaticSecret, spec: PeerSpec, slot: usize) -> Self {
+        Peer {
+            tunn: Tunn::new(
+                secret.clone(),
+                PublicKey::from(spec.public_key),
+                spec.preshared_key,
+                spec.keepalive,
+                slot as u32,
+                None,
+            ),
+            public_key: spec.public_key,
+            preshared_key: spec.preshared_key,
+            allowed: spec.allowed,
+            endpoint: None,
+        }
+    }
+
     /// The longest prefix of this peer's list that holds `ip`, if any.
     fn prefix_for(&self, ip: IpAddr) -> Option<u8> {
         self.allowed
@@ -105,11 +137,46 @@ struct Server {
     socket: Arc<UdpSocket>,
     secret: StaticSecret,
     public: PublicKey,
-    peers: Vec<Peer>,
+    /// Peers by slot; a free slot is `None`.
+    peers: Vec<Option<Peer>>,
     buffer: Vec<u8>,
 }
 
 impl Server {
+    /// Serve `specs` from now on (see the module's description).
+    fn set_peers(&mut self, specs: Vec<PeerSpec>) {
+        for slot in &mut self.peers {
+            let staying = slot.as_ref().and_then(|peer| {
+                specs.iter().find(|spec| {
+                    spec.public_key == peer.public_key && spec.preshared_key == peer.preshared_key
+                })
+            });
+            match (slot.as_mut(), staying) {
+                (Some(peer), Some(spec)) => peer.allowed = spec.allowed.clone(),
+                _ => *slot = None,
+            }
+        }
+        for spec in specs {
+            if self
+                .peers
+                .iter()
+                .flatten()
+                .any(|peer| peer.public_key == spec.public_key)
+            {
+                continue;
+            }
+            let slot = match self.peers.iter().position(Option::is_none) {
+                Some(free) => free,
+                None if self.peers.len() < MAX_PEERS => {
+                    self.peers.push(None);
+                    self.peers.len() - 1
+                }
+                None => return,
+            };
+            self.peers[slot] = Some(Peer::new(&self.secret, spec, slot));
+        }
+    }
+
     /// Datagrams to put on the wire and IP packets for the user, gathered
     /// while a tunnel's result is unwrapped so no borrow outlives it.
     fn unwrap_result(
@@ -139,24 +206,27 @@ impl Server {
         let index = match Tunn::parse_incoming_packet(datagram).ok()? {
             Packet::HandshakeInit(init) => {
                 let half = parse_handshake_anon(&self.secret, &self.public, &init).ok()?;
-                return self
-                    .peers
-                    .iter()
-                    .position(|peer| peer.public_key == half.peer_static_public);
+                return self.peers.iter().position(|peer| {
+                    peer.as_ref()
+                        .is_some_and(|peer| peer.public_key == half.peer_static_public)
+                });
             }
             Packet::HandshakeResponse(response) => response.receiver_idx,
             Packet::PacketCookieReply(reply) => reply.receiver_idx,
             Packet::PacketData(data) => data.receiver_idx,
         };
         let peer = (index >> 8) as usize;
-        (peer < self.peers.len()).then_some(peer)
+        self.peers
+            .get(peer)
+            .is_some_and(Option::is_some)
+            .then_some(peer)
     }
 
     async fn on_datagram(
         &mut self,
         length: usize,
         from: SocketAddr,
-        to_user: &mpsc::Sender<Vec<u8>>,
+        to_user: &mpsc::Sender<(Vec<u8>, SocketAddr)>,
     ) {
         let datagram = self.buffer[..length].to_vec();
         let Some(index) = self.peer_of(&datagram) else {
@@ -165,7 +235,9 @@ impl Server {
         let mut wire = Vec::new();
         let mut packets = Vec::new();
         let mut scratch = vec![0u8; MAX_PACKET];
-        let peer = &mut self.peers[index];
+        let Some(peer) = self.peers[index].as_mut() else {
+            return;
+        };
         let mut again = Self::unwrap_result(
             peer.tunn
                 .decapsulate(Some(from.ip()), &datagram, &mut scratch),
@@ -188,7 +260,7 @@ impl Server {
         }
         for (packet, source) in packets {
             if peer.prefix_for(source).is_some() {
-                let _ = to_user.send(packet).await;
+                let _ = to_user.send((packet, from)).await;
             }
         }
         for datagram in wire {
@@ -204,13 +276,15 @@ impl Server {
             .peers
             .iter()
             .enumerate()
-            .filter_map(|(index, peer)| Some((index, peer.prefix_for(destination)?)))
+            .filter_map(|(index, peer)| Some((index, peer.as_ref()?.prefix_for(destination)?)))
             .max_by_key(|(_, prefix)| *prefix)
             .map(|(index, _)| index)
         else {
             return;
         };
-        let peer = &mut self.peers[index];
+        let Some(peer) = self.peers[index].as_mut() else {
+            return;
+        };
         let Some(endpoint) = peer.endpoint else {
             return;
         };
@@ -229,7 +303,7 @@ impl Server {
 
     async fn on_tick(&mut self) {
         let mut scratch = vec![0u8; 256];
-        for peer in &mut self.peers {
+        for peer in self.peers.iter_mut().flatten() {
             let Some(endpoint) = peer.endpoint else {
                 continue;
             };
@@ -248,36 +322,21 @@ impl Server {
 }
 
 /// Start serving on `socket` for `peers` (at most 2^23, far more than a
-/// config will hold), answering with `secret_key`.
+/// server will hold), answering with `secret_key`.
 pub fn serve(socket: Arc<UdpSocket>, secret_key: [u8; 32], peers: Vec<PeerSpec>) -> WgLink {
     let secret = StaticSecret::from(secret_key);
     let public = PublicKey::from(&secret);
-    let peers: Vec<Peer> = peers
-        .into_iter()
-        .enumerate()
-        .map(|(index, spec)| Peer {
-            tunn: Tunn::new(
-                secret.clone(),
-                PublicKey::from(spec.public_key),
-                spec.preshared_key,
-                spec.keepalive,
-                index as u32,
-                None,
-            ),
-            public_key: spec.public_key,
-            allowed: spec.allowed,
-            endpoint: None,
-        })
-        .collect();
     let (to_user, from_peers) = mpsc::channel(QUEUE);
     let (to_peers, mut from_user) = mpsc::channel::<Vec<u8>>(QUEUE);
+    let (peer_lists, mut new_peers) = mpsc::unbounded_channel::<Vec<PeerSpec>>();
     let mut server = Server {
         socket,
         secret,
         public,
-        peers,
+        peers: Vec::new(),
         buffer: vec![0u8; MAX_PACKET],
     };
+    server.set_peers(peers);
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(TICK);
         let receiving = Arc::clone(&server.socket);
@@ -311,12 +370,17 @@ pub fn serve(socket: Arc<UdpSocket>, secret_key: [u8; 32], peers: Vec<PeerSpec>)
                     server.buffer = buffer;
                     server.on_tick().await;
                 }
+                Some(peers) = new_peers.recv() => {
+                    server.buffer = buffer;
+                    server.set_peers(peers);
+                }
             }
         }
     });
     WgLink {
         from_peers,
         to_peers,
+        peers: peer_lists,
         task,
     }
 }
@@ -360,6 +424,7 @@ mod tests {
                 None,
             ),
             public_key: [2; 32],
+            preshared_key: None,
             allowed: allowed
                 .iter()
                 .map(|(ip, prefix)| (ip.parse().unwrap(), *prefix))
@@ -370,5 +435,41 @@ mod tests {
         assert_eq!(peer.prefix_for("10.8.0.9".parse().unwrap()), Some(24));
         assert_eq!(peer.prefix_for("8.8.8.8".parse().unwrap()), Some(0));
         assert_eq!(peer.prefix_for("::1".parse().unwrap()), None);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_stays_keeps_its_slot_and_a_new_one_takes_a_free_slot() {
+        let spec = |key: u8| PeerSpec {
+            public_key: *PublicKey::from(&StaticSecret::from([key; 32])).as_bytes(),
+            preshared_key: None,
+            allowed: vec![("10.0.0.0".parse().unwrap(), 8)],
+            keepalive: None,
+        };
+        let secret = StaticSecret::from([9u8; 32]);
+        let mut server = Server {
+            socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            public: PublicKey::from(&secret),
+            secret,
+            peers: Vec::new(),
+            buffer: Vec::new(),
+        };
+        server.set_peers(vec![spec(1), spec(2)]);
+        server.peers[1].as_mut().unwrap().endpoint = Some("127.0.0.1:9".parse().unwrap());
+        server.set_peers(vec![spec(2), spec(3)]);
+        let keys: Vec<Option<[u8; 32]>> = server
+            .peers
+            .iter()
+            .map(|peer| peer.as_ref().map(|peer| peer.public_key))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![Some(spec(3).public_key), Some(spec(2).public_key)]
+        );
+        assert!(
+            server.peers[1].as_ref().unwrap().endpoint.is_some(),
+            "the peer that stayed kept its tunnel and endpoint"
+        );
+        server.set_peers(Vec::new());
+        assert!(server.peers.iter().all(Option::is_none));
     }
 }

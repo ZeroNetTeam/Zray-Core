@@ -376,6 +376,12 @@ struct InboundRuntime {
 /// opened it has gone.
 struct TideInbound {
     server: Arc<zero_transport::tide::Server>,
+    /// Its users, shared with the server, which checks them at each
+    /// handshake: id to name.
+    users: crate::tide_users::Users,
+    /// The ids that came from the configuration rather than the users file,
+    /// so an account removed from the configuration leaves the table.
+    from_config: StdMutex<HashSet<zero_protocol::tide::UserId>>,
     /// Streams clients open, until the first connection starts the task that
     /// routes them.
     streams: StdMutex<Option<tokio::sync::mpsc::Receiver<zero_transport::tide::Incoming>>>,
@@ -384,6 +390,7 @@ struct TideInbound {
 impl TideInbound {
     fn new(config: &zero_config::TideInboundConfig) -> Arc<Self> {
         let users = crate::tide_users::load(config);
+        let shared = Arc::clone(&users);
         let (server, streams) =
             zero_transport::tide::Server::new(zero_transport::tide::ServerConfig {
                 path: config.path.to_string(),
@@ -399,8 +406,44 @@ impl TideInbound {
             });
         Arc::new(Self {
             server,
+            users: shared,
+            from_config: StdMutex::new(config.users.iter().map(|user| user.id).collect()),
             streams: StdMutex::new(Some(streams)),
         })
+    }
+
+    /// Bring the user table in line with `config`'s users, keeping those the
+    /// users file added.
+    fn sync_users(&self, config: &zero_config::TideInboundConfig) {
+        let mut from_config = self
+            .from_config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut users = self
+            .users
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for id in from_config.iter() {
+            if !config.users.iter().any(|user| user.id == *id) {
+                users.remove(id);
+            }
+        }
+        for user in config.users.iter() {
+            users.insert(user.id, user.name.to_string());
+        }
+        *from_config = config.users.iter().map(|user| user.id).collect();
+    }
+
+    /// The name `user` is metered under: none for a user without one, and
+    /// `Err` for one that is no longer a user (removed while its session
+    /// still had streams to open).
+    fn account_of(&self, user: &zero_protocol::tide::UserId) -> Result<Option<Arc<str>>, ()> {
+        let users = self
+            .users
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let name = users.get(user).ok_or(())?;
+        Ok((!name.is_empty()).then(|| Arc::from(name.as_str())))
     }
 }
 
@@ -518,10 +561,9 @@ impl InboundRuntime {
 struct WireGuardOwners(Vec<(zero_config::routing::ipnet_lite::Cidr, Arc<str>)>);
 
 impl WireGuardOwners {
-    /// `None` when no peer has an `email`: then nothing is metered.
-    fn of(config: &zero_config::WireGuardInboundConfig) -> Option<Arc<Self>> {
-        let mut owned: Vec<_> = config
-            .peers
+    /// The owners among `peers`; empty when no peer has an `email`.
+    fn of(peers: &[zero_config::WireGuardPeer]) -> Self {
+        let mut owned: Vec<_> = peers
             .iter()
             .filter_map(|peer| Some((peer, peer.email.clone()?)))
             .flat_map(|(peer, email)| {
@@ -532,7 +574,7 @@ impl WireGuardOwners {
             .collect();
         // Longest prefix first, so the most specific owner wins.
         owned.sort_by_key(|(cidr, _)| std::cmp::Reverse(cidr.prefix));
-        (!owned.is_empty()).then(|| Arc::new(Self(owned)))
+        Self(owned)
     }
 
     fn owner(&self, ip: std::net::IpAddr) -> Option<&Arc<str>> {
@@ -548,6 +590,78 @@ impl WireGuardOwners {
 
     fn of_destination(&self, packet: &[u8]) -> Option<&Arc<str>> {
         self.owner(packet_address(packet, false)?)
+    }
+}
+
+/// What the WireGuard server needs of each of `peers`.
+fn peer_specs(peers: &[zero_config::WireGuardPeer]) -> Vec<zero_protocol::wg_server::PeerSpec> {
+    peers
+        .iter()
+        .map(|peer| zero_protocol::wg_server::PeerSpec {
+            public_key: peer.public_key,
+            preshared_key: peer.preshared_key,
+            allowed: peer
+                .allowed_ips
+                .iter()
+                .map(|cidr| (cidr.addr, cidr.prefix))
+                .collect(),
+            keepalive: peer.keepalive,
+        })
+        .collect()
+}
+
+/// How long a WireGuard peer that sent nothing still counts as connected. A
+/// connected client talks at least every two minutes, when its keys rotate.
+const WIREGUARD_IDLE: Duration = Duration::from_secs(180);
+
+/// The named WireGuard peers seen lately, each held online as a session of
+/// its account ([`crate::accounts::Accounts::open_session`]) while it talks.
+#[derive(Default)]
+struct WireGuardSessions(
+    StdMutex<HashMap<Arc<str>, (crate::accounts::SessionGuard, tokio::time::Instant)>>,
+);
+
+impl WireGuardSessions {
+    /// Whether a packet of `email`'s peer from `from` may pass: it opens or
+    /// refreshes the peer's session, which may have been ended.
+    fn heard_from(
+        &self,
+        accounts: &crate::accounts::Accounts,
+        email: &Arc<str>,
+        tag: &Arc<str>,
+        from: SocketAddr,
+    ) -> bool {
+        let mut sessions = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = tokio::time::Instant::now();
+        let (guard, seen) = sessions
+            .entry(Arc::clone(email))
+            .or_insert_with(|| (accounts.open_session(email, tag, Some(from.ip())), now));
+        *seen = now;
+        !guard.is_ended()
+    }
+
+    /// Whether a packet to `email`'s peer may pass: not once its session was
+    /// ended.
+    fn to_peer(&self, email: &Arc<str>) -> bool {
+        let sessions = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sessions
+            .get(email)
+            .is_none_or(|(guard, _)| !guard.is_ended())
+    }
+
+    /// Forget the peers that have been quiet for [`WIREGUARD_IDLE`].
+    fn sweep(&self) {
+        let mut sessions = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sessions.retain(|_, (_, seen)| seen.elapsed() < WIREGUARD_IDLE);
     }
 }
 
@@ -810,7 +924,16 @@ pub struct Server {
     /// one. Mirrored here for the same reason the rung is — materialising an
     /// outbound must not take the planner lock on every new session.
     planner_flow_lifetime_ms: AtomicU64,
+    /// The running WireGuard inbounds by tag, for changing their peers.
+    wireguard: StdMutex<HashMap<Arc<str>, RunningWireGuard>>,
     pub stats: Arc<Stats>,
+}
+
+/// What a running WireGuard inbound takes changes through: its list of
+/// peers, and who owns which address for metering.
+struct RunningWireGuard {
+    peers: tokio::sync::mpsc::UnboundedSender<Vec<zero_protocol::wg_server::PeerSpec>>,
+    owners: Arc<arc_swap::ArcSwap<WireGuardOwners>>,
 }
 
 /// A transport's first stream, and for multiplexing transports the channel
@@ -883,7 +1006,7 @@ fn remove_passwords(
 
 fn accounts_unsupported(tag: &str) -> String {
     format!(
-        "inbound {tag:?} does not take accounts at run time; only vless, vmess, trojan, shadowsocks, hysteria2, tuic and anytls do"
+        "inbound {tag:?} does not take accounts at run time; only vless, vmess, trojan, shadowsocks, hysteria2, tuic, anytls, zerov1 and wireguard do"
     )
 }
 
@@ -1073,6 +1196,47 @@ fn add_account(
             tuic.users = users.into_boxed_slice();
             Ok(replaced)
         }
+        (InboundProtocol::Tide(tide), InboundClient::Tide { id, name }) => {
+            // A Tide user's name is a plain string, not an optional one, so
+            // `place` does not fit it; the rules are the same.
+            if tide
+                .users
+                .iter()
+                .any(|user| user.id == *id && *user.name != **name)
+            {
+                return Err(format!(
+                    "the credential of {name} is already used by another account"
+                ));
+            }
+            let mut users = tide.users.to_vec();
+            let replaced = match users.iter().position(|user| *user.name == **name) {
+                Some(index) => {
+                    let changed = users[index].id != *id;
+                    users[index].id = *id;
+                    changed.then(|| Arc::clone(name))
+                }
+                None => {
+                    users.push(zero_config::TideUser {
+                        id: *id,
+                        name: Box::from(&**name),
+                    });
+                    None
+                }
+            };
+            tide.users = users.into_boxed_slice();
+            Ok(replaced)
+        }
+        (InboundProtocol::WireGuard(wireguard), InboundClient::WireGuard(peer)) => {
+            let mut peers = wireguard.peers.to_vec();
+            let replaced = place(
+                &mut peers,
+                peer.clone(),
+                |p| p.email.as_ref(),
+                |a, b| a.public_key == b.public_key,
+            )?;
+            wireguard.peers = peers.into_boxed_slice();
+            Ok(replaced)
+        }
         (
             InboundProtocol::Vless(_)
             | InboundProtocol::Vmess(_)
@@ -1080,13 +1244,15 @@ fn add_account(
             | InboundProtocol::Shadowsocks(_)
             | InboundProtocol::Hysteria2(_)
             | InboundProtocol::AnyTls(_)
-            | InboundProtocol::Tuic(_),
+            | InboundProtocol::Tuic(_)
+            | InboundProtocol::Tide(_)
+            | InboundProtocol::WireGuard(_),
             _,
         ) => {
             Err("the account is for a different protocol than the inbound".into())
         }
         _ => Err(
-            "this inbound does not take accounts at run time; only vless, vmess, trojan, shadowsocks, hysteria2, tuic and anytls do"
+            "this inbound does not take accounts at run time; only vless, vmess, trojan, shadowsocks, hysteria2, tuic, anytls, zerov1 and wireguard do"
                 .into(),
         ),
     }
@@ -1118,6 +1284,17 @@ pub(crate) fn metered_accounts(config: &RuntimeConfig) -> HashSet<(Arc<str>, Arc
             InboundProtocol::AnyTls(any) => any.emails.iter().flatten().collect(),
             InboundProtocol::Tuic(tuic) => {
                 tuic.users.iter().filter_map(|u| u.email.as_ref()).collect()
+            }
+            InboundProtocol::WireGuard(wireguard) => wireguard
+                .peers
+                .iter()
+                .filter_map(|p| p.email.as_ref())
+                .collect(),
+            InboundProtocol::Tide(tide) => {
+                for user in tide.users.iter().filter(|user| !user.name.is_empty()) {
+                    accounts.insert((Arc::clone(&inbound.tag), Arc::from(&*user.name)));
+                }
+                Vec::new()
             }
             _ => Vec::new(),
         };
@@ -1163,6 +1340,7 @@ impl Server {
             warm: Arc::default(),
             portals: StdMutex::new(HashMap::new()),
             planner_flow_lifetime_ms: AtomicU64::new(0),
+            wireguard: StdMutex::new(HashMap::new()),
             stats,
         }
     }
@@ -1398,6 +1576,7 @@ impl Server {
             }
             Ok(replaced)
         })?;
+        self.sync_running_accounts(tag);
         if !replaced.is_empty() {
             self.stats.accounts.end_where(|email, inbound| {
                 inbound == tag && replaced.iter().any(|r| &**r == email)
@@ -1476,9 +1655,24 @@ impl Server {
                         remove_passwords(&any.passwords, &any.emails, named);
                     removed
                 }
+                InboundProtocol::Tide(tide) => {
+                    let mut users = tide.users.to_vec();
+                    let before = users.len();
+                    users.retain(|user| !emails.contains(&&*user.name));
+                    tide.users = users.into_boxed_slice();
+                    before - tide.users.len()
+                }
+                InboundProtocol::WireGuard(wireguard) => {
+                    let mut peers = wireguard.peers.to_vec();
+                    let before = peers.len();
+                    peers.retain(|peer| !named(peer.email.as_ref()));
+                    wireguard.peers = peers.into_boxed_slice();
+                    before - wireguard.peers.len()
+                }
                 _ => return Err(accounts_unsupported(tag)),
             })
         })?;
+        self.sync_running_accounts(tag);
         self.stats
             .accounts
             .end_where(|email, inbound| inbound == tag && emails.contains(&email));
@@ -1489,6 +1683,43 @@ impl Server {
                 emails: emails.iter().map(|email| email.to_string()).collect(),
             });
         Ok(removed)
+    }
+
+    /// Hand the accounts of the inbound tagged `tag`, as the current state
+    /// has them, to the parts of it that run apart from the state: a Tide
+    /// server's user table and a WireGuard server's peers. Every other
+    /// protocol reads its accounts from the state at each handshake.
+    fn sync_running_accounts(&self, tag: &str) {
+        let state = self.state.load();
+        let Some((index, inbound)) = state
+            .config
+            .inbounds
+            .iter()
+            .enumerate()
+            .find(|(_, inbound)| &*inbound.tag == tag)
+        else {
+            return;
+        };
+        match &inbound.protocol {
+            InboundProtocol::Tide(tide) => {
+                if let Some(running) = state.inbounds.get(index).and_then(|c| c.tide.as_ref()) {
+                    running.sync_users(tide);
+                }
+            }
+            InboundProtocol::WireGuard(wireguard) => {
+                let running = self
+                    .wireguard
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(running) = running.get(tag) {
+                    running
+                        .owners
+                        .store(Arc::new(WireGuardOwners::of(&wireguard.peers)));
+                    let _ = running.peers.send(peer_specs(&wireguard.peers));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Apply `edit` to the protocol settings of the inbound tagged `tag` and
@@ -2802,6 +3033,13 @@ impl Server {
     /// ([`crate::accounts`]); an account with no `email` is passed through.
     /// `early_payload` is what the handshake already read past the request
     /// header, which reaches the relay without passing through the meter.
+    /// Whether a datagram of `email` passes its speed limit, counted if so
+    /// (see [`crate::accounts::Accounts::admit`]). One without an account
+    /// always passes.
+    fn admit_datagram(&self, email: Option<&Arc<str>>, uplink: usize, downlink: usize) -> bool {
+        email.is_none_or(|email| self.stats.accounts.admit(email, uplink, downlink))
+    }
+
     fn meter_account(
         &self,
         email: Option<&Arc<str>>,
@@ -3783,47 +4021,53 @@ impl Server {
                 return;
             }
         };
-        let peers = config
-            .peers
-            .iter()
-            .map(|peer| zero_protocol::wg_server::PeerSpec {
-                public_key: peer.public_key,
-                preshared_key: peer.preshared_key,
-                allowed: peer
-                    .allowed_ips
-                    .iter()
-                    .map(|cidr| (cidr.addr, cidr.prefix))
-                    .collect(),
-                keepalive: peer.keepalive,
-            })
-            .collect();
-        let mut link = zero_protocol::wg_server::serve(Arc::new(socket), config.secret_key, peers);
-        // Peers with an `email` are metered by the addresses they own: a
-        // packet from a peer is counted by its source, one to it by its
-        // destination. Everything to the peers then passes one counting
-        // queue; with no named peer nothing is added to the path.
-        let owners = WireGuardOwners::of(&config);
-        let to_peers = match &owners {
-            None => link.to_peers.clone(),
-            Some(owners) => {
-                let (sender, mut queue) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-                let (owners, accounts, upstream) = (
-                    Arc::clone(owners),
-                    Arc::clone(&self.stats.accounts),
-                    link.to_peers.clone(),
-                );
-                tokio::spawn(async move {
-                    while let Some(packet) = queue.recv().await {
-                        if let Some(email) = owners.of_destination(&packet) {
-                            accounts.count(email, 0, packet.len());
-                        }
-                        if upstream.send(packet).await.is_err() {
-                            return;
+        let mut link = zero_protocol::wg_server::serve(
+            Arc::new(socket),
+            config.secret_key,
+            peer_specs(&config.peers),
+        );
+        // Peers with an `email` are metered and held to their speed limits by
+        // the addresses they own: a packet from a peer by its source, one to
+        // it by its destination. Its peers and owners change at run time
+        // ([`Server::sync_running_accounts`]).
+        let owners = Arc::new(arc_swap::ArcSwap::from_pointee(WireGuardOwners::of(
+            &config.peers,
+        )));
+        self.wireguard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                tag.clone(),
+                RunningWireGuard {
+                    peers: link.peers.clone(),
+                    owners: Arc::clone(&owners),
+                },
+            );
+        // Accounts edited before this task got here are in the state but not
+        // in `config`, which is the configuration it was started with.
+        self.sync_running_accounts(&tag);
+        let sessions = Arc::new(WireGuardSessions::default());
+        let to_peers = {
+            let (sender, mut queue) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+            let (owners, sessions, accounts, upstream) = (
+                Arc::clone(&owners),
+                Arc::clone(&sessions),
+                Arc::clone(&self.stats.accounts),
+                link.to_peers.clone(),
+            );
+            tokio::spawn(async move {
+                while let Some(packet) = queue.recv().await {
+                    if let Some(email) = owners.load().of_destination(&packet) {
+                        if !sessions.to_peer(email) || !accounts.admit(email, 0, packet.len()) {
+                            continue;
                         }
                     }
-                });
-                sender
-            }
+                    if upstream.send(packet).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            sender
         };
         let (mut sink, mut stream) = parts.stack.split();
         if let Some(runner) = parts.runner {
@@ -3834,11 +4078,31 @@ impl Server {
             });
         }
         // Peers to stack.
-        let (from_owners, accounts) = (owners.clone(), Arc::clone(&self.stats.accounts));
+        let (from_owners, from_sessions, accounts, from_tag) = (
+            Arc::clone(&owners),
+            Arc::clone(&sessions),
+            Arc::clone(&self.stats.accounts),
+            tag.clone(),
+        );
         tokio::spawn(async move {
-            while let Some(packet) = link.from_peers.recv().await {
-                if let Some(email) = from_owners.as_ref().and_then(|o| o.of_source(&packet)) {
-                    accounts.count(email, packet.len(), 0);
+            let mut sweep = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                let (packet, from) = tokio::select! {
+                    received = link.from_peers.recv() => match received {
+                        Some(received) => received,
+                        None => return,
+                    },
+                    _ = sweep.tick() => {
+                        from_sessions.sweep();
+                        continue;
+                    }
+                };
+                if let Some(email) = from_owners.load().of_source(&packet) {
+                    if !from_sessions.heard_from(&accounts, email, &from_tag, from)
+                        || !accounts.admit(email, packet.len(), 0)
+                    {
+                        continue;
+                    }
                 }
                 match sink.send(packet).await {
                     Ok(()) => {}
@@ -3868,9 +4132,21 @@ impl Server {
         }
         if let Some(tcp) = parts.tcp {
             info!(%tag, peers = config.peers.len(), "WireGuard userspace stack started");
-            self.serve_netstack_tcp(tcp, id, tag).await;
+            Arc::clone(&self)
+                .serve_netstack_tcp(tcp, id, tag.clone())
+                .await;
         }
         link.task.abort();
+        let mut running = self
+            .wireguard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if running
+            .get(&tag)
+            .is_some_and(|entry| entry.peers.same_channel(&link.peers))
+        {
+            running.remove(&tag);
+        }
     }
 
     async fn serve_tun_udp(
@@ -4183,25 +4459,32 @@ impl Server {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(mut streams) = streams {
-            let server = Arc::clone(&self);
+            let (server, users) = (Arc::clone(&self), Arc::clone(&tide));
             tokio::spawn(async move {
                 // A session spans connections, so a stream has no one peer
                 // address; routing by source does not apply to it.
                 let peer = SocketAddr::from(([0, 0, 0, 0], 0));
-                while let Some((_user, destination, stream)) = streams.recv().await {
+                while let Some((user, destination, stream)) = streams.recv().await {
+                    // Each stream is its user's: metered under its name, and
+                    // refused once the user was removed.
+                    let Ok(email) = users.account_of(&user) else {
+                        continue;
+                    };
                     let (server, tag) = (Arc::clone(&server), tag.clone());
                     if destination.network == Network::Udp {
                         tokio::spawn(async move {
                             let flow = zero_protocol::tide::UdpFlow::new(stream);
-                            if let Err(error) = server.handle_tide_udp(flow, id, tag).await {
+                            if let Err(error) = server.handle_tide_udp(flow, id, tag, email).await {
                                 debug!(%error, "Tide UDP flow ended with an error");
                             }
                         });
                         continue;
                     }
                     tokio::spawn(async move {
+                        let stream =
+                            server.meter_account(email.as_ref(), &tag, peer, boxed(stream), 0);
                         if let Err(error) = server
-                            .handle_hysteria2(boxed(stream), peer, id, tag, destination, None)
+                            .handle_hysteria2(stream, peer, id, tag, destination, email)
                             .await
                         {
                             debug!(%error, "Tide stream ended with an error");
@@ -4225,16 +4508,25 @@ impl Server {
         flow: zero_protocol::tide::UdpFlow,
         id: InboundId,
         tag: Arc<str>,
+        email: Option<Arc<str>>,
     ) -> Result<(), String> {
         let flow = Arc::new(flow);
         // A session spans connections, so a flow has no one peer address.
         let peer = SocketAddr::from(([0, 0, 0, 0], 0));
+        // The flow is its user's session while it lasts.
+        let session = email
+            .as_ref()
+            .map(|email| self.stats.accounts.open_session(email, &tag, None));
         let (mut udp, mut replies) =
             UdpRelay::<()>::new(Arc::clone(&self), id, tag, 64, self.sniff_policy(id));
         let writer = {
-            let (flow, stats) = (Arc::clone(&flow), Arc::clone(&self.stats));
+            let (flow, server, email) = (Arc::clone(&flow), Arc::clone(&self), email.clone());
             tokio::spawn(async move {
+                let stats = Arc::clone(&server.stats);
                 while let Some(reply) = replies.recv().await {
+                    if !server.admit_datagram(email.as_ref(), 0, reply.payload.len()) {
+                        continue;
+                    }
                     let length = reply.payload.len() as u64;
                     if flow.send(&reply.source, &reply.payload).is_err() {
                         return;
@@ -4247,9 +4539,14 @@ impl Server {
         let _writer = AbortOnDrop(vec![writer]);
         let mut seen = udp.activity();
         loop {
+            if session.as_ref().is_some_and(|session| session.is_ended()) {
+                return Ok(());
+            }
             match timeout(UDP_SESSION_IDLE, flow.recv()).await {
                 Ok(Ok((destination, payload))) => {
-                    udp.dispatch((), peer, destination, payload.to_vec()).await;
+                    if self.admit_datagram(email.as_ref(), payload.len(), 0) {
+                        udp.dispatch((), peer, destination, payload.to_vec()).await;
+                    }
                 }
                 Ok(Err(_)) => return Ok(()),
                 Err(_) => {
@@ -4398,6 +4695,9 @@ impl Server {
             destination: destination.clone(),
             payload,
         };
+        if !self.admit_datagram(email.as_ref(), datagram.payload.len(), 0) {
+            return Ok(());
+        }
         let mut ctx = self.new_context(id, tag, destination.clone(), peer);
         ctx.user = email.clone();
         let decision = self.route(&ctx).await;
@@ -4427,6 +4727,9 @@ impl Server {
         } else {
             self.direct_udp(&resolver, &datagram, None).await?
         };
+        if !self.admit_datagram(email.as_ref(), 0, response.len()) {
+            return Ok(());
+        }
         let frame = zero_transport::hysteria2::encode_udp_datagram(
             session_id,
             packet_id,
@@ -4436,11 +4739,6 @@ impl Server {
         connection
             .send_datagram(bytes::Bytes::from(frame))
             .map_err(|error| format!("sending Hysteria2 UDP response: {error}"))?;
-        if let Some(email) = &email {
-            self.stats
-                .accounts
-                .count(email, datagram.payload.len(), response.len());
-        }
         self.stats
             .uploaded
             .fetch_add(datagram.payload.len() as u64, Ordering::Relaxed);
@@ -4469,6 +4767,9 @@ impl Server {
             destination: destination.clone(),
             payload,
         };
+        if !self.admit_datagram(email.as_ref(), datagram.payload.len(), 0) {
+            return Ok(());
+        }
         let mut ctx = self.new_context(id, tag, destination.clone(), peer);
         ctx.user = email.clone();
         let decision = self.route(&ctx).await;
@@ -4497,6 +4798,9 @@ impl Server {
         } else {
             self.direct_udp(&resolver, &datagram, None).await?
         };
+        if !self.admit_datagram(email.as_ref(), 0, response.len()) {
+            return Ok(());
+        }
         let max_datagram = connection
             .max_datagram_size()
             .ok_or_else(|| "TUIC peer does not support QUIC datagrams".to_string())?;
@@ -4510,11 +4814,6 @@ impl Server {
             connection
                 .send_datagram(bytes::Bytes::from(frame))
                 .map_err(|error| format!("sending TUIC UDP response: {error}"))?;
-        }
-        if let Some(email) = &email {
-            self.stats
-                .accounts
-                .count(email, datagram.payload.len(), response.len());
         }
         self.stats
             .uploaded
