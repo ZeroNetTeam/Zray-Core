@@ -65,7 +65,8 @@ jobs:
       # top; it tested them in the last ten minutes.
       - name: keep the fresh configs at the top
         run: |
-          git fetch -q --depth 1 origin crowd-data
+          # The branch does not exist before the first publish.
+          git fetch -q --depth 1 origin crowd-data 2>/dev/null || true
           if git show FETCH_HEAD:fresh.txt > fresh.txt 2>/dev/null; then
             target/release/zeronet-harvest merge --top fresh.txt \
               --rest verified.txt --out verified.txt
