@@ -13,15 +13,16 @@
 //! stays readable and older clients that do not know about signatures keep
 //! working (the check is best-effort until a key is set — see the app).
 //!
-//! The private key never leaves CI: the `create signing key` workflow
-//! prints a fresh key pair once, the public half is pasted here and the
-//! private half stored as the `CROWD_SIGNING_KEY` secret.
+//! The private key is made once, on the maintainer's own computer, with
+//! `zeronet-sign keygen` (never in a CI run: a public repository's run logs
+//! are readable by anyone). The public half is pasted here and the private
+//! half stored as the `CROWD_SIGNING_KEY` secret.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 /// The public key list bodies are verified against, hex-encoded (32 bytes,
-/// 64 hex chars). Set by the maintainer from the `create crowd signing key`
-/// workflow; the matching private seed is the `CROWD_SIGNING_KEY` secret CI
+/// 64 hex chars). Set by the maintainer from `zeronet-sign keygen`;
+/// the matching private seed is the `CROWD_SIGNING_KEY` secret CI
 /// signs with. While empty, [`verify`] rejects everything, so the app treats
 /// "no key compiled in" ([`key_configured`] is false) as "do not verify"
 /// rather than "reject" (see `Crowd`/discovery), which keeps a keyless build

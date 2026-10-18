@@ -89,7 +89,7 @@ jobs:
             # would publish lists nobody accepts, so stop here instead.
             target/release/zeronet-sign verify verified.txt
           else
-            echo "::warning::No CROWD_SIGNING_KEY; publishing verified.txt unsigned. Run the 'create crowd signing key' workflow."
+            echo "::warning::No CROWD_SIGNING_KEY; publishing verified.txt unsigned. Make a key with zeronet-sign keygen on your own computer and store the seed as the CROWD_SIGNING_KEY secret."
           fi
       - name: publish
         env:
