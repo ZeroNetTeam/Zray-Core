@@ -421,3 +421,28 @@ as the key); `aes-256-gcm` and `chacha20-ietf-poly1305` keep 32. Zray used to
 send and expect 32 for every method, which only worked between two Zray ends.
 
 **Pinned by.** `zero-protocol` `the_salt_is_as_long_as_the_key`.
+
+## Server inbounds with no account yet
+
+A `settings.clients` (or `settings.users`) list that is present but empty is
+accepted on every account-taking inbound, as a panel makes an inbound before
+its users: it admits nobody until accounts are added. With neither the list
+nor a single password the configuration is still refused.
+
+**Pinned by.** `zero-config` `server_inbounds_may_start_without_accounts` and
+`tls_inbounds_may_start_without_accounts`.
+
+## Proxies from the environment
+
+The `freedom` outbound honours `HTTPS_PROXY`/`HTTP_PROXY` (and `NO_PROXY`).
+Whether the proxy itself is reached over TLS follows the value's scheme, as
+everywhere else: `HTTPS_PROXY=http://127.0.0.1:10809`, the usual form, is a
+plain HTTP proxy that HTTPS traffic is tunnelled through with `CONNECT`. It
+used to be read as a TLS proxy because of the variable's name, and every
+direct connection then failed.
+
+Tests that dial names only the test knows (`app.test`) fail when such a
+proxy is set, since the proxy cannot resolve them; run them without the
+proxy variables.
+
+**Pinned by.** `zero-runtime` `an_environment_proxy_speaks_tls_only_when_its_url_says_so`.

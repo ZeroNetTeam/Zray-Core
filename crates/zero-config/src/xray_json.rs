@@ -2499,6 +2499,7 @@ fn parse_password_accounts(
         .get("users")
         .or_else(|| settings.get("clients"))
         .and_then(Value::as_array);
+    let listed = users.is_some();
     for (index, user) in users.into_iter().flatten().enumerate() {
         let account = parse_password_account(user, &format!("{path}.settings.users[{index}]"))?;
         let InboundClient::Password { password, email } = account else {
@@ -2507,7 +2508,9 @@ fn parse_password_accounts(
         passwords.push(password);
         emails.push(email);
     }
-    if passwords.is_empty() {
+    // An empty `users` list is an inbound with no account yet, as a panel
+    // makes one; with neither key it is a mistake.
+    if passwords.is_empty() && !listed {
         return Err(format!(
             "{path}.settings.password or settings.users is required for {protocol}"
         ));
@@ -3752,7 +3755,7 @@ fn parse_tuic_inbound(settings: Option<&Value>, path: &str) -> R<TuicInboundConf
             &format!("{path}.settings.users[{index}]"),
         )?);
     }
-    if users.is_empty() {
+    if users.is_empty() && listed.is_none() {
         return Err(format!(
             "{path}.settings.uuid and password, or settings.users, are required for tuic"
         ));
@@ -6413,6 +6416,32 @@ mod tests {
             });
             compile_config(&config, zero_core::GenerationId(1))
                 .unwrap_or_else(|error| panic!("{protocol}: {error}"));
+        }
+    }
+
+    /// The certificate-TLS inbounds too, given their TLS block.
+    #[test]
+    fn tls_inbounds_may_start_without_accounts() {
+        for protocol in ["hysteria2", "tuic", "anytls"] {
+            let config = serde_json::json!({
+                "inbounds": [{
+                    "tag": "in", "listen": "127.0.0.1", "port": 1, "protocol": protocol,
+                    "settings": {"users": []},
+                    "streamSettings": {"security": "tls", "tlsSettings": {"certificates": [
+                        {"certificate": ["-----BEGIN CERTIFICATE-----"], "key": ["-----BEGIN PRIVATE KEY-----"]}
+                    ]}},
+                }],
+                "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            });
+            compile_config(&config, zero_core::GenerationId(1))
+                .unwrap_or_else(|error| panic!("{protocol}: {error}"));
+            // Without the list at all it is still a mistake.
+            let mut missing = config.clone();
+            missing["inbounds"][0]["settings"] = serde_json::json!({});
+            assert!(
+                compile_config(&missing, zero_core::GenerationId(1)).is_err(),
+                "{protocol}"
+            );
         }
     }
 

@@ -527,11 +527,11 @@ impl WireGuardOwners {
             .flat_map(|(peer, email)| {
                 peer.allowed_ips
                     .iter()
-                    .map(move |cidr| (cidr.clone(), Arc::clone(&email)))
+                    .map(move |cidr| (*cidr, Arc::clone(&email)))
             })
             .collect();
         // Longest prefix first, so the most specific owner wins.
-        owned.sort_by(|a, b| b.0.prefix.cmp(&a.0.prefix));
+        owned.sort_by_key(|(cidr, _)| std::cmp::Reverse(cidr.prefix));
         (!owned.is_empty()).then(|| Arc::new(Self(owned)))
     }
 

@@ -485,7 +485,7 @@ pub fn identify_user<P: AsRef<[u8]>>(
     passwords.iter().position(|password| {
         let master = evp_bytes_to_key(password.as_ref(), method.key_len());
         let mut chunk = sealed.to_vec();
-        CipherState::new(method, &master, &salt)
+        CipherState::new(method, &master, salt)
             .open_in_place(&mut chunk)
             .is_ok()
     })

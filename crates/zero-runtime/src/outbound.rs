@@ -47,16 +47,20 @@ fn env_proxy_for(host: &str) -> Option<EnvProxy> {
     if no_proxy_matches(host) {
         return None;
     }
-    let (raw, https) = std::env::var("HTTPS_PROXY")
+    let raw = std::env::var("HTTPS_PROXY")
         .or_else(|_| std::env::var("https_proxy"))
-        .map(|value| (value, true))
-        .or_else(|_| {
-            std::env::var("HTTP_PROXY")
-                .or_else(|_| std::env::var("http_proxy"))
-                .map(|value| (value, false))
-        })
+        .or_else(|_| std::env::var("HTTP_PROXY"))
+        .or_else(|_| std::env::var("http_proxy"))
         .ok()?;
-    parse_proxy_addr(&raw).map(|addr| EnvProxy { addr, https })
+    env_proxy(&raw)
+}
+
+/// A proxy from an environment value. Whether it speaks TLS is the URL's
+/// scheme, not the variable it came from: `HTTPS_PROXY=http://…` (the
+/// usual form) is a plain HTTP proxy that HTTPS traffic goes through.
+fn env_proxy(raw: &str) -> Option<EnvProxy> {
+    let https = raw.trim().to_ascii_lowercase().starts_with("https://");
+    parse_proxy_addr(raw).map(|addr| EnvProxy { addr, https })
 }
 
 fn no_proxy_matches(host: &str) -> bool {
@@ -71,10 +75,9 @@ fn no_proxy_matches(host: &str) -> bool {
 }
 
 fn parse_proxy_addr(raw: &str) -> Option<SocketAddr> {
-    let raw = raw
-        .trim()
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
+    let raw = raw.trim();
+    // Any scheme, in any case: what matters here is the address after it.
+    let raw = raw.split_once("://").map_or(raw, |(_, rest)| rest);
     let hostport = raw.split('/').next()?.split('@').next_back()?;
     hostport.parse().ok()
 }
@@ -3254,6 +3257,16 @@ pub fn filter_family(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_environment_proxy_speaks_tls_only_when_its_url_says_so() {
+        let plain = env_proxy("http://127.0.0.1:10809").unwrap();
+        assert!(!plain.https, "HTTPS_PROXY=http://… is a plain HTTP proxy");
+        assert_eq!(plain.addr, "127.0.0.1:10809".parse().unwrap());
+        assert!(env_proxy("HTTPS://10.0.0.1:443").unwrap().https);
+        assert!(!env_proxy("10.0.0.1:3128").unwrap().https);
+        assert!(env_proxy("not a proxy").is_none());
+    }
 
     /// Iran's resolvers answer a filtered name with the block page; those
     /// answers must never be dialled. Ordinary private and public addresses
