@@ -1,14 +1,9 @@
 <div align="center">
 
-<img src="packaging/icons/zeronet.png" alt="ZeroNet" width="170">
+# Zray Core
 
-# ZeroNet
-
-### Performance, Speed, and Freedom in your hands.
-### کارایی، سرعت و آزادی در دستان شما.
-
-<a href="https://github.com/zeghostwriter/ZeroNet/releases/latest"><b>⬇️ دانلود آخرین نسخه</b></a><br>
-<a href="https://github.com/zeghostwriter/ZeroNet/releases/latest"><b>⬇️ Download the latest release</b></a>
+### The network core behind ZeroNet, written in Rust.
+### هسته‌ی شبکه‌ی زیرونت، نوشته‌شده با Rust.
 
 [فارسی](#فارسی) · [English](#english)
 
@@ -20,7 +15,13 @@
 
 ## فارسی
 
-**زیرونت** یک VPN ساده و سریع برای عبور از فیلترینگ است. برای ویندوز، لینوکس، مک و اندروید. قلب آن **Zray** است، یک هسته‌ی شبکه که از صفر با زبان **Rust** نوشته شده. کانفیگ‌هایی که امروز با Xray کار می‌کنند (VLESS،&rlm; REALITY،&rlm; Vision،&rlm; XHTTP،&rlm; VMess،&rlm; Trojan،&rlm; Shadowsocks و…) در زیرونت هم کار می‌کنند.
+**Zray Core** هسته‌ی شبکه‌ی ZeroNet است، از صفر با **Rust** نوشته شده و با کانفیگ‌های Xray سازگار است (VLESS،&rlm; REALITY،&rlm; Vision،&rlm; XHTTP،&rlm; VMess،&rlm; Trojan،&rlm; Shadowsocks و…). اپ‌ها روی این هسته ساخته می‌شوند و هرکدام ریپوی خودشان را دارند:
+
+| ریپو | چیست؟ |
+|---|---|
+| [ZeroNet-Desktop](https://github.com/ZeroNetTeam/ZeroNet-Desktop) | برنامه‌ی ترمینالی برای ویندوز و لینوکس |
+| [ZeroNet-Mobile](https://github.com/ZeroNetTeam/ZeroNet-Mobile) | برنامه‌ی اندروید |
+| [Z-UI](https://github.com/ZeroNetTeam/Z-UI) | برنامه‌ی گرافیکی (در دست ساخت) |
 
 ### ⚡ چرا این‌قدر سریع است؟
 
@@ -28,7 +29,7 @@
 
 ما Zray و Xray-core را روی یک سیستم، با یک سرور و یک کانفیگ مقایسه کردیم. تنها چیزی که عوض شد هسته‌ی کلاینت بود:
 
-| | Xray-core | **Zray (زیرونت)** |
+| | Xray-core | **Zray** |
 |---|---:|---:|
 | سرعت دانلود با TLS (یک اتصال) | ۳۴۹ مگابایت بر ثانیه | **۵۳۲ مگابایت بر ثانیه** (۵۳٪ سریع‌تر) |
 | مصرف CPU برای هر گیگابایت (TLS) | ۳٫۰ ثانیه | **۱٫۶ ثانیه** (۴۶٪ کمتر) |
@@ -48,63 +49,32 @@
 
 در همه‌ی تست‌ها، Zray مصرف CPU کمتری داشت. تنها موردی که Xray جلو بود، دانلود تک‌اتصالی بدون TLS بود (۸۷۳ در برابر ۷۹۹ مگابایت بر ثانیه). همه‌ی نتایج را همان‌طور که اندازه گرفته شد گذاشته‌ایم. روش تست و ابزار تکرار آن در [docs/benchmarks](docs/benchmarks) است.
 
-### 📥 نصب (فقط چند کلیک)
+### 📥 نصب
 
-همه‌ی فایل‌ها در صفحه‌ی **[Releases](https://github.com/zeghostwriter/ZeroNet/releases/latest)** هستند:
+برنامه‌ی خط فرمان **zray** در صفحه‌ی **[Releases](https://github.com/ZeroNetTeam/Zray-Core/releases/latest)** است: `ZrayCore-Windows-x64.zip`،&rlm; `ZrayCore-Linux-x64.tar.gz` و `ZrayCore-Linux-ARM64.tar.gz`. فایل را باز کنید و `zray run config.json` را بزنید (`zray help` بقیه‌ی دستورها را نشان می‌دهد).
 
-| سیستم | فایل | چه کار کنم؟ |
-|---|---|---|
-| 🪟 ویندوز | `ZeroNet-Windows-x64.zip` | فایل را از حالت فشرده خارج کنید و روی `ZeroNet.exe` دوبار کلیک کنید. اگر ویندوز هشدار داد: **More info ←&rlm; Run anyway**. |
-| 🐧 لینوکس (بیشتر کامپیوترها: اینتل و AMD) | `ZeroNet-Linux-x64.AppImage` | راست‌کلیک ← Properties ← تیک **Allow executing file as program**. بعد دوبار کلیک کنید. برنامه خودش در ترمینال باز می‌شود. |
-| 🐧 لینوکس روی ARM (رزبری‌پای، لپ‌تاپ‌های ARM) | `ZeroNet-Linux-ARM64.AppImage` | مثل بالا. |
-| 🤖 اندروید | `ZeroNet-Android-universal.apk` | نصب کنید. اگر پرسید، اجازه‌ی نصب از منابع ناشناس را بدهید. |
+> مطمئن نیستید کدام فایل لینوکس؟ در ترمینال `uname -m` را بزنید: `x86_64` یعنی **x64** و `aarch64` یعنی **ARM64**.
 
-> مطمئن نیستید کدام فایل لینوکس؟ در ترمینال `uname -m` را بزنید: `x86_64` یعنی **x64** و `aarch64` یعنی **ARM64**. خطای «exec format error» یعنی فایل آن یکی را لازم دارید.
->
-> برای گوشی‌های جدید فایل `arm64-v8a` کم‌حجم‌تر است. اگر مطمئن نیستید، `universal` را بگیرید.
+### 🛠️ استفاده در پروژه‌ی خودتان
 
-**Zray Core** همان موتور بدون برنامه است: یک برنامه‌ی خط فرمان برای سرور، روتر و اسکریپت. در همان صفحه است با نام‌های `ZrayCore-Windows-x64.zip`،&rlm; `ZrayCore-Linux-x64.tar.gz` و `ZrayCore-Linux-ARM64.tar.gz`. فایل را باز کنید و `zray run config.json` را بزنید (`zray help` بقیه‌ی دستورها را نشان می‌دهد).
-
-### 🧭 استفاده
-
-1. لینک کانفیگ (`vless://`،&rlm; `vmess://`،&rlm; `trojan://`،&rlm; `ss://` یا لینک ساب‌اسکریپشن) را کپی کنید و در زیرونت **Ctrl+V** بزنید.
-2. روی دکمه‌ی اتصال کلیک کنید. همه‌چیز با موس کار می‌کند، مثل یک برنامه‌ی معمولی.
-3. در تنظیمات، **System Proxy** را روی **SET SYSTEM** بگذارید (یا آن‌قدر **Ctrl+P** بزنید تا SET SYSTEM شود) تا بقیه‌ی برنامه‌ها هم از آن استفاده کنند.
-
-**اکانت رایگان WARP:** توی زیرونت کلید **W** را بزنید تا یک اکانت WARP از کلودفلر بگیرید. کلیدها روی دستگاه خودتان ساخته می‌شوند و فقط نیمه‌ی عمومی‌شان فرستاده می‌شود. هر سه راه (WireGuard و MASQUE روی HTTP/2 و روی HTTP/3) را با هم امتحان می‌کند و اولی را نگه می‌دارد که واقعاً ترافیک رد کند، و یادش می‌ماند کدام روی شبکه‌ی شما کار کرد. اولین بار که وصل می‌شوید، زیرونت می‌پرسد اجازه دارید از کلودفلر استفاده کند یا نه، و جواب شما یادش می‌ماند (از تنظیمات، بخش **Cloudflare WARP**) و عوض می‌شود. اگر API کلودفلر جایی که هستید فیلتر باشد، خودش اول یک سرور بالا می‌آورد، از راه آن اکانت را می‌سازد، آن سرور را رها می‌کند و بعد اکانت را با ترتیب WARP که انتخاب کرده‌اید وصل می‌کند. با **W** می‌توانید هر وقت خواستید دستی هم این کار را بکنید.
-
-**سبک اتصال** (در اپ اندروید، تنظیمات ← اتصال ← سبک اتصال):
-- **معمولی:** فقط سرورهای رمزگذاری‌شده (TLS یا REALITY) که مثل HTTPS معمولی دیده می‌شوند، همراه چند سرور پشتیبان، و اگر اجازه داده باشید، اکانت WARP خودتان کنار یک سرور پیدا‌شده. بهترین انتخاب برای استفاده‌ی روزمره.
-- **سریع:** به اولین سروری که کار کند وصل می‌شود، بدون جست‌وجوی اضافه. سریع‌ترین راه برای وصل شدن.
-- **گیمینگ:** کمترین پینگ، UDP روشن (برای بازی‌ها و تماس صوتی)، بدون سرورهای پشت CDN، و سرور وسط بازی عوض نمی‌شود. سایت‌ها و سرورهای بازی ایرانی مستقیم می‌روند.
-- **قدیمی:** همان روش قبلی حالت معمولی: سرورهای رمزگذاری‌شده، یک بار جست‌وجو.
-
-**ترتیب WARP** (تنظیمات ← اتصال): **هیبرید** اول یک سرور پیدا‌شده را وصل می‌کند و کلودفلر را از راه آن می‌رساند، پس شبکه‌ی شما فقط همان سرور را می‌بیند. **هیبرید برعکس** اول به کلودفلر وصل می‌شود و سرور را از داخل آن می‌رساند، پس به سرورهایی هم می‌رسد که شبکه‌ی شما بسته است. اگر در حالت هیبرید هیچ سروری کلودفلر را نرساند، خودش مستقیم وصل می‌شود. در گوشی پیش‌فرض **خودکار** است: اول هیبرید برعکس امتحان می‌شود و اگر هیچ سروری از راه کلودفلر کار نکرد، هیبرید.
-
-**برنامه‌های دیگر:**
-- **تلگرام:** Settings ←&rlm; Advanced ←&rlm; Connection type ←&rlm; **Use system proxy**. در لینوکس بعد از روشن‌کردن پروکسی، تلگرام را کامل ببندید و دوباره باز کنید.
-- **فایرفاکس:** Settings ←&rlm; Network Settings ←&rlm; **Use system proxy settings**.
-
-**حالت TUN** (همه‌ی برنامه‌ها بدون تنظیم جداگانه): در لینوکس و مک زیرونت رمز سیستم را می‌پرسد. در ویندوز برنامه را با **Run as administrator** باز کنید (فایل `wintun.dll` کنار برنامه است).
-
-### 🛠️ ساخت از سورس
+راهنما در [docs/embedding.md](docs/embedding.md) است.
 
 </div>
-
-```sh
-cargo run --release -p zeronet-tui        # desktop app
-cd ZeroNet-Mobile && ./gradlew assembleRelease   # Android (see ZeroNet-Mobile/README.md)
-```
 
 ---
 
 ## English
 
-**ZeroNet** is a fast, simple VPN for getting past censorship, on Windows,
-Linux and Android. Its heart is **Zray**, a networking core written
-from scratch in **Rust**. It speaks the same configs as Xray: VLESS, REALITY,
-Vision, XHTTP, VMess, Trojan, Shadowsocks and more. A config that works in
-Xray works here.
+**Zray Core** is the network core behind ZeroNet. It is written from scratch in
+**Rust** and speaks the same configs as Xray: VLESS, REALITY, Vision, XHTTP,
+VMess, Trojan, Shadowsocks and more. The apps are built on top of it, and each
+has its own repository:
+
+| Repository | What it is |
+|---|---|
+| [ZeroNet-Desktop](https://github.com/ZeroNetTeam/ZeroNet-Desktop) | the terminal app for Windows and Linux |
+| [ZeroNet-Mobile](https://github.com/ZeroNetTeam/ZeroNet-Mobile) | the Android app |
+| [Z-UI](https://github.com/ZeroNetTeam/Z-UI) | the graphical app (in the works) |
 
 ### ⚡ Why it's fast
 
@@ -116,7 +86,7 @@ laptops and cheap phones.
 We ran Zray and Xray-core on the same machine, against the same server,
 from the same config file. Only the client core changed:
 
-| | Xray-core | **Zray (ZeroNet)** |
+| | Xray-core | **Zray** |
 |---|---:|---:|
 | Download over TLS, 1 connection | 349 MB/s | **532 MB/s** (+53%) |
 | CPU time per GB over TLS | 3.0 s | **1.6 s** (−46%) |
@@ -130,78 +100,40 @@ are in [docs/benchmarks](docs/benchmarks).
 
 ### 📥 Install
 
-Everything is on the **[Releases page](https://github.com/zeghostwriter/ZeroNet/releases/latest)**:
+The **zray** command-line program is on the **[Releases page](https://github.com/ZeroNetTeam/Zray-Core/releases/latest)**
+as `ZrayCore-Windows-x64.zip`, `ZrayCore-Linux-x64.tar.gz` and
+`ZrayCore-Linux-ARM64.tar.gz`. Unpack it and run `zray run config.json`
+(`zray help` lists the rest). It is meant for servers, routers and scripts.
 
-| Platform | File | What to do |
-|---|---|---|
-| 🪟 Windows | `ZeroNet-Windows-x64.zip` | Extract it and double-click `ZeroNet.exe`. If SmartScreen appears: **More info → Run anyway**. |
-| 🐧 Linux, most computers (Intel / AMD) | `ZeroNet-Linux-x64.AppImage` | Right-click → Properties → **Allow executing file as program**, then double-click. It opens in a terminal window on its own. (A plain `.tar.gz` is there too.) |
-| 🐧 Linux on ARM (Raspberry Pi, ARM laptops) | `ZeroNet-Linux-ARM64.AppImage` | The same. |
-| 🤖 Android | `ZeroNet-Android-universal.apk` | Install it and allow installs from this source if asked. `arm64-v8a` is a smaller download for most modern phones. |
-
-Not sure which Linux file? Run `uname -m` in a terminal: `x86_64` means
-**x64**, `aarch64` means **ARM64**. "exec format error" means you have the
-other one.
-
-**Zray Core** is the same engine without the app: one command-line program
-for servers, routers and scripts. It is on the same page, as
-`ZrayCore-Windows-x64.zip`, `ZrayCore-Linux-x64.tar.gz`
-and `ZrayCore-Linux-ARM64.tar.gz`. Unpack it and run `zray run config.json` (`zray help` lists the rest).
-
-ZeroNet is a terminal app that works like a desktop app: mouse, hover,
-menus, clicks. When you double-click it, it opens its own terminal window.
-
-### 🧭 Using it
-
-1. Copy a config link (`vless://`, `vmess://`, `trojan://`, `ss://`, or a
-   subscription URL) and press **Ctrl+V** in ZeroNet.
-2. Click connect.
-3. In Settings, set **System Proxy** to **SET SYSTEM** (or press **Ctrl+P**
-   until it shows SET SYSTEM) so other apps use it too.
-
-**Free WARP account:** press **W** in ZeroNet to get a Cloudflare WARP account. The keys are made on your device and only the public halves are sent. It tries all three ways (WireGuard, MASQUE over HTTP/2 and over HTTP/3) at once and keeps the first one that really carries traffic, and remembers which one worked on your network. The first time you connect, ZeroNet asks whether it may use Cloudflare and remembers the answer (change it under Settings, Cloudflare WARP). If Cloudflare's API is filtered where you are, it brings a server up itself, makes the account through that tunnel, lets the server go again and then connects the account in the WARP order you picked. Press **W** to do it by hand at any time.
-
-**Connection style** (in the Android app, Settings → Connection → Connection style):
-- **Normal:** encrypted servers only (TLS or REALITY, which look like ordinary HTTPS), with backups ready, and, if you allowed it, your own WARP account paired with a found server. The everyday choice.
-- **Fast:** connects to the first server that works, nothing more. The quickest way to get online.
-- **Gaming:** lowest ping, UDP allowed (games and voice need it), no CDN-fronted servers, and the server is never switched mid-match. Iranian sites and game servers still go direct.
-- **Legacy:** how Normal worked before: encrypted servers, one search.
-
-**WARP order** (Settings → Connection): **Hybrid** dials a found server first and reaches Cloudflare through it, so your network only sees that server. **Reverse hybrid** dials Cloudflare first and reaches the server from inside it, which also reaches servers your network blocks. If no server can carry Cloudflare in Hybrid, it dials Cloudflare directly instead. On the phone the default is **Auto**: reverse hybrid is tried first, and hybrid when no server works through Cloudflare.
-
-**Other apps:**
-- **Telegram:** Settings → Advanced → Connection type → **Use system proxy**.
-  On Linux, Telegram reads the proxy only when it starts, so fully quit it
-  and open it again after turning the proxy on.
-- **Firefox:** Settings → Network Settings → **Use system proxy settings**.
-- **TUN mode** covers every app without configuring anything. On Linux and
-  macOS, ZeroNet asks for your password. On Windows, start it with **Run as
-  administrator**; the `wintun.dll` it needs ships in the zip.
+Not sure which Linux file? Run `uname -m`: `x86_64` means **x64**, `aarch64`
+means **ARM64**.
 
 ### 🛠️ Build from source
 
 ```sh
-cargo run --release -p zeronet-tui              # desktop app
-cd ZeroNet-Mobile && ./gradlew assembleRelease  # Android, see ZeroNet-Mobile/README.md
+cargo build --release -p zray-cli   # target/release/zray
+cargo test --workspace
 ```
 
-Maintainers: pushing a tag like `v0.2.0` builds every download and publishes
-the release (`.github/workflows/release.yml`).
+### Use it in your own project
+
+The crates are meant to be used as git dependencies, which is how the three
+apps do it. [docs/embedding.md](docs/embedding.md) has the `Cargo.toml` to copy
+and `tools/link-local.sh`, which builds an app against your local checkout of
+this repository.
 
 ### Repository layout
 
 | Path | What it is |
 |---|---|
-| `crates/` | **Zray-core**, the Rust workspace: protocols, transports, DNS, routing, evasion, discovery, TUN, and the mobile FFI (`zray-mobile`). |
-| `crates/zeronet-tui/` | The ZeroNet desktop app. |
-| `ZeroNet-Mobile/` | The Android app (Kotlin/Compose), which loads the core as a native library. |
-| `packaging/` | Icons and desktop metadata used by the release builds. |
-| `docs/` | Benchmarks, protocol specs, and design notes. |
-| `deploy/` | The optional Cloudflare Worker edge. |
-| `fuzz/` | Fuzz targets for the parsers. |
+| `crates/` | The Rust workspace: protocols, transports, DNS, routing, evasion, discovery, TUN, the server installer, and the `zray` program (`zray-cli`). |
+| `vendor/` | The patched `rustls` and `netstack-smoltcp` the workspace builds with. Apps repeat this patch. |
+| `docs/` | Benchmarks, protocol specs, platform notes, embedding guide. |
+| `deploy/` | The crowd feed inputs, the crowd relay and the optional edge relay. |
+| `bench/`, `fuzz/` | Allocation and traffic-shape benchmarks, and fuzz targets for the parsers. |
+| `tools/` | `link-local.sh`, for working on the core and an app together. |
+| `.github/` | CI, the release build, and the workflows that publish the shared feeds on the `crowd-data` branch. |
 
 ### License
 
-MIT, for the core, the desktop client and the Android app (see `LICENSE`).
-Third-party components keep their own licences; the app's notices are under
-`ZeroNet-Mobile/app/src/main/assets/licenses/`.
+GPL-3.0 (see `LICENSE`). Third-party components keep their own licences.

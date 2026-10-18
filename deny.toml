@@ -39,6 +39,8 @@ allow = [
   # Boost: permissive, OSI approved. clipboard-win / error-code, via arboard
   # (the TUI's clipboard on Windows).
   "BSL-1.0",
+  # This repository's own licence (the workspace crates are checked too).
+  "GPL-3.0-only",
   "CDLA-Permissive-2.0",
   "CC0-1.0",
   "ISC",

@@ -14,10 +14,8 @@ members = [
     "crates/zero-observatory",
     "crates/zero-tun",
     "crates/zray-cli",
-    "crates/zray-mobile",
     "crates/zero-scanner",
     "crates/zero-discovery",
-    "crates/zeronet-tui",
     "crates/zero-tor",
     "crates/zero-masterdns",
     "crates/zero-provision",
@@ -34,8 +32,8 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
-license = "MIT"
-repository = "https://github.com/zray/zray-core"
+license = "GPL-3.0-only"
+repository = "https://github.com/ZeroNetTeam/Zray-Core"
 
 [workspace.dependencies]
 zero-core = { path = "crates/zero-core", version = "0.1.0" }
@@ -53,8 +51,6 @@ zero-tun = { path = "crates/zero-tun", version = "0.1.0" }
 zero-scanner = { path = "crates/zero-scanner", version = "0.1.0" }
 zero-discovery = { path = "crates/zero-discovery", version = "0.1.0" }
 zray-cli = { path = "crates/zray-cli", version = "0.1.0" }
-zray-mobile = { path = "crates/zray-mobile", version = "0.1.0" }
-zeronet-tui = { path = "crates/zeronet-tui", version = "0.1.0" }
 zero-tor = { path = "crates/zero-tor", version = "0.1.0" }
 zero-masterdns = { path = "crates/zero-masterdns", version = "0.1.0" }
 zero-provision = { path = "crates/zero-provision", version = "0.1.0" }
@@ -146,28 +142,6 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.zero-tun]
 opt-level = 3
-
-# Mobile libraries (crates/zray-mobile/build-android.sh). Identical to release
-# except that panics unwind: the library lives inside someone else's process,
-# every JNI/C entry point catches unwinds and returns an error instead, and a
-# panicking tokio task then ends that one session rather than aborting the
-# user's VPN. With `panic = "abort"` those guards are dead code.
-[profile.release-mobile]
-inherits = "release"
-panic = "unwind"
-# Measured on arm64: 16.5 MB -> 13.3 MB (gzipped 7.6 -> 5.7 MB). Crypto hot
-# paths are hand-written assembly in ring/aws-lc and unaffected; the proxy is
-# I/O bound, and download size matters more on Iranian mobile links.
-opt-level = "s"
-
-# The packet stack is -O3 on desktop (see [profile.release]); phones stay at
-# "s" like the rest of the library.
-[profile.release-mobile.package.smoltcp]
-opt-level = "s"
-[profile.release-mobile.package.netstack-smoltcp]
-opt-level = "s"
-[profile.release-mobile.package.zero-tun]
-opt-level = "s"
 
 [patch.crates-io]
 # The ordinary crates.io rustls API cannot control ClientHello extension order,

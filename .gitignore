@@ -16,8 +16,7 @@
 /assets
 /squashfs-root
 
-# ---- Nested / sibling projects with their own repos ----
-/Zero-IP-Scanner
+# ---- Local-only material ----
 # Local study of the BPB Worker Panel (reference only, not shipped)
 /bpb-study
 # Local dev / test / bootstrap scripts (not shipped in the public repo)
@@ -35,17 +34,13 @@ AGENTS.md
 CLAUDE.md
 .opencode/
 
-# ---- Android (ZeroNet-Mobile also has its own .gitignore) ----
-**/.gradle/
-**/.kotlin/
-**/build/
-**/local.properties
-**/*.keystore
-**/*.jks
-keystore.properties
-signing.properties
-# Native libs are build outputs of zray-core
-ZeroNet-Mobile/app/src/main/jniLibs/
+# ---- Signing material and secrets, never commit ----
+*.keystore
+*.jks
+*.p12
+
+# ---- Written by tools/link-local.sh in a consumer repository ----
+.cargo/
 
 # ---- OS / editor noise ----
 .DS_Store

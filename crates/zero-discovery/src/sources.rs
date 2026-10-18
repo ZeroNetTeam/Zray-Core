@@ -76,7 +76,7 @@ fn cdn_mirror(url: &str) -> Option<String> {
 /// each entry carries its measured gzipped size (2026-10-09) so the next
 /// addition can be weighed against the same budget.
 pub fn builtin() -> Vec<NamedSource> {
-    let verified = "https://cdn.jsdelivr.net/gh/zeghostwriter/ZeroNet@crowd-data/verified.txt";
+    let verified = "https://cdn.jsdelivr.net/gh/ZeroNetTeam/Zray-Core@crowd-data/verified.txt";
     vec![
         source(
             "zeronet",

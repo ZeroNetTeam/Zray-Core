@@ -8,10 +8,10 @@ map of that isolation.
 | Platform | Packet device | Link configuration | Tested by |
 |---|---|---|---|
 | Linux | `/dev/net/tun`, `IFF_TUN\|IFF_NO_PI` | `ip(8)` | unit tests, the netem harness, the TUN handover harness |
-| macOS | `utun` control socket, 4-byte framing | `ifconfig`/`route` | command-shape tests everywhere, unit tests on the Apple CI job |
+| macOS | `utun` control socket, 4-byte framing | `ifconfig`/`route` | command-shape tests everywhere, unit tests on the macOS CI job |
 | Windows | Wintun, dynamically loaded | `netsh` | command-shape tests everywhere, compiled on the cross job |
-| Android | descriptor from `VpnService`, no framing | **none** — the platform owns it | the TUN handover harness, plus a real `.so` built on the mobile CI job |
-| iOS | descriptor from `NEPacketTunnelProvider`, 4-byte framing | **none** — the platform owns it | the same handover path; a real static archive built on the Apple CI job |
+| Android | descriptor from `VpnService`, no framing | **none** — the platform owns it | the TUN handover harness, plus a real `.so` built on the ZeroNet-Mobile CI |
+| iOS | descriptor from `NEPacketTunnelProvider`, 4-byte framing | **none** — the platform owns it | the same handover path; a real static archive built on the ZeroNet-Mobile CI |
 
 ## How the layers split
 
@@ -64,8 +64,9 @@ handle through every such path would guarantee that the one nobody remembered
 is the one that breaks the tunnel. A host that installs nothing gets today's
 behaviour exactly.
 
-The C ABI is in `crates/zray-mobile`, with the header at
-`crates/zray-mobile/include/zray.h`. Every entry point contains its own
+The C ABI is `zray-mobile`, which lives in the ZeroNet-Mobile repository
+(`native/zray-mobile`) and links this one as a library, with the header at
+`native/zray-mobile/include/zray.h`. Every entry point contains its own
 panics: a fault in this library returns `ZRAY_ERR_PANIC` rather than aborting
 somebody's application.
 

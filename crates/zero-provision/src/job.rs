@@ -1,5 +1,5 @@
 //! The installer as one string-in, events-out job, for apps that cannot call
-//! Rust types directly (Android reaches it through JNI, see `zray-mobile`).
+//! Rust types directly (Android reaches it through JNI, see `zray-mobile` in ZeroNet-Mobile).
 //!
 //! A request is one JSON object with an `op`; the job emits JSON events to the
 //! sink and always ends with exactly one `{"t":"done","ok":…}`:

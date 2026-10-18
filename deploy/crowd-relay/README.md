@@ -130,7 +130,7 @@ GitHub. Without the variable the Action writes nothing.
 To read a day:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/zeghostwriter/ZeroNet/crowd-data/modes/2026-09-30.sealed -o day.sealed
+curl -fsSL https://raw.githubusercontent.com/ZeroNetTeam/Zray-Core/crowd-data/modes/2026-09-30.sealed -o day.sealed
 MODE_STATS_SECRET=<the secret key> cargo run -p zero-discovery --bin zeronet-stats -- open day.sealed
 ```
 

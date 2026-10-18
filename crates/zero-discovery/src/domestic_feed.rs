@@ -44,11 +44,11 @@ pub const ID: &str = "domestic-sni";
 
 /// The primary URL: jsDelivr, which tends to outlast GitHub raw in Iran.
 const PRIMARY: &str =
-    "https://cdn.jsdelivr.net/gh/zeghostwriter/ZeroNet@crowd-data/domestic-sni.txt";
+    "https://cdn.jsdelivr.net/gh/ZeroNetTeam/Zray-Core@crowd-data/domestic-sni.txt";
 
 /// The fallback URL on the other CDN, serving the same bytes.
 const MIRROR: &str =
-    "https://raw.githubusercontent.com/zeghostwriter/ZeroNet/crowd-data/domestic-sni.txt";
+    "https://raw.githubusercontent.com/ZeroNetTeam/Zray-Core/crowd-data/domestic-sni.txt";
 
 /// The feed this module fetches: the domestic-SNI list, signed and mirrored,
 /// on the shared `crowd-data` branch beside `verified.txt`.

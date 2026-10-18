@@ -1,8 +1,8 @@
 [
   {
     "id": "verified",
-    "url": "https://raw.githubusercontent.com/zeghostwriter/ZeroNet/crowd-data/verified.txt",
+    "url": "https://raw.githubusercontent.com/ZeroNetTeam/Zray-Core/crowd-data/verified.txt",
     "tier": 1,
-    "sig_url": "https://raw.githubusercontent.com/zeghostwriter/ZeroNet/crowd-data/verified.txt.sig"
+    "sig_url": "https://raw.githubusercontent.com/ZeroNetTeam/Zray-Core/crowd-data/verified.txt.sig"
   }
 ]

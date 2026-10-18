@@ -4,7 +4,7 @@
 //! proxying anything but *looking*: fetching public feeds, sorting thousands
 //! of share links, testing which of them still work on this network today.
 //! This crate is that search, packaged for a host (the Android app, through
-//! `zray-mobile`) that drives it with JSON and listens for JSON events:
+//! `zray-mobile`, in ZeroNet-Mobile) that drives it with JSON and listens for JSON events:
 //!
 //! * [`link`] — pulls share links out of arbitrary text, keys them stably,
 //!   summarises them ([`LinkInfo`]) and classifies them;

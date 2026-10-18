@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 
 /// GitHub project the server program is downloaded from.
-pub const REPO: &str = "zeghostwriter/ZeroNet";
+pub const REPO: &str = "ZeroNetTeam/Zray-Core";
 
 pub const ZRAY_DIR: &str = "/opt/zray";
 pub const ZRAY_BIN: &str = "/opt/zray/zray";

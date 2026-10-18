@@ -121,121 +121,18 @@ jobs:
       # target is compiled even where the tests cannot run.
       - run: cargo check --workspace --target ${{ matrix.target }}
 
-  mobile:
-    name: mobile platform boundary
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          toolchain: stable
-          targets: aarch64-linux-android
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-
-      # `ring`, `aws-lc-sys` and `zstd-sys` all build C, so the shipped
-      # library cannot be produced without the NDK toolchain. The runner has
-      # one; pointing cargo at it is what turns "the Rust compiles" into "the
-      # .so an app would load links".
-      - name: point cargo at the NDK toolchain
-        run: |
-          toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          test -d "$toolchain" || { echo "no NDK at $ANDROID_NDK_HOME"; exit 1; }
-          api=24
-          {
-            echo "CC_aarch64_linux_android=$toolchain/aarch64-linux-android$api-clang"
-            echo "AR_aarch64_linux_android=$toolchain/llvm-ar"
-            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$toolchain/aarch64-linux-android$api-clang"
-          } >> "$GITHUB_ENV"
-
-      # The shared library an Android VpnService loads through JNI.
-      - name: build the Android library
-        run: cargo build -p zray-mobile --target aarch64-linux-android --release
-
-      - name: confirm the exported symbols are present
-        run: |
-          toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          so=target/aarch64-linux-android/release/libzray_mobile.so
-          test -f "$so"
-          for symbol in zray_start zray_stop zray_set_tun_descriptor \
-                        zray_set_protect_callback zray_last_error; do
-            # -D: the release profile strips the static symbol table; the
-            # exports a loader resolves live in the dynamic one.
-            "$toolchain/llvm-nm" -D --defined-only --extern-only "$so" \
-              | grep -q " $symbol$" || { echo "missing export: $symbol"; exit 1; }
-          done
-
-  apple:
-    name: Apple platform boundary
+  # macOS is a desktop target for the same crate set, and its utun and
+  # ifconfig/route paths are the ones the cross job only type-checks.
+  macos:
+    name: macOS unit tests
     runs-on: macos-latest
-    env:
-      # Rust's default iOS target (10.0) predates `___chkstk_darwin`, which
-      # the C dependencies (zstd) reference when built with a current SDK.
-      # Packet tunnel extensions need iOS 15 or later anyway.
-      IPHONEOS_DEPLOYMENT_TARGET: "15.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: stable
-          targets: aarch64-apple-ios
-          # llvm-nm matching rustc's LLVM: Xcode's nm can lag behind it and
-          # then reads nothing from the archive.
-          components: llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-
-      # iOS links the static archive into a NEPacketTunnelProvider extension.
-      - name: build the iOS static library
-        run: cargo build -p zray-mobile --target aarch64-apple-ios --release
-
-      - name: confirm the exported symbols are present
-        run: |
-          archive=target/aarch64-apple-ios/release/libzray_mobile.a
-          test -f "$archive"
-          nm_tool="$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-nm | head -n 1)"
-          "$nm_tool" -g --defined-only "$archive" > symbols.txt
-          for symbol in zray_start zray_stop zray_set_tun_descriptor \
-                        zray_set_protect_callback zray_last_error; do
-            grep -q " _$symbol$" symbols.txt \
-              || { echo "missing export: $symbol"; exit 1; }
-          done
-
-      # macOS is a desktop target for the same crate set, and its utun and
-      # ifconfig/route paths are the ones the cross job only type-checks.
-      - name: macOS unit tests
-        run: cargo test -p zero-tun -p zero-core
-
-  android-app:
-    name: Android app
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
-        with:
-          distribution: temurin
-          java-version: "17"
-      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
-        with:
-          # Its default list includes the legacy "tools" package, which the
-          # SDK repository no longer carries, failing the step.
-          packages: platform-tools
-      # The Android Gradle plugin installs the platform and build tools that
-      # compileSdk names (licences were accepted above), so no package names
-      # are hard-coded here; this only records what the repository offers.
-      - name: available SDK platforms
-        run: sdkmanager --list 2>/dev/null | grep -E "platforms;android-3[6-9]|build-tools;3[6-9]" | sort -u || true
-      - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
-      # The Rust library has its own jobs above; this one checks the Kotlin
-      # and renders every screen (Robolectric + Roborazzi) on the JVM.
-      - name: compile and unit tests
-        working-directory: ZeroNet-Mobile
-        run: ./gradlew --no-daemon -Pzray.skipNative=true :app:compileDebugKotlin :app:testDebugUnitTest
-      - name: screenshots
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: android-screenshots
-          path: ZeroNet-Mobile/app/build/outputs/roborazzi
-          if-no-files-found: ignore
+      - run: cargo test -p zero-tun -p zero-core
 
   # The hot-path benchmark asserts bit-identity for the framed read paths and
   # reports their allocation counts exactly, via a counting global allocator.

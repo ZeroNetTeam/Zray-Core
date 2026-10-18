@@ -25,9 +25,9 @@ use crate::crowd::{RankedIp, RankedServer, Rankings, ALL_NETS, RANKINGS_VERSION}
 
 /// Where the rankings are published, in the order they are tried.
 pub const RANKING_URLS: [&str; 3] = [
-    "https://raw.githubusercontent.com/zeghostwriter/ZeroNet/crowd-data/rankings.json",
-    "https://cdn.jsdelivr.net/gh/zeghostwriter/ZeroNet@crowd-data/rankings.json",
-    "https://fastly.jsdelivr.net/gh/zeghostwriter/ZeroNet@crowd-data/rankings.json",
+    "https://raw.githubusercontent.com/ZeroNetTeam/Zray-Core/crowd-data/rankings.json",
+    "https://cdn.jsdelivr.net/gh/ZeroNetTeam/Zray-Core@crowd-data/rankings.json",
+    "https://fastly.jsdelivr.net/gh/ZeroNetTeam/Zray-Core@crowd-data/rankings.json",
 ];
 /// A downloaded ranking is reused this long before it is fetched again.
 pub const RANKINGS_TTL: Duration = Duration::from_secs(20 * 60);
