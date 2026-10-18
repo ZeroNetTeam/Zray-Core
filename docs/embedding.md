@@ -75,10 +75,11 @@ its `Cargo.lock` records the new revision.
 
 ## 4. What the core publishes
 
-* `rankings.json`, `verified.txt` (signed), `domestic-sni.txt` and the harvest
-  state, on this repository's `crowd-data` branch, written by the `harvest`,
-  `fresh` and `crowd` workflows. The apps read them from
-  `raw.githubusercontent.com` and the jsDelivr mirrors.
+* `verified.txt` (signed, servers that were tested), `domestic-sni.txt` and the
+  harvest state, on this repository's `crowd-data` branch, written by the
+  `harvest` and `fresh` workflows. The apps read them from
+  `raw.githubusercontent.com` and the jsDelivr mirrors. Nothing is reported
+  back: there is no relay and no telemetry.
 * `ZrayCore-*` binaries and a signed `SHA256SUMS.txt` on each release, which
   the apps' "My server" installer downloads. The public half of the signing key
   is compiled into `zero-discovery` (`sign.rs`).

@@ -129,7 +129,7 @@ this repository.
 | `crates/` | The Rust workspace: protocols, transports, DNS, routing, evasion, discovery, TUN, the server installer, and the `zray` program (`zray-cli`). |
 | `vendor/` | The patched `rustls` and `netstack-smoltcp` the workspace builds with. Apps repeat this patch. |
 | `docs/` | Benchmarks, protocol specs, platform notes, embedding guide. |
-| `deploy/` | The crowd feed inputs, the crowd relay and the optional edge relay. |
+| `deploy/` | The inputs of the verified-servers list (feeds, Telegram channels, decoy names) and the optional edge relay. |
 | `bench/`, `fuzz/` | Allocation and traffic-shape benchmarks, and fuzz targets for the parsers. |
 | `tools/` | `link-local.sh`, for working on the core and an app together. |
 | `.github/` | CI, the release build, and the workflows that publish the shared feeds on the `crowd-data` branch. |

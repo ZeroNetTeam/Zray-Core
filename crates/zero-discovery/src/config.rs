@@ -104,9 +104,9 @@ struct BuildRequest {
     /// that reassembles TCP but reads the name from one TLS record.
     fragment_packets: String,
     /// Put the fragmented variants of `auto` first: the app sets this when
-    /// the crowd rankings say fragmenting works better than a plain
+    /// it has learned that fragmenting works better than a plain
     /// connection on this network, so a fresh connect starts with what
-    /// worked for others instead of rediscovering it.
+    /// worked before instead of rediscovering it.
     fragment_first: bool,
     /// Send a decoy ClientHello naming an allowed site ahead of the real one
     /// on every TLS/REALITY outbound. The engine sends it with a raw socket

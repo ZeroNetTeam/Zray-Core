@@ -1,10 +1,9 @@
 //! Detached Ed25519 signatures for the lists the app trusts.
 //!
-//! `verified.txt` (the tested server list) and `rankings.json` (which
-//! servers work on which network) are fetched over a censored, filtered
-//! link where a CDN or a network in the middle could serve a substitute.
-//! `verified.txt` is the graver risk: it can introduce servers the app has
-//! never seen, so a forged one could steer users onto an attacker's relay.
+//! `verified.txt` (the tested server list) is fetched over a censored,
+//! filtered link where a CDN or a network in the middle could serve a
+//! substitute. It can introduce servers the app has never seen, so a forged
+//! one could steer users onto an attacker's relay.
 //!
 //! So each file is signed in CI with a key whose public half is compiled
 //! into the app ([`PUBLIC_KEY_HEX`]), and the app rejects a body whose

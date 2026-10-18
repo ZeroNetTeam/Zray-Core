@@ -42,7 +42,7 @@
 //! These tests run from GitHub's machines, not from inside Iran: a config
 //! on the list is alive and really relays traffic, which weeds out the
 //! great majority of dead feed entries, but whether a given ISP lets it
-//! through is what the crowd rankings and the app's own tests settle.
+//! through is what the app's own tests settle.
 //!
 //! Refuses to write a list shorter than `--min`: a bad run must not replace
 //! a good list with an empty one.

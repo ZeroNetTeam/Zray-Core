@@ -23,8 +23,6 @@
 
 pub mod cloudflare;
 pub mod config;
-pub mod crowd;
-pub mod crowd_client;
 pub mod decoy_check;
 pub mod discover;
 pub mod domestic_feed;
@@ -34,7 +32,6 @@ pub mod github;
 pub mod glyph;
 pub mod json_subscription;
 pub mod link;
-pub mod modestats;
 pub mod order;
 pub mod panel;
 pub mod probe;

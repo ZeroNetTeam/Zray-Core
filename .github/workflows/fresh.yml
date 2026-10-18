@@ -10,7 +10,7 @@ name: fresh
 # them at the top of the list it writes.
 #
 # Testing runs outside the crowd-data lock; only the short publish job
-# waits for the harvest and crowd workflows.
+# waits for the harvest workflow.
 on:
   schedule:
     - cron: "*/10 * * * *"
@@ -83,7 +83,7 @@ jobs:
     if: needs.test.outputs.found == 'yes'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Shared with the harvest and crowd workflows: all replace the
+    # Shared with the harvest workflow: both replace the
     # crowd-data commit.
     concurrency:
       group: crowd-data

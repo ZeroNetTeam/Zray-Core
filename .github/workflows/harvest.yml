@@ -20,7 +20,7 @@ on:
 permissions:
   contents: write
 
-# Shared with the crowd workflow: both replace the crowd-data commit.
+# Shared with the fresh workflow: both replace the crowd-data commit.
 concurrency:
   group: crowd-data
   cancel-in-progress: false

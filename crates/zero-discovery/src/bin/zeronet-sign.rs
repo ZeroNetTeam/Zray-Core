@@ -1,5 +1,5 @@
 //! `zeronet-sign` — makes and verifies the detached Ed25519 signatures that
-//! protect the crowd-data lists (see `zero_discovery::sign`).
+//! protect the lists on the crowd-data branch (see `zero_discovery::sign`).
 //!
 //! ```text
 //! # Once, by a maintainer: print a fresh key pair.
@@ -7,7 +7,7 @@
 //!
 //! # In CI: sign a file, writing <file>.sig beside it.
 //! #   the 32-byte seed comes from $CROWD_SIGNING_KEY (base64 or hex).
-//! zeronet-sign sign verified.txt rankings.json
+//! zeronet-sign sign verified.txt domestic-sni.txt
 //!
 //! # Anywhere: check a file against a public key (hex), by default the one
 //! # compiled into this build.
