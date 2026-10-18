@@ -421,6 +421,24 @@ impl Accounts {
         sessions
     }
 
+    /// End the open sessions of `email` from `address` (known only while
+    /// address tracking is on): an address over an account's limit loses
+    /// its sessions while the others keep theirs. Returns how many.
+    pub fn end_address(&self, email: &str, address: IpAddr) -> usize {
+        let entries = self.entries.read().unwrap_or_else(|p| p.into_inner());
+        let Some(account) = entries.get(email) else {
+            return 0;
+        };
+        let mut ended = 0;
+        for session in lock(&account.sessions).values() {
+            if !session.is_ended() && session.address == Some(address) {
+                session.end();
+                ended += 1;
+            }
+        }
+        ended
+    }
+
     /// End the open sessions for which `stale(email, inbound)` is true.
     /// Returns how many were ended.
     pub fn end_where(&self, stale: impl Fn(&str, &str) -> bool) -> usize {
@@ -891,5 +909,20 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn only_the_sessions_from_one_address_are_ended() {
+        let accounts = Accounts::default();
+        accounts.set_track_addresses(true);
+        let other: IpAddr = "198.51.100.8".parse().unwrap();
+        let (a, _fa) = tokio::io::duplex(64);
+        let (b, _fb) = tokio::io::duplex(64);
+        let mut here = accounts.meter(&name("gina"), &name("in"), PEER, a);
+        let mut there = accounts.meter(&name("gina"), &name("in"), other, b);
+        assert_eq!(accounts.end_address("gina", other), 1);
+        assert_eq!(accounts.end_address("nobody", other), 0);
+        assert!(there.write_all(b"x").await.is_err());
+        assert!(here.write_all(b"x").await.is_ok());
     }
 }
