@@ -1,0 +1,228 @@
+//! `reality` and `zero-config` must read one `realitySettings` block the same
+//! way.
+//!
+//! A REALITY server listener gets its settings from `zero-config` when it runs
+//! inside Zray, and from [`RealityServerConfig`] when a server embeds this
+//! crate directly. Two readers of the same JSON is exactly the shape of bug
+//! that hides until a customer's `shortId` stops matching: the compiler says
+//! one thing, the handshake another, and the symptom on the wire is a silent
+//! fallback to the camouflage site rather than an error. So this test compiles
+//! a document with `zero-config`, parses the same block with this crate, and
+//! compares every field that decides a handshake or a fallback.
+
+use std::time::Duration;
+
+use reality::RealityServerConfig;
+use serde_json::{json, Value};
+
+fn server_settings() -> Value {
+    json!({
+        "show": false,
+        "dest": "example.com:443",
+        "xver": 2,
+        "serverNames": ["example.com", "www.example.com"],
+        "privateKey": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0",
+        "shortIds": ["", "ab12", "0011223344556677"],
+        "mldsa65Seed": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE",
+        "maxTimeDiff": 60000,
+        "minClientVer": "1.0.0",
+        "maxClientVer": "26.3.27",
+        "limitFallbackUpload": {"afterBytes": 10, "bytesPerSec": 20, "burstBytesPerSec": 30},
+        "limitFallbackDownload": {"afterBytes": 40, "bytesPerSec": 50, "burstBytesPerSec": 60}
+    })
+}
+
+/// The same block, as part of a document the configuration compiler accepts.
+fn document(settings: &Value) -> Value {
+    json!({
+        "inbounds": [{
+            "tag": "reality-in",
+            "listen": "127.0.0.1",
+            "port": 8443,
+            "protocol": "vless",
+            "settings": {
+                "clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": settings.clone()
+            }
+        }],
+        "outbounds": [{"protocol": "freedom"}]
+    })
+}
+
+/// The compiler's view of the inbound's REALITY settings.
+fn compiled(settings: &Value) -> zero_config::InboundRealityConfig {
+    let (generation, _) =
+        zero_config::compile_config(&document(settings), zero_core::GenerationId(1))
+            .expect("the document compiles");
+    let inbound = generation
+        .config
+        .inbounds
+        .first()
+        .expect("one inbound was compiled");
+    match &inbound.security {
+        zero_config::InboundSecurity::Reality(reality) => reality.clone(),
+        other => panic!("the inbound compiled to {other:?}, not REALITY"),
+    }
+}
+
+/// A selector as the eight bytes the session id carries.
+fn padded(selectors: &[Box<[u8]>]) -> Vec<Vec<u8>> {
+    selectors
+        .iter()
+        .map(|selector| {
+            assert!(
+                selector.len() <= 8,
+                "a selector wider than the session id's field cannot be compared"
+            );
+            let mut padded = vec![0u8; 8];
+            padded[..selector.len()].copy_from_slice(selector);
+            padded
+        })
+        .collect()
+}
+
+#[test]
+fn both_readers_agree_on_one_reality_block() {
+    let settings = server_settings();
+    let compiled = compiled(&settings);
+    let mine = RealityServerConfig::from_xray_settings(&settings).expect("this crate parses it");
+
+    assert_eq!(mine.private_key, compiled.private_key, "privateKey");
+    assert_eq!(mine.server_names, compiled.server_names, "serverNames");
+    // The compiler stores a selector as it was written; Xray — and therefore
+    // this crate — stores the eight bytes it will be compared against, which
+    // are the same value right-padded with zeros (`transport_internet.go:892`).
+    // What has to agree is the selector's meaning, so both sides are padded
+    // here before they are compared.
+    assert_eq!(
+        padded(&mine.short_ids),
+        padded(&compiled.short_ids),
+        "shortIds"
+    );
+    assert_eq!(
+        mine.mldsa65_seed.map(|seed| seed.to_vec()),
+        compiled.mldsa65_seed.map(|seed| seed.0.to_vec()),
+        "mldsa65Seed"
+    );
+    assert_eq!(
+        mine.max_time_diff,
+        Duration::from_millis(compiled.max_time_diff_ms),
+        "maxTimeDiff"
+    );
+    assert_eq!(mine.min_client_ver, compiled.min_client_ver, "minClientVer");
+    assert_eq!(mine.max_client_ver, compiled.max_client_ver, "maxClientVer");
+    assert_eq!(mine.fallback_xver, compiled.fallback_xver, "xver");
+    assert_eq!(
+        (
+            mine.fallback_limit_up.after_bytes,
+            mine.fallback_limit_up.bytes_per_sec,
+            mine.fallback_limit_up.burst_bytes_per_sec
+        ),
+        (
+            compiled.fallback_limit_up.after_bytes,
+            compiled.fallback_limit_up.bytes_per_sec,
+            compiled.fallback_limit_up.burst_bytes_per_sec
+        ),
+        "limitFallbackUpload"
+    );
+    assert_eq!(
+        (
+            mine.fallback_limit_down.after_bytes,
+            mine.fallback_limit_down.bytes_per_sec,
+            mine.fallback_limit_down.burst_bytes_per_sec
+        ),
+        (
+            compiled.fallback_limit_down.after_bytes,
+            compiled.fallback_limit_down.bytes_per_sec,
+            compiled.fallback_limit_down.burst_bytes_per_sec
+        ),
+        "limitFallbackDownload"
+    );
+
+    let (host, port) = mine.target.expect("dest was read");
+    let (address, compiled_port) = compiled.target.expect("the compiler read dest");
+    assert_eq!(
+        (&*host, port),
+        (address.to_string().as_str(), compiled_port),
+        "dest"
+    );
+}
+
+#[test]
+fn the_readers_agree_on_which_blocks_are_refused() {
+    // Each case is a block one reader must not accept while the other does.
+    // The compiler reports its reason as a string, so the test asserts that
+    // both refused — not that they worded it the same way.
+    let refusals: &[(&str, Value)] = &[
+        (
+            "no privateKey",
+            json!({"serverNames": ["example.com"], "shortIds": [""]}),
+        ),
+        (
+            "no serverNames",
+            json!({"privateKey": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0", "shortIds": [""]}),
+        ),
+        (
+            "no shortIds",
+            json!({"privateKey": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0", "serverNames": ["example.com"]}),
+        ),
+        (
+            "an odd shortId",
+            json!({
+                "privateKey": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0",
+                "serverNames": ["example.com"],
+                "shortIds": ["abc"]
+            }),
+        ),
+        (
+            "a shortId wider than the session id",
+            json!({
+                "privateKey": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0",
+                "serverNames": ["example.com"],
+                "shortIds": ["001122334455667788"]
+            }),
+        ),
+        (
+            "a privateKey that is not 32 bytes",
+            json!({
+                "privateKey": "AAAA",
+                "serverNames": ["example.com"],
+                "shortIds": [""]
+            }),
+        ),
+        (
+            "a version that is not major.minor.patch",
+            json!({
+                "privateKey": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0",
+                "serverNames": ["example.com"],
+                "shortIds": [""],
+                "minClientVer": "1.2"
+            }),
+        ),
+        (
+            "an xver that is not 0, 1 or 2",
+            json!({
+                "privateKey": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0",
+                "serverNames": ["example.com"],
+                "shortIds": [""],
+                "xver": 3
+            }),
+        ),
+    ];
+    for (what, settings) in refusals {
+        let compiler = zero_config::compile_config(&document(settings), zero_core::GenerationId(1));
+        assert!(
+            compiler.is_err(),
+            "the configuration compiler accepted {what}: {settings:#}"
+        );
+        assert!(
+            RealityServerConfig::from_xray_settings(settings).is_err(),
+            "this crate accepted {what}: {settings:#}"
+        );
+    }
+}

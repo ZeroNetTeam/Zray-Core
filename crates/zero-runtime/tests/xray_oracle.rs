@@ -227,7 +227,16 @@ async fn wait_for(address: SocketAddr) -> bool {
     false
 }
 
-async fn socks_connect(socks: SocketAddr, target: SocketAddr) -> std::io::Result<TcpStream> {
+/// Drive a SOCKS5 CONNECT to the point where the server's reply code is
+/// known, leaving the caller to decide what a refusal means.
+///
+/// The reply's bound address is consumed only for a zero code, so a working
+/// tunnel is positioned at payload with nothing left over, and a refused one
+/// is not asked for bytes it may never send.
+async fn socks_handshake(
+    socks: SocketAddr,
+    target: SocketAddr,
+) -> std::io::Result<(TcpStream, u8)> {
     let mut stream = TcpStream::connect(socks).await?;
     stream.set_nodelay(true)?;
     stream.write_all(&[0x05, 0x01, 0x00]).await?;
@@ -245,7 +254,9 @@ async fn socks_connect(socks: SocketAddr, target: SocketAddr) -> std::io::Result
 
     let mut reply = [0u8; 4];
     stream.read_exact(&mut reply).await?;
-    assert_eq!(reply[1], 0x00, "SOCKS5 CONNECT failed with {}", reply[1]);
+    if reply[1] != 0x00 {
+        return Ok((stream, reply[1]));
+    }
     let skip = match reply[3] {
         0x01 => 4,
         0x04 => 16,
@@ -258,6 +269,28 @@ async fn socks_connect(socks: SocketAddr, target: SocketAddr) -> std::io::Result
     };
     let mut discard = vec![0u8; skip + 2];
     stream.read_exact(&mut discard).await?;
+    Ok((stream, 0x00))
+}
+
+/// The strict form, for callers that need a working tunnel: a refused CONNECT
+/// fails the test loudly rather than handing back a socket the server never
+/// connected.
+async fn socks_connect(socks: SocketAddr, target: SocketAddr) -> std::io::Result<TcpStream> {
+    let (stream, code) = socks_handshake(socks, target).await?;
+    assert_eq!(code, 0x00, "SOCKS5 CONNECT failed with {code}");
+    Ok(stream)
+}
+
+/// The tolerant form, for tests that provoke a refusal on purpose (REALITY
+/// hands an unauthenticated client to the decoy, so "no tunnel" is the
+/// expected outcome): the reply code comes back as a value to match on.
+async fn socks_try_connect(socks: SocketAddr, target: SocketAddr) -> std::io::Result<TcpStream> {
+    let (stream, code) = socks_handshake(socks, target).await?;
+    if code != 0x00 {
+        return Err(std::io::Error::other(format!(
+            "SOCKS5 CONNECT failed with {code}"
+        )));
+    }
     Ok(stream)
 }
 
@@ -1243,8 +1276,10 @@ async fn a_wrong_reality_public_key_is_refused_rather_than_silently_relayed() {
     assert!(wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port)).await);
 
     let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    // A refused CONNECT is the *expected* outcome here, so this is the one
+    // call site that wants the tolerant reader rather than the strict one.
     let outcome = async {
-        let mut stream = socks_connect(socks, echo).await?;
+        let mut stream = socks_try_connect(socks, echo).await?;
         stream.write_all(&4u32.to_be_bytes()).await?;
         stream.write_all(b"ping").await?;
         stream.flush().await?;

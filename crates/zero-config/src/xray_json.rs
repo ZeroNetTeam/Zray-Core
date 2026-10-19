@@ -910,7 +910,20 @@ fn parse_inbound_security(settings: Option<&Value>, path: &str) -> R<InboundSecu
                 .ok_or_else(|| format!("{path}: reality shortIds is required"))?
                 .iter()
                 .map(|id| {
-                    parse_hex(id.as_str().unwrap_or(""))
+                    let text = id.as_str().unwrap_or("");
+                    // Xray decodes each selector into the eight bytes the
+                    // session id carries and refuses anything longer
+                    // (`too long "shortIds[i]"`). Accepting a ninth byte here
+                    // would compile a config whose selector can never match:
+                    // the handshake would compare eight bytes, find no
+                    // match, and quietly hand every client to the camouflage
+                    // site.
+                    if text.len() > 16 {
+                        return Err(format!(
+                            "{path}: reality shortId {text:?} is longer than the 8 bytes the session id carries"
+                        ));
+                    }
+                    parse_hex(text)
                         .map(|bytes| bytes.into_boxed_slice())
                         .map_err(|e| format!("{path}: reality shortId: {e}"))
                 })

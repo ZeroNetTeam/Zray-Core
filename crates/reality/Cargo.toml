@@ -1,0 +1,39 @@
+[package]
+name = "reality"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zero-core = { workspace = true }
+zero-security = { workspace = true }
+# The fallback's PROXY protocol header is the workspace's one encoder, so a
+# target reads from us exactly what it would read from any other Zray proxy.
+zero-protocol = { workspace = true }
+tokio = { workspace = true }
+aes-gcm = { workspace = true }
+# Declared here rather than through the workspace table, as `zero-security` does:
+# the pinned ring/aws-lc build of the workspace is what matters, not the shape of
+# the requirement.
+ed25519-dalek = "2"
+hmac = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+serde_json = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+ml-kem = { workspace = true }
+ml-dsa = { workspace = true }
+x25519-dalek = { workspace = true }
+rand = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+# The parity test compares this crate's parse of a `realitySettings` block with
+# the configuration compiler's, so the two readers cannot drift apart.
+zero-config = { workspace = true }
+# The server's own tests push a ClientHello through the fragmentation shape the
+# evasion layer produces, so the handshake is exercised on a stream that does
+# not deliver a record at a time.
+zero-evasion = { workspace = true }

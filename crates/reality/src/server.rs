@@ -21,15 +21,15 @@ use subtle::{Choice, ConstantTimeEq};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroize;
 
-use super::kdf::{
+use zero_core::{Confidence, Failure, FailureKind, Stage};
+use zero_security::tls13::kdf::{
     establish_application_secrets, establish_handshake_secrets, finished_verify_data, Transcript,
 };
-use super::record::{
+use zero_security::tls13::record::{
     parse_header, record_header, RecordCrypter, CONTENT_APPDATA, CONTENT_CCS, CONTENT_HANDSHAKE,
     DUMMY_CCS,
 };
-use super::{CipherSuite, Tls13Stream};
-use zero_core::{Confidence, Failure, FailureKind, Stage};
+use zero_security::tls13::{CipherSuite, Tls13Stream};
 
 #[derive(Clone)]
 pub struct RealityServerParams {
@@ -64,7 +64,7 @@ impl std::fmt::Debug for RealityServerParams {
 }
 
 /// The sizes of the records a camouflage site sends straight after a
-/// handshake, per server name (see [`super::post_handshake`]).
+/// handshake, per server name (see [`zero_security::tls13::post_handshake`]).
 ///
 /// After each handshake it accepts, the server sends empty records of the
 /// sizes stored for the name the client asked for, so the first thing on the
@@ -478,7 +478,7 @@ where
             .map_err(|error| Failure::from_io(&error, Stage::TlsStarted))?;
         record.extend_from_slice(&header);
         let length = match parse_header(&header) {
-            Ok((super::record::CONTENT_HANDSHAKE, length)) => length,
+            Ok((zero_security::tls13::record::CONTENT_HANDSHAKE, length)) => length,
             Ok(_) => {
                 return Ok(ClientHelloRead::NotTls {
                     consumed: record,
@@ -953,8 +953,8 @@ fn reality_error(detail: impl Into<String>) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls13::{HelloParams, PendingHello};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zero_security::tls13::{HelloParams, PendingHello};
 
     #[tokio::test]
     async fn reality_server_round_trips_application_data() {
@@ -972,7 +972,7 @@ mod tests {
             max_client_ver: None,
             post_handshake: Default::default(),
         };
-        let client_params = crate::reality::RealityParams::from_config(
+        let client_params = zero_security::RealityParams::from_config(
             std::sync::Arc::from("example.test"),
             public_key,
             &[0xaa, 0xbb, 0xcc, 0xdd],
@@ -989,7 +989,7 @@ mod tests {
             stream.shutdown().await.unwrap();
         });
 
-        let mut client = crate::reality::connect(client_io, &client_params)
+        let mut client = zero_security::reality_connect(client_io, &client_params)
             .await
             .unwrap();
         client.write_all(b"ping").await.unwrap();
@@ -1018,11 +1018,11 @@ mod tests {
     ) -> bool {
         let (mut server_params, _) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
         server_params.mldsa65_seed = server_seed;
-        let client_params = crate::reality::RealityParams::from_config_with_fingerprint_and_mldsa(
+        let client_params = zero_security::RealityParams::from_config_with_fingerprint_and_mldsa(
             std::sync::Arc::from("example.test"),
             x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([7u8; 32])).to_bytes(),
             &[0xaa, 0xbb, 0xcc, 0xdd],
-            crate::FingerprintProfile::Chrome,
+            zero_security::FingerprintProfile::Chrome,
             verify,
         )
         .with_hybrid_kem(false);
@@ -1038,7 +1038,7 @@ mod tests {
             }
         });
         let outcome = async {
-            let mut client = crate::reality::connect(client_io, &client_params)
+            let mut client = zero_security::reality_connect(client_io, &client_params)
                 .await
                 .ok()?;
             client.write_all(b"ping").await.ok()?;
@@ -1071,9 +1071,7 @@ mod tests {
         assert!(!handshake_with_mldsa65(Some([10u8; 32]), Some(verify)).await);
     }
 
-    fn reality_pair(
-        client_short_id: &[u8],
-    ) -> (RealityServerParams, crate::reality::RealityParams) {
+    fn reality_pair(client_short_id: &[u8]) -> (RealityServerParams, zero_security::RealityParams) {
         let private_key = [7u8; 32];
         let public_key =
             x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key))
@@ -1092,7 +1090,7 @@ mod tests {
             .into_boxed_slice(),
             post_handshake: Default::default(),
         };
-        let client_params = crate::reality::RealityParams::from_config(
+        let client_params = zero_security::RealityParams::from_config(
             std::sync::Arc::from("example.test"),
             public_key,
             client_short_id,
@@ -1143,7 +1141,7 @@ mod tests {
         tokio::spawn(tap(cr, sw, Arc::clone(&from_client)));
         tokio::spawn(tap(sr, cw, Arc::clone(&from_server)));
         let server = tokio::spawn(async move { handshake(server_io, &server_params).await });
-        let mut client = crate::reality::connect(client_io, &client_params)
+        let mut client = zero_security::reality_connect(client_io, &client_params)
             .await
             .unwrap();
         client.write_all(b"x").await.unwrap();
@@ -1190,7 +1188,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut client = crate::reality::connect(fragmented, &client_params)
+        let mut client = zero_security::reality_connect(fragmented, &client_params)
             .await
             .unwrap();
         client.write_all(b"ping").await.unwrap();
@@ -1215,8 +1213,8 @@ mod tests {
             stream.write_all(b"pong").await.unwrap();
             stream.flush().await.unwrap();
         });
-        let (tapped, sizes) = super::super::post_handshake::tap(client_io);
-        let mut client = crate::reality::connect(tapped, &client_params)
+        let (tapped, sizes) = zero_security::tls13::post_handshake::tap(client_io);
+        let mut client = zero_security::reality_connect(tapped, &client_params)
             .await
             .unwrap();
         client.write_all(b"ping").await.unwrap();
@@ -1235,7 +1233,7 @@ mod tests {
         let (server_params, client_params) = reality_pair(&[0xaa, 0xbb]);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let client = tokio::spawn(async move {
-            let _ = crate::reality::connect(client_io, &client_params).await;
+            let _ = zero_security::reality_connect(client_io, &client_params).await;
         });
         match handshake_or_fallback(server_io, &server_params).await {
             HandshakeOutcome::Fallback { failure, .. } => {

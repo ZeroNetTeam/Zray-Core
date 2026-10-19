@@ -24,7 +24,6 @@ pub mod hello;
 pub mod kdf;
 pub mod post_handshake;
 pub mod record;
-pub mod server;
 
 pub use client::{handshake, PendingHello, ServerAuth, Tls13Stream};
 pub use hello::HelloParams;

@@ -74,7 +74,8 @@ impl RecordWalker {
 
 /// Sits under the TLS client and watches record headers go by in both
 /// directions.
-pub(super) struct Tap<S> {
+#[doc(hidden)]
+pub struct Tap<S> {
     inner: S,
     sent: RecordWalker,
     received: RecordWalker,
@@ -136,7 +137,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tap<S> {
 
 /// Put a tap on `io`, and get the list its post-handshake record sizes are
 /// collected in.
-pub(super) fn tap<S>(io: S) -> (Tap<S>, Arc<Mutex<Vec<u16>>>) {
+/// Test support: the REALITY server's own tests observe the record sizes a
+/// server puts on the wire after the handshake, and those tests live in the
+/// `reality` crate now.
+#[doc(hidden)]
+pub fn tap<S>(io: S) -> (Tap<S>, Arc<Mutex<Vec<u16>>>) {
     let sizes = Arc::new(Mutex::new(Vec::new()));
     let tap = Tap {
         inner: io,

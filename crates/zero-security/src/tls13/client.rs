@@ -729,12 +729,12 @@ pub struct Tls13Stream<S> {
 }
 
 impl<S> Tls13Stream<S> {
-    pub(crate) fn new(
-        inner: S,
-        suite: CipherSuite,
-        server_app: Vec<u8>,
-        client_app: Vec<u8>,
-    ) -> Self {
+    /// Wrap a stream whose traffic keys the caller already derived.
+    ///
+    /// `pub` for the REALITY server in the `reality` crate, which terminates
+    /// the handshake itself and then hands the record layer on; the client is
+    /// the only caller inside this crate.
+    pub fn new(inner: S, suite: CipherSuite, server_app: Vec<u8>, client_app: Vec<u8>) -> Self {
         Self {
             inner,
             suite,
@@ -759,7 +759,7 @@ impl<S> Tls13Stream<S> {
 
     /// Queue empty application-data records of these wire sizes behind
     /// anything already waiting to be sent. They leave on the next flush.
-    pub(crate) fn queue_empty_records(&mut self, wire_lens: &[u16]) -> Result<(), super::Failure> {
+    pub fn queue_empty_records(&mut self, wire_lens: &[u16]) -> Result<(), super::Failure> {
         for &wire_len in wire_lens {
             self.write
                 .seal_empty_into(wire_len as usize, &mut self.outgoing)?;

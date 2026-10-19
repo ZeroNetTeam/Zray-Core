@@ -12,7 +12,8 @@
 //! the certificate (HMAC mismatch → `RealityFallback`) and MUST abort —
 //! sending proxy traffic into the fallback connection leaks the tunnel.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use aes_gcm::{
     aead::{Aead, Payload},
@@ -178,6 +179,104 @@ fn seal_session_id(
     out
 }
 
+/// The ML-DSA-65 verification keys this process has already expanded.
+///
+/// A REALITY client that pins `mldsa65Verify` checks one *fixed* key on every
+/// connection, but `VerifyingKey::decode` is not a cheap deserialisation: FIPS
+/// 204's `pkDecode` terminates in `ExpandA`, which SHAKE-squeezes the whole
+/// k×l matrix of NTT polynomials. Measured in this workspace that is about
+/// 130 KB of stack and the same order of CPU as the verification that follows
+/// it (about 380 KB of stack in a debug build), paid per connection, on a call
+/// path that already sits roughly a megabyte deep inside a tokio worker's two
+/// megabyte stack. Remembering the decoded key moves that cost from every
+/// connection to the first one.
+///
+/// The cache is keyed by the exact encoded bytes, so two outbounds that pin
+/// different keys cannot collide, and it is deliberately small: a process has
+/// one key per outbound, and an entry is a few kilobytes.
+struct CachedMldsa65Key {
+    encoded: Box<[u8]>,
+    key: Arc<VerifyingKey<MlDsa65>>,
+}
+
+/// Enough for every outbound in a realistic config plus a reload or two, the
+/// same reasoning as the inbound certificate cache in [`crate::server`].
+const MLDSA65_KEY_CACHE_LIMIT: usize = 8;
+
+fn mldsa65_key_cache() -> &'static Mutex<VecDeque<CachedMldsa65Key>> {
+    static CACHE: OnceLock<Mutex<VecDeque<CachedMldsa65Key>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// The decoded form of `encoded`, expanding it at most once per process.
+///
+/// `None` means the bytes are not a valid ML-DSA-65 public key — a config
+/// error, which the caller turns into the same `RealityFallback` failure the
+/// uncached code produced.
+fn decoding_mldsa65_verifying_key(encoded: &[u8]) -> Option<Arc<VerifyingKey<MlDsa65>>> {
+    let encoded: EncodedVerifyingKey<MlDsa65> = encoded.try_into().ok()?;
+    if let Ok(cache) = mldsa65_key_cache().lock() {
+        if let Some(entry) = cache
+            .iter()
+            .find(|entry| entry.encoded.as_ref() == encoded.as_slice())
+        {
+            return Some(Arc::clone(&entry.key));
+        }
+    }
+    // Expanded with the lock released: two outbounds racing on the same new
+    // key do the work twice and keep one of the results, which is cheaper than
+    // holding a lock across a few hundred microseconds of SHAKE.
+    let key = expand_mldsa65_verifying_key(&encoded);
+    if let Ok(mut cache) = mldsa65_key_cache().lock() {
+        if !cache
+            .iter()
+            .any(|entry| entry.encoded.as_ref() == encoded.as_slice())
+        {
+            if cache.len() >= MLDSA65_KEY_CACHE_LIMIT {
+                cache.pop_front();
+            }
+            cache.push_back(CachedMldsa65Key {
+                encoded: encoded.as_slice().to_vec().into_boxed_slice(),
+                key: Arc::clone(&key),
+            });
+        }
+    }
+    Some(key)
+}
+
+/// `ExpandA` on a thread with a stack of its own.
+///
+/// Expanding an ML-DSA-65 verifying key — FIPS 204 `pkDecode`, which ends in
+/// Algorithm 32 — measured in this workspace at about 130 KB of stack and a
+/// few hundred microseconds in a release build, and about 380 KB in a debug
+/// build. The caller is the REALITY client handshake, which already runs
+/// roughly a megabyte deep inside a tokio worker's two megabyte stack, so the
+/// operation must not borrow what is left of that. A thread of our own makes
+/// the cost independent of the caller's depth, and because the result is
+/// cached it is paid once per pinned key per process, not per connection.
+///
+/// If the thread cannot be created, the expansion happens inline: a working
+/// handshake is worth more than a bounded stack, and the cache still keeps it
+/// to the first connection.
+fn expand_mldsa65_verifying_key(
+    encoded: &EncodedVerifyingKey<MlDsa65>,
+) -> Arc<VerifyingKey<MlDsa65>> {
+    /// Twice what the debug-build measurement asks for, rounded to the
+    /// conventional unit for a thread that does one cryptographic expansion.
+    const EXPANSION_STACK: usize = 1024 * 1024;
+    let owned = *encoded;
+    std::thread::Builder::new()
+        .name("reality-mldsa65".into())
+        .stack_size(EXPANSION_STACK)
+        .spawn(move || VerifyingKey::<MlDsa65>::decode(&owned))
+        .ok()
+        .and_then(|handle| handle.join().ok())
+        .map_or_else(
+            || Arc::new(VerifyingKey::<MlDsa65>::decode(encoded)),
+            Arc::new,
+        )
+}
+
 /// The `ServerAuth` policy: the leaf certificate is authentic when its
 /// signature field equals `HMAC-SHA512(AuthKey, leaf_public_key)`.
 ///
@@ -228,11 +327,10 @@ impl ServerAuth for RealityAuth {
         }
 
         if let Some(verifying_key_bytes) = self.mldsa65_verify.as_deref() {
-            let encoded: EncodedVerifyingKey<MlDsa65> =
-                verifying_key_bytes.try_into().map_err(|_| {
+            let verifying_key =
+                decoding_mldsa65_verifying_key(verifying_key_bytes).ok_or_else(|| {
                     fallback("configured ML-DSA-65 verification key has invalid length")
                 })?;
-            let verifying_key = VerifyingKey::<MlDsa65>::decode(&encoded);
             let Some(extension) = parts.first_extension else {
                 return Err(fallback("REALITY certificate has no ML-DSA-65 extension"));
             };

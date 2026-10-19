@@ -22,6 +22,7 @@ zero-dns = { workspace = true }
 zero-net = { workspace = true }
 zero-router = { workspace = true }
 zero-security = { workspace = true }
+reality = { workspace = true }
 zero-transport = { workspace = true }
 zero-protocol = { workspace = true }
 zero-evasion = { workspace = true }
@@ -59,6 +60,7 @@ x25519-dalek = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time", "test-util"] }
 tracing-subscriber = { workspace = true }
 zero-security = { workspace = true }
+reality = { workspace = true }
 # The ClientHello parity oracle drives the TLS backend directly to capture the
 # shaped hello, without opening a connection to anything.
 rustls = { workspace = true }

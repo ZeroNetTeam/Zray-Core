@@ -7,6 +7,7 @@ members = [
     "crates/zero-dns",
     "crates/zero-router",
     "crates/zero-security",
+    "crates/reality",
     "crates/zero-transport",
     "crates/zero-protocol",
     "crates/zero-runtime",
@@ -42,6 +43,7 @@ zero-net = { path = "crates/zero-net", version = "0.1.0" }
 zero-dns = { path = "crates/zero-dns", version = "0.1.0" }
 zero-router = { path = "crates/zero-router", version = "0.1.0" }
 zero-security = { path = "crates/zero-security", version = "0.1.0" }
+reality = { path = "crates/reality", version = "0.1.0" }
 zero-transport = { path = "crates/zero-transport", version = "0.1.0" }
 zero-protocol = { path = "crates/zero-protocol", version = "0.1.0" }
 zero-runtime = { path = "crates/zero-runtime", version = "0.1.0" }

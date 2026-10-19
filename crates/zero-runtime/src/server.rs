@@ -357,7 +357,7 @@ struct ServerState {
 #[derive(Default, Clone)]
 struct InboundRuntime {
     tls: Option<Result<Arc<rustls::ServerConfig>, String>>,
-    reality: Option<zero_security::tls13::server::RealityServerParams>,
+    reality: Option<reality::RealityServerParams>,
     transport: Option<zero_transport::ws::WsConfig>,
     raw_http_header: Option<zero_transport::tcp_header::HttpHeaderConfig>,
     tide: Option<Arc<TideInbound>>,
@@ -478,7 +478,7 @@ impl InboundRuntime {
         };
         let reality = match &inbound.security {
             zero_config::InboundSecurity::Reality(reality) => {
-                Some(zero_security::tls13::server::RealityServerParams {
+                Some(reality::RealityServerParams {
                     private_key: reality.private_key,
                     server_names: reality.server_names.clone(),
                     short_ids: reality.short_ids.clone(),
@@ -2362,11 +2362,11 @@ impl Server {
                     .reality
                     .as_ref()
                     .ok_or_else(|| "inbound REALITY configuration is missing".to_string())?;
-                match zero_security::tls13::server::handshake_or_fallback(stream, params).await {
-                    zero_security::tls13::server::HandshakeOutcome::Accepted(stream) => {
+                match reality::handshake_or_fallback(stream, params).await {
+                    reality::HandshakeOutcome::Accepted(stream) => {
                         Ok(Secured::Stream(boxed(stream), ConnInfo::default()))
                     }
-                    zero_security::tls13::server::HandshakeOutcome::Fallback {
+                    reality::HandshakeOutcome::Fallback {
                         stream,
                         client_hello,
                         failure,
@@ -2375,7 +2375,7 @@ impl Server {
                         client_hello,
                         failure: failure.to_string(),
                     }),
-                    zero_security::tls13::server::HandshakeOutcome::Rejected(error) => {
+                    reality::HandshakeOutcome::Rejected(error) => {
                         Err(format!("inbound REALITY handshake failed: {error}"))
                     }
                 }
