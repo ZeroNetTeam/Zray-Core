@@ -25,6 +25,29 @@
 //! * [`keys`] — the server's key material, in the encodings `xray x25519`,
 //!   `xray mldsa65` and a `shortIds` entry use.
 //!
+//! A server turns its configuration into a listener like this:
+//!
+//! ```
+//! use reality::RealityServerConfig;
+//!
+//! // The `realitySettings` block, exactly as it appears in an Xray config.
+//! let settings = serde_json::json!({
+//!     "dest": "example.com:443",
+//!     "serverNames": ["example.com"],
+//!     "privateKey": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0",
+//!     "shortIds": [""],
+//!     "maxTimeDiff": 60000,
+//! });
+//! let config = RealityServerConfig::from_xray_settings(&settings)?;
+//! let params = config.server_params();
+//! assert_eq!(params.server_names.as_ref(), [Box::from("example.com")]);
+//! assert_eq!(
+//!     config.target.as_ref().map(|(host, port)| (&**host, *port)),
+//!     Some(("example.com", 443))
+//! );
+//! # Ok::<(), String>(())
+//! ```
+//!
 //! The TLS 1.3 record layer underneath is not REALITY's: it is the same
 //! minimal substrate the client uses, in `zero-security::tls13`, and it stays
 //! there so a REALITY protocol change cannot destabilise ordinary TLS and the

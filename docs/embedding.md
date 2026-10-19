@@ -73,7 +73,46 @@ checkout, so `git checkout Cargo.lock` before committing there. Land the
 core change first, then run `cargo update -p zero-core` in the front end so
 its `Cargo.lock` records the new revision.
 
-## 4. What the core publishes
+## 4. Running a REALITY server
+
+A server that wants to accept REALITY connections takes `reality` and nothing
+else from the core:
+
+```toml
+reality = { git = "https://github.com/ZeroNetTeam/Zray-Core", version = "0.1.0", branch = "main" }
+```
+
+```rust
+use reality::{FallbackPolicy, RealityServerConfig};
+
+let settings = serde_json::json!({
+    "dest": "example.com:443",
+    "serverNames": ["example.com"],
+    "privateKey": "…",            // xray x25519
+    "shortIds": ["", "ab12"],     // hex, up to 8 bytes
+    "mldsa65Seed": "…",           // optional, xray mldsa65
+    "xver": 0,
+    "limitFallbackUpload": { "afterBytes": 0, "bytesPerSec": 1048576, "burstBytesPerSec": 0 },
+});
+let config = RealityServerConfig::from_xray_settings(&settings)?;
+let params = config.server_params();
+// Per accepted connection:
+//   match reality::handshake_or_fallback(stream, &params).await? { … }
+// Accepted  → the connection is REALITY; the stream is the tunnel's.
+// Fallback  → connect to `config.target`, then
+//             reality::fallback::relay(client, target, &policy, &hello_bytes, …).
+```
+
+The wire behaviour is the Go implementation's, not an approximation of it:
+`zero-runtime/tests/xray_oracle.rs` runs an official `xray` binary against this
+server (and this client against an official `xray` server) and is the test that
+decides whether a change here is allowed. `docs/specs/REALITY-server.md` records
+the item-by-item comparison, and `crates/reality/tests/` covers the parts that
+do not need a peer: the configuration reader (compared field by field against
+`zero-config`'s), the key encodings, and the fallback path.
+
+
+## 5. What the core publishes
 
 * `verified.txt` (signed, servers that were tested), `domestic-sni.txt` and the
   harvest state, on this repository's `crowd-data` branch, written by the
