@@ -2008,8 +2008,7 @@ mod tests {
     #[tokio::test]
     async fn a_record_at_go_s_pre_negotiation_bound_is_read_then_relayed() {
         let (params, _) = crafted_params();
-        let mut record =
-            record_header(CONTENT_HANDSHAKE, MAX_CIPHERTEXT_BEFORE_TLS13).to_vec();
+        let mut record = record_header(CONTENT_HANDSHAKE, MAX_CIPHERTEXT_BEFORE_TLS13).to_vec();
         record.resize(5 + MAX_CIPHERTEXT_BEFORE_TLS13, 0);
 
         let (mut client, server) = tokio::io::duplex(64 * 1024);

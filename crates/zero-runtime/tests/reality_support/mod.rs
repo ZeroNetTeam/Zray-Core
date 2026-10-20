@@ -35,8 +35,7 @@ pub const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 /// The same id as the bytes VLESS puts on the wire, for a client that builds
 /// its own request header instead of going through a config.
 pub const UUID_BYTES: [u8; 16] = [
-    0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3, 0x08,
-    0x11,
+    0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3, 0x08, 0x11,
 ];
 /// [`REALITY_SHORT_ID`] as the eight bytes the session id carries.
 ///
@@ -49,7 +48,9 @@ pub fn reality_short_id() -> [u8; 8] {
     let text = REALITY_SHORT_ID.as_bytes();
     let mut out = [0u8; 8];
     for (index, byte) in out.iter_mut().enumerate() {
-        let high = (text[index * 2] as char).to_digit(16).expect("hex short id");
+        let high = (text[index * 2] as char)
+            .to_digit(16)
+            .expect("hex short id");
         let low = (text[index * 2 + 1] as char)
             .to_digit(16)
             .expect("hex short id");
@@ -297,12 +298,7 @@ pub fn spawn_decoy(binary: &str, port: u16) -> ServerProcess {
 
 /// The same, with a chosen certificate — the larger one for the handshakes
 /// whose flight is bigger than the small decoy's certificate.
-pub fn spawn_decoy_with(
-    binary: &str,
-    port: u16,
-    certificate: &str,
-    key: &str,
-) -> ServerProcess {
+pub fn spawn_decoy_with(binary: &str, port: u16, certificate: &str, key: &str) -> ServerProcess {
     ServerProcess::spawn_named(binary, decoy_config_with(port, certificate, key), "decoy")
 }
 

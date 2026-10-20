@@ -114,7 +114,6 @@ impl Round {
             failures: Vec::new(),
         }
     }
-
 }
 
 /// Everything measured against one server.
@@ -142,7 +141,10 @@ struct Measured {
 
 impl Measured {
     fn handshakes(&self) -> usize {
-        self.rounds.iter().map(|round| round.latencies_ms.len()).sum()
+        self.rounds
+            .iter()
+            .map(|round| round.latencies_ms.len())
+            .sum()
     }
 
     fn wall(&self) -> Duration {
@@ -469,17 +471,18 @@ async fn main() {
     let mut preflight: Vec<Result<(), String>> = Vec::new();
     for row in rows.iter() {
         let client_here = client.clone_for(row.address);
-        let outcome = if row.server_accepts_vless() {
-            client_here.vless_round_trip(echo, &support::UUID_BYTES).await
-        } else {
-            // No VLESS layer in the in-process row: the handshake is the whole
-            // of it, so a completed handshake is what can be checked.
-            client_here
-                .handshake()
-                .await
-                .map(|_| ())
-                .map_err(|error| format!("{error} (handshake only: this row has no VLESS layer)"))
-        };
+        let outcome =
+            if row.server_accepts_vless() {
+                client_here
+                    .vless_round_trip(echo, &support::UUID_BYTES)
+                    .await
+            } else {
+                // No VLESS layer in the in-process row: the handshake is the whole
+                // of it, so a completed handshake is what can be checked.
+                client_here.handshake().await.map(|_| ()).map_err(|error| {
+                    format!("{error} (handshake only: this row has no VLESS layer)")
+                })
+            };
         match &outcome {
             Ok(()) => println!(
                 "  {:<12} ok      {}",
@@ -502,8 +505,14 @@ async fn main() {
     for row in rows.iter() {
         let floor = connect_floor(row.address, 50).await;
         match floor {
-            Some(p50) => print!("  floor: bare TCP connect to {:<12} p50 {p50:.3} ms    ", row.name),
-            None => print!("  floor: bare TCP connect to {:<12} failed            ", row.name),
+            Some(p50) => print!(
+                "  floor: bare TCP connect to {:<12} p50 {p50:.3} ms    ",
+                row.name
+            ),
+            None => print!(
+                "  floor: bare TCP connect to {:<12} failed            ",
+                row.name
+            ),
         }
         let _ = std::io::stdout().flush();
         floors.push(floor);
@@ -518,15 +527,15 @@ async fn main() {
             if let Err(reason) = client.clone_for(row.address).handshake().await {
                 failures += 1;
                 if failures == 1 {
-                    println!(
-                        "  warm-up: a handshake to {} failed: {reason}",
-                        row.name
-                    );
+                    println!("  warm-up: a handshake to {} failed: {reason}", row.name);
                 }
             }
         }
         if failures == 0 {
-            print!("  warm-up: {} {warmup} handshakes, 0 failures     ", row.name);
+            print!(
+                "  warm-up: {} {warmup} handshakes, 0 failures     ",
+                row.name
+            );
             let _ = std::io::stdout().flush();
         }
     }
@@ -606,15 +615,11 @@ async fn main() {
     println!(
         "  everything above is loopback: work per connection for a server facing many clients,"
     );
-    println!(
-        "  not what one client on a real link sees, where the round trips dominate."
-    );
+    println!("  not what one client on a real link sees, where the round trips dominate.");
     println!(
         "  A handshake costs crypto and syscalls (X25519, HKDF, Ed25519, AES-GCM, a few reads and"
     );
-    println!(
-        "  writes), not throughput; nothing here carries a payload through the tunnel."
-    );
+    println!("  writes), not throughput; nothing here carries a payload through the tunnel.");
     println!(
         "  zray-inproc's server runs in this process, so its CPU is mixed with the client's and is"
     );
@@ -660,9 +665,7 @@ async fn measure_round(client: &Client, row: &Row, count: usize) -> Round {
         let at = Instant::now();
         match client_here.handshake().await {
             Ok(bytes) => {
-                round
-                    .latencies_ms
-                    .push(at.elapsed().as_secs_f64() * 1000.0);
+                round.latencies_ms.push(at.elapsed().as_secs_f64() * 1000.0);
                 round.bytes.push(bytes);
             }
             Err(reason) => {
@@ -719,10 +722,7 @@ fn servers_section(measured: &[Measured]) -> String {
                 "",
                 bytes as f64 / (1024.0 * 1024.0)
             )),
-            None => out.push_str(&format!(
-                "  {:<12} resident: shares this process\n",
-                ""
-            )),
+            None => out.push_str(&format!("  {:<12} resident: shares this process\n", "")),
         }
         if let Some(shapes) = &row.shapes {
             out.push_str(&format!(
@@ -976,7 +976,10 @@ fn check(
             ));
         }
         if !row.alive {
-            failures.push(format!("{}: the server was not running at the end", row.name));
+            failures.push(format!(
+                "{}: the server was not running at the end",
+                row.name
+            ));
         }
         if let Some(Err(reason)) = &row.preflight {
             failures.push(format!(
@@ -1077,10 +1080,7 @@ fn check(
         .filter(|row| row.cpu_measured && row.handshakes() > 0)
         .collect();
     if external.len() == 2 {
-        if let (
-            Some(left),
-            Some(right),
-        ) = (
+        if let (Some(left), Some(right)) = (
             external[0].cpu_per_handshake(Which::Client),
             external[1].cpu_per_handshake(Which::Client),
         ) {
@@ -1115,7 +1115,9 @@ fn zray_binary() -> Result<String, String> {
         if std::path::Path::new(&path).exists() {
             return Ok(path);
         }
-        return Err(format!("ZRAY_BINARY points at {path}, which does not exist"));
+        return Err(format!(
+            "ZRAY_BINARY points at {path}, which does not exist"
+        ));
     }
     let built = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/zray");
     if built.exists() {

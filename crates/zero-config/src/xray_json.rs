@@ -2214,8 +2214,8 @@ fn parse_obfs_settings(settings: Option<&Value>, path: &str) -> R<Option<ObfsCon
         "tls" => ObfsMode::Tls,
         other => {
             return Err(format!(
-                "{path}.settings.obfs.type {other:?} is unsupported; simple-obfs speaks http and tls"
-            ))
+            "{path}.settings.obfs.type {other:?} is unsupported; simple-obfs speaks http and tls"
+        ))
         }
     };
     let host = object
@@ -2298,8 +2298,7 @@ fn parse_vmess(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
 /// The shape is Xray's `naive` outbound: `server` (or `address`), `port`,
 /// `username`, `password` and `padding`.
 fn parse_naive(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
-    let settings = settings
-        .ok_or_else(|| format!("{path}.settings is required for naive"))?;
+    let settings = settings.ok_or_else(|| format!("{path}.settings is required for naive"))?;
     let server = settings
         .get("server")
         .or_else(|| settings.get("address"))
@@ -2349,8 +2348,7 @@ fn parse_naive(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
 /// `tactics`, `tacticsUrl`, and the numeric knobs. The entries are carried
 /// through as *text*, because the signature covers the exact bytes.
 fn parse_psiphon(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
-    let settings = settings
-        .ok_or_else(|| format!("{path}.settings is required for psiphon"))?;
+    let settings = settings.ok_or_else(|| format!("{path}.settings is required for psiphon"))?;
 
     let entries = settings
         .get("serverEntries")
@@ -2438,7 +2436,11 @@ fn parse_psiphon(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
     if let Some(url) = upstream_proxy_url {
         // The client dials this as an HTTP or SOCKS5 proxy. A scheme it does
         // not speak is a configuration that cannot work, so it is named here.
-        let scheme = url.split(':').next().unwrap_or_default().to_ascii_lowercase();
+        let scheme = url
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         if !matches!(scheme.as_str(), "http" | "https" | "socks5" | "socks5h") {
             return Err(format!(
                 "{path}.settings.upstreamProxyUrl {url:?} names the {scheme:?} scheme, which the \
@@ -2448,10 +2450,7 @@ fn parse_psiphon(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
     }
 
     let number = |key: &str, default: u64| -> u64 {
-        settings
-            .get(key)
-            .and_then(Value::as_u64)
-            .unwrap_or(default)
+        settings.get(key).and_then(Value::as_u64).unwrap_or(default)
     };
     let count = |key: &str, default: u8| -> u8 {
         settings
@@ -2489,11 +2488,17 @@ fn parse_psiphon(settings: Option<&Value>, path: &str) -> R<OutboundProtocol> {
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(Box::from),
-        establish_timeout_seconds: number("establishTimeoutSeconds", defaults.establish_timeout_seconds),
+        establish_timeout_seconds: number(
+            "establishTimeoutSeconds",
+            defaults.establish_timeout_seconds,
+        ),
         establish_concurrency: count("establishConcurrency", defaults.establish_concurrency),
         tunnel_pool_size: count("tunnelPoolSize", defaults.tunnel_pool_size),
         max_channels: number("maxChannels", defaults.max_channels as u64) as u32,
-        keepalive_interval_seconds: number("keepaliveIntervalSeconds", defaults.keepalive_interval_seconds),
+        keepalive_interval_seconds: number(
+            "keepaliveIntervalSeconds",
+            defaults.keepalive_interval_seconds,
+        ),
         propagation_channel_id: settings
             .get("propagationChannelId")
             .and_then(Value::as_str)

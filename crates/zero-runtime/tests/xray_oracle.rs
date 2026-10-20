@@ -2190,7 +2190,11 @@ async fn recording_relay(
                         tokio::io::copy(&mut from_visitor, &mut to_server),
                         tokio::io::copy(&mut from_server, &mut to_visitor),
                     );
-                    let flight = taps.flight.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    let flight = taps
+                        .flight
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
                     if !flight.is_empty() {
                         flights
                             .lock()
@@ -2242,7 +2246,9 @@ async fn spawn_reality_server(
                         reality::HandshakeOutcome::Fallback { failure, .. } => {
                             format!("fell back to the site: {failure}")
                         }
-                        reality::HandshakeOutcome::Rejected(failure) => format!("refused: {failure}"),
+                        reality::HandshakeOutcome::Rejected(failure) => {
+                            format!("refused: {failure}")
+                        }
                     };
                     outcomes
                         .lock()
@@ -2257,7 +2263,13 @@ async fn spawn_reality_server(
 
 /// An official Xray client with a SOCKS inbound, tunnelling VLESS over REALITY
 /// to `port`.
-fn spawn_xray_reality_client(binary: &str, socks_port: u16, port: u16, public_key: &str, mldsa: Option<&str>) -> Oracle {
+fn spawn_xray_reality_client(
+    binary: &str,
+    socks_port: u16,
+    port: u16,
+    public_key: &str,
+    mldsa: Option<&str>,
+) -> Oracle {
     let (_, client_settings) = protocol_settings("vless", port);
     let mut client_stream = transport("tcp");
     client_stream["security"] = json!("reality");
@@ -2516,7 +2528,9 @@ async fn reality_refuses_a_client_the_sites_flight_is_too_small_for() {
     // are shared with the running listener through an `Arc`, which is how the
     // runtime files what it learned at start-up under a server already
     // accepting connections.
-    params.post_handshake.set_flight(REALITY_SNI, &shapes.flight);
+    params
+        .post_handshake
+        .set_flight(REALITY_SNI, &shapes.flight);
     params
         .post_handshake
         .set(REALITY_SNI, &shapes.post_handshake);
@@ -2539,17 +2553,24 @@ async fn reality_refuses_a_client_the_sites_flight_is_too_small_for() {
     let mut recorded = Vec::new();
     for _ in 0..40 {
         recorded = outcomes.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        if recorded.iter().any(|outcome| outcome.starts_with("refused:")) {
+        if recorded
+            .iter()
+            .any(|outcome| outcome.starts_with("refused:"))
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        recorded.iter().any(|outcome| outcome.starts_with("refused:")),
+        recorded
+            .iter()
+            .any(|outcome| outcome.starts_with("refused:")),
         "the server should have refused the connection, and said why: {recorded:?}"
     );
     assert!(
-        !recorded.iter().any(|outcome| outcome.starts_with("fell back")),
+        !recorded
+            .iter()
+            .any(|outcome| outcome.starts_with("fell back")),
         "an authenticated client must not be answered with the camouflage site: {recorded:?}"
     );
 }
@@ -2600,10 +2621,7 @@ async fn a_case_folded_server_name_is_not_the_advertised_one() {
     let binary = oracle_binary().unwrap_or_else(|reason| {
         panic!("the oracle comparison cannot run: {reason}");
     });
-    eprintln!(
-        "oracle: {} (REALITY server names)",
-        oracle_version(&binary)
-    );
+    eprintln!("oracle: {} (REALITY server names)", oracle_version(&binary));
     xray_client_to_zray_reality_server_with(
         &binary,
         "tcp",

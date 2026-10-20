@@ -94,8 +94,8 @@ impl NaiveStream {
             }
             other => format!("{}:{}", other.host_string(), destination.port),
         };
-        let token = base64::engine::general_purpose::STANDARD
-            .encode(format!("{username}:{password}"));
+        let token =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
         let mut request = http::Request::builder()
             .method(http::Method::CONNECT)
             // Authority form (`host:port`): HTTP/2 carries it as
@@ -208,7 +208,9 @@ fn padding_header_value() -> String {
     use rand::Rng as _;
     let mut rng = rand::thread_rng();
     let len = rng.gen_range(16..=32);
-    (0..len).map(|_| char::from(rng.gen_range(b'!'..=b'~'))).collect()
+    (0..len)
+        .map(|_| char::from(rng.gen_range(b'!'..=b'~')))
+        .collect()
 }
 
 /// Bring up a NaiveProxy tunnel over `secured` (a TLS stream whose ALPN
@@ -357,20 +359,14 @@ impl AsyncWrite for NaiveStream {
         Poll::Ready(Ok(take))
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.drive(cx) {
             Ok(()) => Poll::Ready(Ok(())),
             Err(error) => Poll::Ready(Err(error)),
         }
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         // Half-close: an empty DATA frame with END_STREAM. A closed send
         // side is not an error here — the caller is done either way.
         let _ = self.send.send_data(Bytes::new(), true);

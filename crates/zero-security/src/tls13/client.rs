@@ -1592,7 +1592,8 @@ mod tests {
             for _ in 0..32 {
                 seal.seal_empty_into(69, &mut wire).unwrap();
             }
-            seal.seal_into(&[round], CONTENT_APPDATA, &mut wire).unwrap();
+            seal.seal_into(&[round], CONTENT_APPDATA, &mut wire)
+                .unwrap();
         }
         peer.write_all(&wire).await.unwrap();
         let mut got = [0u8; 1];

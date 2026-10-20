@@ -110,7 +110,9 @@ impl InProcessServer {
                 .await
                 {
                     Ok(learned) => {
-                        params.post_handshake.set_flight(server_name, &learned.flight);
+                        params
+                            .post_handshake
+                            .set_flight(server_name, &learned.flight);
                         params
                             .post_handshake
                             .set(server_name, &learned.post_handshake);
@@ -153,7 +155,8 @@ impl InProcessServer {
                     let rejected = Arc::clone(&rejected);
                     let complaints = Arc::clone(&complaints);
                     tokio::spawn(async move {
-                        let complaint = match reality::handshake_or_fallback(stream, &params).await {
+                        let complaint = match reality::handshake_or_fallback(stream, &params).await
+                        {
                             HandshakeOutcome::Accepted(_stream) => {
                                 accepted.fetch_add(1, Ordering::Relaxed);
                                 None
@@ -364,10 +367,17 @@ fn zray_version(binary: &str) -> String {
         .output()
         .ok()
         .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|text| text.lines().find(|line| !line.trim().is_empty()).map(str::to_owned))
+        .and_then(|text| {
+            text.lines()
+                .find(|line| !line.trim().is_empty())
+                .map(str::to_owned)
+        })
         .unwrap_or_else(|| "unknown".into())
 }
 
 fn zray_version_crate() -> String {
-    format!("reality {} (crate in this build)", env!("CARGO_PKG_VERSION"))
+    format!(
+        "reality {} (crate in this build)",
+        env!("CARGO_PKG_VERSION")
+    )
 }
