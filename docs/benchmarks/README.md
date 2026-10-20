@@ -3,6 +3,12 @@
 The charts in the main README come from this harness. Everything needed to
 reproduce them is in [`harness/`](harness).
 
+The **server** side of REALITY has its own benchmark, in
+[`reality-handshake.md`](reality-handshake.md): one REALITY handshake at a time
+against the official Xray binary and against `zray run`, with the same Zray
+client driving both, server CPU read from `/proc`, and the flight-size
+difference between the two designs reported next to the numbers.
+
 ## Setup
 
 - **Xray-core** v26.3.27 (official `Xray-linux-64` release build) against

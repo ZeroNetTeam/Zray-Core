@@ -27,6 +27,9 @@ members = [
     # What a proxied page load looks like from outside the tunnel: packet
     # sizes and directions, scored the way a traffic classifier would.
     "bench/shape",
+    # What one REALITY handshake costs the server: the official Xray binary
+    # against this workspace's server, with the same client on both.
+    "bench/reality-handshake",
 ]
 
 [workspace.package]
