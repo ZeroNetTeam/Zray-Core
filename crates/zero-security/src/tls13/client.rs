@@ -31,8 +31,8 @@ use super::kdf::{
     next_traffic_secret, Transcript,
 };
 use super::record::{
-    parse_header, record_header, RecordCrypter, CONTENT_ALERT, CONTENT_APPDATA, CONTENT_CCS,
-    CONTENT_HANDSHAKE, DUMMY_CCS,
+    check_cleartext_body, parse_header, record_header, RecordCrypter, CONTENT_ALERT,
+    CONTENT_APPDATA, CONTENT_CCS, CONTENT_HANDSHAKE, DUMMY_CCS,
 };
 use super::{malformed, CipherSuite, MAX_PLAINTEXT};
 
@@ -366,6 +366,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut message: Vec<u8> = Vec::new();
+    // One record buffer for the whole call: before the ServerHello every
+    // record is cleartext and at most one plaintext long, so the buffer grows
+    // to that once and is reused. Allocating per record would put a
+    // peer-sized allocation on the read path for nothing.
+    let mut body: Vec<u8> = Vec::new();
     let mut guard = 0u64;
     loop {
         let mut header = [0u8; 5];
@@ -373,8 +378,11 @@ where
             .await
             .map_err(|e| classify_eof(e, "waiting for ServerHello"))?;
         let (ctype, len) = parse_header(&header)?;
+        // Nothing here is protected yet: the body is plaintext, and Go fails
+        // one longer than a plaintext (`RL/conn.go:725-727`).
+        check_cleartext_body(len)?;
 
-        let mut body = vec![0u8; len];
+        body.resize(len, 0);
         match ctype {
             CONTENT_HANDSHAKE => {
                 io.read_exact(&mut body)
@@ -438,14 +446,24 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut guard = 0u64;
+    // One buffer for the whole call, reused per record: the record a peer
+    // declares can be thousands of bytes, and a read path that allocates one
+    // per record hands it that memory each time.
+    let mut body: Vec<u8> = Vec::new();
     loop {
         let mut header = [0u8; 5];
         io.read_exact(&mut header)
             .await
             .map_err(|e| classify_eof(e, "waiting for encrypted flight"))?;
         let (ctype, len) = parse_header(&header)?;
+        if ctype != CONTENT_APPDATA {
+            // Not protected, so the body is plaintext and Go's narrower bound
+            // applies (`RL/conn.go:725-727`). The protected case is checked
+            // inside `open_in_place`, at the TLS 1.3 ciphertext bound.
+            check_cleartext_body(len)?;
+        }
 
-        let mut body = vec![0u8; len];
+        body.resize(len, 0);
         io.read_exact(&mut body)
             .await
             .map_err(|e| classify_eof(e, "reading encrypted flight"))?;
@@ -689,6 +707,32 @@ fn read_u24(buf: &[u8], at: usize) -> Result<usize, Failure> {
 /// plaintext until the socket drains: four full records.
 const OUTGOING_HIGH_WATER: usize = 4 * (MAX_PLAINTEXT + 5 + 1 + 16);
 
+/// How many consecutive records that advance nothing a peer may send before
+/// the connection is dead: Go's `maxUselessRecords` (`RL/common.go:70`),
+/// enforced by `retryReadRecord` (`RL/conn.go:827-839`), which closes with
+/// `alertUnexpectedMessage` and "tls: too many ignored records" on the
+/// thirty-third. The run is *consecutive*: `readRecordOrCCS` resets the count
+/// as soon as a record carries data (`RL/conn.go:734-737`), which is what
+/// makes this a shape a real peer can rely on — a session that keeps making
+/// progress may idle as long as it likes, while one that only emits
+/// placeholders is bounded.
+///
+/// Go learns the number from the camouflage site and may raise it
+/// (`RL/tls.go:404-428`); the port has no probe for that, so it uses the
+/// default every real site with Go's TLS stack answers with.
+pub const MAX_USELESS_RECORDS: u64 = 32;
+
+/// The record that trips [`MAX_USELESS_RECORDS`], as a failure a caller can
+/// name rather than one more `malformed`.
+fn too_many_useless_records() -> Failure {
+    Failure::new(FailureKind::TlsAlert, Stage::TlsStarted)
+        .with_confidence(Confidence::Confirmed)
+        .with_detail(format!(
+            "peer sent more than {MAX_USELESS_RECORDS} consecutive non-advancing records \
+             (Go: alertUnexpectedMessage, \"tls: too many ignored records\")"
+        ))
+}
+
 /// Plaintext of the record at the head of `wire`, as offsets into it.
 /// `frame_len == 0` means no record is pending.
 #[derive(Debug, Clone, Copy, Default)]
@@ -724,8 +768,10 @@ pub struct Tls13Stream<S> {
     /// response from exposing request bytes that are still being written.
     direct_read: bool,
     direct_write: bool,
-    /// Consecutive empty app-data records consumed — bounds ticket mimicry.
-    empty_records: u64,
+    /// Consecutive records that advanced nothing: warning alerts, empty
+    /// application data, change_cipher_spec. Reset by any record that does
+    /// advance the stream; fatal past [`MAX_USELESS_RECORDS`].
+    useless_records: u64,
 }
 
 impl<S> Tls13Stream<S> {
@@ -749,7 +795,7 @@ impl<S> Tls13Stream<S> {
             close_sent: false,
             direct_read: false,
             direct_write: false,
-            empty_records: 0,
+            useless_records: 0,
         }
     }
 
@@ -803,11 +849,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
             if self.wire.len() < 5 + len {
                 return Ok(true);
             }
+            if ctype != CONTENT_APPDATA {
+                // After the handshake the only protected type is
+                // application_data; a change_cipher_spec or a cleartext alert
+                // is plaintext on the wire, so Go's `maxPlaintext` bound
+                // applies to its body (`RL/conn.go:725-727`).
+                check_cleartext_body(len)?;
+            }
             let mut header = [0u8; 5];
             header.copy_from_slice(&self.wire[..5]);
 
             match ctype {
-                CONTENT_CCS => self.wire.advance(5 + len), // dummy: ignore, any time
+                CONTENT_CCS => {
+                    // A compatibility change_cipher_spec is legal but useless;
+                    // Go counts one that arrives during a TLS 1.3 handshake
+                    // against `MaxUselessRecords` (`RL/conn.go:793-795`) and
+                    // refuses one after the handshake outright
+                    // (`:796-798`). This stream stays tolerant of a stray CCS
+                    // — REALITY's own peers can emit them — but a run of them
+                    // is exactly the shape the counter exists to bound.
+                    self.count_useless_record()?;
+                    self.wire.advance(5 + len);
+                }
                 CONTENT_ALERT => {
                     let close_notify = self.wire.get(5 + 1) == Some(&0) && len >= 2;
                     if close_notify {
@@ -832,15 +895,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
                         CONTENT_APPDATA => {
                             if pt_len == 0 {
                                 // REALITY ticket-mimicry: validly encrypted
-                                // empty records. Bounded tolerance.
-                                self.empty_records += 1;
-                                if self.empty_records > 256 {
-                                    return Err(malformed(
-                                        "peer sent an implausible run of empty records",
-                                    ));
-                                }
+                                // empty records. Go counts these against
+                                // `MaxUselessRecords` too (`RL/conn.go:803-811`),
+                                // so the count *is* the old "ticket mimicry"
+                                // bound: 32 consecutive ones is fewer than the
+                                // 256 the port used to allow, and any run long
+                                // enough for the old bound to matter trips this
+                                // one first.
+                                self.count_useless_record()?;
                             } else {
-                                self.empty_records = 0;
+                                // The record advanced the stream; the run a
+                                // peer may spend on placeholders starts over.
+                                self.useless_records = 0;
                                 self.plain = PlainFrame {
                                     pos: payload_range.start,
                                     end: payload_range.end,
@@ -858,6 +924,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
                             return Err(alert_failure(payload));
                         }
                         CONTENT_HANDSHAKE => {
+                            // A post-handshake message carries data, so Go's
+                            // `readRecordOrCCS` resets the count on the record
+                            // before `handlePostHandshakeMessage` even looks
+                            // at what it is (`RL/conn.go:734-737`).
+                            self.useless_records = 0;
                             let payload = self.wire[payload_range].to_vec();
                             self.handle_post_handshake_messages(&payload)?;
                         }
@@ -881,6 +952,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
                 _ => return Err(malformed(format!("unexpected record type {ctype:#04x}"))),
             }
         }
+    }
+
+    /// One more record that advanced nothing, and the connection dies on the
+    /// thirty-third consecutive one. Go's `retryReadRecord` (`RL/conn.go:827-839`):
+    /// `retryCount++`, then `alertUnexpectedMessage` and "tls: too many
+    /// ignored records" once the count passes `MaxUselessRecords`. The alert
+    /// itself is not sendable here — the record layer has no way to report a
+    /// warning without ending the stream — so the closure is the failure.
+    fn count_useless_record(&mut self) -> Result<(), Failure> {
+        self.useless_records += 1;
+        if self.useless_records > MAX_USELESS_RECORDS {
+            return Err(too_many_useless_records());
+        }
+        Ok(())
     }
 
     /// Post-handshake handshake messages: session tickets are ignored,
@@ -1422,5 +1507,98 @@ mod tests {
         let mut header = [0u8; 5];
         peer.read_exact(&mut header).await.unwrap();
         assert_eq!(&header[..3], &[CONTENT_APPDATA, 0x03, 0x03]);
+    }
+
+    /// One side of a stream whose peer seals with `peer_secrets`, and the wire
+    /// the peer writes. Both ends are the same key material, so the stream
+    /// opens what the tests seal.
+    fn stream_and_sealer(
+        suite: CipherSuite,
+    ) -> (
+        tokio::io::DuplexStream,
+        Tls13Stream<tokio::io::DuplexStream>,
+        RecordCrypter,
+    ) {
+        let (peer, io) = tokio::io::duplex(64 * 1024);
+        let stream = Tls13Stream::new(io, suite, vec![1; 32], vec![2; 32]);
+        // The stream reads with the *server* application secret.
+        (peer, stream, RecordCrypter::new(suite, &[1; 32]))
+    }
+
+    /// Go's `maxUselessRecords` is 32 consecutive non-advancing records, and
+    /// the thirty-third closes the connection (`RL/common.go:70`,
+    /// `RL/conn.go:827-839`). The port tolerated 256 consecutive empty records
+    /// and counted a change_cipher_spec at all, so a peer could keep a
+    /// connection alive for an unbounded number of records that advanced
+    /// nothing — the shape a censor measures against the site the server
+    /// claims to be, since Go's REALITY copies its decoy's own tolerance.
+    #[tokio::test]
+    async fn thirty_two_consecutive_useless_records_are_the_limit() {
+        let suite = CipherSuite::TLS_AES_128_GCM_SHA256;
+        // The bound is Go's number and nothing else, so the counts below are
+        // written out rather than taken from the constant they check.
+        assert_eq!(MAX_USELESS_RECORDS, 32);
+
+        // Exactly Go's allowance, then real data: tolerated.
+        let (mut peer, mut stream, mut seal) = stream_and_sealer(suite);
+        let mut wire = Vec::new();
+        for _ in 0..32 {
+            seal.seal_empty_into(69, &mut wire).unwrap();
+        }
+        seal.seal_into(b"live", CONTENT_APPDATA, &mut wire).unwrap();
+        peer.write_all(&wire).await.unwrap();
+        let mut got = [0u8; 4];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"live");
+
+        // One more than the allowance is fatal, and it is a failure the caller
+        // can name rather than a dropped connection.
+        let (mut peer, mut stream, mut seal) = stream_and_sealer(suite);
+        let mut wire = Vec::new();
+        for _ in 0..33 {
+            seal.seal_empty_into(69, &mut wire).unwrap();
+        }
+        seal.seal_into(b"live", CONTENT_APPDATA, &mut wire).unwrap();
+        peer.write_all(&wire).await.unwrap();
+        let error = stream.read(&mut [0u8; 4]).await.unwrap_err();
+        assert_eq!(error.to_string(), too_many_useless_records().to_string());
+
+        // A change_cipher_spec advances nothing either, so a run of them is
+        // the same failure — the port ignored them without counting at all.
+        let (mut peer, mut stream, _) = stream_and_sealer(suite);
+        let mut wire = Vec::new();
+        for _ in 0..33 {
+            wire.extend_from_slice(&DUMMY_CCS);
+        }
+        let mut trailing = RecordCrypter::new(suite, &[1; 32]);
+        trailing
+            .seal_into(b"live", CONTENT_APPDATA, &mut wire)
+            .unwrap();
+        peer.write_all(&wire).await.unwrap();
+        let error = stream.read(&mut [0u8; 4]).await.unwrap_err();
+        assert_eq!(error.to_string(), too_many_useless_records().to_string());
+    }
+
+    /// The bound is on a *consecutive* run: Go resets `retryCount` on any
+    /// record that carries data (`RL/conn.go:734-737`), so a long-lived flow
+    /// that keeps making progress is never closed, however many keepalive
+    /// probes it spends in between. A total counter would fail here.
+    #[tokio::test]
+    async fn a_record_that_advances_the_stream_resets_the_run() {
+        let suite = CipherSuite::TLS_AES_128_GCM_SHA256;
+        let (mut peer, mut stream, mut seal) = stream_and_sealer(suite);
+        let mut wire = Vec::new();
+        for round in 0..4u8 {
+            for _ in 0..32 {
+                seal.seal_empty_into(69, &mut wire).unwrap();
+            }
+            seal.seal_into(&[round], CONTENT_APPDATA, &mut wire).unwrap();
+        }
+        peer.write_all(&wire).await.unwrap();
+        let mut got = [0u8; 1];
+        for round in 0..4u8 {
+            stream.read_exact(&mut got).await.unwrap();
+            assert_eq!(got[0], round, "128 useless records between four writes");
+        }
     }
 }

@@ -745,6 +745,31 @@ async fn xray_client_to_zray_reality_server_with(
     server_extra: Value,
     expect_through: bool,
 ) {
+    xray_client_to_zray_reality_server_with_client(
+        binary,
+        carrier,
+        flow,
+        mldsa,
+        server_extra,
+        json!({}),
+        expect_through,
+    )
+    .await
+}
+
+/// The same again, with `client_extra` merged into the Xray client's REALITY
+/// settings. An official client decides the shape of its ClientHello from
+/// `fingerprint` and the name it announces from `serverName`, so the two
+/// variants of the same client config are what a server-side parity test needs.
+async fn xray_client_to_zray_reality_server_with_client(
+    binary: &str,
+    carrier: &str,
+    flow: Option<&str>,
+    mldsa: Option<&(String, String)>,
+    server_extra: Value,
+    client_extra: Value,
+    expect_through: bool,
+) {
     let echo = echo_service().await;
     let relay_port = free_port();
     let socks_port = free_port();
@@ -778,6 +803,9 @@ async fn xray_client_to_zray_reality_server_with(
     }
     for (key, value) in server_extra.as_object().into_iter().flatten() {
         zray_stream["realitySettings"][key] = value.clone();
+    }
+    for (key, value) in client_extra.as_object().into_iter().flatten() {
+        oracle_stream["realitySettings"][key] = value.clone();
     }
 
     spawn_zray(json!({
@@ -2150,5 +2178,234 @@ async fn the_reality_server_limits_hold_against_the_oracles_client() {
         json!({"maxClientVer": "1.0.0"}),
     ] {
         xray_client_to_zray_reality_server_with(&binary, "tcp", None, None, extra, false).await;
+    }
+}
+
+/// The server name is matched exactly, as Go's `config.ServerNames[...]` map
+/// lookup matches it (`RL/tls.go:211`).
+///
+/// The client announces `www.googletagmanager.com`; the server is configured
+/// with the same name in upper case. Go does not match it, so the visitor is
+/// relayed to the camouflage site and the tunnel never comes up. A port that
+/// folds case authenticates it instead — accepting a spelling it does not
+/// advertise is exactly the fingerprint a prober enumerates, which is why the
+/// exact-match rule is worth a differential test rather than a unit test. The
+/// second half is the control: the same server config with the name in the
+/// case the client sends gets the client through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn a_case_folded_server_name_is_not_the_advertised_one() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!(
+        "oracle: {} (REALITY server names)",
+        oracle_version(&binary)
+    );
+    xray_client_to_zray_reality_server_with(
+        &binary,
+        "tcp",
+        None,
+        None,
+        json!({"serverNames": [REALITY_SNI.to_uppercase()]}),
+        false,
+    )
+    .await;
+    xray_client_to_zray_reality_server_with(
+        &binary,
+        "tcp",
+        None,
+        None,
+        json!({"serverNames": [REALITY_SNI]}),
+        true,
+    )
+    .await;
+}
+
+/// Whatever ClientHello an official Xray client builds, the Zray server has to
+/// settle on TLS 1.3 from its `supported_versions` before it derives anything
+/// (`RL/tls.go:211` with `RL/handshake_server.go:180-196`).
+///
+/// The negative case — a hello that offers a TLS 1.3 cipher suite but no
+/// `supported_versions: 0x0304` — cannot be produced by an official client:
+/// every uTLS preset Xray knows emits the extension whenever it offers TLS 1.3
+/// (`SetTLSVers` adds it from `TLSVersMax`), and the fingerprints that do not
+/// offer TLS 1.3 offer no TLS 1.3 suite either. So this test pins the other
+/// half against real hellos: the extension parser has to read each shape the
+/// official client really sends. A parser that missed or mis-read the
+/// extension would send every one of these clients to the decoy; the old
+/// behaviour — no check at all — is the crafted-hello test in
+/// `crates/reality/src/server.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn every_official_client_hello_shape_still_offers_tls13() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!(
+        "oracle: {} (REALITY client fingerprints)",
+        oracle_version(&binary)
+    );
+    for fingerprint in ["chrome", "firefox", "edge"] {
+        xray_client_to_zray_reality_server_with_client(
+            &binary,
+            "tcp",
+            None,
+            None,
+            json!({}),
+            json!({"fingerprint": fingerprint}),
+            true,
+        )
+        .await;
+    }
+}
+
+/// What a REALITY server did with one hand-built first record.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum IntakeAnswer {
+    /// The decoy answered: the record was relayed, as REALITY relays every
+    /// visitor that does not authenticate.
+    Decoy,
+    /// The server started its own TLS 1.3 handshake, which for these records
+    /// would mean it took them for a REALITY ClientHello.
+    ServerHello,
+    /// Anything else, with the first byte that came back.
+    Other(u8),
+    /// The peer closed without a byte.
+    Closed,
+}
+
+/// Write one hand-built first record at a REALITY inbound and classify the
+/// answer. The decoy is an official Xray TLS server, so an alert here is the
+/// decoy's, i.e. proof that the port relayed the connection rather than
+/// authenticating it.
+async fn probe_reality_intake(address: SocketAddr, record: &[u8]) -> IntakeAnswer {
+    let mut stream = match TcpStream::connect(address).await {
+        Ok(stream) => stream,
+        Err(error) => panic!("could not reach {address}: {error}"),
+    };
+    stream.write_all(record).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut header = [0u8; 5];
+    match tokio::time::timeout(Duration::from_secs(8), stream.read_exact(&mut header)).await {
+        Ok(Ok(_)) => match header[0] {
+            // 0x15 = alert, 0x16 = handshake: the decoy's TLS server answers a
+            // record it will not parse with a fatal alert.
+            0x15 => IntakeAnswer::Decoy,
+            0x16 => IntakeAnswer::ServerHello,
+            other => IntakeAnswer::Other(other),
+        },
+        Ok(Err(_)) => IntakeAnswer::Closed,
+        Err(_) => IntakeAnswer::Closed,
+    }
+}
+
+/// Go reads the first record of a connection under `maxCiphertext =
+/// 16384 + 2048` (`RL/common.go:64-66`, `RL/conn.go:707-711`) and then fails a
+/// cleartext body longer than one plaintext (`:725-727`) — and REALITY's
+/// answer to any such error is the fallback, with the record's bytes already
+/// on their way to the target. The port's substrate refused anything over
+/// 16640 at the header and enforced neither of Go's content bounds, so this
+/// pins the sizes at the edge of the limit against the official server: both
+/// must relay, and neither may answer with a REALITY handshake.
+///
+/// The peer here is a raw socket rather than an official client, and that is
+/// not a shortcut: Go's writer splits a ClientHello at 16384 bytes and its
+/// reader fails a cleartext body past that, so no official client — Xray's
+/// included — can put a record this large on the wire. The official half of
+/// the comparison is the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn the_record_size_limit_is_the_oracles_at_the_edges() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!("oracle: {} (REALITY record limit)", oracle_version(&binary));
+    let (private_key, _) = oracle_x25519_keypair(&binary);
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the REALITY decoy never listened");
+
+    let oracle_port = free_port();
+    let _oracle = spawn_oracle(
+        &binary,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "relay-in",
+                "listen": "127.0.0.1",
+                "port": oracle_port,
+                "protocol": "vless",
+                "settings": {"clients": [{"id": UUID}], "decryption": "none"},
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": reality_server_settings(&private_key, decoy),
+                },
+            }],
+            "outbounds": [oracle_loopback_freedom()],
+        }),
+    );
+
+    let zray_port = free_port();
+    spawn_zray(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "relay-in",
+            "listen": "127.0.0.1",
+            "port": zray_port,
+            "protocol": "vless",
+            "settings": {"clients": [{"id": UUID}], "decryption": "none"},
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": reality_server_settings(&private_key, decoy),
+            },
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }));
+
+    for port in [oracle_port, zray_port] {
+        assert!(
+            wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), port)).await,
+            "a REALITY server never listened on {port}"
+        );
+    }
+
+    // A record at Go's pre-negotiation bound, and one byte past it: Go reads
+    // the first and refuses it as a cleartext record, refuses the second at
+    // the header, and relays both. Neither may look like a REALITY handshake:
+    // that is what a port which authenticated an oversized record would do.
+    let mut cases: Vec<Vec<u8>> = Vec::new();
+    for body in [16384 + 2048, 16384 + 2048 + 1] {
+        let mut record = vec![0x16, 0x03, 0x03];
+        record.extend_from_slice(&(body as u16).to_be_bytes());
+        record.resize(5 + body, 0);
+        cases.push(record);
+    }
+    // A small record of the same shape: the control that says a relayed
+    // connection really is answered by the decoy through this harness.
+    let mut small = vec![0x16, 0x03, 0x03, 0x00, 0x10];
+    small.resize(5 + 16, 0);
+    cases.push(small);
+
+    for record in cases {
+        let official = probe_reality_intake(
+            SocketAddr::new("127.0.0.1".parse().unwrap(), oracle_port),
+            &record,
+        )
+        .await;
+        let port = probe_reality_intake(
+            SocketAddr::new("127.0.0.1".parse().unwrap(), zray_port),
+            &record,
+        )
+        .await;
+        assert_eq!(
+            (official, port),
+            (IntakeAnswer::Decoy, IntakeAnswer::Decoy),
+            "a {} -byte first record: the official server answered {official:?}",
+            record.len()
+        );
     }
 }

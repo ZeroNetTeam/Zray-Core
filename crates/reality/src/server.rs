@@ -26,8 +26,8 @@ use zero_security::tls13::kdf::{
     establish_application_secrets, establish_handshake_secrets, finished_verify_data, Transcript,
 };
 use zero_security::tls13::record::{
-    parse_header, record_header, RecordCrypter, CONTENT_APPDATA, CONTENT_CCS, CONTENT_HANDSHAKE,
-    DUMMY_CCS,
+    check_cleartext_body, parse_header, record_header, RecordCrypter, CONTENT_APPDATA, CONTENT_CCS,
+    CONTENT_HANDSHAKE, DUMMY_CCS,
 };
 use zero_security::tls13::{CipherSuite, Tls13Stream};
 
@@ -187,10 +187,16 @@ where
             }
         }
     };
+    // The server name is compared exactly, as sent: Go's gate is a plain
+    // `config.ServerNames[hs.clientHello.serverName]` map lookup
+    // (`RL/tls.go:211`), so a hello naming `Example.com` does not match a
+    // configured `example.com` and is answered by the camouflage site. A server
+    // that accepts a spelling it does not advertise is a fingerprint, and
+    // widening the accepted set is exactly the direction a prober can measure.
     if !params
         .server_names
         .iter()
-        .any(|name| name.eq_ignore_ascii_case(&hello.sni))
+        .any(|name| name.as_ref() == hello.sni.as_str())
     {
         return HandshakeOutcome::Fallback {
             stream: io,
@@ -229,6 +235,19 @@ where
                 }
             }
         };
+    // The gates are asked in Go's order (`RL/tls.go:257-262`): the seal above,
+    // then `MinClientVer` / `MaxClientVer`, then `MaxTimeDiff`, then the
+    // shortId. Every one of them fails into the same silent fallback, so the
+    // order is only visible in which refusal a probe that fails several earns
+    // — and a server that named the selector before the version would be
+    // answering about a hello Go had already sent to the site.
+    if let Err(failure) = check_client_limits(params, &plaintext) {
+        return HandshakeOutcome::Fallback {
+            stream: io,
+            client_hello,
+            failure,
+        };
+    }
     // Fold over every configured id without short-circuiting: the shortId is
     // the actual secret gate (anyone with the public key can produce a valid
     // seal), so its comparison must not leak through timing.
@@ -240,13 +259,6 @@ where
             stream: io,
             client_hello,
             failure: reality_error("REALITY shortId is not authorised"),
-        };
-    }
-    if let Err(failure) = check_client_limits(params, &plaintext) {
-        return HandshakeOutcome::Fallback {
-            stream: io,
-            client_hello,
-            failure,
         };
     }
 
@@ -478,7 +490,7 @@ where
             .map_err(|error| Failure::from_io(&error, Stage::TlsStarted))?;
         record.extend_from_slice(&header);
         let length = match parse_header(&header) {
-            Ok((zero_security::tls13::record::CONTENT_HANDSHAKE, length)) => length,
+            Ok((CONTENT_HANDSHAKE, length)) => length,
             Ok(_) => {
                 return Ok(ClientHelloRead::NotTls {
                     consumed: record,
@@ -492,12 +504,26 @@ where
                 })
             }
         };
+        // The record is cleartext, so its body is the plaintext, and Go reads
+        // it before failing a body longer than one plaintext
+        // (`len(data) > maxPlaintext`, `RL/conn.go:725-727`) — by which time
+        // the record has already been mirrored to the target. REALITY's answer
+        // to that error is the fallback, so the whole record is handed back
+        // for replay here rather than refused at the header. The wider
+        // `parse_header` bound covers what a pre-1.3 *ciphertext* may be; it
+        // is not what a ClientHello record may be.
         let body_at = record.len();
         record.resize(body_at + length, 0);
         io.read_exact(&mut record[body_at..])
             .await
             .map_err(|error| Failure::from_io(&error, Stage::TlsStarted))?;
         message.extend_from_slice(&record[body_at..]);
+        if let Err(failure) = check_cleartext_body(length) {
+            return Ok(ClientHelloRead::NotTls {
+                consumed: record,
+                failure,
+            });
+        }
         if length == 0 {
             // RFC 8446 §5.1 forbids empty handshake fragments.
             return Ok(ClientHelloRead::NotTls {
@@ -578,8 +604,9 @@ fn parse_client_hello(message: Vec<u8>) -> Result<ClientHelloInfo, Failure> {
         return Err(reality_error("ClientHello extensions are truncated"));
     }
     let mut sni = None;
-    let mut auth_key_share = None;
+    let mut standalone_x25519 = None;
     let mut hybrid = None;
+    let mut tls13_offered = false;
     while at + 4 <= end {
         let typ = u16::from_be_bytes([message[at], message[at + 1]]);
         let len = u16::from_be_bytes([message[at + 2], message[at + 3]]) as usize;
@@ -590,22 +617,67 @@ fn parse_client_hello(message: Vec<u8>) -> Result<ClientHelloInfo, Failure> {
         at += len;
         if typ == 0 {
             sni = parse_sni(body);
+        } else if typ == 43 {
+            tls13_offered |= offers_tls13(body);
         } else if typ == 51 {
             let (x25519, parsed_hybrid) = parse_key_shares(body);
-            auth_key_share = x25519;
-            hybrid = parsed_hybrid;
+            // Every `key_share` extension is read, and the *first* acceptable
+            // share of each group is the one that counts (Go appends the
+            // shares of all of them and then breaks on the first match,
+            // `RL/tls.go:214-228`). Letting a later extension displace an
+            // earlier one would authenticate against a different point than
+            // Go does — and only one of the two would accept the seal.
+            standalone_x25519 = standalone_x25519.or(x25519);
+            hybrid = hybrid.or(parsed_hybrid);
         }
     }
+    // Go derives nothing until the hello has negotiated TLS 1.3: REALITY's own
+    // gate is `hs.c.vers != VersionTLS13` (`RL/tls.go:211`), and that version
+    // comes from `mutualVersion` over `supported_versions`
+    // (`RL/handshake_server.go:180-196`). A hello offering a TLS 1.3 suite but
+    // no `supported_versions: 0x0304` is not TLS 1.3 to Go and is answered by
+    // the camouflage site, never by a wire error.
+    if !tls13_offered {
+        return Err(reality_error(
+            "ClientHello does not offer TLS 1.3 in supported_versions",
+        ));
+    }
+    // "Secondary choice: X25519 in X25519MLKEM768" (`RL/tls.go:221-228`): a
+    // hello that offers only the hybrid still authenticates, against the key
+    // inside it. Go's two loops run over every share it collected, so a
+    // standalone share anywhere wins over any hybrid's half.
+    let auth_key_share = standalone_x25519
+        .or_else(|| hybrid.as_ref().map(|share| share.x25519))
+        .ok_or_else(|| reality_error("ClientHello has no X25519 key share"))?;
     Ok(ClientHelloInfo {
         message,
         random,
         session_id,
-        auth_key_share: auth_key_share
-            .ok_or_else(|| reality_error("ClientHello has no X25519 key share"))?,
+        auth_key_share,
         hybrid,
         sni: sni.ok_or_else(|| reality_error("ClientHello has no SNI"))?,
         suite,
     })
+}
+
+/// Does this `supported_versions` body offer TLS 1.3?
+///
+/// RFC 8446 §4.2.1: in a ClientHello the body is a one-byte list length and
+/// then that many two-byte versions. Anything malformed simply does not offer
+/// it, which is Go's outcome too — no mutual version, no REALITY.
+fn offers_tls13(body: &[u8]) -> bool {
+    let Some(&list_len) = body.first() else {
+        return false;
+    };
+    let list = &body[1..];
+    let list_len = usize::from(list_len);
+    if list.len() < list_len {
+        return false;
+    }
+    let (versions, _) = list[..list_len].as_chunks::<2>();
+    versions
+        .iter()
+        .any(|version| u16::from_be_bytes(*version) == 0x0304)
 }
 
 fn take2(buf: &[u8], at: usize, what: &'static str) -> Result<[u8; 2], Failure> {
@@ -634,6 +706,13 @@ fn parse_sni(body: &[u8]) -> Option<String> {
 /// Both are returned because REALITY uses them for different things: the tag
 /// is authenticated against the standalone share when there is one, while the
 /// TLS handshake secret comes from whichever group the server selects.
+///
+/// A group offered twice keeps its **first** share, like Go: both of its
+/// scans `break` on the first acceptable entry (`RL/tls.go:214-228`), so the
+/// last duplicate is never looked at. RFC 8446 §4.2.8 forbids the duplicate,
+/// so no honest client reaches the difference — a probe can, and the two
+/// implementations would otherwise derive different auth keys from the same
+/// hello and only one would accept.
 fn parse_key_shares(body: &[u8]) -> (Option<[u8; 32]>, Option<HybridShare>) {
     if body.len() < 2 {
         return (None, None);
@@ -650,9 +729,9 @@ fn parse_key_shares(body: &[u8]) -> (Option<[u8; 32]>, Option<HybridShare>) {
             Some(share) => share,
             None => break,
         };
-        if group == 0x001d && len == 32 {
+        if group == 0x001d && len == 32 && x25519.is_none() {
             x25519 = share.try_into().ok();
-        } else if group == 0x11ec && len == 1216 {
+        } else if group == 0x11ec && len == 1216 && hybrid.is_none() {
             if let Ok(tail) = share[1184..].try_into() {
                 hybrid = Some(HybridShare {
                     mlkem_key: share[..1184].to_vec(),
@@ -661,13 +740,6 @@ fn parse_key_shares(body: &[u8]) -> (Option<[u8; 32]>, Option<HybridShare>) {
             }
         }
         at += len;
-    }
-    // "Secondary choice: X25519 in X25519MLKEM768" — a hello that offers only
-    // the hybrid still authenticates, against the key inside it.
-    if x25519.is_none() {
-        if let Some(share) = hybrid.as_ref() {
-            x25519 = Some(share.x25519);
-        }
     }
     (x25519, hybrid)
 }
@@ -756,13 +828,23 @@ where
     S: AsyncRead + Unpin,
 {
     let mut crypter = RecordCrypter::new(suite, secret);
+    // One record buffer for the whole loop: the peer chooses the length in
+    // the header, so allocating a fresh `vec![0u8; len]` per record hands it
+    // an allocation of its own choosing on every iteration.
+    let mut body: Vec<u8> = Vec::new();
     loop {
         let mut header = [0u8; 5];
         io.read_exact(&mut header)
             .await
             .map_err(|error| Failure::from_io(&error, Stage::TlsStarted))?;
         let (kind, len) = parse_header(&header)?;
-        let mut body = vec![0u8; len];
+        if kind != CONTENT_APPDATA {
+            // A change_cipher_spec or alert here is cleartext, and Go fails a
+            // cleartext record longer than a plaintext (`RL/conn.go:725-727`).
+            // A protected record is bounded inside `open_in_place`.
+            check_cleartext_body(len)?;
+        }
+        body.resize(len, 0);
         io.read_exact(&mut body)
             .await
             .map_err(|error| Failure::from_io(&error, Stage::TlsStarted))?;
@@ -776,8 +858,7 @@ where
             return Err(reality_error("client Finished is not encrypted"));
         }
         let (inner_type, plaintext_len) = crypter.open_in_place(&header, &mut body)?;
-        body.truncate(plaintext_len);
-        let plaintext = body;
+        let plaintext = &body[..plaintext_len];
         if inner_type != CONTENT_HANDSHAKE || plaintext.len() < 4 || plaintext[0] != 20 {
             return Err(reality_error(format!(
                 "client did not send Finished (inner={inner_type:#04x}, plaintext_len={}, first={:02x?})",
@@ -791,9 +872,7 @@ where
         if len + 4 != plaintext.len() {
             return Err(reality_error("client Finished length is invalid"));
         }
-        let mut finished = plaintext;
-        finished.drain(..4);
-        return Ok(finished);
+        return Ok(plaintext[4..].to_vec());
     }
 }
 
@@ -954,6 +1033,7 @@ fn reality_error(detail: impl Into<String>) -> Failure {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zero_security::tls13::record::MAX_CIPHERTEXT_BEFORE_TLS13;
     use zero_security::tls13::{HelloParams, PendingHello};
 
     #[tokio::test]
@@ -1295,6 +1375,384 @@ mod tests {
             HandshakeOutcome::Fallback { client_hello, .. } => assert_eq!(client_hello, expected),
             HandshakeOutcome::Accepted(_) => panic!("ordinary hello must not authenticate"),
             HandshakeOutcome::Rejected(error) => panic!("hello should be replayable: {error}"),
+        }
+    }
+
+    /// A ClientHello a test builds byte by byte and seals the way a REALITY
+    /// client seals one: ECDH against the server's static key, HKDF-SHA256
+    /// with the first 20 bytes of `random` as the salt, and AES-256-GCM over
+    /// the 16-byte version/clock/shortId block with the hello's session id
+    /// zeroed as the AAD.
+    ///
+    /// Every gate in the accept path ends the same way — the connection is
+    /// relayed to the camouflage site — so a test that only observes "it did
+    /// not get through" cannot tell one gate from a malformed hello. Building
+    /// the hello here, with a genuine seal, is what makes the gates themselves
+    /// observable.
+    struct CraftedHello {
+        sni: Option<String>,
+        /// Versions offered in `supported_versions`; `None` omits the
+        /// extension, as a pre-TLS-1.3 client would.
+        versions: Option<Vec<u16>>,
+        /// One `key_share` extension per entry, each a list of (group, share).
+        key_shares: Vec<Vec<(u16, Vec<u8>)>>,
+        suites: Vec<u16>,
+        /// The X25519 secret the seal is derived from. A share only
+        /// authenticates the hello if it is this key's public half.
+        secret: [u8; 32],
+        version: [u8; 3],
+        time: u32,
+        short_id: [u8; 8],
+    }
+
+    fn unix_now() -> u32 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() as u32)
+    }
+
+    fn x25519_public(secret: [u8; 32]) -> [u8; 32] {
+        x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret)).to_bytes()
+    }
+
+    impl CraftedHello {
+        /// A hello the server accepts as it stands: the configured name, TLS
+        /// 1.3 offered, one X25519 share, a fresh clock and the configured
+        /// shortId. Tests change one thing at a time from here.
+        fn new() -> Self {
+            let secret = [3u8; 32];
+            Self {
+                sni: Some("example.test".into()),
+                versions: Some(vec![0x0304]),
+                key_shares: vec![vec![(0x001d, x25519_public(secret).to_vec())]],
+                suites: vec![0x1301],
+                secret,
+                version: [1, 0, 0],
+                time: unix_now(),
+                short_id: [0xaa, 0xbb, 0xcc, 0xdd, 0, 0, 0, 0],
+            }
+        }
+
+        /// One `x25519` share per secret, in the order given, all in a single
+        /// `key_share` extension — a hello no honest client sends, because
+        /// RFC 8446 §4.2.8 forbids offering a group twice.
+        fn with_shares(mut self, secrets: &[[u8; 32]]) -> Self {
+            self.secret = secrets[0];
+            let shares: Vec<(u16, Vec<u8>)> = secrets
+                .iter()
+                .map(|secret| (0x001d, x25519_public(*secret).to_vec()))
+                .collect();
+            self.key_shares = vec![shares];
+            self
+        }
+
+        fn extensions(&self) -> Vec<(u16, Vec<u8>)> {
+            let mut extensions = Vec::new();
+            if let Some(sni) = &self.sni {
+                let mut body = Vec::new();
+                body.extend_from_slice(&((sni.len() + 3) as u16).to_be_bytes());
+                body.push(0);
+                body.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+                body.extend_from_slice(sni.as_bytes());
+                extensions.push((0, body));
+            }
+            if let Some(versions) = &self.versions {
+                let mut body = vec![(versions.len() * 2) as u8];
+                for version in versions {
+                    body.extend_from_slice(&version.to_be_bytes());
+                }
+                extensions.push((43, body));
+            }
+            for shares in &self.key_shares {
+                let total: usize = shares.iter().map(|(_, share)| 4 + share.len()).sum();
+                let mut body = (total as u16).to_be_bytes().to_vec();
+                for (group, share) in shares {
+                    body.extend_from_slice(&group.to_be_bytes());
+                    body.extend_from_slice(&(share.len() as u16).to_be_bytes());
+                    body.extend_from_slice(share);
+                }
+                extensions.push((51, body));
+            }
+            extensions
+        }
+
+        fn message(&self) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&[0x03, 0x03]);
+            body.extend_from_slice(&[0x11; 32]);
+            body.push(32);
+            body.extend_from_slice(&[0u8; 32]); // the seal goes here
+            body.extend_from_slice(&((self.suites.len() * 2) as u16).to_be_bytes());
+            for suite in &self.suites {
+                body.extend_from_slice(&suite.to_be_bytes());
+            }
+            body.extend_from_slice(&[1, 0]); // one compression method: null
+            let mut extensions = Vec::new();
+            for (typ, extension) in self.extensions() {
+                extensions.extend_from_slice(&typ.to_be_bytes());
+                extensions.extend_from_slice(&(extension.len() as u16).to_be_bytes());
+                extensions.extend_from_slice(&extension);
+            }
+            body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+            body.extend_from_slice(&extensions);
+            handshake_message(1, &body)
+        }
+
+        /// The sealed ClientHello message.
+        fn sealed(&self, server_public: [u8; 32]) -> Vec<u8> {
+            let mut message = self.message();
+            let random: [u8; 32] = message[6..38].try_into().unwrap();
+            let shared = x25519_dalek::x25519(self.secret, server_public);
+            let auth_key = derive_auth_key(&shared, &random[..20]);
+            let aad = zero_session_id(&message).unwrap();
+            let mut plaintext = [0u8; 16];
+            plaintext[..3].copy_from_slice(&self.version);
+            plaintext[4..8].copy_from_slice(&self.time.to_be_bytes());
+            plaintext[8..].copy_from_slice(&self.short_id);
+            let cipher = Aes256Gcm::new_from_slice(&auth_key).unwrap();
+            let sealed = cipher
+                .encrypt(
+                    Nonce::from_slice(&random[20..]),
+                    Payload {
+                        msg: &plaintext,
+                        aad: &aad,
+                    },
+                )
+                .unwrap();
+            message[39..71].copy_from_slice(&sealed);
+            message
+        }
+
+        /// The sealed message as the one handshake record the intake reads.
+        fn record(&self, server_public: [u8; 32]) -> Vec<u8> {
+            let message = self.sealed(server_public);
+            let mut record = record_header(CONTENT_HANDSHAKE, message.len()).to_vec();
+            record.extend_from_slice(&message);
+            record
+        }
+    }
+
+    /// What the server did with one crafted hello.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Intake {
+        /// The hello was left for the fallback target, refused by the gate
+        /// named here.
+        Fallback(String),
+        /// The seal opened and no gate refused it: the server answered with a
+        /// ServerHello of its own instead of relaying the connection.
+        Accepted,
+    }
+
+    /// The parameters these tests use, and the public key a client configured
+    /// for them holds.
+    fn crafted_params() -> (RealityServerParams, [u8; 32]) {
+        let (params, _) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let public = x25519_public(params.private_key);
+        (params, public)
+    }
+
+    /// Feed one hello to the accept path and report which way it went.
+    ///
+    /// No timeout is needed to tell the outcomes apart: a refused hello
+    /// returns the fallback outcome and writes nothing, while an accepted one
+    /// makes the server write its ServerHello before it waits for the client's
+    /// Finished.
+    async fn intake(params: &RealityServerParams, record: Vec<u8>) -> Intake {
+        let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        let params = params.clone();
+        let mut server =
+            tokio::spawn(async move { handshake_or_fallback(server_io, &params).await });
+        client.write_all(&record).await.unwrap();
+        client.flush().await.unwrap();
+        let mut header = [0u8; 5];
+        tokio::select! {
+            outcome = &mut server => match outcome.unwrap() {
+                HandshakeOutcome::Fallback { failure, .. } => Intake::Fallback(failure.to_string()),
+                HandshakeOutcome::Rejected(failure) => {
+                    panic!("the hello was rejected rather than relayed: {failure}")
+                }
+                HandshakeOutcome::Accepted(_) => panic!("a relayed hello has no handshake"),
+            },
+            read = client.read_exact(&mut header) => {
+                read.expect("the server closed instead of answering");
+                assert_eq!(
+                    header[0], CONTENT_HANDSHAKE,
+                    "an accepted hello is answered with a ServerHello record",
+                );
+                server.abort();
+                Intake::Accepted
+            }
+        }
+    }
+
+    /// Go's SNI gate is a plain map lookup of the name as it arrived
+    /// (`RL/tls.go:211`), so case matters. The port folded it, and a server
+    /// that accepts a spelling it does not advertise is a fingerprint: a
+    /// prober that gets a REALITY ServerHello for `Example.test` against a
+    /// configured `example.test` has found the server, and the accepted set is
+    /// exactly what such a probe enumerates.
+    #[tokio::test]
+    async fn a_server_name_in_another_case_is_not_the_advertised_one() {
+        let (params, public) = crafted_params();
+        // The positive control: the exact name authenticates.
+        assert_eq!(
+            intake(&params, CraftedHello::new().record(public)).await,
+            Intake::Accepted
+        );
+
+        let mut hello = CraftedHello::new();
+        hello.sni = Some("Example.test".into());
+        match intake(&params, hello.record(public)).await {
+            Intake::Fallback(reason) => assert!(reason.contains("SNI"), "{reason}"),
+            Intake::Accepted => panic!("the server name is matched exactly, as Go matches it"),
+        }
+    }
+
+    /// Go settles the version before it derives anything: `mutualVersion` over
+    /// `supported_versions` (`RL/handshake_server.go:180-196`) feeds the
+    /// `hs.c.vers != VersionTLS13` gate (`RL/tls.go:211`). The port inferred
+    /// TLS 1.3 from a TLS 1.3 cipher suite being in the list, so a hello
+    /// offering `0x1301` with no `supported_versions` at all — or with one
+    /// that never names `0x0304` — authenticated here and was handed to the
+    /// camouflage site by Go.
+    #[tokio::test]
+    async fn a_hello_without_supported_versions_is_not_tls13_enough() {
+        let (params, public) = crafted_params();
+
+        let mut hello = CraftedHello::new();
+        hello.versions = None;
+        match intake(&params, hello.record(public)).await {
+            Intake::Fallback(reason) => {
+                assert!(reason.contains("supported_versions"), "{reason}")
+            }
+            Intake::Accepted => panic!("TLS 1.3 has to be offered, not assumed"),
+        }
+
+        // An extension that offers only older versions is the same refusal.
+        let mut hello = CraftedHello::new();
+        hello.versions = Some(vec![0x0303, 0x0302]);
+        assert!(matches!(
+            intake(&params, hello.record(public)).await,
+            Intake::Fallback(_)
+        ));
+
+        // Offering 1.3 among older versions is still TLS 1.3: Go's
+        // `mutualVersion` picks the highest version both ends have.
+        let mut hello = CraftedHello::new();
+        hello.versions = Some(vec![0x0303, 0x0304]);
+        assert_eq!(
+            intake(&params, hello.record(public)).await,
+            Intake::Accepted
+        );
+    }
+
+    /// Go keeps the **first** share of a group: both of its scans `break` on
+    /// the first acceptable entry (`RL/tls.go:214-228`). The port kept the
+    /// last, so a hello carrying two X25519 shares was authenticated against a
+    /// different point than Go uses, and a client that seals against its first
+    /// share was accepted by Go and refused here.
+    #[tokio::test]
+    async fn the_first_share_of_a_duplicated_group_is_the_one_that_counts() {
+        let (params, public) = crafted_params();
+        let (first, second) = ([4u8; 32], [5u8; 32]);
+
+        // Sealed against the first share: what Go uses, so this authenticates.
+        let hello = CraftedHello::new().with_shares(&[first, second]);
+        assert_eq!(
+            intake(&params, hello.record(public)).await,
+            Intake::Accepted
+        );
+
+        // Sealed against the second: Go never looks at it, so the seal cannot
+        // open — and the "last wins" port accepted exactly this hello.
+        let mut hello = CraftedHello::new().with_shares(&[first, second]);
+        hello.secret = second;
+        assert!(matches!(
+            intake(&params, hello.record(public)).await,
+            Intake::Fallback(_)
+        ));
+    }
+
+    /// The gates are asked in Go's order (`RL/tls.go:257-262`): the seal, then
+    /// `MinClientVer` / `MaxClientVer`, then `MaxTimeDiff`, then the shortId.
+    /// Each one fails into the same silent fallback, so a probe that fails
+    /// several learns the order from *which* refusal comes back. The port
+    /// asked the selector first and named it, telling a prober about a hello
+    /// the version gate had already rejected.
+    #[tokio::test]
+    async fn a_hello_that_fails_several_gates_is_refused_for_go_s_first_one() {
+        let (mut params, public) = crafted_params();
+        params.min_client_ver = Some([1, 0, 0]);
+        params.max_client_ver = Some([3, 0, 0]);
+        params.max_time_diff = Duration::from_secs(60);
+
+        // Too old a client, a stale clock and an unknown selector at once.
+        let mut hello = CraftedHello::new();
+        hello.version = [0, 9, 0];
+        hello.time = unix_now() - 3600;
+        hello.short_id = [0x99; 8];
+        match intake(&params, hello.record(public)).await {
+            Intake::Fallback(reason) => assert!(reason.contains("version"), "{reason}"),
+            Intake::Accepted => panic!("three failing gates cannot be accepted"),
+        }
+
+        // A version inside the range leaves the clock, not the selector.
+        let mut hello = CraftedHello::new();
+        hello.time = unix_now() - 3600;
+        hello.short_id = [0x99; 8];
+        match intake(&params, hello.record(public)).await {
+            Intake::Fallback(reason) => assert!(reason.contains("clock"), "{reason}"),
+            Intake::Accepted => panic!("a stale clock and a wrong selector cannot be accepted"),
+        }
+
+        // Only the selector is wrong.
+        let mut hello = CraftedHello::new();
+        hello.short_id = [0x99; 8];
+        match intake(&params, hello.record(public)).await {
+            Intake::Fallback(reason) => assert!(reason.contains("shortId"), "{reason}"),
+            Intake::Accepted => panic!("an unknown selector cannot be accepted"),
+        }
+
+        // The control: everything inside the limits authenticates.
+        assert_eq!(
+            intake(&params, CraftedHello::new().record(public)).await,
+            Intake::Accepted
+        );
+    }
+
+    /// Go reads the first record of a connection under its *pre-negotiation*
+    /// bound, `maxCiphertext = 16384 + 2048` (`RL/conn.go:707-711`), and only
+    /// then fails a **cleartext** body longer than one plaintext (`:725-727`)
+    /// — by which time the record is already on its way to the target. The
+    /// substrate refused anything over 16640 at the header, turning a peer at
+    /// Go's limit away before its bytes were handed back for replay.
+    #[tokio::test]
+    async fn a_record_at_go_s_pre_negotiation_bound_is_read_then_relayed() {
+        let (params, _) = crafted_params();
+        let mut record =
+            record_header(CONTENT_HANDSHAKE, MAX_CIPHERTEXT_BEFORE_TLS13).to_vec();
+        record.resize(5 + MAX_CIPHERTEXT_BEFORE_TLS13, 0);
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client.write_all(&record).await.unwrap();
+        client.flush().await.unwrap();
+        match handshake_or_fallback(server, &params).await {
+            HandshakeOutcome::Fallback {
+                client_hello,
+                failure,
+                ..
+            } => {
+                assert_eq!(
+                    client_hello.len(),
+                    record.len(),
+                    "every consumed byte is replayed to the target"
+                );
+                assert!(failure.to_string().contains("cleartext"), "{failure}");
+            }
+            HandshakeOutcome::Accepted(_) => {
+                panic!("a cleartext record past the plaintext bound cannot authenticate")
+            }
+            HandshakeOutcome::Rejected(error) => panic!("expected fallback: {error}"),
         }
     }
 }

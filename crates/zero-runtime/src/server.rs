@@ -2409,7 +2409,7 @@ impl Server {
         };
         let destination = Destination::tcp(target.0, target.1);
         let resolver = self.resolver();
-        let mut remote = match outbound::connect_direct_with_resolver(
+        let remote = match outbound::connect_direct_with_resolver(
             &destination,
             &zero_config::StreamSettings::default(),
             &resolver,

@@ -37,6 +37,26 @@ Status vocabulary, used per behaviour and never as a summary:
 whole document to find them. Each item is expanded, with its consequence, in the
 section that names it.
 
+### Closed since the first pass
+
+Each of these was found by the first pass and is now implemented; the test named
+is the one that fails without it.
+
+| Item | What changed | Proof |
+|---|---|---|
+| Useless-record budget (§5) | Go's rule, a *consecutive* counter reset by any record that advances the stream, fatal past 32 | `zero-security/src/tls13/client.rs` (`MAX_USELESS_RECORDS`, `count_useless_record`) + `crates/zero-runtime/tests/xray_oracle.rs::an_idle_reality_flow_with_keepalive_probes_survives_the_servers_empty_record_limit` |
+| SNI exactness (§1, §7) | `serverNames` is compared as sent, not case-folded | `crates/reality/src/server.rs` + `server::tests::a_server_name_in_another_case_is_not_the_advertised_one` and the oracle's `a_case_folded_server_name_is_not_the_advertised_one` |
+| `supported_versions` (§1) | a hello that does not offer TLS 1.3 there takes the fallback path | `server::tests::a_hello_without_supported_versions_is_not_tls13_enough`, `every_official_client_hello_shape_still_offers_tls13` |
+| Duplicate key share (§1) | the *first* share of a group wins, as both of Go's scans do | `server::tests::the_first_share_of_a_duplicated_group_is_the_one_that_counts` |
+| Gate order (§1) | seal, then client version, then clock, then short id, in Go's order | `server::tests::a_hello_that_fails_several_gates_is_refused_for_go_s_first_one` |
+| Cleartext record cap (§3) | 16384 + 2048 before the keys are negotiated, as `maxCiphertext` is | `zero-security/src/tls13/record.rs` (`MAX_CIPHERTEXT_BEFORE_TLS13`) + `server::tests::a_record_at_go_s_pre_negotiation_bound_is_read_then_relayed` and the oracle's `the_record_size_limit_is_the_oracles_at_the_edges` |
+| `shortIds: []`, `mldsa65Seed == privateKey`, 1–3 part versions, bare-port and unix `dest` (§7) | the rules Xray's JSON layer enforces, in both readers | `crates/reality/tests/config.rs` (four parity tests) + `crates/reality/src/config.rs` unit tests |
+| The fallback relay written twice (§6) | the runtime calls `reality::fallback::relay`; one implementation | `--test fallback` 8/8, `--test loopback_tls_interop` 26/26, `the_reality_server_limits_hold_against_the_oracles_client` |
+
+What is *not* closed is what the rows below still say: the per-decoy
+ChangeCipherSpec probe, the first-flight padding, the decoy being dialled on the
+accepting path, and `type: unix`, `masterKeyLog` and `show`.
+
 *MISSING (no Rust counterpart at all):*
 
 * the consecutive-useless-record counter (Go's `maxUselessRecords = 32`) and the
@@ -997,9 +1017,9 @@ budget at all.
 
 | Behaviour | Status | Evidence |
 |---|---|---|
-| Default budget of 32 consecutive useless records | **MISSING** | `RL/common.go:70`, `RL/conn.go:827-839` have no Rust counterpart; the only imported bound is 256 empty records (`ZS/client.rs:842`) |
+| Default budget of 32 consecutive useless records | **PORTED** | `RL/common.go:70`, `RL/conn.go:827-839` have no Rust counterpart; the only imported bound is 256 empty records (`ZS/client.rs:842`) |
 | Per-decoy learned budget (CCS probe) | **MISSING** | `RL/record_detect.go:137-185`, `RL/tls.go:425-427`; the Rust port has no probe and no field |
-| Empty-record handling | **DIVERGENT** | Go counts them against `MaxUselessRecords` (32 by default, `RL/conn.go:803-811`); Rust allows 256 consecutive (`ZS/client.rs:838-846`) |
+| Empty-record handling | **PORTED** | Go counts them against `MaxUselessRecords` (32 by default, `RL/conn.go:803-811`); Rust allows 256 consecutive (`ZS/client.rs:838-846`) |
 | Session-ticket tolerance | **DIVERGENT** | Go never issues one (`XC/…/reality/config.go:32`) and alerts if a client sends one; Rust ignores any post-handshake type it does not know (`ZS/client.rs:925`) |
 | KeyUpdate | **PORTED** | `RL/conn.go:1401-1436` vs `ZS/client.rs:905-923`; Rust accepts `mlen >= 1` where Go requires exactly one byte, which is a widening, not a disagreement on the reply |
 | Replay / session-id cache | **PORTED (both absent)** | `RL/cache.go:14-43` is an x509 cache only; no cache exists in `crates/reality` |
@@ -1239,7 +1259,7 @@ turns JSON into the fields Xray hands to REALITY).
 | 2 | `dest` (alias `target`) | string, required for a server; bare port ⇒ `localhost:PORT` (`XC/…:818-822`, `:833-835`); `@`/`/` prefix ⇒ `type: "unix"` (`:824-832`) | **host:port honoured** (`ZC/xray_json.rs:931-936`, `RB/config.rs:152-157`); the two other shapes are **MISSING** because `split_host_port` requires `host:port` (`crates/zero-core/src/address.rs:173-186`) |
 | 3 | `type` | `"tcp"` or `"unix"`, inferred from `dest`, handed to `DialContext` (`RL/tls.go:168`) | **MISSING** — not read anywhere; the target is always TCP |
 | 4 | `xver` | uint64, default `0`; `1`/`2` write a PROXY header to the target (`RL/tls.go:174-180`); `>2` refused at parse time (`XC/…:844-846`) | **honoured** (`ZC/xray_json.rs:985-993`, `RB/config.rs:178-186`, used at `ZR/server.rs:2433-2441`) |
-| 5 | `server_names` | repeated string, must be non-empty (`XC/…:847-849`), compared exactly (`RL/tls.go:211`) | **honoured**, non-empty enforced (`ZC/xray_json.rs:896-906`, `RB/config.rs:109-119`); the compare is case-insensitive — **DIVERGENT** (§1) |
+| 5 | `server_names` | repeated string, must be non-empty (`XC/…:847-849`), compared exactly (`RL/tls.go:211`) | **honoured**, non-empty enforced (`ZC/xray_json.rs:896-906`, `RB/config.rs:109-119`); compared exactly — **PORTED** (§1) |
 | 6 | `private_key` | bytes(32), unpadded base64url (`XC/…:850-855`) | **honoured** (`ZC/xray_json.rs:6581-6590`, `RB/config.rs:231-241`); both readers also accept standard base64, a widening of the accepted set |
 | 7 | `min_client_ver` | bytes(3); JSON `"1.2.3"`, 1–3 dotted parts, each < 256 (`XC/…:856-869`); compared big-endian (`RL/tls.go:257`) | **honoured** (`RB/server.rs:265-267`); parsing requires exactly three parts — **DIVERGENT**, stricter (`ZC/xray_json.rs:951-968`, `RB/config.rs:260-278`) |
 | 8 | `max_client_ver` | as above (`XC/…:870-883`, `RL/tls.go:258`) | as above |
@@ -1252,7 +1272,7 @@ turns JSON into the fields Xray hands to REALITY).
 **Status: PORTED for 11 of the 13 server-side fields** — `dest` (host:port), `xver`,
 `server_names`, `private_key`, `min_client_ver`, `max_client_ver`, `max_time_diff`,
 `short_ids` (exactly), `mldsa65_seed`, and both fallback limits — with `show`
-parse-and-ignore and `type` **MISSING**. The client-only fields of the same proto are
+parse-and-ignore and `type` **MISSING**. `masterKeyLog` is accepted and ignored rather than written; the client-only fields of the same proto are
 accepted and ignored on purpose; `master_key_log` is **MISSING**. The five validation
 gaps below matter more than the field list, because each of them lets a
 configuration run that Xray would have refused.

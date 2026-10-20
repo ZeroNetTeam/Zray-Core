@@ -30,6 +30,22 @@ pub const DUMMY_CCS: [u8; 6] = [CONTENT_CCS, 0x03, 0x03, 0x00, 0x01, 0x01];
 /// AEAD tag length shared by all three TLS 1.3 suites.
 const TAG_LEN: usize = 16;
 
+/// The wire-body bound for a record read while TLS 1.3 has not been
+/// negotiated yet: Go's `maxCiphertext = 16384 + 2048` (`RL/common.go:64-66`),
+/// checked as `n > maxCiphertext` in `RL/conn.go:707-711`. The 2048 bytes of
+/// slack exist for a pre-1.3 ciphertext, which carries its MAC, explicit IV
+/// and padding on the wire.
+///
+/// This is the bound the *first* records of a connection are held to — the
+/// ClientHello at a server, the ServerHello at a client — because Go's tighter
+/// `n > maxCiphertextTLS13` is guarded by `c.vers == VersionTLS13` and the
+/// version is not known until the hello has been read. A record that is still
+/// cleartext is additionally held to `MAX_PLAINTEXT` by Go's second check
+/// (`len(data) > maxPlaintext`, `RL/conn.go:725-727`), which callers here apply
+/// themselves; a *protected* record is held to [`super::MAX_CIPHERTEXT`]
+/// instead, in [`RecordCrypter::open_in_place`].
+pub const MAX_CIPHERTEXT_BEFORE_TLS13: usize = MAX_PLAINTEXT + 2048;
+
 /// The AES key schedules are several hundred bytes each; boxing them keeps
 /// the enum (and every `Tls13Stream`, which holds two) small enough to move
 /// cheaply through futures.
@@ -56,12 +72,37 @@ pub fn record_header(content_type: u8, len: usize) -> [u8; 5] {
     h
 }
 
+/// Refuse a cleartext record whose body is longer than one plaintext.
+///
+/// [`parse_header`] allows the wider pre-negotiation bound, but for a record
+/// that is not protected the body *is* the plaintext, and Go fails one longer
+/// than `maxPlaintext` right after reading it (`RL/conn.go:725-727`) — for a
+/// ClientHello record that is REALITY's fallback, not a wire error. Callers
+/// apply this where they know the bytes are still cleartext: the hello at
+/// either end, and the change_cipher_spec / cleartext alert records a peer may
+/// put in front of its first protected flight.
+pub fn check_cleartext_body(len: usize) -> Result<(), super::Failure> {
+    if len > MAX_PLAINTEXT {
+        return Err(malformed(format!(
+            "cleartext record of {len} bytes exceeds the TLS limit"
+        )));
+    }
+    Ok(())
+}
+
 /// Parse one record header. Returns (content_type, body_len).
 ///
 /// A peer that is not speaking TLS at all shows up here first, as the bytes
 /// of its own reply read as a header. The commonest case is a web server
 /// answering a hello with `HTTP/1.1 400`: those five bytes would parse as a
 /// record of 20527 bytes, so they are named instead of reported as a length.
+///
+/// The length is bounded by Go's pre-negotiation limit
+/// ([`MAX_CIPHERTEXT_BEFORE_TLS13`]), which is what the hello's record is read
+/// under: the version is not known yet, and a peer at the limit Go reads must
+/// not be turned away here. What a record may *carry* is a second, narrower
+/// bound, applied by whoever knows whether the bytes are cleartext or
+/// protected.
 pub fn parse_header(header: &[u8]) -> Result<(u8, usize), super::Failure> {
     let h: [u8; 5] = header
         .try_into()
@@ -72,7 +113,7 @@ pub fn parse_header(header: &[u8]) -> Result<(u8, usize), super::Failure> {
         ));
     }
     let len = u16::from_be_bytes([h[3], h[4]]) as usize;
-    if len > MAX_CIPHERTEXT {
+    if len > MAX_CIPHERTEXT_BEFORE_TLS13 {
         return Err(malformed(format!(
             "record of {len} bytes exceeds the TLS limit"
         )));
@@ -285,6 +326,14 @@ impl RecordCrypter {
     /// Open a protected record in place. `header` is the five-byte record
     /// header (the AAD) and `body` its ciphertext, tag included.
     ///
+    /// Two of Go's three size checks apply here, because a record that reaches
+    /// this function is a TLS 1.3 ciphertext: the wire bound is
+    /// `maxCiphertextTLS13 = 16384 + 256` (`RL/common.go:64-66`, checked at
+    /// `RL/conn.go:707-711` with `c.vers == VersionTLS13`) and the plaintext
+    /// after padding and type are stripped is `maxPlaintext` (`RL/conn.go:725-727`).
+    /// The third, the wider [`MAX_CIPHERTEXT_BEFORE_TLS13`] that
+    /// [`parse_header`] enforces, belongs to the hello before a version exists.
+    ///
     /// On success returns the inner content type and the plaintext length:
     /// `body[..len]` then holds the plaintext with padding and the inner type
     /// stripped. On failure the contents of `body` are unspecified.
@@ -295,6 +344,12 @@ impl RecordCrypter {
     ) -> Result<(u8, usize), super::Failure> {
         if body.len() < TAG_LEN + 1 {
             return Err(malformed("encrypted record shorter than the GCM tag"));
+        }
+        if body.len() > MAX_CIPHERTEXT {
+            return Err(malformed(format!(
+                "protected record of {} bytes exceeds the TLS 1.3 limit",
+                body.len()
+            )));
         }
         let nonce = self.next_nonce()?;
         let (ciphertext, tag) = body.split_at_mut(body.len() - TAG_LEN);
@@ -316,6 +371,11 @@ impl RecordCrypter {
         ) {
             return Err(malformed(format!(
                 "record has illegal inner content type {inner_type:#04x}"
+            )));
+        }
+        if last > MAX_PLAINTEXT {
+            return Err(malformed(format!(
+                "record plaintext of {last} bytes exceeds the TLS limit"
             )));
         }
 
@@ -500,5 +560,82 @@ mod tests {
         assert!(http.contains("plain HTTP"), "{http}");
         let (t, len) = parse_header(&[0x17, 0x03, 0x03, 0x41, 0x00]).unwrap();
         assert_eq!((t, len), (CONTENT_APPDATA, 16640));
+    }
+
+    /// Go's bound for a record read before the version is agreed is
+    /// `maxCiphertext = 16384 + 2048` (`RL/common.go:64-66`, checked at
+    /// `RL/conn.go:707-711`); the substrate's 16640 is Go's *TLS 1.3* bound and
+    /// was applied to every record, so a peer at Go's pre-negotiation limit was
+    /// refused at the header where Go reads the record.
+    #[test]
+    fn the_pre_negotiation_record_bound_is_go_s_not_the_tls13_one() {
+        // 18432, the largest record Go reads while `c.vers` is still unset.
+        let at_the_limit = [CONTENT_HANDSHAKE, 0x03, 0x03, 0x48, 0x00];
+        assert_eq!(
+            parse_header(&at_the_limit).unwrap(),
+            (CONTENT_HANDSHAKE, MAX_CIPHERTEXT_BEFORE_TLS13)
+        );
+        assert_eq!(MAX_CIPHERTEXT_BEFORE_TLS13, 18432);
+        // One byte more is not a record at all.
+        assert!(parse_header(&[CONTENT_HANDSHAKE, 0x03, 0x03, 0x48, 0x01]).is_err());
+
+        // What a *cleartext* record may carry is one plaintext: Go reads the
+        // record and then fails it (`len(data) > maxPlaintext`,
+        // `RL/conn.go:725-727`), which is the rule that turns away a
+        // ClientHello record padded past the pre-negotiation bound.
+        assert!(check_cleartext_body(MAX_CIPHERTEXT_BEFORE_TLS13).is_err());
+        assert!(check_cleartext_body(MAX_PLAINTEXT).is_ok());
+    }
+
+    /// The wider header bound must not widen what a *protected* record may be:
+    /// once the version is known Go holds the ciphertext to
+    /// `maxCiphertextTLS13 = 16384 + 256` (`RL/conn.go:707-711`) and the
+    /// plaintext under the padding to `maxPlaintext` (`:725-727`). The port
+    /// enforced neither before, because the header check refused the record
+    /// first.
+    #[test]
+    fn a_protected_record_is_still_held_to_the_tls13_bounds() {
+        let suite = CipherSuite::TLS_AES_128_GCM_SHA256;
+        let secret = [9u8; 32];
+
+        // Exactly Go's TLS 1.3 ciphertext limit: one content byte, the inner
+        // type, and zero padding up to the bound. Accepted, which is what a
+        // decoy that pads its records this far requires.
+        let mut plain = vec![0x41u8, CONTENT_APPDATA];
+        plain.resize(MAX_CIPHERTEXT - TAG_LEN, 0);
+        let header = record_header(CONTENT_APPDATA, plain.len() + TAG_LEN);
+        let w = RecordCrypter::new(suite, &secret);
+        let mut r = RecordCrypter::new(suite, &secret);
+        let nonce = w.nonce();
+        let tag = w.seal_in_place(&nonce, &header, &mut plain).unwrap();
+        let mut body = plain;
+        body.extend_from_slice(&tag);
+        assert_eq!(body.len(), MAX_CIPHERTEXT);
+        let (kind, len) = r.open_in_place(&header, &mut body).unwrap();
+        assert_eq!((kind, &body[..len]), (CONTENT_APPDATA, &b"A"[..]));
+
+        // One byte past it is refused, even though the header parser allows it.
+        let mut plain = vec![0x41u8, CONTENT_APPDATA];
+        plain.resize(MAX_CIPHERTEXT + 1 - TAG_LEN, 0);
+        let header = record_header(CONTENT_APPDATA, plain.len() + TAG_LEN);
+        let w = RecordCrypter::new(suite, &secret);
+        let mut r = RecordCrypter::new(suite, &secret);
+        let nonce = w.nonce();
+        let tag = w.seal_in_place(&nonce, &header, &mut plain).unwrap();
+        let mut body = plain;
+        body.extend_from_slice(&tag);
+        assert!(r.open_in_place(&header, &mut body).is_err());
+
+        // A payload over one plaintext, sealed by hand because `seal_into`
+        // refuses to build a record that big.
+        let w = RecordCrypter::new(suite, &secret);
+        let mut r = RecordCrypter::new(suite, &secret);
+        let mut plain = vec![0x41u8; MAX_PLAINTEXT + 116];
+        plain.push(CONTENT_APPDATA);
+        let header = record_header(CONTENT_APPDATA, plain.len() + TAG_LEN);
+        let nonce = w.nonce();
+        let tag = w.seal_in_place(&nonce, &header, &mut plain).unwrap();
+        plain.extend_from_slice(&tag);
+        assert!(r.open_in_place(&header, &mut plain).is_err());
     }
 }
