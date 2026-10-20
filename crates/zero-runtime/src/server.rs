@@ -2423,63 +2423,52 @@ impl Server {
                 return;
             }
         };
-        // The target learns who is really connecting, if it asked to.
-        if reality.fallback_xver != 0 {
-            let header =
-                zero_protocol::proxy_protocol::encode(reality.fallback_xver, Some(peer), local);
-            if let Err(error) = remote.write_all(&header).await {
+        // What happens next — the PROXY header `xver` asks for, the hello the
+        // handshake already consumed replayed to the target, the half-close
+        // when the visitor stops talking, and the rate the visitor is held to —
+        // is REALITY's, not this runtime's, so it lives in `reality::fallback`
+        // where a server outside this runtime can reach it too. This function
+        // keeps the two things that are the runtime's own: the dial (with the
+        // resolver and its deadline) and the counters.
+        let policy = reality::fallback::FallbackPolicy::new(
+            reality.fallback_xver,
+            fallback_limit(reality.fallback_limit_up),
+            fallback_limit(reality.fallback_limit_down),
+        );
+        match reality::fallback::relay(stream, remote, &policy, &client_hello, Some(peer), local)
+            .await
+        {
+            Ok(outcome) => {
+                self.stats
+                    .uploaded
+                    .fetch_add(outcome.transferred.uploaded, Ordering::Relaxed);
+                self.stats
+                    .downloaded
+                    .fetch_add(outcome.transferred.downloaded, Ordering::Relaxed);
+                if outcome.is_useful() {
+                    self.stats.succeeded.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                }
+                debug!(
+                    %peer,
+                    target = %destination,
+                    up = outcome.transferred.uploaded,
+                    down = outcome.transferred.downloaded,
+                    stage = ?outcome.stage,
+                    error = ?outcome.error,
+                    "REALITY fallback relay finished"
+                );
+            }
+            Err(error) => {
+                // Only the setup can fail this way — a header or a hello the
+                // target would not take — which means the visitor got nothing
+                // back at all.
                 self.stats.failed.fetch_add(1, Ordering::Relaxed);
-                debug!(%peer, error = %error, "REALITY fallback PROXY header failed");
-                return;
+                debug!(%peer, target = %destination, error = %error,
+                       "REALITY fallback setup failed");
             }
         }
-        if let Err(error) = remote.write_all(&client_hello).await {
-            self.stats.failed.fetch_add(1, Ordering::Relaxed);
-            debug!(%peer, error = %error, "REALITY fallback ClientHello replay failed");
-            return;
-        }
-        if let Err(error) = remote.flush().await {
-            self.stats.failed.fetch_add(1, Ordering::Relaxed);
-            debug!(%peer, error = %error, "REALITY fallback flush failed");
-            return;
-        }
-        // An unauthenticated visitor is held to the configured rates, so a
-        // probe cannot pull a large file through us from the target or push
-        // traffic at it.
-        let limit = |limit: zero_config::FallbackLimit| crate::throttle::Limit {
-            after_bytes: limit.after_bytes,
-            bytes_per_sec: limit.bytes_per_sec,
-            burst: limit.burst_bytes_per_sec,
-        };
-        let client = boxed(crate::throttle::Throttle::new(
-            stream,
-            limit(reality.fallback_limit_up),
-        ));
-        let remote = boxed(crate::throttle::Throttle::new(
-            remote,
-            limit(reality.fallback_limit_down),
-        ));
-        let outcome = relay(client, remote).await;
-        self.stats
-            .uploaded
-            .fetch_add(outcome.transferred.uploaded, Ordering::Relaxed);
-        self.stats
-            .downloaded
-            .fetch_add(outcome.transferred.downloaded, Ordering::Relaxed);
-        if outcome.is_useful() {
-            self.stats.succeeded.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.stats.failed.fetch_add(1, Ordering::Relaxed);
-        }
-        debug!(
-            %peer,
-            target = %destination,
-            up = outcome.transferred.uploaded,
-            down = outcome.transferred.downloaded,
-            stage = ?outcome.stage,
-            error = ?outcome.error,
-            "REALITY fallback relay finished"
-        );
     }
 
     /// Complete the inbound transport. `Ok(None)` means the connection was
@@ -9882,6 +9871,19 @@ mod tests {
             );
         }
     }
+}
+
+
+/// Xray's `limitFallbackUpload` / `limitFallbackDownload` as the fallback relay
+/// in `reality` takes them: the same three numbers, in the type the relay and
+/// the settings reader share, so neither side can pass the upload limit where
+/// the download limit belongs without the compiler noticing.
+fn fallback_limit(limit: zero_config::FallbackLimit) -> reality::fallback::FallbackLimit {
+    reality::fallback::FallbackLimit::new(
+        limit.after_bytes,
+        limit.bytes_per_sec,
+        limit.burst_bytes_per_sec,
+    )
 }
 
 #[cfg(test)]
