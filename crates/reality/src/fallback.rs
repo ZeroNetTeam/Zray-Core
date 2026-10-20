@@ -74,6 +74,20 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// accumulate connections.
 pub const HALF_CLOSE_IDLE: Duration = Duration::from_secs(1);
 
+/// Once one direction has failed, how long the other may keep delivering
+/// before the relay closes both sockets.
+///
+/// A failed direction is usually the target hanging up on a visitor it will
+/// not serve, and the answer it already sent — an alert, a `400`, a redirect —
+/// is on its way to a visitor that is still being written to. Go reads the
+/// target in its own goroutine and writes what it read to the visitor before
+/// the other goroutine's failure can close anything (`RL/tls.go:437-442`), so
+/// that answer survives; a single future that returns as soon as either side
+/// errors loses it, and the visitor sees a bare close where the real site
+/// answered. The grace is short because the bytes are already on the wire: it
+/// only has to cover reading and writing what the peer has sent.
+pub const DRAIN_AFTER_ERROR: Duration = Duration::from_millis(250);
+
 /// One read buffer per direction. The runtime's *small* relay buffer: the
 /// fallback carries a prober's traffic, not a bulk transfer, so there is no
 /// promotion to the large one.
@@ -367,6 +381,8 @@ where
         // A caller that asked for no idle limit gets no half-close limit
         // either.
         half_close_limit: idle_timeout.map(|_| HALF_CLOSE_IDLE),
+        error: None,
+        draining: None,
     };
     let CopyResult {
         uploaded,
@@ -750,6 +766,12 @@ struct Copy<'a, C, T> {
     /// Armed when exactly one direction has finished; see [`HALF_CLOSE_IDLE`].
     half_closed: Option<IdleTimer>,
     half_close_limit: Option<Duration>,
+    /// The failure that ended one direction, kept so the outcome can report
+    /// it once the other direction has had its chance.
+    error: Option<String>,
+    /// Armed when one direction failed and the other may still deliver; see
+    /// [`DRAIN_AFTER_ERROR`].
+    draining: Option<IdleTimer>,
 }
 
 struct CopyResult {
@@ -768,30 +790,45 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
 
-        // Visitor to target, then target to visitor.
-        let _ = this.upload.poll_copy_step(
-            cx,
-            Pin::new(&mut *this.client),
-            Pin::new(&mut *this.target),
-        );
+        // Target to visitor first, then visitor to target.
+        //
+        // The order is the point. A target that has already answered — a
+        // camouflage site's alert, a `400`, a redirect — is waiting to be
+        // read, and the answer is on the wire whether or not this side
+        // failed. Reading it first gives it the best chance of being
+        // delivered: a target that hangs up while its answer is in flight
+        // makes the kernel reset the connection, and a reset discards
+        // whatever was queued but not yet read. Go reads the target in its
+        // own goroutine, armed from the first moment, so the answer is
+        // taken off the socket before the reset can take it away.
         let _ = this.download.poll_copy_step(
             cx,
             Pin::new(&mut *this.target),
             Pin::new(&mut *this.client),
         );
+        let _ = this.upload.poll_copy_step(
+            cx,
+            Pin::new(&mut *this.client),
+            Pin::new(&mut *this.target),
+        );
 
-        // An error on one side makes the other meaningless, and both sockets
-        // are closed when the relay returns.
-        let error = this
-            .upload
-            .error
-            .take()
-            .or_else(|| this.download.error.take());
-        if error.is_some() || (this.upload.done && this.download.done) {
+        // A failure in one direction does not silence the other: the peer
+        // may already have sent the answer the visitor is waiting for.
+        if this.error.is_none() {
+            this.error = this
+                .upload
+                .error
+                .clone()
+                .or_else(|| this.download.error.clone());
+            if this.error.is_some() {
+                this.draining = Some(IdleTimer::new(DRAIN_AFTER_ERROR));
+            }
+        }
+        if (this.upload.done && this.download.done) || (this.error.is_some() && this.drained(cx)) {
             return Poll::Ready(CopyResult {
                 uploaded: this.upload.total,
                 downloaded: this.download.total,
-                error,
+                error: this.error.take(),
             });
         }
 
@@ -807,7 +844,7 @@ where
                     return Poll::Ready(CopyResult {
                         uploaded: this.upload.total,
                         downloaded: this.download.total,
-                        error: None,
+                        error: self.error.take(),
                     });
                 }
             }
@@ -830,6 +867,23 @@ where
         }
 
         Poll::Pending
+    }
+}
+
+impl<C, T> Copy<'_, C, T> {
+    /// Has the surviving direction had its grace to deliver what the peer
+    /// already sent?
+    ///
+    /// The timer is armed when a direction fails, and it expires
+    /// [`DRAIN_AFTER_ERROR`] later unless the surviving direction moves
+    /// something in the meantime — an answer that arrives late still counts,
+    /// so the timer is pushed out while the flow is alive.
+    fn drained(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(timer) = self.draining.as_mut() else {
+            return true;
+        };
+        let activity = self.upload.activity.wrapping_add(self.download.activity);
+        timer.poll_expired(cx, activity)
     }
 }
 

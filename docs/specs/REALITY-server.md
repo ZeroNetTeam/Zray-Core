@@ -52,6 +52,7 @@ is the one that fails without it.
 | Cleartext record cap (§3) | 16384 + 2048 before the keys are negotiated, as `maxCiphertext` is | `zero-security/src/tls13/record.rs` (`MAX_CIPHERTEXT_BEFORE_TLS13`) + `server::tests::a_record_at_go_s_pre_negotiation_bound_is_read_then_relayed` and the oracle's `the_record_size_limit_is_the_oracles_at_the_edges` |
 | `shortIds: []`, `mldsa65Seed == privateKey`, 1–3 part versions, bare-port and unix `dest` (§7) | the rules Xray's JSON layer enforces, in both readers | `crates/reality/tests/config.rs` (four parity tests) + `crates/reality/src/config.rs` unit tests |
 | The fallback relay written twice (§6) | the runtime calls `reality::fallback::relay`; one implementation | `--test fallback` 8/8, `--test loopback_tls_interop` 26/26, `the_reality_server_limits_hold_against_the_oracles_client` |
+| A failed direction cancelling the other (§6) | the surviving direction gets a 250 ms grace to deliver what the peer already sent | `crates/reality/tests/fallback.rs::the_targets_answer_survives_the_write_to_the_target_failing` + the oracle's `the_record_size_limit_is_the_oracles_at_the_edges`, 20/20 runs |
 
 What is *not* closed is what the rows below still say: the per-decoy
 ChangeCipherSpec probe, the first-flight padding, the decoy being dialled on the
@@ -1186,8 +1187,42 @@ zero burst as one second's worth of credit (`:60-66`) and guarantees a throttled
 read still makes progress (`:111-116`). Counting starts at the first byte read
 through the wrapper, i.e. after the replayed hello — the same rule as Go.
 
+**A failure in one direction does not cancel the other.** Go runs the two copies
+as two goroutines (`RL/tls.go:275-286` and `:437-442`), so the target→visitor copy
+keeps reading the target whatever the visitor→target copy does. The Rust relay is
+one future driving both directions, so it has to reproduce that by hand, and it did
+not at first: the relay returned as soon as *either* direction failed, which threw
+away an answer the target had already sent. The differential test against Xray
+caught it — `the_record_size_limit_is_the_oracles_at_the_edges`
+(`OR:2739-2831`) failed about half the runs with `left: (Decoy, Closed)` against
+`right: (Decoy, Decoy)`, i.e. the official server relayed the decoy's alert and
+this port did not.
+
+The mechanism, from the relay's own log: the visitor sends a record one byte past
+the pre-negotiation bound, the decoy answers with a fatal alert and closes with
+unread bytes in its queue (so the kernel resets the connection), and the relay's
+write to that closed target fails with `Connection reset by peer`. Under the old
+code the relay stopped there, and the 7 alert bytes still in the socket's queue
+were discarded with it. Go's goroutine had already read them.
+
+Two changes close it, and the measurements say which one carries the weight:
+
+* the surviving direction gets a grace period (`DRAIN_AFTER_ERROR = 250 ms`,
+  `RB/fallback.rs:89`) before the relay gives up on it, and
+* the target is read *before* the visitor is written to, so the answer is taken off
+  the socket in the same poll that fails.
+
+Measured over 20 runs of the differential test each: the grace period alone is
+20/20, the reordering alone is 13/20, and both together are 20/20. The grace
+period is the load-bearing part; the reordering is kept because it makes the
+common case deterministic rather than lucky. `crates/reality/tests/fallback.rs`
+pins the grace period with
+`the_targets_answer_survives_the_write_to_the_target_failing`, whose target is
+scripted to release its answer only after the relay's write to it has failed —
+removing the grace period makes that test fail.
+
 **Status: PORTED** for dialling, the PROXY header, the hello replay and the rate
-limits, with two named differences:
+limits, with three named differences:
 
 1. **When the target is dialled.** Rust dials on fallback only
    (`ZR/server.rs:2395-2431`); Go dials on every connection (`RL/tls.go:168`). For a

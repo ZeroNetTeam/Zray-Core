@@ -2181,7 +2181,7 @@ fn parse_shadowsocks(settings: Option<&Value>, path: &str) -> R<OutboundProtocol
             .ok_or_else(|| format!("{path}.settings.servers[0].port is required (1-65535)"))?,
         method,
         password: password.into(),
-        obfs: parse_obfs_settings(settings, &path)?,
+        obfs: parse_obfs_settings(settings, path)?,
     }))
 }
 

@@ -351,6 +351,162 @@ async fn the_relay_half_closes_the_target_and_keeps_the_response_flowing() {
     assert!(outcome.is_useful());
 }
 
+/// A target that hangs up does not take the visitor down with it.
+///
+/// This is the shape of a real camouflage site that rejects a visitor: it
+/// sends a TLS alert and closes, while the visitor is still sending. The
+/// relay's write to the closed target then fails, and a relay that tears the
+/// visitor's side down at that moment takes two things with it:
+///
+/// * the answer the target already sent, which is still on the wire, and
+/// * the visitor's own connection, which is closed with unread data in it —
+///   and a socket closed that way is reset, not closed, so the answer the
+///   visitor had not yet read is discarded on its way in.
+///
+/// The official server gets this right because it reads the target in its own
+/// goroutine, so the failure of the visitor's direction cannot cancel it. A
+/// single future has to give the surviving direction its chance by hand: the
+/// drain grace in `reality::fallback` is that chance, and this is the test
+/// that says it is load-bearing.
+///
+/// The target here is scripted rather than a socket, because the race is
+/// about *when* the answer arrives relative to the failure: the answer is
+/// released only after the relay's write to the target has failed, which is
+/// exactly the order a real site produces when it refuses a visitor.
+#[tokio::test]
+async fn the_targets_answer_survives_the_write_to_the_target_failing() {
+    // A TLS alert record: a five-byte header and the two bytes of the alert.
+    let alert = [0x15u8, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28];
+    let hello = client_hello_record("camouflage.example");
+
+    let (client, mut visitor) = tokio::io::duplex(64 * 1024);
+    let (target, _peer) = tokio::io::duplex(64 * 1024);
+    // The target refuses everything the relay writes to it after the hello,
+    // and only speaks once the refusal has happened: a site that has already
+    // hung up.
+    let refusing = ScriptedTarget::new(target, alert.to_vec());
+
+    let relay = tokio::spawn(async move {
+        relay_with_idle_timeout(
+            client,
+            refusing,
+            &FallbackPolicy::default(),
+            &hello,
+            None,
+            None,
+            Some(Duration::from_secs(30)),
+        )
+        .await
+    });
+
+    // The visitor sends something, so the relay writes to the target — and
+    // the write fails.
+    visitor.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+
+    // The visitor must still get the answer.
+    let mut got = vec![0u8; alert.len()];
+    tokio::time::timeout(DEADLINE, visitor.read_exact(&mut got))
+        .await
+        .expect("the visitor must receive the target's answer")
+        .expect("the visitor's read must succeed");
+    assert_eq!(
+        got, alert,
+        "the target's answer must reach the visitor even though the write to the target failed"
+    );
+
+    drop(visitor);
+    let outcome = timeout(DEADLINE, relay)
+        .await
+        .expect("the relay must return")
+        .expect("the relay task must not panic")
+        .expect("the relay must not fail once it has started");
+    assert_eq!(outcome.transferred.downloaded, alert.len() as u64);
+}
+
+/// A target that refuses every write after the hello and releases its answer
+/// only after that refusal.
+struct ScriptedTarget {
+    /// Kept so the target is a real duplex underneath; the scripted behaviour
+    /// is what this test is about, not the transport.
+    _inner: tokio::io::DuplexStream,
+    answer: Vec<u8>,
+    /// How many writes have been attempted; the hello is the first.
+    writes: usize,
+    released: bool,
+}
+
+impl ScriptedTarget {
+    fn new(inner: tokio::io::DuplexStream, answer: Vec<u8>) -> Self {
+        Self {
+            _inner: inner,
+            answer,
+            writes: 0,
+            released: false,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for ScriptedTarget {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if !this.released {
+            // The answer is not out yet: the site has not seen the visitor's
+            // request. A read is pending, exactly as a socket with nothing
+            // queued in it.
+            return std::task::Poll::Pending;
+        }
+        let answer = std::mem::take(&mut this.answer);
+        if answer.is_empty() {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        let n = answer.len().min(buf.remaining());
+        buf.put_slice(&answer[..n]);
+        this.answer = answer[n..].to_vec();
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncWrite for ScriptedTarget {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        let this = self.get_mut();
+        this.writes += 1;
+        if this.writes == 1 {
+            // The hello goes through: the relay has to hand it over before
+            // the site sees anything.
+            return std::task::Poll::Ready(Ok(buf.len()));
+        }
+        // The site hangs up on the next write: the answer comes out only
+        // after that, which is the order this test is about.
+        this.released = true;
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "the site hung up",
+        )))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 /// `limitFallbackUpload` holds what the visitor sends to the target.
 ///
 /// Nothing here can pass without the limit: at the configured rate the second
