@@ -149,16 +149,49 @@ impl RealityServerConfig {
             );
         }
 
-        let target = object
-            .get("dest")
-            .or_else(|| object.get("target"))
-            .and_then(Value::as_str)
-            .and_then(zero_core::address::split_host_port)
-            .map(|(host, port)| (Box::from(host), port));
+        // Xray requires a camouflage target for a REALITY inbound: `dest` (or
+        // its alias `target`), inferring the kind from the text — an `@` or `/`
+        // path is a unix socket, a bare number is a port on localhost, anything
+        // else must be host:port (`infra/conf/transport_internet.go:820-843`).
+        // A server whose fallback has nowhere to go answers a probe with a
+        // silent nothing, so the missing case is refused here rather than
+        // discovered by an operator under censorship.
+        let target = match object.get("dest").or_else(|| object.get("target")) {
+            None | Some(Value::Null) => {
+                return Err(
+                    "realitySettings.dest is required: an unauthenticated visitor has to be \
+                     handed to the real site"
+                        .into(),
+                )
+            }
+            Some(value) => {
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| "realitySettings.dest must be a string".to_string())?;
+                Some(parse_target(text)?)
+            }
+        };
 
         let mldsa65_seed = match object.get("mldsa65Seed").and_then(Value::as_str) {
             None | Some("") => None,
-            Some(text) => Some(decode_base64_32(text, "mldsa65Seed")?),
+            Some(text) => {
+                let seed = decode_base64_32(text, "mldsa65Seed")?;
+                // Xray refuses this pair (`infra/conf/transport_internet.go:904-906`),
+                // and it is worth refusing for a stronger reason than it gives:
+                // the seed is what makes the ML-DSA-65 half a *different*
+                // secret from the X25519 half, so reusing one for the other
+                // collapses the two factors into one an attacker who ever saw
+                // the private key already holds. Xray compares the strings; the
+                // bytes are compared here, so the same key written in another
+                // base64 spelling cannot slip through.
+                if seed == private_key {
+                    return Err(
+                        "realitySettings.mldsa65Seed and privateKey must not be the same value"
+                            .into(),
+                    );
+                }
+                Some(seed)
+            }
         };
 
         Ok(Self {
@@ -257,6 +290,12 @@ fn decode_base64_32(text: &str, field: &str) -> Result<[u8; 32], String> {
         .ok_or_else(|| format!("realitySettings.{field} must be 32 bytes of base64"))
 }
 
+/// Xray's `minClientVer` / `maxClientVer`: one to three dot-separated
+/// decimal bytes, right-padded with zeros, so `"1.2"` is `1.2.0` and `"26"`
+/// is `26.0.0` (`infra/conf/transport_internet.go:856-883`). A fourth part is
+/// refused there and here; a part that is not a byte, or that carries a sign —
+/// which Go's `ParseUint` rejects and Rust's `parse` would accept — is refused
+/// too.
 fn client_version(
     object: &serde_json::Map<String, Value>,
     field: &str,
@@ -267,14 +306,54 @@ fn client_version(
     if text.is_empty() {
         return Ok(None);
     }
-    let parts = text
-        .split('.')
-        .map(str::parse::<u8>)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()
-        .filter(|parts| parts.len() == 3)
-        .ok_or_else(|| format!("realitySettings.{field} must look like 1.2.3"))?;
-    Ok(Some([parts[0], parts[1], parts[2]]))
+    let mut version = [0u8; 3];
+    let mut parts = text.split('.');
+    for slot in version.iter_mut() {
+        match parts.next() {
+            None => break,
+            Some(part) if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) => {
+                return Err(format!(
+                    "realitySettings.{field} {text:?} is not a dotted byte, like 1.2.3"
+                ))
+            }
+            Some(part) => {
+                *slot = part.parse().map_err(|_| {
+                    format!("realitySettings.{field} {text:?} has a part above 255")
+                })?;
+            }
+        }
+    }
+    if parts.next().is_some() {
+        return Err(format!(
+            "realitySettings.{field} {text:?} has more than three parts"
+        ));
+    }
+    Ok(Some(version))
+}
+
+/// `dest` as Xray reads it: a unix socket path, a bare port on localhost, or
+/// host:port.
+fn parse_target(text: &str) -> Result<(Box<str>, u16), String> {
+    let text = text.trim();
+    if text.starts_with('@') || text.starts_with('/') {
+        // A unix-socket target is a real Xray feature this crate does not
+        // speak yet. Refusing beats resolving it as a host name, which would
+        // hand every unauthenticated visitor to a DNS lookup of `/run/x.sock`.
+        return Err(format!(
+            "realitySettings.dest {text:?} is a unix socket, which this server does not dial yet"
+        ));
+    }
+    if text.bytes().all(|byte| byte.is_ascii_digit()) && !text.is_empty() {
+        // Xray turns a bare port into `localhost:<port>`
+        // (`infra/conf/transport_internet.go:834-836`).
+        let port: u16 = text
+            .parse()
+            .map_err(|_| format!("realitySettings.dest {text:?} is not a port"))?;
+        return Ok((Box::from("localhost"), port));
+    }
+    zero_core::address::split_host_port(text)
+        .map(|(host, port)| (Box::from(host), port))
+        .ok_or_else(|| format!("realitySettings.dest {text:?} is not host:port"))
 }
 
 fn fallback_limit(
@@ -352,6 +431,46 @@ mod tests {
     }
 
     #[test]
+    fn a_version_field_is_zero_filled_the_way_xray_fills_it() {
+        // Xray accepts one to three parts and pads the rest with zeros
+        // (`transport_internet.go:856-883`), so `"1.2"` means `1.2.0`. A server
+        // that insisted on three parts would refuse a config Xray runs.
+        let mut value = settings();
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("minClientVer".into(), json!("1.2"));
+        let config = RealityServerConfig::from_xray_settings(&value).expect("1.2 is 1.2.0");
+        assert_eq!(config.min_client_ver, Some([1, 2, 0]));
+    }
+
+    #[test]
+    fn a_bare_port_dest_means_localhost() {
+        // `dest: "443"` is `localhost:443` in Xray, and resolving "443" as a
+        // host name would hand every visitor to a DNS failure instead.
+        let mut value = settings();
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("dest".into(), json!("8443"));
+        let config = RealityServerConfig::from_xray_settings(&value).expect("a bare port");
+        let (host, port) = config.target.expect("dest is required, so it is set");
+        assert_eq!((&*host, port), ("localhost", 8443));
+    }
+
+    #[test]
+    fn a_server_without_a_camouflage_target_is_refused() {
+        // Xray refuses it (`transport_internet.go:841-843`); a server without a
+        // target answers a probe with nothing at all, which is itself a
+        // fingerprint.
+        let mut value = settings();
+        value.as_object_mut().expect("object").remove("dest");
+        let error = RealityServerConfig::from_xray_settings(&value)
+            .expect_err("a missing dest is a configuration error");
+        assert!(error.contains("dest"), "{error}");
+    }
+
+    #[test]
     fn every_rejected_shape_is_rejected_for_its_own_reason() {
         let cases: &[(&str, Value)] = &[
             ("privateKey", json!({"privateKey": "not base64!!"})),
@@ -362,7 +481,10 @@ mod tests {
             ("shortId", json!({"shortIds": ["xyz"]})),
             ("shortId", json!({"shortIds": ["001122334455667788"]})),
             ("mldsa65Seed", json!({"mldsa65Seed": "AAAA"})),
-            ("minClientVer", json!({"minClientVer": "1.2"})),
+            ("minClientVer", json!({"minClientVer": "1.2.3.4"})),
+            ("minClientVer", json!({"minClientVer": "1.two"})),
+            ("minClientVer", json!({"minClientVer": "+1.2.3"})),
+            ("minClientVer", json!({"minClientVer": "1.2.300"})),
             ("xver", json!({"xver": 3})),
             (
                 "limitFallbackUpload",
@@ -413,6 +535,7 @@ mod tests {
         // the operator's public key belongs to.
         let pair = zero_security::keys::x25519();
         let json = json!({
+            "dest": "example.com:443",
             "privateKey": pair.private_key,
             "serverNames": ["example.com"],
             "shortIds": [""],

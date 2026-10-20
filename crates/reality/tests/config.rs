@@ -196,15 +196,6 @@ fn the_readers_agree_on_which_blocks_are_refused() {
             }),
         ),
         (
-            "a version that is not major.minor.patch",
-            json!({
-                "privateKey": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0",
-                "serverNames": ["example.com"],
-                "shortIds": [""],
-                "minClientVer": "1.2"
-            }),
-        ),
-        (
             "an xver that is not 0, 1 or 2",
             json!({
                 "privateKey": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0",
@@ -225,4 +216,39 @@ fn the_readers_agree_on_which_blocks_are_refused() {
             "this crate accepted {what}: {settings:#}"
         );
     }
+}
+
+#[test]
+fn both_readers_fill_in_a_short_client_version_the_same_way() {
+    // Xray accepts one to three parts and pads with zeros, so `"1.2"` is
+    // `1.2.0`; a reader that demanded three parts would refuse a config the
+    // official implementation runs, and a client would be refused for a
+    // version it never claimed.
+    let mut settings = server_settings();
+    settings
+        .as_object_mut()
+        .expect("object")
+        .insert("minClientVer".into(), json!("1.2"));
+    let compiled = compiled(&settings);
+    let mine = RealityServerConfig::from_xray_settings(&settings).expect("this crate parses it");
+    assert_eq!(compiled.min_client_ver, Some([1, 2, 0]));
+    assert_eq!(mine.min_client_ver, compiled.min_client_ver);
+}
+
+#[test]
+fn both_readers_treat_a_bare_port_dest_as_localhost() {
+    // `dest: "443"` is `localhost:443` in Xray; resolving "443" as a host name
+    // would send every unauthenticated visitor into a DNS failure instead of
+    // to the camouflage site.
+    let mut settings = server_settings();
+    settings
+        .as_object_mut()
+        .expect("object")
+        .insert("dest".into(), json!("8443"));
+    let compiled = compiled(&settings);
+    let mine = RealityServerConfig::from_xray_settings(&settings).expect("this crate parses it");
+    let (address, port) = compiled.target.expect("the compiler read dest");
+    let (host, mine_port) = mine.target.expect("this crate read dest");
+    assert_eq!((address.to_string().as_str(), port), ("localhost", 8443));
+    assert_eq!((&*host, mine_port), ("localhost", 8443));
 }

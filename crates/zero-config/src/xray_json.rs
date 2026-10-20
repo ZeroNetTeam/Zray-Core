@@ -928,12 +928,21 @@ fn parse_inbound_security(settings: Option<&Value>, path: &str) -> R<InboundSecu
                         .map_err(|e| format!("{path}: reality shortId: {e}"))
                 })
                 .collect::<R<Vec<_>>>()?;
+            if short_ids.is_empty() {
+                // Xray refuses this (`empty "shortIds"`) and so must the
+                // compiler: a REALITY server with no selector accepts nobody,
+                // so it would come up healthy and hand every client to the
+                // camouflage site — a silent total failure, not a loud one.
+                return Err(format!(
+                    "{path}: reality shortIds must not be empty; with no selector the server \
+                     would authenticate nobody"
+                ));
+            }
             let target = reality
                 .get("dest")
                 .or_else(|| reality.get("target"))
                 .and_then(Value::as_str)
-                .and_then(zero_core::address::split_host_port)
-                .map(|(host, port)| (Address::parse_host(host), port));
+                .and_then(parse_reality_target);
             let mldsa65_seed = match reality.get("mldsa65Seed").and_then(Value::as_str) {
                 None | Some("") => None,
                 Some(text) => {
@@ -945,6 +954,17 @@ fn parse_inbound_security(settings: Option<&Value>, path: &str) -> R<InboundSecu
                         .ok_or_else(|| {
                             format!("{path}: reality mldsa65Seed must be 32 bytes of base64url")
                         })?;
+                    if seed == private_key {
+                        // Xray refuses this pair
+                        // (`infra/conf/transport_internet.go:904-906`). The
+                        // seed is what makes the ML-DSA-65 half a different
+                        // secret from the X25519 half; reusing one for the
+                        // other collapses the two into a key an attacker who
+                        // ever saw it already holds.
+                        return Err(format!(
+                            "{path}: reality mldsa65Seed and privateKey must not be the same value"
+                        ));
+                    }
                     Some(Secret32(seed))
                 }
             };
@@ -955,15 +975,9 @@ fn parse_inbound_security(settings: Option<&Value>, path: &str) -> R<InboundSecu
                     .filter(|v| !v.is_empty())
                 {
                     None => Ok(None),
-                    Some(text) => {
-                        let parts: Vec<u8> = text
-                            .split('.')
-                            .map(|part| part.parse().ok())
-                            .collect::<Option<_>>()
-                            .filter(|parts: &Vec<u8>| parts.len() == 3)
-                            .ok_or_else(|| format!("{path}: reality {key} must look like 1.2.3"))?;
-                        Ok(Some([parts[0], parts[1], parts[2]]))
-                    }
+                    Some(text) => parse_reality_client_version(text)
+                        .map(Some)
+                        .map_err(|reason| format!("{path}: reality {key} {reason}")),
                 }
             };
             let limit = |key: &str| -> R<FallbackLimit> {
@@ -6382,6 +6396,52 @@ fn parse_reality_pubkey(s: &str) -> Result<[u8; 32], String> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
     Ok(out)
+}
+
+/// Xray's `dest` / `target` for a REALITY server
+/// (`infra/conf/transport_internet.go:820-843`): a bare port means
+/// `localhost:<port>`, anything else must be host:port. A unix-socket path is a
+/// real Xray feature this core does not dial yet, so it is refused rather than
+/// resolved as a host name.
+fn parse_reality_target(text: &str) -> Option<(Address, u16)> {
+    let text = text.trim();
+    if text.starts_with('@') || text.starts_with('/') {
+        return None;
+    }
+    if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return text
+            .parse::<u16>()
+            .ok()
+            .map(|port| (Address::parse_host("localhost"), port));
+    }
+    zero_core::address::split_host_port(text).map(|(host, port)| (Address::parse_host(host), port))
+}
+
+/// Xray's `minClientVer` / `maxClientVer`: one to three dot-separated decimal
+/// bytes, right-padded with zeros, so `"1.2"` is `1.2.0`. A fourth part is
+/// refused; a part that is not a byte — or that carries a sign, which Go's
+/// `ParseUint` rejects and Rust's `parse` would accept — is refused too
+/// (`infra/conf/transport_internet.go:856-883`).
+fn parse_reality_client_version(text: &str) -> Result<[u8; 3], String> {
+    let mut version = [0u8; 3];
+    let mut parts = text.split('.');
+    for slot in version.iter_mut() {
+        match parts.next() {
+            None => break,
+            Some(part) if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) => {
+                return Err("must be dotted bytes, like 1.2.3".into())
+            }
+            Some(part) => {
+                *slot = part
+                    .parse()
+                    .map_err(|_| "has a part above 255".to_string())?;
+            }
+        }
+    }
+    if parts.next().is_some() {
+        return Err("has more than three parts".into());
+    }
+    Ok(version)
 }
 
 fn parse_reality_private_key(s: &str) -> Result<[u8; 32], String> {
