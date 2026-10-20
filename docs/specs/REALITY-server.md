@@ -89,14 +89,14 @@ ChangeCipherSpec probe, the decoy being dialled on the accepting path, and
 * cipher-suite choice follows the client, not the decoy or a server list —
   `crates/reality/src/server.rs:559-567`, `:675-700` against
   `RL/handshake_server_tls13.go:102` (§3);
-* no padding of the first flight to the decoy's record lengths —
-  `crates/reality/src/server.rs:716-748` against `RL/conn.go:526-557` (§3);
 * the ML-DSA-65 extension uses OID 1.3 at a computed offset instead of Go's
   placeholder OID 0.0 at a fixed one — `crates/reality/src/server.rs:835-843`
   against `RL/handshake_server_tls13.go:82`; invisible to both clients (§3, §4);
-* empty-record tolerance is 256, not 32-or-learned —
-  `crates/zero-security/src/tls13/client.rs:838-846` against `RL/conn.go:803-811`,
-  `:827-839` (§5);
+* the useless-record budget is the fixed 32, never the one learned from the
+  decoy — Go probes the site for how many non-advancing records it tolerates
+  and applies *that* (`RL/record_detect.go:137-185`, `RL/tls.go:425-427`); the
+  port counts to 32 and stops (`crates/zero-security/src/tls13/client.rs:723`,
+  `MAX_USELESS_RECORDS`) (§5);
 * a session ticket or unknown post-handshake type from the peer is ignored, not
   alerted — `crates/zero-security/src/tls13/client.rs:925` against
   `RL/conn.go:1387-1398` (§5);
