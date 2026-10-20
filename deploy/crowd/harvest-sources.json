@@ -23,5 +23,10 @@
     "id": "irancell",
     "url": "https://raw.githubusercontent.com/morteza-v2/free-v2ray-irancell-config/main/Sub1.txt",
     "tier": 1
+  },
+  {
+    "id": "patterniha",
+    "url": "https://raw.githubusercontent.com/patterniha/Free-Configs/main/configs.txt",
+    "tier": 1
   }
 ]

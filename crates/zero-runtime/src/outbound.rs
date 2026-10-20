@@ -793,6 +793,9 @@ pub async fn connect(outbound: &Outbound, destination: &Destination) -> Result<B
     if let OutboundProtocol::Tor(tor) = &outbound.protocol {
         return connect_tor(tor, destination).await;
     }
+    if let OutboundProtocol::Psiphon(psiphon) = &outbound.protocol {
+        return connect_psiphon(psiphon, destination).await;
+    }
     if let OutboundProtocol::MasterDns(masterdns) = &outbound.protocol {
         return crate::masterdns::connect(masterdns, destination).await;
     }
@@ -825,6 +828,12 @@ pub async fn connect_with_resolver(
 ) -> Result<BoxStream, Failure> {
     if let OutboundProtocol::Tor(tor) = &outbound.protocol {
         return connect_tor(tor, destination).await;
+    }
+    if let OutboundProtocol::Psiphon(psiphon) = &outbound.protocol {
+        // Psiphon dials its own servers by address and resolves the
+        // destination at the far end, so the managed resolver has nothing to
+        // do here.
+        return connect_psiphon(psiphon, destination).await;
     }
     if let OutboundProtocol::MasterDns(masterdns) = &outbound.protocol {
         return crate::masterdns::connect(masterdns, destination).await;
@@ -890,6 +899,65 @@ async fn connect_tor(
 ) -> Result<BoxStream, Failure> {
     Err(Failure::new(FailureKind::LocalPolicy, Stage::Resolving)
         .with_detail("this build was made without Tor support; use a build with the `tor` feature"))
+}
+
+/// Open a stream through the native Psiphon client.
+///
+/// Deliberately outside `within_setup_deadline`: the first connection of a
+/// process builds a tunnel, which is several round trips to a server that may
+/// have to be chosen from several candidates, and `zero-psiphon` applies its
+/// own bounds to that work. Later connections reuse the established tunnel and
+/// are as fast as any other outbound.
+///
+/// The destination name is handed over unresolved: the Psiphon server resolves
+/// it, so the local resolver never learns it.
+#[cfg(feature = "psiphon")]
+async fn connect_psiphon(
+    psiphon: &zero_config::PsiphonConfig,
+    destination: &Destination,
+) -> Result<BoxStream, Failure> {
+    if destination.network != zero_core::Network::Tcp {
+        return Err(Failure::new(FailureKind::LocalPolicy, Stage::RequestSent)
+            .with_detail("Psiphon carries TCP only"));
+    }
+
+    let config =
+        zero_psiphon::ClientConfig::from_value(psiphon.to_settings()).map_err(|error| {
+            Failure::new(FailureKind::LocalPolicy, Stage::Resolving)
+                .with_detail(format!("psiphon configuration: {error}"))
+        })?;
+
+    let started = std::time::Instant::now();
+    let stream = zero_psiphon::dial(
+        &config,
+        &destination.address.host_string(),
+        destination.port,
+    )
+    .await
+    .map_err(|error| {
+        Failure::new(FailureKind::TcpUnreachable, Stage::SocketConnected)
+            .with_detail(format!("psiphon: {error}"))
+    })?;
+    tracing::debug!(
+        target: "zero_runtime::outbound",
+        host = %destination.address.host_string(),
+        port = destination.port,
+        waited_ms = started.elapsed().as_millis() as u64,
+        "opened a psiphon stream",
+    );
+    Ok(stream)
+}
+
+#[cfg(not(feature = "psiphon"))]
+async fn connect_psiphon(
+    _psiphon: &zero_config::PsiphonConfig,
+    _destination: &Destination,
+) -> Result<BoxStream, Failure> {
+    Err(
+        Failure::new(FailureKind::LocalPolicy, Stage::Resolving).with_detail(
+            "this build was made without Psiphon support; use a build with the `psiphon` feature",
+        ),
+    )
 }
 
 /// The tunnel parameters of a WireGuard/AmneziaWG outbound.
@@ -1790,6 +1858,12 @@ async fn secure(
             if let Some(version) = hello_version {
                 params = params.with_hello_version(version);
             }
+            // NaiveProxy rides HTTP/2; a config that names no ALPN list must
+            // still offer h2, or the front answers in HTTP/1.1 and the h2
+            // preface never matches.
+            if matches!(outbound.protocol, OutboundProtocol::Naive(_)) && params.alpn.is_empty() {
+                params.alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            }
             Ok(boxed(zero_security::connect(base, &params).await?))
         }
         Security::Reality(reality) => {
@@ -2468,6 +2542,22 @@ async fn finish_stack(
         secured
     };
 
+    if let OutboundProtocol::Naive(naive) = &outbound.protocol {
+        let stream = zero_transport::naive::client_handshake(
+            secured,
+            &naive.username,
+            &naive.password,
+            destination,
+            naive.padding,
+        )
+        .await
+        .map_err(|error| {
+            Failure::new(FailureKind::ProtocolRejected, Stage::RequestSent)
+                .with_detail(format!("NaiveProxy handshake: {error}"))
+        })?;
+        return Ok(boxed(stream));
+    }
+
     if let OutboundProtocol::AnyTls(anytls) = &outbound.protocol {
         let stream =
             zero_protocol::anytls::client_handshake(secured, &anytls.password, destination)
@@ -2861,8 +2951,10 @@ fn protocol_header(outbound: &Outbound, destination: &Destination) -> Result<Vec
         OutboundProtocol::Shadowsocks(_) => Ok(Vec::new()),
         OutboundProtocol::Vmess(_) => Ok(Vec::new()),
         OutboundProtocol::AnyTls(_) => Ok(Vec::new()),
+        OutboundProtocol::Naive(_) => Ok(Vec::new()),
         OutboundProtocol::Socks(_) => Ok(Vec::new()),
         OutboundProtocol::Tor(_) => Ok(Vec::new()),
+        OutboundProtocol::Psiphon(_) => Ok(Vec::new()),
         OutboundProtocol::MasterDns(_) => Ok(Vec::new()),
         OutboundProtocol::Tide(_) => Ok(Vec::new()),
         OutboundProtocol::Hysteria2(_) => Ok(Vec::new()),

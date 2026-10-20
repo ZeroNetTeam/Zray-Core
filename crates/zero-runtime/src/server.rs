@@ -477,18 +477,16 @@ impl InboundRuntime {
             _ => None,
         };
         let reality = match &inbound.security {
-            zero_config::InboundSecurity::Reality(reality) => {
-                Some(reality::RealityServerParams {
-                    private_key: reality.private_key,
-                    server_names: reality.server_names.clone(),
-                    short_ids: reality.short_ids.clone(),
-                    mldsa65_seed: reality.mldsa65_seed.as_ref().map(|seed| seed.0),
-                    max_time_diff: Duration::from_millis(reality.max_time_diff_ms),
-                    min_client_ver: reality.min_client_ver,
-                    max_client_ver: reality.max_client_ver,
-                    post_handshake: Default::default(),
-                })
-            }
+            zero_config::InboundSecurity::Reality(reality) => Some(reality::RealityServerParams {
+                private_key: reality.private_key,
+                server_names: reality.server_names.clone(),
+                short_ids: reality.short_ids.clone(),
+                mldsa65_seed: reality.mldsa65_seed.as_ref().map(|seed| seed.0),
+                max_time_diff: Duration::from_millis(reality.max_time_diff_ms),
+                min_client_ver: reality.min_client_ver,
+                max_client_ver: reality.max_client_ver,
+                post_handshake: Default::default(),
+            }),
             _ => None,
         };
         let transport = match &inbound.transport {
@@ -1500,6 +1498,12 @@ impl Server {
                     .is_some_and(|new| format!("{new:?}") == format!("{old:?}"));
                 if !unchanged {
                     health.forget(&old.tag);
+                    // A Psiphon outbound that changed keeps a tunnel it no
+                    // longer needs: the old configuration's client is dropped
+                    // so its SSH session and its memory go with it. One that
+                    // did not change keeps its tunnel, which is the point of
+                    // sharing a client per configuration.
+                    forget_psiphon(old);
                 }
             }
         }
@@ -4353,8 +4357,11 @@ impl Server {
             self.record_outbound_observation(tag, &outcome);
         }
         self.record_observation(&outcome).await;
+        // The outbound that carried the session is named in the counter, so a
+        // panel can tell which outbound an account's traffic went through.
+        // A session that went direct has no outbound to name.
         self.stats
-            .record_tag_traffic(&ctx.inbound_tag, None, &outcome.transferred);
+            .record_tag_traffic(&ctx.inbound_tag, health.as_deref(), &outcome.transferred);
         self.stats
             .uploaded
             .fetch_add(outcome.transferred.uploaded, Ordering::Relaxed);
@@ -5093,8 +5100,11 @@ impl Server {
             self.record_outbound_observation(tag, &outcome);
         }
         self.record_observation(&outcome).await;
+        // The outbound that carried the session is named in the counter, so a
+        // panel can tell which outbound an account's traffic went through.
+        // A session that went direct has no outbound to name.
         self.stats
-            .record_tag_traffic(&ctx.inbound_tag, None, &outcome.transferred);
+            .record_tag_traffic(&ctx.inbound_tag, health.as_deref(), &outcome.transferred);
         self.stats
             .uploaded
             .fetch_add(outcome.transferred.uploaded, Ordering::Relaxed);
@@ -5334,8 +5344,10 @@ impl Server {
                     | OutboundProtocol::Shadowsocks(_)
                     | OutboundProtocol::Vmess(_)
                     | OutboundProtocol::AnyTls(_)
+                    | OutboundProtocol::Naive(_)
                     | OutboundProtocol::Socks(_)
                     | OutboundProtocol::Tor(_)
+                    | OutboundProtocol::Psiphon(_)
                     | OutboundProtocol::MasterDns(_)
                     | OutboundProtocol::Tide(_)
                     | OutboundProtocol::Hysteria2(_)
@@ -5429,8 +5441,11 @@ impl Server {
             self.record_outbound_observation(tag, &outcome);
         }
         self.record_observation(&outcome).await;
+        // The outbound that carried the session is named in the counter, so a
+        // panel can tell which outbound an account's traffic went through.
+        // A session that went direct has no outbound to name.
         self.stats
-            .record_tag_traffic(&ctx.inbound_tag, None, &outcome.transferred);
+            .record_tag_traffic(&ctx.inbound_tag, health.as_deref(), &outcome.transferred);
         self.stats
             .uploaded
             .fetch_add(outcome.transferred.uploaded, Ordering::Relaxed);
@@ -6603,8 +6618,10 @@ impl Server {
             | OutboundProtocol::Shadowsocks(_)
             | OutboundProtocol::Vmess(_)
             | OutboundProtocol::AnyTls(_)
+            | OutboundProtocol::Naive(_)
             | OutboundProtocol::Socks(_)
             | OutboundProtocol::Tor(_)
+            | OutboundProtocol::Psiphon(_)
             | OutboundProtocol::MasterDns(_)
             | OutboundProtocol::Tide(_)
             | OutboundProtocol::Hysteria2(_)
@@ -8360,6 +8377,26 @@ async fn write_udp_replies<W, K, F>(
     }
 }
 
+/// Drop the Psiphon client belonging to an outbound that is going away or
+/// changing.
+///
+/// The client is shared by every connection that uses the same configuration,
+/// so this is what ends its tunnel: the last stream through it closes, the
+/// client is released, and the SSH session ends with it.
+#[cfg(feature = "psiphon")]
+fn forget_psiphon(outbound: &zero_config::Outbound) {
+    let zero_config::OutboundProtocol::Psiphon(psiphon) = &outbound.protocol else {
+        return;
+    };
+    let Ok(config) = zero_psiphon::ClientConfig::from_value(psiphon.to_settings()) else {
+        return;
+    };
+    zero_psiphon::shared::forget(&config);
+}
+
+#[cfg(not(feature = "psiphon"))]
+fn forget_psiphon(_outbound: &zero_config::Outbound) {}
+
 fn replace_outbound_endpoint(outbound: &mut zero_config::Outbound, address: Address, port: u16) {
     match &mut outbound.protocol {
         OutboundProtocol::Vless(config) => {
@@ -8379,6 +8416,10 @@ fn replace_outbound_endpoint(outbound: &mut zero_config::Outbound, address: Addr
             config.port = port;
         }
         OutboundProtocol::AnyTls(config) => {
+            config.address = address;
+            config.port = port;
+        }
+        OutboundProtocol::Naive(config) => {
             config.address = address;
             config.port = port;
         }
@@ -8402,9 +8443,12 @@ fn replace_outbound_endpoint(outbound: &mut zero_config::Outbound, address: Addr
         // CDN/TCP optimization and must not rewrite its authenticated peer
         // endpoint behind the caller's back. A SOCKS5 upstream is the user's
         // own client (often loopback), not a CDN edge, so it is left alone too.
+        // Psiphon chooses its own servers from its signed entry list; a
+        // clean-IP rewrite would point it at an address it has no entry for.
         OutboundProtocol::AmneziaWireguard(_)
         | OutboundProtocol::Socks(_)
         | OutboundProtocol::Tor(_)
+        | OutboundProtocol::Psiphon(_)
         | OutboundProtocol::MasterDns(_)
         | OutboundProtocol::Freedom { .. }
         | OutboundProtocol::Blackhole { .. }
@@ -8889,13 +8933,18 @@ fn asset_specs(assets: &zero_config::AssetsConfig) -> Vec<zero_router::AssetSpec
 /// keeps a pathological one from opening a connection per name at start.
 const POST_HANDSHAKE_NAMES: usize = 8;
 
-/// Ask each REALITY inbound's camouflage site what it sends straight after a
-/// handshake, in the background, and file the answer where the inbound's
-/// handshakes will find it (see [`zero_security::tls13::post_handshake`]).
+/// Ask each REALITY inbound's camouflage site what its handshake looks like,
+/// in the background, and file the answer where the inbound's handshakes will
+/// find it (see [`zero_security::tls13::post_handshake`]).
+///
+/// Both halves are learned in the one connection: the sizes of the records in
+/// the site's first flight, which the inbound then writes its own flight in,
+/// and the sizes of what the site sends after the handshake, which the inbound
+/// replays as empty records.
 ///
 /// Nothing waits on this. Until a site has answered, and for good if it never
-/// does, the inbound sends no extra records after its handshakes for that
-/// name, which is how every inbound behaved before.
+/// does, the inbound sends a flight of its own sizes and no extra records
+/// after a handshake, which is how every inbound behaved before.
 fn learn_post_handshake(
     config: &RuntimeConfig,
     inbounds: &[InboundRuntime],
@@ -8928,21 +8977,38 @@ fn learn_post_handshake(
                         &resolver,
                     )
                     .await?;
-                    zero_security::tls13::post_handshake::observe(site, &name).await
+                    // Unverified on purpose: this connection carries no
+                    // application data, the site is the operator's own choice
+                    // of camouflage, and requiring a public chain would leave
+                    // every private-CA or self-signed decoy unshaped — which
+                    // Go's REALITY handles, since it reads these sizes off the
+                    // live connection without verifying anything.
+                    zero_security::tls13::post_handshake::observe_all_with(
+                        site,
+                        &name,
+                        zero_security::tls13::post_handshake::SiteTrust::Unverified,
+                    )
+                    .await
                 })
                 .await;
                 match learned {
-                    Ok(Ok(sizes)) => {
-                        debug!(%name, ?sizes, "REALITY target's post-handshake records learned");
-                        shapes.set(&name, &sizes);
+                    Ok(Ok(learned)) => {
+                        debug!(
+                            %name,
+                            flight = ?learned.flight,
+                            post_handshake = ?learned.post_handshake,
+                            "REALITY target's handshake shapes learned"
+                        );
+                        shapes.set_flight(&name, &learned.flight);
+                        shapes.set(&name, &learned.post_handshake);
                     }
                     Ok(Err(error)) => warn!(
                         %name, %error,
-                        "REALITY target did not complete a handshake; this inbound will not copy its session tickets. Check that the target serves this name."
+                        "REALITY target did not complete a handshake; this inbound will copy neither its flight nor its session tickets. Check that the target serves this name."
                     ),
                     Err(_) => warn!(
                         %name,
-                        "REALITY target did not answer in time; this inbound will not copy its session tickets. Check that the server can reach the target."
+                        "REALITY target did not answer in time; this inbound will copy neither its flight nor its session tickets. Check that the server can reach the target."
                     ),
                 }
             });
