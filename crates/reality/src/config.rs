@@ -310,6 +310,8 @@ impl RealityServerConfig {
             min_client_ver: self.min_client_ver,
             max_client_ver: self.max_client_ver,
             post_handshake: Default::default(),
+            show: self.show,
+            key_log: None,
         }
     }
 

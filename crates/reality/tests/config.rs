@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 fn server_settings() -> Value {
     json!({
-        "show": false,
+        "show": true,
         "dest": "example.com:443",
         "xver": 2,
         "serverNames": ["example.com", "www.example.com"],
@@ -27,6 +27,7 @@ fn server_settings() -> Value {
         "maxTimeDiff": 60000,
         "minClientVer": "1.0.0",
         "maxClientVer": "26.3.27",
+        "masterKeyLog": "/tmp/zray-reality-keys.log",
         "limitFallbackUpload": {"afterBytes": 10, "bytesPerSec": 20, "burstBytesPerSec": 30},
         "limitFallbackDownload": {"afterBytes": 40, "bytesPerSec": 50, "burstBytesPerSec": 60}
     })
@@ -117,6 +118,12 @@ fn both_readers_agree_on_one_reality_block() {
     assert_eq!(mine.min_client_ver, compiled.min_client_ver, "minClientVer");
     assert_eq!(mine.max_client_ver, compiled.max_client_ver, "maxClientVer");
     assert_eq!(mine.fallback_xver, compiled.fallback_xver, "xver");
+    assert_eq!(mine.show, compiled.show, "show");
+    assert_eq!(
+        mine.master_key_log.as_deref(),
+        compiled.master_key_log.as_deref(),
+        "masterKeyLog"
+    );
     assert_eq!(
         (
             mine.fallback_limit_up.after_bytes,

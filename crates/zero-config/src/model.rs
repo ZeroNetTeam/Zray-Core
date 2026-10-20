@@ -3582,6 +3582,18 @@ pub struct InboundRealityConfig {
     /// the target or to feed it traffic.
     pub fallback_limit_up: FallbackLimit,
     pub fallback_limit_down: FallbackLimit,
+    /// Xray's `show`: report, per connection, what the handshake decoded.
+    ///
+    /// A debugging switch an operator turns on to answer "why did this
+    /// client fall back?"; it says nothing about the protocol.
+    pub show: bool,
+    /// Xray's `masterKeyLog`: the file the handshake appends its TLS 1.3
+    /// traffic secrets to.
+    ///
+    /// A secret on disk, on purpose: it is what lets an operator read the
+    /// handshake of a client whose traffic must be decrypted. `None` writes
+    /// nothing at all.
+    pub master_key_log: Option<Box<str>>,
 }
 
 /// Xray's `limitFallbackUpload` / `limitFallbackDownload`: after

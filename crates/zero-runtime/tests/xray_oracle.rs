@@ -2241,7 +2241,8 @@ async fn spawn_reality_server(
                 let params = params.clone();
                 let outcomes = Arc::clone(&outcomes);
                 tokio::spawn(async move {
-                    let outcome = match reality::handshake_or_fallback(stream, &params).await {
+                    let outcome = match reality::handshake_or_fallback(stream, &params, None).await
+                    {
                         reality::HandshakeOutcome::Accepted(_) => "accepted".to_string(),
                         reality::HandshakeOutcome::Fallback { failure, .. } => {
                             format!("fell back to the site: {failure}")

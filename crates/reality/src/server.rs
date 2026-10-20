@@ -50,6 +50,17 @@ pub struct RealityServerParams {
     /// by whoever can reach that site. Empty until then, and the server sends
     /// nothing extra for a name it has no entry for.
     pub post_handshake: Arc<PostHandshakeShapes>,
+    /// Xray's `show`: report, per connection, what the handshake decoded.
+    ///
+    /// The report is a line, and it names what the client sent and whether it
+    /// was let through — never the key that proved it. `false` reports
+    /// nothing.
+    pub show: bool,
+    /// Xray's `masterKeyLog`: where the handshake's traffic secrets are
+    /// written, so an operator can decrypt a captured session.
+    ///
+    /// A secret on disk, on purpose; `None` writes nothing.
+    pub key_log: Option<Arc<crate::keys::KeyLog>>,
 }
 
 impl std::fmt::Debug for RealityServerParams {
@@ -194,7 +205,7 @@ pub async fn handshake<S>(io: S, params: &RealityServerParams) -> Result<Tls13St
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    match handshake_or_fallback(io, params).await {
+    match handshake_or_fallback(io, params, None).await {
         HandshakeOutcome::Accepted(stream) => Ok(stream),
         HandshakeOutcome::Fallback { failure, .. } | HandshakeOutcome::Rejected(failure) => {
             Err(failure)
@@ -205,9 +216,13 @@ where
 /// Perform the REALITY handshake while preserving a valid first record for a
 /// fallback site when the connection is ordinary TLS or has the wrong REALITY
 /// credentials.
+///
+/// `peer` is the address the connection came from, as the server sees it. It
+/// is only used for the `show` report; the handshake itself never looks at it.
 pub async fn handshake_or_fallback<S>(
     mut io: S,
     params: &RealityServerParams,
+    peer: Option<std::net::SocketAddr>,
 ) -> HandshakeOutcome<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -284,6 +299,23 @@ where
                 }
             }
         };
+    // The `show` report: what the client said, and whether it was let
+    // through. It is written here rather than at the end, because the fields
+    // it names are the ones the session id carried, and a client that is
+    // refused is refused *for* one of them.
+    let report = params.show.then(|| crate::keys::ClientReport {
+        peer: peer.unwrap_or(std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
+        client_version: [plaintext[0], plaintext[1], plaintext[2]],
+        client_clock: std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(u64::from(u32::from_be_bytes([
+                plaintext[4],
+                plaintext[5],
+                plaintext[6],
+                plaintext[7],
+            ]))),
+        short_id: plaintext[8..16].into(),
+        authenticated: false,
+    });
     // The gates are asked in Go's order (`RL/tls.go:257-262`): the seal above,
     // then `MinClientVer` / `MaxClientVer`, then `MaxTimeDiff`, then the
     // shortId. Every one of them fails into the same silent fallback, so the
@@ -291,6 +323,9 @@ where
     // — and a server that named the selector before the version would be
     // answering about a hello Go had already sent to the site.
     if let Err(failure) = check_client_limits(params, &plaintext) {
+        if let Some(report) = report {
+            report_line(report);
+        }
         return HandshakeOutcome::Fallback {
             stream: io,
             client_hello,
@@ -304,6 +339,9 @@ where
         acc | short_id_matches(&plaintext[8..16], short)
     });
     if !bool::from(authorised) {
+        if let Some(report) = report {
+            report_line(report);
+        }
         return HandshakeOutcome::Fallback {
             stream: io,
             client_hello,
@@ -312,10 +350,37 @@ where
     }
 
     let shapes = params.post_handshake.site(&hello.sni);
-    match complete_handshake(io, hello, auth_key, shapes, params.mldsa65_seed).await {
-        Ok(stream) => HandshakeOutcome::Accepted(stream),
+    match complete_handshake(
+        io,
+        hello,
+        auth_key,
+        shapes,
+        params.mldsa65_seed,
+        params.key_log.as_ref(),
+    )
+    .await
+    {
+        Ok(stream) => {
+            if let Some(mut report) = report {
+                report.authenticated = true;
+                report_line(report);
+            }
+            HandshakeOutcome::Accepted(stream)
+        }
         Err(failure) => HandshakeOutcome::Rejected(failure),
     }
+}
+
+/// The `show` line, as one line of the log.
+///
+/// The level is `info`: `show` is a switch an operator turns on to read, and
+/// a line that needs `debug` turned on as well is a line nobody reads.
+fn report_line(report: crate::keys::ClientReport) {
+    tracing::info!(
+        target: "reality",
+        "REALITY {}",
+        report.line(std::time::SystemTime::now())
+    );
 }
 
 /// The client's version and clock, from the session id's plaintext, held to
@@ -356,6 +421,7 @@ async fn complete_handshake<S>(
     auth_key: [u8; 32],
     shapes: SiteShapes,
     mldsa65_seed: Option<[u8; 32]>,
+    key_log: Option<&Arc<crate::keys::KeyLog>>,
 ) -> Result<Tls13Stream<S>, Failure>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -460,6 +526,19 @@ where
     // traffic secret but is not part of the transcript input to the
     // application traffic key schedule (RFC 8446 §7.1).
     let (client_app, server_app) = establish_application_secrets(&schedule, &transcript.snapshot());
+    // The key log, when it is on, gets the handshake secrets as soon as they
+    // exist and the application secrets as soon as they do
+    // (`RL/handshake_server_tls13.go:884-893`, `:1031-1040`). A log that
+    // cannot be written is a debugging aid failing, not a connection to drop:
+    // the line is skipped and the handshake carries on.
+    if let Some(log) = key_log {
+        let _ = log.log_handshake_secrets(
+            &hello.random,
+            &schedule.client_hs_traffic,
+            &schedule.server_hs_traffic,
+        );
+        let _ = log.log_application_secrets(&hello.random, &client_app, &server_app);
+    }
     let mut stream = Tls13Stream::new(io, hello.suite, client_app, server_app);
     if let Some(wire_lens) = shapes.after {
         // Where the real site would be sending its session tickets.
@@ -1176,6 +1255,48 @@ mod tests {
     use zero_security::tls13::record::MAX_CIPHERTEXT_BEFORE_TLS13;
     use zero_security::tls13::{HelloParams, PendingHello};
 
+    /// A `tracing` writer that keeps every line, so a test can read what the
+    /// code under test logged.
+    struct CollectingSink {
+        lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl std::io::Write for CollectingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let text = String::from_utf8_lossy(buf).into_owned();
+            for line in text.lines() {
+                self.lines.lock().unwrap().push(line.to_string());
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CollectingSink {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            CollectingSink {
+                lines: self.lines.clone(),
+            }
+        }
+    }
+
+    /// The sink, wrapped so it can be a `MakeWriter` by value: the orphan
+    /// rule will not let this crate implement a foreign trait for `Arc<_>`.
+    struct SinkWriter(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SinkWriter {
+        type Writer = CollectingSink;
+        fn make_writer(&'a self) -> Self::Writer {
+            CollectingSink {
+                lines: self.0.clone(),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn reality_server_round_trips_application_data() {
         let private_key = [7u8; 32];
@@ -1191,6 +1312,8 @@ mod tests {
             min_client_ver: None,
             max_client_ver: None,
             post_handshake: Default::default(),
+            show: false,
+            key_log: None,
         };
         let client_params = zero_security::RealityParams::from_config(
             std::sync::Arc::from("example.test"),
@@ -1218,6 +1341,140 @@ mod tests {
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"pong");
         server.await.unwrap();
+    }
+
+    /// The `show` switch writes a line per connection, and the line names
+    /// what the client sent and whether it was let through.
+    ///
+    /// The report is what an operator turns the switch on for, so a version
+    /// that reported nothing would be worse than no switch at all.
+    #[tokio::test]
+    async fn the_show_switch_reports_what_the_client_sent() {
+        // A subscriber that keeps what was logged, so the test can read the
+        // line the switch wrote. One per process, so the first test to want
+        // one installs it and the rest share it.
+        static LINES: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<String>>>> =
+            std::sync::OnceLock::new();
+        let lines = LINES.get_or_init(|| {
+            let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(SinkWriter(lines.clone()))
+                .try_init();
+            lines
+        });
+        lines.lock().unwrap().clear();
+
+        let private_key = [7u8; 32];
+        let public_key =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key))
+                .to_bytes();
+        let server_params = RealityServerParams {
+            private_key,
+            server_names: vec![Box::from("example.test")].into_boxed_slice(),
+            short_ids: vec![vec![0xaa, 0xbb, 0xcc, 0xdd].into_boxed_slice()].into_boxed_slice(),
+            mldsa65_seed: None,
+            max_time_diff: Duration::ZERO,
+            min_client_ver: None,
+            max_client_ver: None,
+            post_handshake: Default::default(),
+            show: true,
+            key_log: None,
+        };
+        let client_params = zero_security::RealityParams::from_config(
+            std::sync::Arc::from("example.test"),
+            public_key,
+            &[0xaa, 0xbb, 0xcc, 0xdd],
+        )
+        .with_hybrid_kem(true);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let _ = handshake_or_fallback(
+                server_io,
+                &server_params,
+                Some("192.0.2.1:1234".parse().unwrap()),
+            )
+            .await;
+        });
+        let mut client = zero_security::reality_connect(client_io, &client_params)
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let _ = client.read_exact(&mut byte).await;
+        server.await.unwrap();
+
+        let logged = lines.lock().unwrap().join("\n");
+        assert!(
+            logged.contains("REALITY remoteAddr: 192.0.2.1:1234"),
+            "the show line must name where the connection came from:\n{logged}"
+        );
+        assert!(
+            logged.contains("authenticated: true"),
+            "the show line must say whether the client was let through:\n{logged}"
+        );
+    }
+
+    /// `masterKeyLog` writes the handshake's traffic secrets, in Go's order.
+    ///
+    /// The four lines are what an operator needs to decrypt a captured
+    /// session, so their absence would make the switch a no-op.
+    #[tokio::test]
+    async fn the_key_log_writes_the_handshakes_traffic_secrets() {
+        let private_key = [7u8; 32];
+        let public_key =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key))
+                .to_bytes();
+        let path = std::env::temp_dir().join(format!(
+            "zray-reality-keylog-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log = Arc::new(crate::keys::KeyLog::open(path.to_str().unwrap()).unwrap());
+        let server_params = RealityServerParams {
+            private_key,
+            server_names: vec![Box::from("example.test")].into_boxed_slice(),
+            short_ids: vec![vec![0xaa, 0xbb, 0xcc, 0xdd].into_boxed_slice()].into_boxed_slice(),
+            mldsa65_seed: None,
+            max_time_diff: Duration::ZERO,
+            min_client_ver: None,
+            max_client_ver: None,
+            post_handshake: Default::default(),
+            show: false,
+            key_log: Some(log),
+        };
+        let client_params = zero_security::RealityParams::from_config(
+            std::sync::Arc::from("example.test"),
+            public_key,
+            &[0xaa, 0xbb, 0xcc, 0xdd],
+        )
+        .with_hybrid_kem(true);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let _ = handshake_or_fallback(server_io, &server_params, None).await;
+        });
+        let mut client = zero_security::reality_connect(client_io, &client_params)
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let _ = client.read_exact(&mut byte).await;
+        server.await.unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        for label in [
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+            "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            "CLIENT_TRAFFIC_SECRET_0",
+            "SERVER_TRAFFIC_SECRET_0",
+        ] {
+            assert!(
+                written.contains(label),
+                "the key log has no {label} line:\n{written}"
+            );
+        }
     }
 
     /// The ML-DSA-65 verify key for `seed`, as a client is configured with it.
@@ -1309,6 +1566,8 @@ mod tests {
             ]
             .into_boxed_slice(),
             post_handshake: Default::default(),
+            show: false,
+            key_log: None,
         };
         let client_params = zero_security::RealityParams::from_config(
             std::sync::Arc::from("example.test"),
@@ -1389,7 +1648,7 @@ mod tests {
         let (server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
-            let mut stream = match handshake_or_fallback(server_io, &server_params).await {
+            let mut stream = match handshake_or_fallback(server_io, &server_params, None).await {
                 HandshakeOutcome::Accepted(stream) => stream,
                 HandshakeOutcome::Fallback { failure, .. }
                 | HandshakeOutcome::Rejected(failure) => {
@@ -1568,7 +1827,7 @@ mod tests {
                 .await
                 .is_ok()
         });
-        let outcome = handshake_or_fallback(server_io, &server_params).await;
+        let outcome = handshake_or_fallback(server_io, &server_params, None).await;
         assert!(
             !client.await.unwrap(),
             "the client must not be handed a flight the site never sends"
@@ -1594,7 +1853,7 @@ mod tests {
         let client = tokio::spawn(async move {
             let _ = zero_security::reality_connect(client_io, &client_params).await;
         });
-        match handshake_or_fallback(server_io, &server_params).await {
+        match handshake_or_fallback(server_io, &server_params, None).await {
             HandshakeOutcome::Fallback { failure, .. } => {
                 assert!(failure.to_string().contains("shortId"), "{failure}")
             }
@@ -1622,7 +1881,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(1024);
         client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
         let (params, _) = reality_pair(&[0xaa]);
-        match handshake_or_fallback(server, &params).await {
+        match handshake_or_fallback(server, &params, None).await {
             HandshakeOutcome::Fallback { client_hello, .. } => assert_eq!(client_hello, b"GET /"),
             HandshakeOutcome::Accepted(_) => panic!("HTTP must not authenticate"),
             HandshakeOutcome::Rejected(error) => panic!("expected fallback: {error}"),
@@ -1649,8 +1908,10 @@ mod tests {
             server_names: vec![Box::from("reality.example")].into_boxed_slice(),
             short_ids: vec![vec![1, 2, 3, 4].into_boxed_slice()].into_boxed_slice(),
             post_handshake: Default::default(),
+            show: false,
+            key_log: None,
         };
-        match handshake_or_fallback(server, &params).await {
+        match handshake_or_fallback(server, &params, None).await {
             HandshakeOutcome::Fallback { client_hello, .. } => assert_eq!(client_hello, expected),
             HandshakeOutcome::Accepted(_) => panic!("ordinary hello must not authenticate"),
             HandshakeOutcome::Rejected(error) => panic!("hello should be replayable: {error}"),
@@ -1840,7 +2101,7 @@ mod tests {
         let (mut client, server_io) = tokio::io::duplex(64 * 1024);
         let params = params.clone();
         let mut server =
-            tokio::spawn(async move { handshake_or_fallback(server_io, &params).await });
+            tokio::spawn(async move { handshake_or_fallback(server_io, &params, None).await });
         client.write_all(&record).await.unwrap();
         client.flush().await.unwrap();
         let mut header = [0u8; 5];
@@ -2014,7 +2275,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         client.write_all(&record).await.unwrap();
         client.flush().await.unwrap();
-        match handshake_or_fallback(server, &params).await {
+        match handshake_or_fallback(server, &params, None).await {
             HandshakeOutcome::Fallback {
                 client_hello,
                 failure,

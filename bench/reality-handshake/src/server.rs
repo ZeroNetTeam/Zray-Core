@@ -155,21 +155,21 @@ impl InProcessServer {
                     let rejected = Arc::clone(&rejected);
                     let complaints = Arc::clone(&complaints);
                     tokio::spawn(async move {
-                        let complaint = match reality::handshake_or_fallback(stream, &params).await
-                        {
-                            HandshakeOutcome::Accepted(_stream) => {
-                                accepted.fetch_add(1, Ordering::Relaxed);
-                                None
-                            }
-                            HandshakeOutcome::Fallback { failure, .. } => {
-                                fell_back.fetch_add(1, Ordering::Relaxed);
-                                Some(format!("fell back to the camouflage site: {failure}"))
-                            }
-                            HandshakeOutcome::Rejected(failure) => {
-                                rejected.fetch_add(1, Ordering::Relaxed);
-                                Some(format!("rejected: {failure}"))
-                            }
-                        };
+                        let complaint =
+                            match reality::handshake_or_fallback(stream, &params, None).await {
+                                HandshakeOutcome::Accepted(_stream) => {
+                                    accepted.fetch_add(1, Ordering::Relaxed);
+                                    None
+                                }
+                                HandshakeOutcome::Fallback { failure, .. } => {
+                                    fell_back.fetch_add(1, Ordering::Relaxed);
+                                    Some(format!("fell back to the camouflage site: {failure}"))
+                                }
+                                HandshakeOutcome::Rejected(failure) => {
+                                    rejected.fetch_add(1, Ordering::Relaxed);
+                                    Some(format!("rejected: {failure}"))
+                                }
+                            };
                         if let Some(complaint) = complaint {
                             let mut complaints = complaints
                                 .lock()

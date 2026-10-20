@@ -486,6 +486,22 @@ impl InboundRuntime {
                 min_client_ver: reality.min_client_ver,
                 max_client_ver: reality.max_client_ver,
                 post_handshake: Default::default(),
+                show: reality.show,
+                // The key log is opened once here, so that every handshake
+                // appends to the same file. A path that cannot be opened is
+                // reported and the listener runs without one: Xray does the
+                // same (`XC/transport/internet/reality/config.go:66-71`), and
+                // a debugging aid is not a reason for a listener to be down.
+                key_log: match &reality.master_key_log {
+                    None => None,
+                    Some(path) => match reality::keys::KeyLog::open(path) {
+                        Ok(log) => Some(Arc::new(log)),
+                        Err(error) => {
+                            warn!(%error, %path, "REALITY key log could not be opened");
+                            None
+                        }
+                    },
+                },
             }),
             _ => None,
         };
@@ -2227,7 +2243,7 @@ impl Server {
         let stream = zero_evasion::ReadPastMark::new(stream);
         let (secured, mut conn) = match timeout(
             handshake_timeout(),
-            Self::secure_inbound(stream, &inbound.security, compiled),
+            Self::secure_inbound(stream, &inbound.security, compiled, peer),
         )
         .await
         {
@@ -2329,10 +2345,14 @@ impl Server {
     }
 
     /// Terminate the inbound's TLS or REALITY layer.
+    ///
+    /// `peer` is the address the connection came from, as the server sees it.
+    /// It is only used for REALITY's `show` report.
     async fn secure_inbound(
         stream: InboundTcp,
         security: &zero_config::InboundSecurity,
         compiled: &InboundRuntime,
+        peer: SocketAddr,
     ) -> Result<Secured, String> {
         match security {
             zero_config::InboundSecurity::None => {
@@ -2366,7 +2386,7 @@ impl Server {
                     .reality
                     .as_ref()
                     .ok_or_else(|| "inbound REALITY configuration is missing".to_string())?;
-                match reality::handshake_or_fallback(stream, params).await {
+                match reality::handshake_or_fallback(stream, params, Some(peer)).await {
                     reality::HandshakeOutcome::Accepted(stream) => {
                         Ok(Secured::Stream(boxed(stream), ConnInfo::default()))
                     }

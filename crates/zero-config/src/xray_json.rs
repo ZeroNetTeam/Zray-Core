@@ -1055,6 +1055,24 @@ fn parse_inbound_security(settings: Option<&Value>, path: &str) -> R<InboundSecu
                 fallback_xver,
                 fallback_limit_up: limit("limitFallbackUpload")?,
                 fallback_limit_down: limit("limitFallbackDownload")?,
+                show: match reality.get("show") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(value)) => *value,
+                    Some(other) => {
+                        return Err(format!(
+                            "{path}: reality show must be true or false, not {other}"
+                        ))
+                    }
+                },
+                master_key_log: match reality.get("masterKeyLog") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(path)) => Some(path.clone().into_boxed_str()),
+                    Some(other) => {
+                        return Err(format!(
+                            "{path}: reality masterKeyLog must be a file path, not {other}"
+                        ))
+                    }
+                },
             }))
         }
         other => Err(format!(

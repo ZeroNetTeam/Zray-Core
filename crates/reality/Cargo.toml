@@ -28,11 +28,17 @@ x25519-dalek = { workspace = true }
 rand = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
+# The `show` switch writes its report through this workspace's own logger, so
+# a server that already has a subscriber says nothing extra to get it.
+tracing = { workspace = true }
 
 [dev-dependencies]
 # The parity test compares this crate's parse of a `realitySettings` block with
 # the configuration compiler's, so the two readers cannot drift apart.
 zero-config = { workspace = true }
+# The `show` test reads the line the switch writes, so it needs a subscriber
+# that collects what was logged.
+tracing-subscriber = { workspace = true }
 # The server's own tests push a ClientHello through the fragmentation shape the
 # evasion layer produces, so the handshake is exercised on a stream that does
 # not deliver a record at a time.
