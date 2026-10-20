@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [features]
 # Build in the Tor client (Arti). Off by default; see zero-runtime's `tor`.
-tor = ["zero-runtime/tor"]
+tor = ["zero-runtime/tor", "zero-config/tor"]
 
 [dependencies]
 zero-core = { workspace = true }

@@ -47,7 +47,7 @@ use tokio_util::sync::CancellationToken;
 use crate::events::EventSink;
 use crate::feed::{fetch_feed, FeedSource, FeedStatus};
 use crate::link::{parse_candidate, parse_candidates, parse_feed_candidates, Candidate};
-use crate::order::order_by_class;
+use crate::order::order_by_class_spread;
 use crate::probe::{real_test, tcp_ping, ProbeTarget, DEFAULT_PROBE_URL};
 
 /// The `discover` request. Every field has a default, so `{}` is a valid
@@ -565,9 +565,10 @@ async fn run(shared: Arc<Shared>) {
             }
             shared.sink.emit(event);
         }
-        let ordered = order_by_class(
+        let ordered = order_by_class_spread(
             fetched,
             |candidate| candidate.class,
+            |candidate| candidate.wire_name().to_string(),
             &mut rand::thread_rng(),
         );
         pool.extend(ordered);

@@ -414,6 +414,9 @@ pub struct Evasion {
     /// Optional keepalive shaping for a network that resets flows on a time
     /// threshold rather than a byte threshold (PLAN-01 §5.2).
     pub keepalive: Option<KeepaliveConfig>,
+    /// Optional post-handshake record shaping, the rung above ClientHello
+    /// fragmentation for behavioural matching.
+    pub record_shaping: Option<RecordShapingConfig>,
 }
 
 impl Evasion {
@@ -522,6 +525,33 @@ impl Default for KeepaliveConfig {
         Self {
             idle_after: Duration::from_secs(15),
             max_flow_lifetime: Some(Duration::from_secs(120)),
+        }
+    }
+}
+
+/// Post-handshake record shaping: re-frame the application-data records of a
+/// TLS carrier so their sizes no longer follow the payload, which is what a
+/// behavioural freeze (the TSPU style of matching) keys on. Only the record
+/// *boundaries* move; the bytes inside them are the stream's own, unchanged.
+///
+/// The first flight of a session is never re-framed: the ClientHello already
+/// carries the name-hiding rungs, and a filter watching the handshake would
+/// see the split as its own signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordShapingConfig {
+    /// Shortest record the shaper may emit. Kept well under the 16 KB
+    /// record ceiling so a bulk upload cannot be told from a web session by
+    /// its record sizes alone.
+    pub length_min: u16,
+    /// Longest record the shaper may emit.
+    pub length_max: u16,
+}
+
+impl Default for RecordShapingConfig {
+    fn default() -> Self {
+        Self {
+            length_min: 100,
+            length_max: 1400,
         }
     }
 }
@@ -1186,6 +1216,8 @@ pub enum OutboundProtocol {
     Vmess(VmessConfig),
     /// AnyTLS v2 over ordinary certificate TLS.
     AnyTls(AnyTlsConfig),
+    /// NaiveProxy over ordinary certificate TLS and HTTP/2 CONNECT.
+    Naive(NaiveConfig),
     /// A SOCKS5 upstream: a local Tor, Orbot or Psiphon client, or any other
     /// SOCKS5 server. TCP only.
     Socks(SocksConfig),
@@ -1194,6 +1226,11 @@ pub enum OutboundProtocol {
     /// TCP only. It has no endpoint of its own: the circuit's far end is the
     /// destination.
     Tor(TorConfig),
+    /// The Psiphon network, through a native Rust client (needs a build with
+    /// the `psiphon` feature; without it connections fail with a message
+    /// saying so). TCP only. Like Tor it has no endpoint of its own: the
+    /// Psiphon server connects to the destination.
+    Psiphon(Box<PsiphonConfig>),
     /// A MasterDnsVPN server, reached through ordinary DNS resolvers: the
     /// traffic is carried in DNS questions and answers under a domain the
     /// server is the authority for. TCP only. Like Tor it has no endpoint of its
@@ -1231,9 +1268,11 @@ impl OutboundProtocol {
             OutboundProtocol::Shadowsocks(_) => "shadowsocks",
             OutboundProtocol::Vmess(_) => "vmess",
             OutboundProtocol::AnyTls(_) => "anytls",
+            OutboundProtocol::Naive(_) => "naive",
             OutboundProtocol::Socks(k) if k.http => "http",
             OutboundProtocol::Socks(_) => "socks",
             OutboundProtocol::Tor(_) => "tor",
+            OutboundProtocol::Psiphon(_) => "psiphon",
             OutboundProtocol::MasterDns(_) => "masterdns",
             OutboundProtocol::Tide(_) => "zerov1",
             OutboundProtocol::Hysteria2(_) => "hysteria2",
@@ -1252,8 +1291,10 @@ impl OutboundProtocol {
                 | OutboundProtocol::Shadowsocks(_)
                 | OutboundProtocol::Vmess(_)
                 | OutboundProtocol::AnyTls(_)
+                | OutboundProtocol::Naive(_)
                 | OutboundProtocol::Socks(_)
                 | OutboundProtocol::Tor(_)
+                | OutboundProtocol::Psiphon(_)
                 | OutboundProtocol::MasterDns(_)
                 | OutboundProtocol::Tide(_)
                 | OutboundProtocol::Hysteria2(_)
@@ -1396,6 +1437,49 @@ pub struct ShadowsocksConfig {
     pub port: u16,
     pub method: ShadowsocksMethod,
     pub password: Box<str>,
+    /// The SIP003 `plugin=obfs-local` layer, when the server entry carries
+    /// one. `None` is a plain stream.
+    pub obfs: Option<ObfsConfig>,
+}
+
+/// The simple-obfs (`obfs-local`) plugin settings carried on a Shadowsocks
+/// entry as SIP003 `plugin=obfs-local;obfs=http;obfs-host=example.com`.
+///
+/// Obfs is a disguise, not encryption: the Shadowsocks stream is what keeps
+/// the content private, and these bytes only decide what the traffic looks
+/// like on its way to the server. The plugin name's other half,
+/// `obfs-host`, is the name a watcher sees — a CDN host is the usual choice
+/// because the server operator's domain is what they are hiding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObfsConfig {
+    pub mode: ObfsMode,
+    /// The `Host:` header (http) or SNI (tls) the disguise carries.
+    pub host: Box<str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObfsMode {
+    /// Wrap the stream in a fake HTTP request and response head.
+    Http,
+    /// Wrap the stream in the framing of a TLS session.
+    Tls,
+}
+
+impl ObfsMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            ObfsMode::Http => "http",
+            ObfsMode::Tls => "tls",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "http" => Some(ObfsMode::Http),
+            "tls" => Some(ObfsMode::Tls),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1433,6 +1517,25 @@ pub struct AnyTlsConfig {
     pub password: Box<str>,
 }
 
+/// A NaiveProxy server: an HTTP/2 (or HTTP/3) CONNECT tunnel behind an
+/// ordinary TLS site, spoken to with a browser-shaped handshake.
+///
+/// The credential is HTTP Basic, the same pair a Caddy `forwardproxy`
+/// frontend checks. `padding` enables the padding protocol (NaiveProxy's
+/// README): the first few units in each direction carry a size header and
+/// trailing zeros so packet sizes do not track payload sizes. The server
+/// decides whether it is spoken by whether its CONNECT response carries a
+/// `padding` header, so a client that offers it interoperates either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NaiveConfig {
+    pub address: Address,
+    pub port: u16,
+    pub username: Box<str>,
+    pub password: Box<str>,
+    /// Offer the padding protocol (`padding=1` in the link, the default).
+    pub padding: bool,
+}
+
 /// A SOCKS5 upstream (RFC 1928). The credential is RFC 1929 user/password; a
 /// local Tor or Psiphon client needs none, a remote SOCKS5 server often does.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1450,6 +1553,159 @@ pub struct SocksConfig {
 pub struct SocksCredential {
     pub username: Box<str>,
     pub password: Box<str>,
+}
+
+/// The Psiphon outbound: a native client for the Psiphon network.
+///
+/// Psiphon is a circumvention system whose servers are reached over SSH under
+/// one of several transports, each shaped to survive a different kind of
+/// blocking. The client keeps its own server list: the entries are the signed
+/// records Psiphon publishes (`serverEntries`), and the signing key says which
+/// authority is trusted to have produced them.
+///
+/// The fields here are the ones that change what the client does. The server
+/// entries themselves stay as JSON text, because they are signed as JSON and
+/// re-encoding them would break the signature. `zero-runtime` hands this to
+/// `zero-psiphon`, which parses and enforces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PsiphonConfig {
+    /// Server entries: the JSON text of one entry object or an array of them.
+    pub server_entries: Box<str>,
+    /// The Ed25519 public key (base64) that signed those entries. When set,
+    /// an entry whose signature does not verify is refused rather than used.
+    pub server_entry_signature_public_key: Option<Box<str>>,
+    /// Where remote server lists are fetched from, when configured.
+    pub remote_server_list_urls: Vec<Box<str>>,
+    /// Egress region (`"US"`, `"GB"`, …); empty or absent means anywhere.
+    pub egress_region: Option<Box<str>>,
+    /// Transports the client may use (`"SSH"`, `"OSSH"`, `"TLS-OSSH"`, …).
+    /// Empty means every transport the server entries offer.
+    pub protocols: Vec<Box<str>>,
+    /// A SOCKS5 or HTTP proxy to reach Psiphon through.
+    pub upstream_proxy_url: Option<Box<str>>,
+    /// Whether to fetch and apply Psiphon's tactics parameters.
+    pub tactics: bool,
+    /// Where tactics are fetched from.
+    pub tactics_url: Option<Box<str>>,
+    /// Budget for one candidate's tunnel establishment, in seconds.
+    pub establish_timeout_seconds: u64,
+    /// How many candidates may be dialled at once.
+    pub establish_concurrency: u8,
+    /// How many tunnels to keep established.
+    pub tunnel_pool_size: u8,
+    /// Refuse to open more channels than this at once.
+    pub max_channels: u32,
+    /// `keepalive@openssh.com` interval in seconds; `0` disables keepalives.
+    pub keepalive_interval_seconds: u64,
+    /// The identity announced to the server.
+    pub propagation_channel_id: Option<Box<str>>,
+    pub sponsor_id: Option<Box<str>>,
+    pub client_version: Option<Box<str>>,
+    pub client_platform: Option<Box<str>>,
+}
+
+impl Default for PsiphonConfig {
+    fn default() -> Self {
+        PsiphonConfig {
+            server_entries: Box::from("[]"),
+            server_entry_signature_public_key: None,
+            remote_server_list_urls: Vec::new(),
+            egress_region: None,
+            protocols: Vec::new(),
+            upstream_proxy_url: None,
+            tactics: false,
+            tactics_url: None,
+            establish_timeout_seconds: 20,
+            establish_concurrency: 3,
+            tunnel_pool_size: 1,
+            max_channels: 128,
+            keepalive_interval_seconds: 25,
+            propagation_channel_id: None,
+            sponsor_id: None,
+            client_version: None,
+            client_platform: None,
+        }
+    }
+}
+
+impl PsiphonConfig {
+    /// The settings object `zero-psiphon` parses.
+    pub fn to_settings(&self) -> serde_json::Value {
+        let mut settings = serde_json::Map::new();
+
+        // The entries are re-parsed into JSON, never re-encoded from pieces:
+        // the signature covers the exact text.
+        if let Ok(entries) = serde_json::from_str::<serde_json::Value>(&self.server_entries) {
+            settings.insert("server_entries".into(), entries);
+        }
+        let string = |value: &str| serde_json::Value::String(value.to_string());
+        if let Some(key) = &self.server_entry_signature_public_key {
+            settings.insert("server_entry_signature_public_key".into(), string(key));
+        }
+        if !self.remote_server_list_urls.is_empty() {
+            settings.insert(
+                "remote_server_list_urls".into(),
+                serde_json::Value::Array(
+                    self.remote_server_list_urls
+                        .iter()
+                        .map(|url| serde_json::Value::String(url.to_string()))
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(region) = &self.egress_region {
+            settings.insert("egress_region".into(), string(region));
+        }
+        if !self.protocols.is_empty() {
+            settings.insert(
+                "protocols".into(),
+                serde_json::Value::Array(
+                    self.protocols
+                        .iter()
+                        .map(|name| serde_json::Value::String(name.to_string()))
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(url) = &self.upstream_proxy_url {
+            settings.insert("upstream_proxy_url".into(), string(url));
+        }
+        settings.insert("tactics".into(), serde_json::Value::Bool(self.tactics));
+        if let Some(url) = &self.tactics_url {
+            settings.insert("tactics_url".into(), string(url));
+        }
+        settings.insert(
+            "establish_timeout_seconds".into(),
+            serde_json::json!(self.establish_timeout_seconds),
+        );
+        settings.insert(
+            "establish_concurrency".into(),
+            serde_json::json!(self.establish_concurrency),
+        );
+        settings.insert(
+            "tunnel_pool_size".into(),
+            serde_json::json!(self.tunnel_pool_size),
+        );
+        settings.insert("max_channels".into(), serde_json::json!(self.max_channels));
+        settings.insert(
+            "keepalive_interval_seconds".into(),
+            serde_json::json!(self.keepalive_interval_seconds),
+        );
+        if let Some(channel) = &self.propagation_channel_id {
+            settings.insert("propagation_channel_id".into(), string(channel));
+        }
+        if let Some(sponsor) = &self.sponsor_id {
+            settings.insert("sponsor_id".into(), string(sponsor));
+        }
+        if let Some(version) = &self.client_version {
+            settings.insert("client_version".into(), string(version));
+        }
+        if let Some(platform) = &self.client_platform {
+            settings.insert("client_platform".into(), string(platform));
+        }
+
+        serde_json::Value::Object(settings)
+    }
 }
 
 /// How the embedded Tor client reaches the Tor network.
@@ -2025,6 +2281,7 @@ impl Outbound {
                 | OutboundProtocol::Trojan(_)
                 | OutboundProtocol::Shadowsocks(_)
                 | OutboundProtocol::AnyTls(_)
+                | OutboundProtocol::Naive(_)
                 | OutboundProtocol::Socks(_)
         ) && !self.mux.enabled
             && matches!(
@@ -2209,6 +2466,93 @@ impl Outbound {
             }
         }
 
+        if let OutboundProtocol::Psiphon(psiphon) = &self.protocol {
+            if psiphon.server_entries.trim().is_empty() {
+                return Err(format!(
+                    "outbound {}: Psiphon needs server entries",
+                    self.tag
+                ));
+            }
+            // The entries have to be JSON here: the signature covers the exact
+            // bytes, so a malformed list is a configuration error and not
+            // something to discover at dial time.
+            let parsed: serde_json::Value =
+                serde_json::from_str(&psiphon.server_entries).map_err(|error| {
+                    format!(
+                        "outbound {}: Psiphon server entries are not valid JSON: {error}",
+                        self.tag
+                    )
+                })?;
+            let entries = match &parsed {
+                serde_json::Value::Array(entries) => entries.len(),
+                serde_json::Value::Object(_) => 1,
+                _ => {
+                    return Err(format!(
+                        "outbound {}: Psiphon server entries must be an entry object or an array",
+                        self.tag
+                    ))
+                }
+            };
+            if entries == 0 {
+                return Err(format!(
+                    "outbound {}: Psiphon needs at least one server entry",
+                    self.tag
+                ));
+            }
+            if !(1..=8).contains(&psiphon.establish_concurrency) {
+                return Err(format!(
+                    "outbound {}: Psiphon establishConcurrency must be between 1 and 8",
+                    self.tag
+                ));
+            }
+            if !(1..=4).contains(&psiphon.tunnel_pool_size) {
+                return Err(format!(
+                    "outbound {}: Psiphon tunnelPoolSize must be between 1 and 4",
+                    self.tag
+                ));
+            }
+            if psiphon.max_channels == 0 {
+                return Err(format!(
+                    "outbound {}: Psiphon maxChannels must not be zero",
+                    self.tag
+                ));
+            }
+            // Transports are matched against Psiphon's own names so a typo is
+            // rejected here rather than silently narrowing the candidate list
+            // to nothing at dial time.
+            for name in &psiphon.protocols {
+                let known = [
+                    "SSH",
+                    "OSSH",
+                    "TLS-OSSH",
+                    "UNFRONTED-MEEK-OSSH",
+                    "UNFRONTED-MEEK-HTTPS-OSSH",
+                    "UNFRONTED-MEEK-SESSION-TICKET-OSSH",
+                    "FRONTED-MEEK-OSSH",
+                    "FRONTED-MEEK-HTTP-OSSH",
+                    "SHADOWSOCKS-OSSH",
+                    "QUIC-OSSH",
+                    "FRONTED-MEEK-QUIC-OSSH",
+                    "TAPDANCE-OSSH",
+                    "CONJURE-OSSH",
+                ];
+                if !known.contains(&name.trim().to_ascii_uppercase().as_str()) {
+                    return Err(format!(
+                        "outbound {}: Psiphon does not have a {name:?} transport",
+                        self.tag
+                    ));
+                }
+            }
+            if let Some(url) = psiphon.upstream_proxy_url.as_deref() {
+                if !(url.starts_with("socks5://") || url.starts_with("http://")) {
+                    return Err(format!(
+                        "outbound {}: Psiphon upstreamProxyUrl must be socks5:// or http://",
+                        self.tag
+                    ));
+                }
+            }
+        }
+
         if let OutboundProtocol::Tor(tor) = &self.protocol {
             if tor.memory_mib != 0 && tor.memory_mib < TOR_MIN_MEMORY_MIB {
                 return Err(format!(
@@ -2272,6 +2616,27 @@ impl Outbound {
             if !matches!(self.stream.transport, Transport::Raw) {
                 return Err(format!(
                     "outbound {}: SOCKS5 requires the raw carrier",
+                    self.tag
+                ));
+            }
+        }
+
+        if let OutboundProtocol::Naive(naive) = &self.protocol {
+            if naive.username.is_empty() || naive.password.is_empty() {
+                return Err(format!(
+                    "outbound {}: a NaiveProxy link needs both a username and a password",
+                    self.tag
+                ));
+            }
+            if !matches!(self.stream.transport, Transport::Raw) {
+                return Err(format!(
+                    "outbound {}: NaiveProxy currently requires the raw carrier",
+                    self.tag
+                ));
+            }
+            if !matches!(self.stream.security, Security::Tls(_)) {
+                return Err(format!(
+                    "outbound {}: NaiveProxy requires ordinary certificate TLS",
                     self.tag
                 ));
             }
@@ -2560,6 +2925,7 @@ impl Outbound {
             OutboundProtocol::Shadowsocks(s) => s.port = port,
             OutboundProtocol::Vmess(v) => v.port = port,
             OutboundProtocol::AnyTls(a) => a.port = port,
+            OutboundProtocol::Naive(n) => n.port = port,
             _ => return false,
         }
         true
@@ -2573,6 +2939,7 @@ impl Outbound {
             OutboundProtocol::Shadowsocks(s) => Some((s.address.clone(), s.port)),
             OutboundProtocol::Vmess(v) => Some((v.address.clone(), v.port)),
             OutboundProtocol::AnyTls(a) => Some((a.address.clone(), a.port)),
+            OutboundProtocol::Naive(n) => Some((n.address.clone(), n.port)),
             OutboundProtocol::Socks(k) => Some((k.address.clone(), k.port)),
             OutboundProtocol::Tide(t) => Some((t.address.clone(), t.port)),
             OutboundProtocol::Hysteria2(h) => Some((h.address.clone(), h.port)),

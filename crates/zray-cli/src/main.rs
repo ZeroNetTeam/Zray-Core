@@ -10,6 +10,7 @@ const VERSION: &str = match option_env!("ZRAY_APP_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+mod oneclick;
 mod tide;
 mod tools;
 
@@ -30,6 +31,8 @@ fn main() -> Result<()> {
             cmd_run(&args)
         }
         "preset" => cmd_preset(&args[1..]),
+        "connect" => oneclick::connect(&args[1..]),
+        "catalog" => oneclick::run(&args[1..]),
         "assets" => cmd_assets(&args[1..]),
         "zerov1" | "tide" => tide::run(&args[1..]),
         "version" | "-version" | "--version" | "-V" => {
@@ -53,7 +56,7 @@ fn print_usage() {
     println!(
         "zray {}\n\n\
          USAGE:\n  \
-         zray check <file>     Parse a config or subscription and report diagnostics\n  \
+         zray check <file>     Parse a config or subscription and report diagnostics (`-` = stdin)\n  \
          zray run <file>       Run the client from a config file\n  \
          zray run <file> -i N  Run config number N from a config array\n  \
          zray run <file> --management ADDR\n  \
@@ -64,6 +67,10 @@ fn print_usage() {
                               Seconds to finish live sessions on shutdown (default 10, 0 = off)\n  \
          zray preset iran <link|file> [options]\n  \
                               Emit an Iran configuration from share links\n  \
+         zray connect <kind> [link] [options]\n  \
+                              Build a one-click profile: the config of a catalog kind\n  \
+         zray catalog [doctor <kind> [link]]\n  \
+                              List the one-click kinds, or run local checks on one\n  \
          zray assets refresh <file>\n  \
                               Download and validate the config\'s rule sets\n  \
          zray assets check <file>\n  \
@@ -90,6 +97,13 @@ fn print_usage() {
          zray tls cert [--ca] [--domain=D] [--expire=240h] [--file=F] [--json]\n  \
                               Make a self-signed certificate and key\n  \
          zray version\n\n\
+         CONNECT OPTIONS:\n  \
+         --socks-port N        SOCKS listener port (default 10808)\n  \
+         --http-port N         HTTP listener port, or `off`\n  \
+         --no-evasion-defaults generate the link exactly as parsed, no per-kind fragment\n  \
+         --fragment-lengths a-b\n  \
+                               byte range of the per-kind ClientHello fragment\n  \
+         -o, --output FILE     write the config instead of printing it\n\n\
          PRESET OPTIONS:\n  \
          --remote-dns NAME     cloudflare (default), google, quad9, adguard\n  \
          --local-dns NAME      google (default), cloudflare, system\n  \
@@ -380,9 +394,9 @@ fn cmd_check(files: &[PathBuf]) -> Result<()> {
 }
 
 /// The configuration files a command was given: every `-c FILE`, the `.json`
-/// files of every `-confdir DIR` in file-name order, or else the first
-/// bare argument. `value_flags` are the command's own flags that take a
-/// value, so that value is not mistaken for a file.
+/// files of every `-confdir DIR` in file-name order, or else the first bare
+/// argument, where `-` means standard input. `value_flags` are the command's
+/// own flags that take a value, so that value is not mistaken for a file.
 fn config_files(args: &[String], value_flags: &[&str]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut positional = None;
@@ -418,6 +432,9 @@ fn config_files(args: &[String], value_flags: &[&str]) -> Result<Vec<PathBuf>> {
                 let _ = flag;
                 iter.next();
             }
+            // `-` is the stdin file, matched on its own because it begins
+            // with a dash like a flag.
+            _ if arg == "-" && positional.is_none() => positional = Some(PathBuf::from("-")),
             _ if !arg.starts_with('-') && positional.is_none() => {
                 positional = Some(PathBuf::from(arg))
             }
@@ -435,7 +452,17 @@ fn config_files(args: &[String], value_flags: &[&str]) -> Result<Vec<PathBuf>> {
 
 /// The text of the configuration: one file as it is (it may be an array of
 /// configs or a subscription), several merged the way Xray merges them.
+/// `-` reads standard input, so a generated config can be piped straight in
+/// (`zray connect direct | zray check -`).
 fn load_config_text(files: &[PathBuf]) -> Result<String> {
+    use std::io::Read;
+    if files.len() == 1 && files[0].as_os_str() == "-" {
+        let mut buffer = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buffer)
+            .context("reading standard input")?;
+        return Ok(buffer);
+    }
     let read = |path: &PathBuf| {
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
     };

@@ -7,6 +7,7 @@
 pub mod dns;
 pub mod merge;
 pub mod model;
+pub mod oneclick;
 pub mod presets;
 pub mod routing;
 pub mod share_link;
@@ -15,6 +16,7 @@ pub mod xray_json;
 
 pub use merge::merge_documents;
 pub use model::*;
+pub use oneclick::{catalog, generate};
 pub use presets::{AntiSanctionDns, IranPreset, LocalDns, RemoteDns, RuleAction, UserRule};
 pub use share_link::{parse_link, parse_subscription, ShareLink};
 pub use xray_json::{
@@ -463,6 +465,102 @@ mod tests {
                 "settings": {"address": "127.0.0.1", "port": 1, "user": "only"}}]
         });
         assert!(parse_config(&half).is_err());
+    }
+
+    #[test]
+    fn compiles_a_psiphon_outbound_from_psiphon_field_names() {
+        // The same shape Psiphon's own `config.json` uses, so a configuration
+        // can be translated without a lookup table.
+        let config = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [
+                {"tag": "psiphon", "protocol": "psiphon", "settings": {
+                    "serverEntries": [{
+                        "ipAddress": "192.0.2.10",
+                        "sshPort": 22,
+                        "sshUsername": "psiphon",
+                        "sshPassword": "password",
+                        "sshHostKey": "AAAA",
+                        "sshObfuscatedPort": 2222,
+                        "sshObfuscatedKey": "aabbccdd",
+                        "capabilities": ["SSH", "OSSH", "TLS-OSSH"]
+                    }],
+                    "serverEntrySignaturePublicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                    "egressRegion": "US",
+                    "protocols": ["OSSH", "TLS-OSSH"],
+                    "establishTimeoutSeconds": 15,
+                    "establishConcurrency": 2,
+                    "tunnelPoolSize": 2,
+                    "keepaliveIntervalSeconds": 30,
+                    "propagationChannelId": "0123456789abcdef",
+                    "sponsorId": "fedcba9876543210"
+                }}
+            ]
+        });
+        let (config, _) = parse_config(&config).unwrap();
+        let outbound = &config.outbounds[0];
+        assert_eq!(outbound.protocol.name(), "psiphon");
+        assert!(outbound.protocol.is_proxy());
+        // Like Tor, a Psiphon outbound has no endpoint of its own: the server
+        // connects to the destination.
+        assert!(outbound.endpoint().is_none());
+
+        match &outbound.protocol {
+            OutboundProtocol::Psiphon(psiphon) => {
+                assert_eq!(psiphon.establish_timeout_seconds, 15);
+                assert_eq!(psiphon.establish_concurrency, 2);
+                assert_eq!(psiphon.tunnel_pool_size, 2);
+                assert_eq!(psiphon.keepalive_interval_seconds, 30);
+                assert_eq!(psiphon.egress_region.as_deref(), Some("US"));
+                assert_eq!(&*psiphon.protocols[0], "OSSH");
+
+                // The settings object the client parses carries the entries
+                // through unchanged, signature included.
+                let settings = psiphon.to_settings();
+                assert_eq!(settings["egress_region"], "US");
+                assert_eq!(settings["server_entries"][0]["sshObfuscatedPort"], 2222);
+                assert_eq!(settings["protocols"][1], "TLS-OSSH");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_psiphon_outbound_needs_entries_and_known_transports() {
+        let parse = |settings: serde_json::Value| {
+            parse_config(&serde_json::json!({
+                "inbounds": [],
+                "outbounds": [{"tag": "psiphon", "protocol": "psiphon", "settings": settings}]
+            }))
+        };
+
+        // No server entries at all.
+        let error = parse(serde_json::json!({})).unwrap_err();
+        assert!(error.contains("serverEntries"), "{error}");
+
+        // An empty list is not a working configuration either.
+        let error = parse(serde_json::json!({"serverEntries": []})).unwrap_err();
+        assert!(error.contains("Psiphon"), "{error}");
+
+        // Entries that are not JSON.
+        let error = parse(serde_json::json!({"serverEntries": "not json"})).unwrap_err();
+        assert!(error.contains("JSON"), "{error}");
+
+        // A transport Psiphon does not have.
+        let error = parse(serde_json::json!({
+            "serverEntries": [{"ipAddress": "192.0.2.10", "sshPort": 22}],
+            "protocols": ["I2P"],
+        }))
+        .unwrap_err();
+        assert!(error.contains("I2P"), "{error}");
+
+        // A proxy scheme the client cannot dial.
+        let error = parse(serde_json::json!({
+            "serverEntries": [{"ipAddress": "192.0.2.10", "sshPort": 22}],
+            "upstreamProxyUrl": "ftp://192.0.2.1:21",
+        }))
+        .unwrap_err();
+        assert!(error.contains("upstreamProxyUrl"), "{error}");
     }
 
     #[test]

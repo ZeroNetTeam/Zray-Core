@@ -22,7 +22,7 @@ fn source(
     tier: u32,
     sig_url: Option<String>,
 ) -> NamedSource {
-    let mirrors = cdn_mirror(&url).into_iter().collect();
+    let mirrors = cdn_mirrors(&url);
     NamedSource {
         name,
         source: FeedSource {
@@ -35,33 +35,57 @@ fn source(
     }
 }
 
-/// The same file on the other CDN.
+/// The other CDNs serving the same file.
 ///
-/// GitHub raw and jsDelivr are filtered at different times in Iran, so every
-/// feed whose URL maps cleanly gets a second path to the same bytes:
-/// `raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>` becomes
-/// `cdn.jsdelivr.net/gh/<owner>/<repo>@<branch>/<path>`, and back. Nothing is
-/// guessed: a URL that does not match either shape gets no mirror.
-fn cdn_mirror(url: &str) -> Option<String> {
+/// GitHub raw, jsDelivr and Fastly are filtered at different times in Iran,
+/// so every feed whose URL maps cleanly gets the other paths to the same
+/// bytes: `raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>` becomes
+/// `cdn.jsdelivr.net/gh/<owner>/<repo>@<branch>/<path>` and
+/// `fastly.jsdelivr.net/gh/<owner>/<repo>@<branch>/<path>`, and jsDelivr
+/// shapes map back to raw. Nothing is guessed: a URL that does not match any
+/// shape gets no mirror.
+fn cdn_mirrors(url: &str) -> Vec<String> {
     const RAW: &str = "https://raw.githubusercontent.com/";
     const JSD: &str = "https://cdn.jsdelivr.net/gh/";
+    const FASTLY: &str = "https://fastly.jsdelivr.net/gh/";
     if let Some(rest) = url.strip_prefix(RAW) {
         let mut parts = rest.splitn(4, '/');
-        let owner = parts.next()?;
-        let repo = parts.next()?;
-        let branch = parts.next()?;
-        let path = parts.next()?;
-        return Some(format!("{JSD}{owner}/{repo}@{branch}/{path}"));
+        let owner = parts.next().unwrap_or_default();
+        let repo = parts.next().unwrap_or_default();
+        let branch = parts.next().unwrap_or_default();
+        let path = parts.next().unwrap_or_default();
+        if owner.is_empty() || repo.is_empty() || branch.is_empty() || path.is_empty() {
+            return Vec::new();
+        }
+        return vec![
+            format!("{JSD}{owner}/{repo}@{branch}/{path}"),
+            format!("{FASTLY}{owner}/{repo}@{branch}/{path}"),
+        ];
     }
-    if let Some(rest) = url.strip_prefix(JSD) {
+    let jsdelivr = url
+        .strip_prefix(JSD)
+        .map(|rest| (rest, JSD))
+        .or_else(|| url.strip_prefix(FASTLY).map(|rest| (rest, FASTLY)));
+    if let Some((rest, _)) = jsdelivr {
         let mut parts = rest.splitn(3, '/');
-        let owner = parts.next()?;
-        let repo_ref = parts.next()?;
-        let path = parts.next()?;
-        let (repo, branch) = repo_ref.rsplit_once('@')?;
-        return Some(format!("{RAW}{owner}/{repo}/{branch}/{path}"));
+        let owner = parts.next().unwrap_or_default();
+        let repo_ref = parts.next().unwrap_or_default();
+        let path = parts.next().unwrap_or_default();
+        let Some((repo, branch)) = repo_ref.split_once('@') else {
+            return Vec::new();
+        };
+        if owner.is_empty() || repo.is_empty() || branch.is_empty() || path.is_empty() {
+            return Vec::new();
+        }
+        return vec![format!("{RAW}{owner}/{repo}/{branch}/{path}")];
     }
-    None
+    Vec::new()
+}
+
+/// The mirrors implied by a feed URL's CDN shape, for callers that did not
+/// carry a mirror list of their own (see [`FeedSource::with_derived_mirrors`]).
+pub fn cdn_mirrors_for(url: &str) -> Vec<String> {
+    cdn_mirrors(url)
 }
 
 /// Every built-in feed.
@@ -149,6 +173,16 @@ pub fn builtin() -> Vec<NamedSource> {
             "irancell",
             "Irancell configs",
             format!("{RAW}/morteza-v2/free-v2ray-irancell-config/main/Sub1.txt"),
+            1,
+            None,
+        ),
+        // The list the UAC client ships as its one-tap source: rebuilds daily
+        // from a few dozen upstream lists and keeps only nodes it re-tested,
+        // three variants each (8 KB gzipped, measured 2026-10-16).
+        source(
+            "patterniha",
+            "Free-Configs (Iran)",
+            format!("{RAW}/patterniha/Free-Configs/main/configs.txt"),
             1,
             None,
         ),
@@ -284,6 +318,7 @@ mod tests {
             "mahdi0024",
             "norouzi",
             "irancell",
+            "patterniha",
         ] {
             let named = all
                 .iter()
@@ -335,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn every_feed_carries_the_other_cdn_as_a_mirror() {
+    fn every_feed_carries_the_other_cdns_as_mirrors() {
         for named in builtin() {
             let source = &named.source;
             let mirror = source
@@ -344,17 +379,36 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} has no mirror", source.id));
             assert_ne!(mirror, &source.url);
             assert!(mirror.starts_with("https://"));
-            // The verified feed's primary is jsDelivr and mirrors to GitHub
-            // raw; the rest are the reverse.
+            // A raw-primary feed is reachable through both jsDelivr hosts, so
+            // all three CDNs have to be filtered together to starve it; the
+            // verified feed's primary is itself jsDelivr and maps back to raw.
+            if source.url.starts_with("https://raw.githubusercontent.com/") {
+                assert!(
+                    source.mirrors.len() == 2
+                        && source
+                            .mirrors
+                            .iter()
+                            .any(|m| m.starts_with("https://fastly.jsdelivr.net/gh/")),
+                    "{} should carry both jsDelivr mirrors",
+                    source.id
+                );
+            }
         }
         assert_eq!(
-            cdn_mirror("https://raw.githubusercontent.com/a/b/main/c.txt").as_deref(),
-            Some("https://cdn.jsdelivr.net/gh/a/b@main/c.txt")
+            cdn_mirrors("https://raw.githubusercontent.com/a/b/main/c.txt"),
+            vec![
+                "https://cdn.jsdelivr.net/gh/a/b@main/c.txt".to_string(),
+                "https://fastly.jsdelivr.net/gh/a/b@main/c.txt".to_string(),
+            ]
         );
         assert_eq!(
-            cdn_mirror("https://cdn.jsdelivr.net/gh/a/b@main/c.txt").as_deref(),
-            Some("https://raw.githubusercontent.com/a/b/main/c.txt")
+            cdn_mirrors("https://cdn.jsdelivr.net/gh/a/b@main/c.txt"),
+            vec!["https://raw.githubusercontent.com/a/b/main/c.txt".to_string()]
         );
-        assert_eq!(cdn_mirror("https://example.com/x"), None);
+        assert_eq!(
+            cdn_mirrors("https://fastly.jsdelivr.net/gh/a/b@main/c.txt"),
+            vec!["https://raw.githubusercontent.com/a/b/main/c.txt".to_string()]
+        );
+        assert!(cdn_mirrors("https://example.com/x").is_empty());
     }
 }

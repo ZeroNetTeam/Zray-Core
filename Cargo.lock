@@ -4068,6 +4068,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "reality"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm 0.10.3",
+ "base64 0.22.1",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "hkdf 0.12.4",
+ "hmac 0.12.1",
+ "ml-dsa",
+ "ml-kem",
+ "rand 0.8.8",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tokio",
+ "x25519-dalek",
+ "zero-config",
+ "zero-core",
+ "zero-evasion",
+ "zero-protocol",
+ "zero-security",
+ "zeroize",
+]
+
+[[package]]
+name = "reality-handshake-bench"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "libc",
+ "reality",
+ "serde_json",
+ "tokio",
+ "zero-core",
+ "zero-protocol",
+ "zero-security",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7627,6 +7667,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "zero-psiphon"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "ed25519-dalek 2.2.0",
+ "futures",
+ "hex",
+ "hkdf 0.12.4",
+ "hmac 0.12.1",
+ "poly1305 0.9.1",
+ "rand 0.8.8",
+ "russh",
+ "rustls",
+ "salsa20",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "universal-hash 0.5.1",
+ "url",
+ "x25519-dalek",
+ "zero-core",
+]
+
+[[package]]
 name = "zero-router"
 version = "0.1.0"
 dependencies = [
@@ -7662,6 +7732,7 @@ dependencies = [
  "qrcode",
  "quinn",
  "rand 0.8.8",
+ "reality",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -7683,6 +7754,7 @@ dependencies = [
  "zero-net",
  "zero-observatory",
  "zero-protocol",
+ "zero-psiphon",
  "zero-router",
  "zero-security",
  "zero-tor",

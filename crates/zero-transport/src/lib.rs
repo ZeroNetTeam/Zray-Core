@@ -12,6 +12,7 @@ pub mod hysteria2;
 pub mod juicity;
 pub mod masque;
 pub mod masquerade;
+pub mod naive;
 pub mod quic_cc;
 pub mod quic_pool;
 pub mod quic_shape;

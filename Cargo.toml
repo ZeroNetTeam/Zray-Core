@@ -20,6 +20,7 @@ members = [
     "crates/zero-tor",
     "crates/zero-masterdns",
     "crates/zero-provision",
+    "crates/zero-psiphon",
     # Allocation counts for the framed read paths. A workspace member so it
     # resolves the same dependency versions as the code it measures, and so its
     # release profile is the shipped one.
@@ -59,6 +60,7 @@ zray-cli = { path = "crates/zray-cli", version = "0.1.0" }
 zero-tor = { path = "crates/zero-tor", version = "0.1.0" }
 zero-masterdns = { path = "crates/zero-masterdns", version = "0.1.0" }
 zero-provision = { path = "crates/zero-provision", version = "0.1.0" }
+zero-psiphon = { path = "crates/zero-psiphon", version = "0.1.0" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "aws-lc-rs", "tls12", "logging"] }
@@ -123,6 +125,13 @@ zstd = "0.13"
 # dependency; only the raw block API (size-prefixed) is used, to match the
 # Go server's `lz4.CompressBlock` + 4-byte little-endian length header.
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
+# The SSH client Psiphon tunnels through. `ring` (not the default aws-lc-rs)
+# and RSA stay on for parity with `zero-provision`: old Psiphon servers may
+# offer only an RSA host key.
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa"] }
+# Server entries and tactics are signed with Ed25519, the same scheme the Go
+# client uses.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 # Decode-only brotli, for certificate compression. rustls' own `brotli`
 # feature links the full compressor as well (~800 KB of the mobile core) for
 # a job only a server does.

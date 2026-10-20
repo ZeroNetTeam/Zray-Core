@@ -107,6 +107,35 @@ impl Candidate {
                 | OutboundProtocol::Juicity(_)
         )
     }
+
+    /// The name a censor would see on the wire: the TLS (or REALITY) server
+    /// name, or the carrier's `Host:` value when there is no TLS name. Used
+    /// to spread a batch across distinct wire names, because a filtering
+    /// action against one worker domain takes out every config behind it.
+    ///
+    /// The empty string means "nothing distinctive": raw transports without
+    /// TLS all collide under one key on purpose, so they still shuffle
+    /// together.
+    pub fn wire_name(&self) -> &str {
+        let stream = &self.outbound.stream;
+        let named = match &stream.security {
+            Security::Tls(tls) => tls.server_name.as_deref(),
+            Security::Reality(reality) => Some(reality.server_name.as_ref()),
+            Security::ShadowTls(shadow) => Some(shadow.server_name.as_ref()),
+            Security::None => None,
+        };
+        named
+            .filter(|name| !name.is_empty())
+            .or_else(|| match &stream.transport {
+                Transport::WebSocket(ws) | Transport::HttpUpgrade(ws) | Transport::Grpc(ws) => {
+                    ws.host.as_deref()
+                }
+                Transport::Xhttp(xhttp) => xhttp.host.as_deref().or(Some(xhttp.path.as_ref())),
+                Transport::Raw => None,
+            })
+            .filter(|name| !name.is_empty())
+            .unwrap_or_default()
+    }
 }
 
 /// The stable key of a link: see the module documentation.

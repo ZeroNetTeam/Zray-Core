@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Mirrors zero-runtime's `tor`: set wherever the embedded Tor client is built
+# in, so the one-click catalog can mark the Tor entry usable rather than
+# planned. Dependency-free on purpose — it only flips a flag.
+tor = []
+
 [dependencies]
 zero-core = { workspace = true }
 serde = { workspace = true }

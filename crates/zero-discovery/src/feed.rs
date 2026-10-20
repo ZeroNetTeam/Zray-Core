@@ -52,6 +52,24 @@ fn default_tier() -> u32 {
     1
 }
 
+impl FeedSource {
+    /// Fill in the CDN mirrors a URL shape implies, when the caller sent none.
+    ///
+    /// A host that builds `FeedSource` itself (the built-in list, the TUI)
+    /// carries its mirrors already, but the Android app sends only id, url
+    /// and tier over IPC and older clients send no mirror list at all.
+    /// Rather than trust every caller to keep that in sync, the fetch path
+    /// derives them from the same raw↔jsDelivr↔Fastly shapes. Explicitly
+    /// listed mirrors always win; an unknown URL shape simply stays
+    /// mirrorless.
+    pub fn with_derived_mirrors(mut self) -> Self {
+        if self.mirrors.is_empty() {
+            self.mirrors = crate::sources::cdn_mirrors_for(&self.url);
+        }
+        self
+    }
+}
+
 /// How a feed body was obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedStatus {
@@ -206,6 +224,10 @@ pub async fn fetch_feed(
     cache_dir: Option<&Path>,
     timeout: Duration,
 ) -> FeedResult {
+    // IPC callers send only id/url/tier, so the mirrors the URL shape
+    // implies are derived here rather than trusted to arrive.
+    let source = source.clone().with_derived_mirrors();
+    let source = &source;
     let files = cache_dir.map(|dir| paths(dir, &source.id));
     let cached_body = files
         .as_ref()
