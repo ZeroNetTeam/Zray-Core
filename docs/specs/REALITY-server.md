@@ -1255,9 +1255,9 @@ turns JSON into the fields Xray hands to REALITY).
 
 | # | Field | Xray semantics, default, unit | Rust |
 |---|---|---|---|
-| 1 | `show` | bool, default `false`; enables `RL`'s diagnostics, which include `AuthKey[:16]`, the decoded client version/shortId and record lengths (`RL/tls.go:164-166`, `:238-256`, `:331-333`) | **ignored** — neither reader touches it; diagnostics are `tracing` in the runtime, and no key material is ever logged (`RB/server.rs:55-64` prints `mldsa65: bool`, `short_ids: len`) |
-| 2 | `dest` (alias `target`) | string, required for a server; bare port ⇒ `localhost:PORT` (`XC/…:818-822`, `:833-835`); `@`/`/` prefix ⇒ `type: "unix"` (`:824-832`) | **host:port honoured** (`ZC/xray_json.rs:931-936`, `RB/config.rs:152-157`); the two other shapes are **MISSING** because `split_host_port` requires `host:port` (`crates/zero-core/src/address.rs:173-186`) |
-| 3 | `type` | `"tcp"` or `"unix"`, inferred from `dest`, handed to `DialContext` (`RL/tls.go:168`) | **MISSING** — not read anywhere; the target is always TCP |
+| 1 | `show` | bool, default `false`; enables `RL`'s diagnostics, which include `AuthKey[:16]`, the decoded client version/shortId and record lengths (`RL/tls.go:164-166`, `:238-256`, `:331-333`) | **parsed, carried, not yet printed** — both readers read the switch and refuse a non-bool, as Xray's decode does; the report line is `keys::ClientReport`, the one shape it takes here, and Xray's `AuthKey[:16]` is deliberately absent from it (`crates/zero-runtime/tests/log_privacy.rs`). The per-connection call site is the handshake's (`RB/server.rs`, a separate workstream) |
+| 2 | `dest` (alias `target`) | string, required for a server; bare port ⇒ `localhost:PORT` (`XC/…:818-822`, `:833-835`); `@`/`/` prefix ⇒ `type: "unix"` (`:824-832`) | **host:port and bare port honoured** (`ZC/xray_json.rs`, `RB/config.rs`), and a missing `dest` is now refused by **both** readers, as Xray refuses it (`XC/…:841-843`); a `/path` or `@name` unix socket is refused **by name** rather than dialled, with the reason in the message — the fallback relay speaks TCP only (`crates/reality/tests/config.rs`) |
+| 3 | `type` | `"tcp"` or `"unix"`, inferred from `dest`, handed to `DialContext` (`RL/tls.go:168`) | **MISSING, and refused instead** — `type` is not read; a `dest` shape that would make Xray set `"unix"` is refused by both readers, each naming the shape it saw |
 | 4 | `xver` | uint64, default `0`; `1`/`2` write a PROXY header to the target (`RL/tls.go:174-180`); `>2` refused at parse time (`XC/…:844-846`) | **honoured** (`ZC/xray_json.rs:985-993`, `RB/config.rs:178-186`, used at `ZR/server.rs:2433-2441`) |
 | 5 | `server_names` | repeated string, must be non-empty (`XC/…:847-849`), compared exactly (`RL/tls.go:211`) | **honoured**, non-empty enforced (`ZC/xray_json.rs:896-906`, `RB/config.rs:109-119`); compared exactly — **PORTED** (§1) |
 | 6 | `private_key` | bytes(32), unpadded base64url (`XC/…:850-855`) | **honoured** (`ZC/xray_json.rs:6581-6590`, `RB/config.rs:231-241`); both readers also accept standard base64, a widening of the accepted set |
@@ -1269,11 +1269,15 @@ turns JSON into the fields Xray hands to REALITY).
 | 12 | `limit_fallback_upload` | `{after_bytes, bytes_per_sec, burst_bytes_per_sec}`, all default `0` = unlimited (`XC/…:918-921`) | **honoured** (`ZC/xray_json.rs:969-984`, `RB/config.rs:280-299`, `ZR/server.rs:2455-2467`) with the burst-clamp difference of §6 |
 | 13 | `limit_fallback_download` | as above (`XC/…:922-925`) | as above |
 
-**Status: PORTED for 11 of the 13 server-side fields** — `dest` (host:port), `xver`,
+**Status: PORTED for 11 of the 13 server-side fields** — `dest` (host:port and bare
+port, with the shapes that cannot be dialled refused by name), `xver`,
 `server_names`, `private_key`, `min_client_ver`, `max_client_ver`, `max_time_diff`,
-`short_ids` (exactly), `mldsa65_seed`, and both fallback limits — with `show`
-parse-and-ignore and `type` **MISSING**. `masterKeyLog` is accepted and ignored rather than written; the client-only fields of the same proto are
-accepted and ignored on purpose; `master_key_log` is **MISSING**. The five validation
+`short_ids` (exactly), `mldsa65_seed`, and both fallback limits — plus the two
+diagnostics switches `show` and `masterKeyLog`, which both readers now *read* (a
+wrong shape is refused) while the handshake call sites that would print the line
+and write the file are still to come; `type` stays **MISSING**. The client-only
+fields of the same proto are
+accepted and ignored on purpose. The five validation
 gaps below matter more than the field list, because each of them lets a
 configuration run that Xray would have refused.
 
@@ -1294,8 +1298,13 @@ and REALITY writes NSS key-log lines from the handshake
 (`RL/handshake_server_tls13.go:884-893`, `:1031-1040`) — a debugging aid for
 decrypting one's own traffic. The port has the equivalent for its rustls path
 (`zero-security/src/tls.rs:607-631`, tested by `zero-runtime/tests/tls_options.rs`)
-but **nothing for the REALITY handshake**: neither reader takes the field and no
-key-log line is written. **MISSING.**
+and now the writer for the REALITY handshake too: both readers read the field
+(`"none"`, empty and absent all mean off), `RB/keys.rs::KeyLog` appends the four
+NSS lines and says what writing them exposes, and
+`RB/config.rs::RealityServerConfig::key_log()` opens one per listener. What is
+still missing is the *call*: the two derivation points
+(`RL/handshake_server_tls13.go:884-893`, `:1031-1040`) are in `RB/server.rs`, which
+a separate workstream owns, so nothing writes a line yet. **PARTIAL.**
 
 ### Validation gaps, each with its consequence
 
@@ -1312,17 +1321,22 @@ key-log line is written. **MISSING.**
   server whose ML-DSA binding adds nothing (the seed is the HMAC key material's
   neighbour, and reusing one secret in two roles is exactly what the check exists to
   prevent). **MISSING.**
-* **A missing `dest`/`target` is accepted.** Xray requires it on a server block
-  (`XC/…:841-843`) — and chooses the *role* by its presence (`:812`, `:926`). Rust
-  accepts the block, leaving `target: None`, and the runtime then drops every
-  fallback connection (`ZR/server.rs:2407-2415`): a REALITY inbound that answers
-  nothing to a prober, which is the opposite of the protocol's purpose. The
-  standalone reader documents the `None` case as "only sensible when something else
-  in front of it does" (`RB/config.rs:54-57`), but nothing enforces that something
-  does. **DIVERGENT.**
-* **`type: "unix"` and a bare-port `dest` are not supported**, because both readers
-  route `dest` through `split_host_port` (`crates/zero-core/src/address.rs:173-186`),
-  which needs `host:port`. Xray supports both. **MISSING.**
+* **A missing `dest`/`target` is now refused by both readers.** Xray requires it on
+  a server block (`XC/…:841-843`) — and chooses the *role* by its presence (`:812`,
+  `:926`). The compiler used to accept the block and leave the target unset, and the
+  runtime then dropped every fallback connection (`ZR/server.rs:2407-2415`): a
+  REALITY inbound that answers nothing to a prober, which is the opposite of the
+  protocol's purpose. `crates/reality/tests/config.rs::the_readers_agree_about_a_camouflage_target_they_cannot_dial`
+  drives it, and the shapes below, through both readers. **PORTED.**
+* **A `dest` this port cannot dial is refused by name, not resolved as a host.**
+  Xray accepts `@`/`/` unix sockets and dials them (`XC/…:824-832`, `type: "unix"`);
+  the fallback relay here speaks TCP only, so both readers refuse both unix shapes,
+  and any `dest` that is neither `host:port` nor a bare port, with a message that
+  names the shape and the reason — resolving `/run/decoy.sock` as a host name would
+  fail at DNS time, for a reason that names nothing. A bare-port `dest` *is*
+  supported, by both
+  (`crates/reality/tests/config.rs::both_readers_treat_a_bare_port_dest_as_localhost`).
+  **REFUSED, deliberately.**
 * **Unknown keys are ignored** by both readers (no key-set validation), which
   matches `encoding/json`'s behaviour in Xray (`XC/infra/conf/transport_internet.go:780-805`
   is a struct decoded field by field) — a typo in a field name is silent on both
@@ -1338,10 +1352,13 @@ by `crates/reality/tests/fallback.rs:175-251` instead. `maxTimeDiff` is exercise
 only locally (`RB/server.rs:272-288`) and by the source-level correspondence in the
 table above.
 
-**Still to test.** Nothing drives `"shortIds": []`, `mldsa65Seed == privateKey`, or a
-missing `dest` through `zero_config` and asserts that the config is refused (or, for
-`shortIds`, that the server declares itself unusable). Those three are the concrete
-items to fix and pin; the rest of the table is either proven or read.
+**Still to test.** A missing `dest` is no longer one of them: it is driven through
+both readers by `the_readers_agree_about_a_camouflage_target_they_cannot_dial`
+(`crates/reality/tests/config.rs`), together with both unix shapes and a target that
+is not `host:port`. Nothing yet drives `"shortIds": []` or
+`mldsa65Seed == privateKey` through `zero_config` and asserts that the config is
+refused, though both readers refuse them today. The rest of the table is either
+proven or read.
 
 _Unit reminder for operators:_ `maxTimeDiff` is **milliseconds** in JSON (both
 implementations), and `afterBytes` / `bytesPerSec` / `burstBytesPerSec` are **bytes

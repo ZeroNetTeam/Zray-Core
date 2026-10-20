@@ -938,11 +938,46 @@ fn parse_inbound_security(settings: Option<&Value>, path: &str) -> R<InboundSecu
                      would authenticate nobody"
                 ));
             }
-            let target = reality
-                .get("dest")
-                .or_else(|| reality.get("target"))
-                .and_then(Value::as_str)
-                .and_then(parse_reality_target);
+            // Xray requires a camouflage target on a REALITY inbound: it picks
+            // the role by the field's presence, and refuses a server block
+            // without it (`infra/conf/transport_internet.go:841-843`). Accepting
+            // the block instead would leave the target unset, and the runtime
+            // then drops every fallback connection — a REALITY listener that
+            // answers a censor's probe with a silent nothing, which is the
+            // opposite of the protocol's purpose. The reason for a shape that
+            // cannot be dialled comes from `parse_reality_target`.
+            let target = match reality.get("dest").or_else(|| reality.get("target")) {
+                None | Some(Value::Null) => {
+                    return Err(format!(
+                        "{path}: reality dest is required: an unauthenticated visitor has to be \
+                         handed to the real site"
+                    ))
+                }
+                Some(value) => {
+                    let text = value
+                        .as_str()
+                        .ok_or_else(|| format!("{path}: reality dest must be a string"))?;
+                    Some(
+                        parse_reality_target(text)
+                            .map_err(|reason| format!("{path}: reality {reason}"))?,
+                    )
+                }
+            };
+            // The two diagnostics switches are shape-checked the way Xray's own
+            // JSON decode checks them (`infra/conf/transport_internet.go:781-782`)
+            // and then have nowhere to go: this core's REALITY settings carry
+            // neither, so a listener compiled here starts with both off. The
+            // standalone reader (`crates/reality/src/config.rs`) does carry
+            // them; `crates/reality/tests/config.rs` holds the two readers to
+            // the same verdict on a shape neither can use.
+            match reality.get("show") {
+                None | Some(Value::Null) | Some(Value::Bool(_)) => {}
+                Some(_) => return Err(format!("{path}: reality show must be true or false")),
+            }
+            match reality.get("masterKeyLog") {
+                None | Some(Value::Null) | Some(Value::String(_)) => {}
+                Some(_) => return Err(format!("{path}: reality masterKeyLog must be a file path")),
+            }
             let mldsa65_seed = match reality.get("mldsa65Seed").and_then(Value::as_str) {
                 None | Some("") => None,
                 Some(text) => {
@@ -6681,18 +6716,29 @@ fn parse_reality_pubkey(s: &str) -> Result<[u8; 32], String> {
 /// `localhost:<port>`, anything else must be host:port. A unix-socket path is a
 /// real Xray feature this core does not dial yet, so it is refused rather than
 /// resolved as a host name.
-fn parse_reality_target(text: &str) -> Option<(Address, u16)> {
+fn parse_reality_target(text: &str) -> Result<(Address, u16), String> {
     let text = text.trim();
-    if text.starts_with('@') || text.starts_with('/') {
-        return None;
+    if let Some(name) = text.strip_prefix('@') {
+        return Err(format!(
+            "dest {text:?} is an abstract unix socket (Linux, \"@{name}\"), which this core cannot \
+             dial: the fallback relay speaks TCP only. Use a host:port dest."
+        ));
+    }
+    if text.starts_with('/') {
+        return Err(format!(
+            "dest {text:?} is a unix socket path (Xray's `type: \"unix\"`), which this core cannot \
+             dial: the fallback relay speaks TCP only. Use a host:port dest."
+        ));
     }
     if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) {
         return text
             .parse::<u16>()
-            .ok()
-            .map(|port| (Address::parse_host("localhost"), port));
+            .map(|port| (Address::parse_host("localhost"), port))
+            .map_err(|_| format!("dest {text:?} is not a port"));
     }
-    zero_core::address::split_host_port(text).map(|(host, port)| (Address::parse_host(host), port))
+    zero_core::address::split_host_port(text)
+        .map(|(host, port)| (Address::parse_host(host), port))
+        .ok_or_else(|| format!("dest {text:?} is not host:port"))
 }
 
 /// Xray's `minClientVer` / `maxClientVer`: one to three dot-separated decimal

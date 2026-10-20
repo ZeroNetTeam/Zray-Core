@@ -204,6 +204,26 @@ fn the_readers_agree_on_which_blocks_are_refused() {
                 "xver": 3
             }),
         ),
+        (
+            "a show that is not a boolean",
+            json!({
+                "privateKey": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0",
+                "serverNames": ["example.com"],
+                "shortIds": [""],
+                "dest": "example.com:443",
+                "show": "yes"
+            }),
+        ),
+        (
+            "a masterKeyLog that is not a path",
+            json!({
+                "privateKey": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0",
+                "serverNames": ["example.com"],
+                "shortIds": [""],
+                "dest": "example.com:443",
+                "masterKeyLog": 5
+            }),
+        ),
     ];
     for (what, settings) in refusals {
         let compiler = zero_config::compile_config(&document(settings), zero_core::GenerationId(1));
@@ -216,6 +236,96 @@ fn the_readers_agree_on_which_blocks_are_refused() {
             "this crate accepted {what}: {settings:#}"
         );
     }
+}
+
+#[test]
+fn the_readers_agree_about_a_camouflage_target_they_cannot_dial() {
+    // Every one of these is a `dest` Xray accepts — it dials unix sockets and
+    // picks the role by the field's presence (`infra/conf/transport_internet.go:812-843`)
+    // — and none is reachable from here: the fallback relay speaks TCP only.
+    // Refusing with a reason that names the target matters as much as refusing:
+    // a server that came up with no target would answer a censor's probe with a
+    // silent nothing, which is the opposite of the protocol's purpose, and the
+    // operator would have no line to read that says so.
+    for (what, written) in [
+        ("no dest at all", None),
+        ("a unix socket path", Some(json!("/run/decoy.sock"))),
+        ("an abstract unix socket", Some(json!("@decoy"))),
+        ("a host with no port", Some(json!("example.com"))),
+        ("a dest that is not a string", Some(json!(8443))),
+    ] {
+        let mut settings = server_settings();
+        let object = settings.as_object_mut().expect("object");
+        match written {
+            None => {
+                object.remove("dest");
+            }
+            Some(value) => {
+                object.insert("dest".into(), value);
+            }
+        }
+
+        let compiler =
+            zero_config::compile_config(&document(&settings), zero_core::GenerationId(1))
+                .err()
+                .unwrap_or_else(|| panic!("the configuration compiler accepted {what}"));
+        assert!(
+            compiler.contains("dest"),
+            "{what} was refused for the wrong reason: {compiler}"
+        );
+        let mine = RealityServerConfig::from_xray_settings(&settings)
+            .err()
+            .unwrap_or_else(|| panic!("this crate accepted {what}"));
+        assert!(
+            mine.contains("dest"),
+            "{what} was refused for the wrong reason: {mine}"
+        );
+    }
+}
+
+#[test]
+fn the_readers_agree_about_a_diagnostic_switch_of_the_wrong_shape() {
+    // Xray decodes this object into a Go struct with a `bool` and a `string`
+    // field, so a string `show` or a numeric `masterKeyLog` is a configuration
+    // error there too (`infra/conf/transport_internet.go:781-782`). It matters
+    // that both readers say so rather than one of them skipping the field: an
+    // operator who wrote `"show": "yes"` believes diagnostics are on, and would
+    // be reading logs that say nothing.
+    for (field, written) in [("show", json!("yes")), ("masterKeyLog", json!(5))] {
+        let mut settings = server_settings();
+        settings
+            .as_object_mut()
+            .expect("object")
+            .insert(field.into(), written);
+        let compiler =
+            zero_config::compile_config(&document(&settings), zero_core::GenerationId(1))
+                .err()
+                .unwrap_or_else(|| panic!("the configuration compiler accepted {field}"));
+        assert!(compiler.contains(field), "{compiler}");
+        let mine = RealityServerConfig::from_xray_settings(&settings)
+            .err()
+            .unwrap_or_else(|| panic!("this crate accepted {field}"));
+        assert!(mine.contains(field), "{mine}");
+    }
+
+    // And a block that sets them the way Xray documents is accepted by both,
+    // which is what keeps the switches usable while the listener's plumbing for
+    // them is still the handshake's to add.
+    let mut settings = server_settings();
+    let object = settings.as_object_mut().expect("object");
+    object.insert("show".into(), json!(true));
+    object.insert("masterKeyLog".into(), json!("none"));
+    let compiled = compiled(&settings);
+    let mine = RealityServerConfig::from_xray_settings(&settings).expect("this crate parses it");
+    assert!(mine.show);
+    assert_eq!(
+        mine.master_key_log, None,
+        "\"none\" is off, not a file called none"
+    );
+    assert!(
+        compiled.target.is_some(),
+        "the block still compiled its target"
+    );
 }
 
 #[test]

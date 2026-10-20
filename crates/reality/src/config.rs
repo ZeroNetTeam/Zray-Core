@@ -24,11 +24,18 @@
 //! The fields map one to one onto
 //! [`zero_config::InboundRealityConfig`], and `crates/reality/tests/config.rs`
 //! compares the two parses field by field so the copies cannot drift.
+//!
+//! Both of Xray's diagnostic switches are read as well: `show` (#1) and
+//! `masterKeyLog` (#31), the two fields an operator turns on to see inside a
+//! handshake. What they may reveal is documented where it belongs — with the key
+//! material they are about, in [`crate::keys`]: a key log hands out session
+//! secrets on purpose, and a `show` line must never carry one at all.
 
 use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::keys::KeyLog;
 use crate::server::RealityServerParams;
 
 /// The type of `limitFallbackUpload` / `limitFallbackDownload` is
@@ -41,6 +48,20 @@ pub use crate::fallback::FallbackLimit;
 /// Everything a REALITY server listener needs, parsed from `realitySettings`.
 #[derive(Clone)]
 pub struct RealityServerConfig {
+    /// Xray's `show`: report, per connection that gets as far as opening a
+    /// REALITY seal, the peer's address and the client fields its session id
+    /// carried — Xray's per-connection diagnostics (`RL/tls.go:164-166`,
+    /// `:252-256`). Default `false`.
+    ///
+    /// What the report may *not* carry is as much a part of this field as what
+    /// it may: Xray's `show` also prints the first 16 bytes of the
+    /// authentication key it derived (`RL/tls.go:238-240`), and this port prints
+    /// no key material of any kind (`crates/zero-runtime/tests/log_privacy.rs`).
+    /// [`ClientReport`](crate::keys::ClientReport) is the only shape a report
+    /// takes here, and it has no field a key could go in.
+    ///
+    /// The handshake writes the line; this reader carries the switch for it.
+    pub show: bool,
     /// The names the server will camouflage itself as. At least one; Xray
     /// compares the client's SNI against this list exactly.
     pub server_names: Box<[Box<str>]>,
@@ -52,8 +73,14 @@ pub struct RealityServerConfig {
     /// configuration error, not "accept anyone".
     pub short_ids: Box<[Box<[u8]>]>,
     /// The camouflage site: `dest` (or `target`) as written, host and port.
-    /// `None` means the server has nowhere to send an unauthenticated visitor,
-    /// which is only sensible when something else in front of it does.
+    ///
+    /// Always `Some` in a configuration this reader produced: a block with no
+    /// `dest` is refused, exactly as Xray refuses it
+    /// (`infra/conf/transport_internet.go:841-843`). It stays an `Option` only
+    /// for a caller that builds the struct by hand, who is then saying that
+    /// something else in front of this listener handles the fallback — a REALITY
+    /// server with nowhere to send an unauthenticated visitor answers a probe
+    /// with a silent nothing, which is the opposite of the protocol's purpose.
     pub target: Option<(Box<str>, u16)>,
     /// Xray's `mldsa65Seed`: 32 secret bytes that make the server sign every
     /// handshake with an ML-DSA-65 key, so a client holding the matching
@@ -72,6 +99,19 @@ pub struct RealityServerConfig {
     pub fallback_xver: u8,
     pub fallback_limit_up: FallbackLimit,
     pub fallback_limit_down: FallbackLimit,
+    /// Xray's `masterKeyLog`: the file the handshake appends its TLS 1.3 traffic
+    /// secrets to, so that a capture of this server's traffic can be decrypted.
+    /// `None` — the default — when the field is absent, empty or `"none"`, the
+    /// three spellings Xray treats as off
+    /// (`XC/transport_internet/reality/config.go:61-64`).
+    ///
+    /// This is a debugging switch and not a diagnostic trail:
+    /// [`KeyLog`](crate::keys::KeyLog) documents what a reader of that file can
+    /// do, which is decrypt every session of every user of this server for as
+    /// long as it is being written. Open it once per listener with
+    /// [`Self::key_log`] rather than once per connection, and delete the file
+    /// when the investigation is over.
+    pub master_key_log: Option<Box<str>>,
 }
 
 impl std::fmt::Debug for RealityServerConfig {
@@ -87,6 +127,11 @@ impl std::fmt::Debug for RealityServerConfig {
             .field("min_client_ver", &self.min_client_ver)
             .field("max_client_ver", &self.max_client_ver)
             .field("fallback_xver", &self.fallback_xver)
+            // Whether the evidence trail is on, not where it goes: a path is
+            // not a secret, but a key log's location is nobody else's business
+            // either.
+            .field("master_key_log", &self.master_key_log.is_some())
+            .field("show", &self.show)
             .finish_non_exhaustive()
     }
 }
@@ -194,7 +239,32 @@ impl RealityServerConfig {
             }
         };
 
+        // Xray decodes this object into a Go struct with a `bool` and a
+        // `string` field, so a `show` of the wrong shape and a `masterKeyLog`
+        // that is not a path are configuration errors there too
+        // (`XC/infra/conf/transport_internet.go:781-782`).
+        let show = match object.get("show") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(other) => {
+                return Err(format!(
+                    "realitySettings.show must be true or false, not {other}"
+                ))
+            }
+        };
+        let master_key_log = match object.get("masterKeyLog") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(path)) if path.is_empty() || path == "none" => None,
+            Some(Value::String(path)) => Some(Box::from(&**path)),
+            Some(other) => {
+                return Err(format!(
+                    "realitySettings.masterKeyLog must be a file path, not {other}"
+                ))
+            }
+        };
+
         Ok(Self {
+            show,
             server_names: server_names.into_boxed_slice(),
             private_key,
             short_ids: short_ids.into_boxed_slice(),
@@ -219,6 +289,7 @@ impl RealityServerConfig {
             },
             fallback_limit_up: fallback_limit(object, "limitFallbackUpload")?,
             fallback_limit_down: fallback_limit(object, "limitFallbackDownload")?,
+            master_key_log,
         })
     }
 
@@ -239,6 +310,22 @@ impl RealityServerConfig {
             min_client_ver: self.min_client_ver,
             max_client_ver: self.max_client_ver,
             post_handshake: Default::default(),
+        }
+    }
+
+    /// The key log this configuration asks for, or `None` when `masterKeyLog` is
+    /// off. The file is opened here, once per listener, so that every handshake
+    /// appends to the same one.
+    ///
+    /// A path that cannot be opened comes back as an error for the caller to
+    /// decide about. Xray logs the error and runs with no key log rather than
+    /// refusing to start (`XC/transport_internet/reality/config.go:66-71`), and
+    /// that is the right shape for this feature: a debugging aid is not a reason
+    /// for a REALITY listener to be down.
+    pub fn key_log(&self) -> Result<Option<KeyLog>, String> {
+        match &self.master_key_log {
+            None => Ok(None),
+            Some(path) => KeyLog::open(path).map(Some),
         }
     }
 }
@@ -331,16 +418,27 @@ fn client_version(
     Ok(Some(version))
 }
 
-/// `dest` as Xray reads it: a unix socket path, a bare port on localhost, or
-/// host:port.
+/// `dest` as Xray reads it: `host:port`, a bare port on localhost, or a unix
+/// socket path — which this port refuses by name rather than resolving as a host
+/// name (`XC/infra/conf/transport_internet.go:812-843`).
 fn parse_target(text: &str) -> Result<(Box<str>, u16), String> {
     let text = text.trim();
-    if text.starts_with('@') || text.starts_with('/') {
-        // A unix-socket target is a real Xray feature this crate does not
-        // speak yet. Refusing beats resolving it as a host name, which would
-        // hand every unauthenticated visitor to a DNS lookup of `/run/x.sock`.
+    if let Some(name) = text.strip_prefix('@') {
+        // Xray's `type: "unix"` on Linux, as an abstract socket: a name in the
+        // kernel's namespace rather than a file to bind (`:824-832`). Refused
+        // loudly, and refused as *its own* shape, so that an operator who wrote
+        // `@decoy` is not told their host name is malformed.
         return Err(format!(
-            "realitySettings.dest {text:?} is a unix socket, which this server does not dial yet"
+            "realitySettings.dest {text:?} is an abstract unix socket (Linux, \"@{name}\"), which \
+             this server cannot dial: the fallback relay speaks TCP only, so an unauthenticated \
+             visitor would have nowhere to go. Use a host:port dest."
+        ));
+    }
+    if text.starts_with('/') {
+        return Err(format!(
+            "realitySettings.dest {text:?} is a unix socket path (Xray's `type: \"unix\"`), which \
+             this server cannot dial: the fallback relay speaks TCP only, so an unauthenticated \
+             visitor would have nowhere to go. Use a host:port dest."
         ));
     }
     if text.bytes().all(|byte| byte.is_ascii_digit()) && !text.is_empty() {
@@ -471,6 +569,107 @@ mod tests {
     }
 
     #[test]
+    fn the_two_unix_socket_shapes_are_refused_as_their_own_shapes() {
+        // Xray dials both (`transport_internet.go:824-832`): a filesystem socket
+        // and, on Linux, an abstract one. Neither can be reached by a fallback
+        // relay that only speaks TCP, so the operator is told which of the two
+        // they wrote and why it cannot work — resolving `@decoy` as a host name
+        // would fail at DNS time, minutes later, for a reason that names
+        // nothing.
+        for (written, expected) in [
+            ("/run/decoy.sock", "unix socket path"),
+            ("@decoy", "abstract unix socket"),
+        ] {
+            let mut value = settings();
+            value
+                .as_object_mut()
+                .expect("object")
+                .insert("dest".into(), json!(written));
+            let error = RealityServerConfig::from_xray_settings(&value)
+                .expect_err("a unix socket target cannot be dialled");
+            assert!(error.contains(expected), "{written}: {error}");
+            assert!(
+                error.contains("TCP only"),
+                "{written}: the reason has to be in the message: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_diagnostic_switches_are_read_the_way_xray_reads_them() {
+        // `show` defaults to false and is carried as written.
+        let config = RealityServerConfig::from_xray_settings(&settings()).expect("parses");
+        assert!(
+            !config.show,
+            "a block that says nothing about show is quiet"
+        );
+        assert_eq!(config.master_key_log, None, "and writes no key log");
+
+        let mut loud = settings();
+        loud.as_object_mut()
+            .expect("object")
+            .insert("show".into(), json!(true));
+        assert!(
+            RealityServerConfig::from_xray_settings(&loud)
+                .expect("parses")
+                .show
+        );
+
+        // The three spellings Xray treats as "off"
+        // (`transport_internet/reality/config.go:61-64`), and the one that turns
+        // it on. `key_log()` is the caller's way in, so it is what the test
+        // uses: a switch that parses but cannot be honoured is the bug this
+        // catches.
+        for off in [json!("none"), json!(""), json!(null)] {
+            let mut value = settings();
+            value
+                .as_object_mut()
+                .expect("object")
+                .insert("masterKeyLog".into(), off.clone());
+            let config = RealityServerConfig::from_xray_settings(&value).expect("parses");
+            assert_eq!(config.master_key_log, None, "masterKeyLog {off} is off");
+            assert!(
+                config.key_log().expect("nothing to open").is_none(),
+                "masterKeyLog {off} must not create a file"
+            );
+        }
+
+        let path = crate::keys::scratch_path("config-keylog");
+        let mut on = settings();
+        on.as_object_mut()
+            .expect("object")
+            .insert("masterKeyLog".into(), json!(path.to_string_lossy()));
+        let config = RealityServerConfig::from_xray_settings(&on).expect("parses");
+        assert_eq!(
+            config.master_key_log.as_deref(),
+            Some(path.to_string_lossy().as_ref())
+        );
+        assert!(
+            !path.exists(),
+            "reading the setting must not create the file: only opening it does"
+        );
+        let log = config
+            .key_log()
+            .expect("the target directory is writable")
+            .expect("the path was named");
+        assert_eq!(log.path(), path.to_string_lossy());
+        log.log(
+            crate::keys::CLIENT_TRAFFIC_SECRET_0,
+            &[0x11u8; 32],
+            &[0x22u8; 32],
+        )
+        .expect("the file was created for appending");
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("the key log was written")
+                .lines()
+                .count(),
+            1
+        );
+        std::fs::remove_file(&path).expect("the test's own key log is removable");
+    }
+
+    #[test]
     fn every_rejected_shape_is_rejected_for_its_own_reason() {
         let cases: &[(&str, Value)] = &[
             ("privateKey", json!({"privateKey": "not base64!!"})),
@@ -490,6 +689,18 @@ mod tests {
                 "limitFallbackUpload",
                 json!({"limitFallbackUpload": {"afterBytes": "ten"}}),
             ),
+            // A camouflage target Xray accepts but this port cannot dial is
+            // refused as its own shape, not as a host name that failed to
+            // resolve: the difference is what an operator reads at startup.
+            ("dest", json!({"dest": null})),
+            ("dest", json!({"dest": "/run/decoy.sock"})),
+            ("dest", json!({"dest": "@decoy"})),
+            ("dest", json!({"dest": "example.com"})),
+            ("dest", json!({"dest": 8443})),
+            ("show", json!({"show": "yes"})),
+            ("show", json!({"show": 1})),
+            ("masterKeyLog", json!({"masterKeyLog": 5})),
+            ("masterKeyLog", json!({"masterKeyLog": ["/tmp/keys.log"]})),
         ];
         for (field, extra) in cases {
             let mut value = settings();

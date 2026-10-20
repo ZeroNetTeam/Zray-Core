@@ -18,6 +18,24 @@ test `zero-runtime/tests/reality_compatibility.rs`, which compares the config
 compiler's independent copy of the rule against the wire corpus for every
 profile in it.
 
+## REALITY `dest` shapes this port refuses to dial
+
+A REALITY `dest` (or `target`) is `host:port`, or a bare port meaning
+`localhost:PORT`. Xray also accepts a `/path` or `@name` unix socket, infers
+`type: "unix"` from it and dials it (`infra/conf/transport_internet.go:812-843`).
+The fallback relay here speaks TCP only, so both readers refuse those two shapes
+*by name* and with the reason in the message, rather than resolving
+`/run/decoy.sock` as a host name and failing at DNS time. A block with no `dest`
+at all is refused as well, and that part is parity rather than a divergence: Xray
+requires the field on a server block and picks the role by its presence (`:812`,
+`:841-843`), and a REALITY listener whose fallback has nowhere to go answers a
+censor's probe with a silent nothing.
+
+**Pinned by.**
+`crates/reality/tests/config.rs::the_readers_agree_about_a_camouflage_target_they_cannot_dial`,
+which holds the configuration compiler and the standalone reader to one verdict
+and one reason.
+
 ## ClientHellos that are not browser-shaped
 
 The uTLS profile is applied to TCP TLS hellos only. Three kinds of hello leave

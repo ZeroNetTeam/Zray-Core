@@ -23,7 +23,9 @@
 //!   the PROXY protocol header the target asked for, the ClientHello replayed
 //!   exactly as it arrived, and a rate-limited relay to the camouflage site.
 //! * [`keys`] — the server's key material, in the encodings `xray x25519`,
-//!   `xray mldsa65` and a `shortIds` entry use.
+//!   `xray mldsa65` and a `shortIds` entry use, plus the two switches that
+//!   decide what a running server says about a handshake: [`keys::KeyLog`]
+//!   (`masterKeyLog`) and [`keys::ClientReport`] (`show`).
 //!
 //! A server turns its configuration into a listener like this:
 //!
