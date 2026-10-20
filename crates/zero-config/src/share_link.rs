@@ -129,6 +129,8 @@ fn parse_link_inner(link: &str) -> Result<ShareLink, String> {
         "ss" => parse_shadowsocks(rest),
         "vmess" => parse_vmess(rest),
         "anytls" => parse_anytls(rest),
+        // `naive+https://` is the clash spelling of the same thing.
+        "naive" | "naive+https" => parse_naive_link(rest),
         // `socks5h` is curl's spelling for "let the proxy resolve names",
         // which is the only way this outbound works.
         "socks" | "socks5" | "socks5h" => parse_socks(rest),
@@ -362,6 +364,7 @@ fn parse_shadowsocks(rest: &str) -> Result<ShareLink, String> {
             port: p.port,
             method,
             password: p.credential.into(),
+            obfs: parse_obfs_link(&p.query)?,
         }),
         stream: StreamSettings::default(),
         mux: MuxConfig::default(),
@@ -372,6 +375,55 @@ fn parse_shadowsocks(rest: &str) -> Result<ShareLink, String> {
         remark: p.remark,
         outbound,
     })
+}
+
+/// The SIP003 plugin parameter of a Shadowsocks link:
+/// `plugin=obfs-local;obfs=http;obfs-host=example.com`. Only `obfs-local`
+/// is accepted — `v2ray-plugin` and friends are transports of their own,
+/// not a disguise on this stream — and a plugin line that names one of
+/// them is refused with where to take it instead.
+fn parse_obfs_link(query: &BTreeMap<String, String>) -> Result<Option<ObfsConfig>, String> {
+    let Some(plugin) = query.get("plugin") else {
+        return Ok(None);
+    };
+    // The whole value arrives percent-decoded by `parse_query`; the plugin
+    // options are a `;`-separated `key=value` list after the binary name.
+    let mut parts = plugin.split(';');
+    let name = parts.next().unwrap_or_default().trim();
+    // `plugin=none` is what a client writes when it has no plugin to say, and
+    // a legacy Shadowsocks link often carries it. It is not a plugin this core
+    // does not speak — it is the absence of one.
+    if name.eq_ignore_ascii_case("none") || name.is_empty() {
+        return Ok(None);
+    }
+    if name != "obfs-local" {
+        return Err(format!(
+            "unsupported Shadowsocks plugin {name:?}; only simple-obfs (obfs-local) is spoken here, and a v2ray-plugin link is an ordinary vless-style ws link"
+        ));
+    }
+    let mut mode = None;
+    let mut host = None;
+    for part in parts {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        match key.trim() {
+            "obfs" => {
+                mode = Some(
+                    ObfsMode::parse(value.trim())
+                        .ok_or_else(|| format!("unsupported obfs mode {value:?}"))?,
+                );
+            }
+            "obfs-host" => host = Some(value.trim()),
+            _ => {}
+        }
+    }
+    let mode = mode.ok_or_else(|| "a simple-obfs link needs obfs=http or obfs=tls".to_string())?;
+    // simple-obfs falls back to the server's own address when no host is
+    // given; the caller hands that in when the link did not.
+    let host = match host.filter(|host| !host.is_empty()) {
+        Some(host) => Box::from(host),
+        None => return Err("a simple-obfs link needs obfs-host".into()),
+    };
+    Ok(Some(ObfsConfig { mode, host }))
 }
 
 /// Decode base64 in any of the four alphabets/padding variants panels emit,
@@ -501,6 +553,85 @@ fn parse_vmess(rest: &str) -> Result<ShareLink, String> {
         remark,
         outbound,
         link: String::new(),
+    })
+}
+
+/// `naive://user:password@host[:port]?sni=…&padding=1#name`, and the clash
+/// spelling `naive+https://user:password@host#name` (the scheme match routes
+/// both here). The credential is HTTP Basic, so both fields must be present.
+/// Port defaults to 443 the way the NaiveProxy client treats a missing one.
+fn parse_naive_link(rest: &str) -> Result<ShareLink, String> {
+    // A missing `:port` fails `split_link`, so append the default to the
+    // host part first. The colon inside the userinfo is not a port, so the
+    // host is looked at strictly after the `@`.
+    let (body, fragment) = rest.split_once('#').unwrap_or((rest, ""));
+    let authority_end = body.find(['?', '/']).unwrap_or(body.len());
+    let body = match body[..authority_end].rfind('@') {
+        // Insert the default port right after the host, before any query,
+        // path or fragment split (`authority_end`), or it would land inside
+        // them and corrupt the link.
+        Some(at) if !body[at + 1..authority_end].contains(':') => {
+            format!("{}:443{}", &body[..authority_end], &body[authority_end..])
+        }
+        Some(_) => body.to_string(),
+        None => return Err("share link is missing the '@' before the host".into()),
+    };
+    let rest = match fragment {
+        "" => body,
+        fragment => format!("{body}#{fragment}"),
+    };
+    let p = split_link(&rest)?;
+    let (username, password) = p.credential.split_once(':').ok_or_else(|| {
+        "a NaiveProxy link carries the HTTP Basic user and password as user:password".to_string()
+    })?;
+    if username.is_empty() || password.is_empty() {
+        return Err("a NaiveProxy link needs both a username and a password".into());
+    }
+    // The link's own `sni` and `alpn` come through `build_stream`; NaiveProxy
+    // speaks HTTP/2, so `h2` must lead the ALPN list a server sees.
+    let mut stream = build_stream(&p.query, p.host)?;
+    // TLS is not optional for NaiveProxy: a link that does not spell out
+    // `security=tls` still means TLS, unlike vless where `none` is a choice.
+    if matches!(stream.security, Security::None) {
+        stream.security = Security::Tls(TlsConfig {
+            server_name: Some(Arc::from(p.host)),
+            alpn: vec!["h2".into(), "http/1.1".into()],
+            ..TlsConfig::default()
+        });
+    }
+    if let Security::Tls(tls) = &mut stream.security {
+        if let Some(sni) = p.query.get("sni").filter(|s| !s.is_empty()) {
+            tls.server_name = Some(Arc::from(sni.as_str()));
+        }
+        if tls.alpn.is_empty() {
+            tls.alpn = vec!["h2".into(), "http/1.1".into()];
+        } else if !tls.alpn.iter().any(|a| &**a == "h2") {
+            tls.alpn.insert(0, "h2".into());
+        }
+    }
+    // The padding protocol is on unless the link turns it off with
+    // `padding=0`; the server says in its response whether it speaks it.
+    let padding = !matches!(
+        p.query.get("padding").map(String::as_str),
+        Some("0") | Some("false") | Some("no")
+    );
+    let outbound = Outbound {
+        tag: Arc::from("proxy"),
+        protocol: OutboundProtocol::Naive(NaiveConfig {
+            address: Address::parse_host(p.host),
+            port: p.port,
+            username: username.into(),
+            password: password.into(),
+            padding,
+        }),
+        stream,
+        mux: MuxConfig::default(),
+    };
+    outbound.validate()?;
+    Ok(ShareLink {
+        link: String::new(),
+        remark: p.remark,
+        outbound,
     })
 }
 
@@ -1978,6 +2109,58 @@ mod tests {
             OutboundProtocol::AnyTls(_)
         ));
         assert!(matches!(link.outbound.stream.security, Security::Tls(_)));
+    }
+
+    #[test]
+    fn parses_naive_links_in_both_spellings_and_defaults_the_port() {
+        let long = parse_link(
+            "naive://user:secret@front.example.com?security=tls&sni=front.example.com#Naive",
+        )
+        .unwrap();
+        assert_eq!(long.remark, "Naive");
+        match &long.outbound.protocol {
+            OutboundProtocol::Naive(naive) => {
+                assert_eq!(naive.port, 443);
+                assert_eq!(&*naive.username, "user");
+                assert_eq!(&*naive.password, "secret");
+                assert!(naive.padding);
+            }
+            other => panic!("expected Naive, got {}", other.name()),
+        }
+        let tls = match &long.outbound.stream.security {
+            Security::Tls(tls) => tls,
+            other => panic!("expected TLS, got {}", other.name()),
+        };
+        assert_eq!(tls.alpn.iter().map(|a| &**a).next(), Some("h2"));
+
+        // The clash spelling reads the same body.
+        let short =
+            parse_link("naive+https://user:secret@front.example.com:8443#viaClash").unwrap();
+        match &short.outbound.protocol {
+            OutboundProtocol::Naive(naive) => assert_eq!(naive.port, 8443),
+            other => panic!("expected Naive, got {}", other.name()),
+        }
+
+        // `padding=0` turns the padding protocol off.
+        let plain = parse_link("naive://user:secret@front.example.com?padding=0#off").unwrap();
+        match &plain.outbound.protocol {
+            OutboundProtocol::Naive(naive) => assert!(!naive.padding),
+            other => panic!("expected Naive, got {}", other.name()),
+        }
+    }
+
+    #[test]
+    fn a_naive_link_without_a_credential_or_a_password_is_refused() {
+        // No `@` at all is the "missing credential" case for every link
+        // shape; say that rather than inventing a naive-specific wording.
+        let no_credential = parse_link("naive://front.example.com:443#x").unwrap_err();
+        assert!(no_credential.contains("missing the '@'"), "{no_credential}");
+        // A user without a password names the pairing rule.
+        let empty_password = parse_link("naive://user:@front.example.com:443#x").unwrap_err();
+        assert!(
+            empty_password.contains("username and a password"),
+            "{empty_password}"
+        );
     }
 
     #[test]
