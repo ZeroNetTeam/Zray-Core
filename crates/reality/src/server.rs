@@ -63,32 +63,81 @@ impl std::fmt::Debug for RealityServerParams {
     }
 }
 
-/// The sizes of the records a camouflage site sends straight after a
-/// handshake, per server name (see [`zero_security::tls13::post_handshake`]).
+/// The record sizes a camouflage site presents, per server name (see
+/// [`zero_security::tls13::post_handshake`]).
 ///
-/// After each handshake it accepts, the server sends empty records of the
-/// sizes stored for the name the client asked for, so the first thing on the
-/// wire after the handshake matches the real site's.
+/// Two things are stored for each name, both learned by asking the real site:
+///
+/// * the **first flight**: the wire sizes of the records it answered a
+///   ClientHello with, ServerHello first. The server puts its own flight on
+///   the wire in those sizes, so the bytes an observer counts before the
+///   handshake completes are the site's and not this implementation's
+///   (REALITY's own server does the same, `RL/conn.go:526-557`).
+/// * the **post-handshake** records: the sizes it sends once the handshake is
+///   done. After each handshake it accepts, the server sends empty records of
+///   those sizes, so the first thing on the wire afterwards matches the site.
+///
+/// Either half may be missing, and both start out missing: a name nothing has
+/// been learned for keeps the behaviour of a server that never learned
+/// anything — its own flight sizes, and nothing after the handshake.
 #[derive(Debug, Default)]
-pub struct PostHandshakeShapes(Mutex<Vec<Shape>>);
+pub struct PostHandshakeShapes(Mutex<Vec<Site>>);
 
-/// A server name and the record sizes its site sends.
-type Shape = (Box<str>, Arc<[u16]>);
+/// One server name and what its site's handshake looks like.
+#[derive(Debug, Default, Clone)]
+struct Site {
+    name: Box<str>,
+    /// Wire sizes of the site's first-flight records, ServerHello first.
+    flight: Arc<[u16]>,
+    /// Wire sizes of the records it sends after the handshake.
+    after: Arc<[u16]>,
+}
+
+/// What is known about one name, as the handshake path wants it.
+#[derive(Debug, Default, Clone)]
+pub(super) struct SiteShapes {
+    pub flight: Option<Arc<[u16]>>,
+    pub after: Option<Arc<[u16]>>,
+}
 
 impl PostHandshakeShapes {
-    /// Remember `wire_lens` for `server_name`, replacing what was there.
+    /// Remember the post-handshake record sizes for `server_name`, replacing
+    /// what was there. The first flight learned for the name, if any, stays.
     pub fn set(&self, server_name: &str, wire_lens: &[u16]) {
-        let mut shapes = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        shapes.retain(|(name, _)| &**name != server_name);
-        shapes.push((server_name.into(), wire_lens.into()));
+        self.edit(server_name, |site| site.after = wire_lens.into());
     }
 
-    fn get(&self, server_name: &str) -> Option<Arc<[u16]>> {
-        let shapes = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        shapes
-            .iter()
-            .find(|(name, _)| &**name == server_name)
-            .map(|(_, lens)| Arc::clone(lens))
+    /// Remember the first flight's record sizes for `server_name`, replacing
+    /// what was there (the post-handshake sizes stay).
+    pub fn set_flight(&self, server_name: &str, wire_lens: &[u16]) {
+        self.edit(server_name, |site| site.flight = wire_lens.into());
+    }
+
+    fn edit(&self, server_name: &str, change: impl FnOnce(&mut Site)) {
+        let mut sites = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match sites.iter_mut().find(|site| &*site.name == server_name) {
+            Some(site) => change(site),
+            None => {
+                let mut site = Site {
+                    name: server_name.into(),
+                    ..Site::default()
+                };
+                change(&mut site);
+                sites.push(site);
+            }
+        }
+    }
+
+    /// What is known about `server_name`, for one handshake.
+    pub(super) fn site(&self, server_name: &str) -> SiteShapes {
+        let sites = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match sites.iter().find(|site| &*site.name == server_name) {
+            Some(site) => SiteShapes {
+                flight: Some(Arc::clone(&site.flight)).filter(|lens| !lens.is_empty()),
+                after: Some(Arc::clone(&site.after)).filter(|lens| !lens.is_empty()),
+            },
+            None => SiteShapes::default(),
+        }
     }
 }
 
@@ -262,8 +311,8 @@ where
         };
     }
 
-    let post_handshake = params.post_handshake.get(&hello.sni);
-    match complete_handshake(io, hello, auth_key, post_handshake, params.mldsa65_seed).await {
+    let shapes = params.post_handshake.site(&hello.sni);
+    match complete_handshake(io, hello, auth_key, shapes, params.mldsa65_seed).await {
         Ok(stream) => HandshakeOutcome::Accepted(stream),
         Err(failure) => HandshakeOutcome::Rejected(failure),
     }
@@ -305,7 +354,7 @@ async fn complete_handshake<S>(
     mut io: S,
     hello: ClientHelloInfo,
     auth_key: [u8; 32],
-    post_handshake: Option<Arc<[u16]>>,
+    shapes: SiteShapes,
     mldsa65_seed: Option<[u8; 32]>,
 ) -> Result<Tls13Stream<S>, Failure>
 where
@@ -348,6 +397,11 @@ where
         0x001d
     };
     let server_hello = build_server_hello(&hello.session_id, hello.suite, group, &server_share);
+    // What the camouflage site's own flight looked like, if it can be copied
+    // at all: our ServerHello has to be the size the site's was, or there is
+    // no record-for-record shape to reproduce and the flight goes out as
+    // this server makes it.
+    let flight = FlightPlan::for_hello(shapes.flight.as_deref(), &server_hello);
     write_clear_record(&mut io, &server_hello).await?;
 
     let mut transcript = Transcript::new(hello.suite.hash);
@@ -375,13 +429,16 @@ where
         &mut transcript,
         &certificate,
         &signing,
+        flight.as_ref(),
     )?;
     // The dummy CCS a real server sends after its ServerHello, in the same
-    // write as the encrypted flight it precedes.
-    let mut flight = Vec::with_capacity(DUMMY_CCS.len() + encrypted_flight.len());
-    flight.extend_from_slice(&DUMMY_CCS);
-    flight.extend_from_slice(&encrypted_flight);
-    io.write_all(&flight)
+    // write as the encrypted flight it precedes. It is six bytes on every
+    // server, which is why a site whose CCS is not six bytes cannot be copied
+    // record for record and `FlightPlan` refuses the whole shape.
+    let mut flight_bytes = Vec::with_capacity(DUMMY_CCS.len() + encrypted_flight.len());
+    flight_bytes.extend_from_slice(&DUMMY_CCS);
+    flight_bytes.extend_from_slice(&encrypted_flight);
+    io.write_all(&flight_bytes)
         .await
         .map_err(|error| Failure::from_io(&error, Stage::TlsStarted))?;
     io.flush()
@@ -404,7 +461,7 @@ where
     // application traffic key schedule (RFC 8446 §7.1).
     let (client_app, server_app) = establish_application_secrets(&schedule, &transcript.snapshot());
     let mut stream = Tls13Stream::new(io, hello.suite, client_app, server_app);
-    if let Some(wire_lens) = post_handshake {
+    if let Some(wire_lens) = shapes.after {
         // Where the real site would be sending its session tickets.
         stream.queue_empty_records(&wire_lens)?;
         stream
@@ -785,24 +842,77 @@ where
     Ok(())
 }
 
+/// The record sizes this server's first flight is to be written in, learned
+/// from the site the name belongs to.
+///
+/// REALITY's own server reads the site's flight on every connection and
+/// writes its four encrypted messages padded to the site's record sizes
+/// (`RL/conn.go:526-557`), so the record boundaries a censor can count are the
+/// site's. This is the same idea, with the sizes learned once at start-up
+/// instead of per connection.
+///
+/// It is a plan only when the shape can be reproduced exactly. Two things can
+/// rule that out, and both leave the flight as this server would have written
+/// it anyway:
+///
+/// * the site's ServerHello record is not the size of ours. Go replays the
+///   site's ServerHello byte for byte, so it never has this problem; this
+///   implementation builds its own, and a site whose ServerHello differs
+///   (another extension set, another key share) cannot be copied record for
+///   record. A flight that matches everywhere except its first record is no
+///   better than one that matches nowhere, and refusing every client because
+///   a site's ServerHello is 3 bytes longer would be worse than either.
+/// * the site's ChangeCipherSpec is not six bytes. Go treats that as the
+///   site not being TLS 1.3 as expected and gives up on the connection
+///   (`RL/tls.go:337-339`); here the name simply keeps this server's sizes.
+#[derive(Debug)]
+struct FlightPlan {
+    /// The sizes of the site's encrypted flight records, in order: what each
+    /// of EncryptedExtensions, Certificate, CertificateVerify and Finished is
+    /// padded to.
+    encrypted: Arc<[u16]>,
+}
+
+impl FlightPlan {
+    fn for_hello(flight: Option<&[u16]>, server_hello: &[u8]) -> Option<Self> {
+        let [hello, ccs, encrypted @ ..] = flight? else {
+            return None;
+        };
+        if usize::from(*hello) != 5 + server_hello.len() {
+            return None;
+        }
+        if usize::from(*ccs) != DUMMY_CCS.len() {
+            return None;
+        }
+        if encrypted.is_empty() {
+            return None;
+        }
+        Some(Self {
+            encrypted: encrypted.into(),
+        })
+    }
+}
+
 fn build_encrypted_flight(
     suite: CipherSuite,
     secret: &[u8],
     transcript: &mut Transcript,
     certificate: &[u8],
     signing: &SigningKey,
+    plan: Option<&FlightPlan>,
 ) -> Result<Vec<u8>, Failure> {
     // EncryptedExtensions is a vector, even when no extensions are selected.
     // The two-byte zero length is required by RFC 8446 §4.4.2 and by Go's
     // TLS parser; an empty handshake body is not a valid message.
     let ee = handshake_message(8, &[0, 0]);
     let cert = certificate_message(certificate);
+    let sizes = plan.map(|plan| &plan.encrypted[..]).unwrap_or_default();
     let mut out = Vec::new();
     let mut crypter = RecordCrypter::new(suite, secret);
     transcript.update(&ee);
-    out.extend_from_slice(&crypter.seal(&ee, CONTENT_HANDSHAKE)?.bytes);
+    seal_flight_record(&mut crypter, &ee, sizes.first().copied(), &mut out)?;
     transcript.update(&cert);
-    out.extend_from_slice(&crypter.seal(&cert, CONTENT_HANDSHAKE)?.bytes);
+    seal_flight_record(&mut crypter, &cert, sizes.get(1).copied(), &mut out)?;
     let signed = certificate_verify_input(transcript.snapshot());
     let signature = signing.sign(&signed);
     let mut cv_body = Vec::with_capacity(68);
@@ -811,12 +921,42 @@ fn build_encrypted_flight(
     cv_body.extend_from_slice(&signature.to_bytes());
     let cv = handshake_message(15, &cv_body);
     transcript.update(&cv);
-    out.extend_from_slice(&crypter.seal(&cv, CONTENT_HANDSHAKE)?.bytes);
+    seal_flight_record(&mut crypter, &cv, sizes.get(2).copied(), &mut out)?;
     let verify = finished_verify_data(suite.hash, secret, &transcript.snapshot());
     let finished = handshake_message(20, &verify);
     transcript.update(&finished);
-    out.extend_from_slice(&crypter.seal(&finished, CONTENT_HANDSHAKE)?.bytes);
+    seal_flight_record(&mut crypter, &finished, sizes.get(3).copied(), &mut out)?;
     Ok(out)
+}
+
+/// Seal one record of the flight, in the size the site sent for that message
+/// when one was learned.
+///
+/// A message that does not fit the site's record is the one thing this
+/// implementation refuses rather than papers over: the flight would have to
+/// go out in a size the site never sends, which is exactly what a censor
+/// comparing the two would see. REALITY's own server fails the write there
+/// and drops the connection (`RL/conn.go:553-555`), and so does this.
+fn seal_flight_record(
+    crypter: &mut RecordCrypter,
+    content: &[u8],
+    target: Option<u16>,
+    out: &mut Vec<u8>,
+) -> Result<(), Failure> {
+    let Some(wire_len) = target else {
+        return crypter
+            .seal_into(content, CONTENT_HANDSHAKE, out)
+            .map_err(|failure| reality_error(format!("sealing the handshake flight: {failure}")));
+    };
+    crypter
+        .seal_padded_into(content, CONTENT_HANDSHAKE, usize::from(wire_len), out)
+        .map_err(|_| {
+            reality_error(format!(
+                "the camouflage site's {} byte record cannot carry this handshake's {} byte message",
+                wire_len,
+                content.len()
+            ))
+        })
 }
 
 async fn read_encrypted_handshake<S>(
@@ -1306,6 +1446,145 @@ mod tests {
         // The two replayed records, then the 4-byte reply in a record of its
         // own: header, payload, type byte, tag.
         assert_eq!(*sizes.lock().unwrap(), [255, 69, 5 + 4 + 1 + 16]);
+    }
+
+    /// One handshake against `server_params`, and the sizes of the records the
+    /// client received before it sent its Finished — the server's flight.
+    async fn flight_sizes(
+        server_params: &RealityServerParams,
+        client_params: &zero_security::RealityParams,
+    ) -> Vec<u16> {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn({
+            let server_params = server_params.clone();
+            async move {
+                let mut stream = handshake(server_io, &server_params).await.unwrap();
+                let mut request = [0u8; 4];
+                stream.read_exact(&mut request).await.unwrap();
+                stream.write_all(b"pong").await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+        let (tapped, taps) = zero_security::tls13::post_handshake::tap_with_flight(client_io);
+        let mut client = zero_security::reality_connect(tapped, client_params)
+            .await
+            .unwrap();
+        client.write_all(b"ping").await.unwrap();
+        client.flush().await.unwrap();
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"pong");
+        server.await.unwrap();
+        let flight = taps.flight.lock().unwrap().clone();
+        flight
+    }
+
+    /// The sizes a site's flight is copied in, and the three cases that decide
+    /// whether it can be copied at all.
+    #[tokio::test]
+    async fn the_flight_is_written_in_the_sizes_learned_from_the_site() {
+        let (server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let natural = flight_sizes(&server_params, &client_params).await;
+        assert_eq!(
+            natural.len(),
+            6,
+            "ServerHello, compatibility CCS, then EncryptedExtensions, Certificate, \
+             CertificateVerify and Finished in a record each: {natural:?}"
+        );
+
+        // A site whose flight is learned: every record after the ServerHello
+        // goes out in the size the site sent, whatever this server's own
+        // messages come to.
+        let learned: Vec<u16> = vec![
+            natural[0],
+            natural[1],
+            natural[2] + 64,
+            natural[3] + 512,
+            natural[4] + 48,
+            natural[5] + 16,
+        ];
+        server_params
+            .post_handshake
+            .set_flight("example.test", &learned);
+        assert_eq!(flight_sizes(&server_params, &client_params).await, learned);
+
+        // The same server, a name nothing was learned for.
+        let (untouched_params, _) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        untouched_params
+            .post_handshake
+            .set_flight("other.test", &learned);
+        assert_eq!(
+            flight_sizes(&untouched_params, &client_params).await,
+            natural
+        );
+    }
+
+    /// A shape that cannot be reproduced exactly is not half-copied: Go
+    /// replays the site's ServerHello byte for byte, this server builds its
+    /// own, and a flight that matches every record but the first is no better
+    /// than one that matches none of them.
+    #[tokio::test]
+    async fn a_site_hello_of_another_size_leaves_the_flight_as_it_is() {
+        let (server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let natural = flight_sizes(&server_params, &client_params).await;
+
+        let mut elsewhere: Vec<u16> = vec![natural[0] + 7, natural[1]];
+        elsewhere.extend([natural[2] + 64, natural[3] + 512, natural[4], natural[5]]);
+        server_params
+            .post_handshake
+            .set_flight("example.test", &elsewhere);
+        assert_eq!(
+            flight_sizes(&server_params, &client_params).await,
+            natural,
+            "a ServerHello of another size cannot be copied, so nothing is"
+        );
+
+        // As is a site whose ChangeCipherSpec is not the six bytes every TLS
+        // 1.3 middlebox compatibility record is.
+        let (odd_ccs, _) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let mut not_six: Vec<u16> = vec![natural[0], 32];
+        not_six.extend([natural[2], natural[3], natural[4], natural[5]]);
+        odd_ccs.post_handshake.set_flight("example.test", &not_six);
+        assert_eq!(flight_sizes(&odd_ccs, &client_params).await, natural);
+    }
+
+    /// A site whose certificate record is smaller than this server's
+    /// certificate needs is refused, rather than answered with a flight whose
+    /// sizes are this implementation's and not the site's
+    /// (`RL/conn.go:553-555`).
+    #[tokio::test]
+    async fn a_site_flight_too_small_for_the_certificate_is_refused() {
+        let (server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let natural = flight_sizes(&server_params, &client_params).await;
+        let mut too_small = natural.clone();
+        too_small[3] = natural[3] - 128;
+        server_params
+            .post_handshake
+            .set_flight("example.test", &too_small);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client = tokio::spawn(async move {
+            zero_security::reality_connect(client_io, &client_params)
+                .await
+                .is_ok()
+        });
+        let outcome = handshake_or_fallback(server_io, &server_params).await;
+        assert!(
+            !client.await.unwrap(),
+            "the client must not be handed a flight the site never sends"
+        );
+        match outcome {
+            HandshakeOutcome::Rejected(failure) => assert!(
+                failure.to_string().contains("cannot carry"),
+                "the refusal should say what did not fit: {failure}"
+            ),
+            HandshakeOutcome::Accepted(_) => {
+                panic!("a flight that cannot be shaped like the site's must be refused")
+            }
+            HandshakeOutcome::Fallback { .. } => {
+                panic!("an authenticated client is not answered with the camouflage site")
+            }
+        }
     }
 
     #[tokio::test]

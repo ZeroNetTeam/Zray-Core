@@ -38,14 +38,17 @@ pub struct Outcomes {
     pub first_complaint: Option<String>,
 }
 
-/// What the camouflage site told the server about the records it sends right
-/// after a handshake.
+/// What the camouflage site told the server about its handshake: the sizes of
+/// its first flight's records, and of the records it sends afterwards.
 pub enum Shapes {
     /// The site completed a handshake and these are the sizes of the records
-    /// it sends afterwards.
-    Learned(Vec<u16>),
+    /// it sent, flight first.
+    Learned {
+        flight: Vec<u16>,
+        post_handshake: Vec<u16>,
+    },
     /// The probe did not get an answer that could be used, so the server sends
-    /// nothing extra after its handshakes.
+    /// its own flight sizes and nothing extra after its handshakes.
     ///
     /// Against a test camouflage site this is the ordinary outcome, and it is
     /// also Xray's: its own start-up probe verifies the site's certificate,
@@ -59,7 +62,10 @@ impl Shapes {
     /// The sizes, as the report prints them.
     pub fn note(&self) -> String {
         match self {
-            Shapes::Learned(sizes) => format!("{sizes:?}"),
+            Shapes::Learned {
+                flight,
+                post_handshake,
+            } => format!("flight {flight:?}, then {post_handshake:?}"),
             Shapes::NotLearned(reason) => format!("nothing learned ({reason})"),
         }
     }
@@ -84,10 +90,11 @@ impl InProcessServer {
     /// Bind a loopback port and start accepting REALITY handshakes.
     ///
     /// `decoy` is the camouflage site behind the server. When it is given, the
-    /// server asks it what it sends after a handshake and files the answer in
+    /// server asks it what its handshake looks like — its first flight's
+    /// record sizes and what it sends afterwards — and files the answer in
     /// `params.post_handshake`, which is what a deployed Zray inbound does
-    /// once at start-up — doing it here keeps this row's server shaped like
-    /// the one that ships.
+    /// once at start-up. Doing it here keeps this row's server shaped like the
+    /// one that ships, so the row measures the same server the binary runs.
     pub async fn start(
         params: reality::RealityServerParams,
         decoy: Option<SocketAddr>,
@@ -95,11 +102,22 @@ impl InProcessServer {
     ) -> Result<(Self, Shapes), String> {
         let shapes = match decoy {
             Some(decoy) => match tokio::net::TcpStream::connect(decoy).await {
-                Ok(site) => match zero_security::tls13::post_handshake::observe(site, server_name).await
+                Ok(site) => match zero_security::tls13::post_handshake::observe_all_with(
+                    site,
+                    server_name,
+                    zero_security::tls13::post_handshake::SiteTrust::Unverified,
+                )
+                .await
                 {
-                    Ok(sizes) => {
-                        params.post_handshake.set(server_name, &sizes);
-                        Shapes::Learned(sizes)
+                    Ok(learned) => {
+                        params.post_handshake.set_flight(server_name, &learned.flight);
+                        params
+                            .post_handshake
+                            .set(server_name, &learned.post_handshake);
+                        Shapes::Learned {
+                            flight: learned.flight,
+                            post_handshake: learned.post_handshake,
+                        }
                     }
                     Err(failure) => Shapes::NotLearned(failure.to_string()),
                 },

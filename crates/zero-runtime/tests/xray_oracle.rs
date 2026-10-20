@@ -2152,6 +2152,408 @@ async fn reality_with_the_mldsa65_binding_matches_the_oracle() {
     xray_client_to_zray_reality_server(&binary, "tcp", None, Some(&keys)).await;
 }
 
+/// A relay that forwards one port to another and notes, per connection, the
+/// wire sizes of the records the server sent back before the client's own
+/// encrypted record — the server's flight.
+///
+/// It looks at the bytes with `zero_security`'s own tap, so what it records is
+/// what the client beside it receives, and nothing is interpreted or altered
+/// on the way through.
+async fn recording_relay(
+    listen: u16,
+    target: u16,
+) -> (Arc<Mutex<Vec<Vec<u16>>>>, tokio::task::JoinHandle<()>) {
+    let listen = SocketAddr::new("127.0.0.1".parse().unwrap(), listen);
+    let target = SocketAddr::new("127.0.0.1".parse().unwrap(), target);
+    let listener = TcpListener::bind(listen).await.unwrap();
+    let flights: Arc<Mutex<Vec<Vec<u16>>>> = Arc::new(Mutex::new(Vec::new()));
+    let task = tokio::spawn({
+        let flights = Arc::clone(&flights);
+        async move {
+            while let Ok((mut visitor, _)) = listener.accept().await {
+                let flights = Arc::clone(&flights);
+                tokio::spawn(async move {
+                    let Ok(server) = TcpStream::connect(target).await else {
+                        return;
+                    };
+                    // The tap goes on the relay's connection *to the server*,
+                    // not on the visitor's: it is built to sit under a TLS
+                    // client, where reads are the server's bytes and writes are
+                    // the client's. On the visitor side those two are the other
+                    // way round, and the "flight" it would collect would be the
+                    // ClientHello.
+                    let (mut tapped, taps) =
+                        zero_security::tls13::post_handshake::tap_with_flight(server);
+                    let (mut from_visitor, mut to_visitor) = visitor.split();
+                    let (mut from_server, mut to_server) = tokio::io::split(&mut tapped);
+                    let _ = tokio::join!(
+                        tokio::io::copy(&mut from_visitor, &mut to_server),
+                        tokio::io::copy(&mut from_server, &mut to_visitor),
+                    );
+                    let flight = taps.flight.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    if !flight.is_empty() {
+                        flights
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(flight);
+                    }
+                });
+            }
+        }
+    });
+    (flights, task)
+}
+
+/// The most recent flight the relay recorded, once there is one.
+async fn latest_flight(flights: &Arc<Mutex<Vec<Vec<u16>>>>) -> Option<Vec<u16>> {
+    for _ in 0..80 {
+        if let Some(flight) = flights
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .last()
+            .cloned()
+        {
+            return Some(flight);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+/// The REALITY server this workspace has, on a loopback port, with a record of
+/// what it did with every connection it was given.
+async fn spawn_reality_server(
+    params: reality::RealityServerParams,
+    port: u16,
+) -> (Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind(SocketAddr::new("127.0.0.1".parse().unwrap(), port))
+        .await
+        .unwrap();
+    let outcomes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let task = tokio::spawn({
+        let outcomes = Arc::clone(&outcomes);
+        async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let params = params.clone();
+                let outcomes = Arc::clone(&outcomes);
+                tokio::spawn(async move {
+                    let outcome = match reality::handshake_or_fallback(stream, &params).await {
+                        reality::HandshakeOutcome::Accepted(_) => "accepted".to_string(),
+                        reality::HandshakeOutcome::Fallback { failure, .. } => {
+                            format!("fell back to the site: {failure}")
+                        }
+                        reality::HandshakeOutcome::Rejected(failure) => format!("refused: {failure}"),
+                    };
+                    outcomes
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(outcome);
+                });
+            }
+        }
+    });
+    (outcomes, task)
+}
+
+/// An official Xray client with a SOCKS inbound, tunnelling VLESS over REALITY
+/// to `port`.
+fn spawn_xray_reality_client(binary: &str, socks_port: u16, port: u16, public_key: &str, mldsa: Option<&str>) -> Oracle {
+    let (_, client_settings) = protocol_settings("vless", port);
+    let mut client_stream = transport("tcp");
+    client_stream["security"] = json!("reality");
+    client_stream["realitySettings"] = reality_client_settings(public_key);
+    if let Some(verify) = mldsa {
+        client_stream["realitySettings"]["mldsa65Verify"] = json!(verify);
+    }
+    spawn_oracle(
+        binary,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "port": socks_port,
+                "protocol": "socks",
+                "settings": {"udp": false},
+            }],
+            "outbounds": [{
+                "tag": "proxy",
+                "protocol": "vless",
+                "settings": client_settings,
+                "streamSettings": client_stream,
+            }],
+        }),
+    )
+}
+
+/// One proxied request through a SOCKS client to an echo service: the whole
+/// stack, end to end. Used as the control that the server under test is still
+/// a working proxy, and as the thing that must *fail* when it refuses — so it
+/// reports failure rather than panicking like [`round_trip`] does.
+async fn proxied_echo(socks: SocketAddr, echo: SocketAddr, seed: u8) -> Result<(), String> {
+    let mut stream = socks_connect(socks, echo)
+        .await
+        .map_err(|error| format!("the SOCKS CONNECT was refused: {error}"))?;
+    let sent = payload(seed, 64);
+    stream
+        .write_all(&sent)
+        .await
+        .map_err(|error| format!("writing the request: {error}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|error| format!("flushing the request: {error}"))?;
+    let mut echoed = vec![0u8; sent.len()];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut echoed))
+        .await
+        .map_err(|_| "the echo never came back".to_string())?
+        .map_err(|error| format!("reading the echo: {error}"))?;
+    if echoed != sent {
+        return Err("the payload came back altered".into());
+    }
+    Ok(())
+}
+
+/// The shape a camouflage site answers with is the shape this server answers
+/// with.
+///
+/// REALITY's own server reads the site's record sizes off a live connection
+/// and writes its own flight padded to them (`RL/conn.go:526-557`), which is
+/// why a connection to a REALITY server looks, record for record, like a
+/// connection to the site it borrows a name from. This is the same claim for
+/// this server, measured where it matters and not in the implementation's own
+/// terms: a relay watches what an **official Xray client** actually receives,
+/// and the sizes have to be the site's.
+///
+/// It runs the server this workspace ships, on a config, so the sizes are
+/// learned the way the runtime learns them at start-up; the client gets
+/// through the tunnel as well, which is the control that the server is still a
+/// working proxy and not merely a well-shaped one.
+///
+/// "The handshake succeeded" is not the assertion. A server that padded
+/// nothing would still pass that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn reality_flight_record_sizes_match_the_camouflage_site() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!("oracle: {} (REALITY first flight)", oracle_version(&binary));
+
+    // The camouflage site, and the sizes it answers with as a browser sees
+    // them. This fixture's certificate is RSA-2048, whose CertificateVerify
+    // signature — and so that record — is the same length on every connection,
+    // which is what makes "the sizes match" an invariant rather than a
+    // coincidence. An ECDSA site, like `BIG_DECOY_CERTIFICATE`, puts a DER
+    // signature in that record and its length moves by a byte or two per
+    // handshake: nothing that learns the sizes once can match every connection
+    // of such a site, and Go only does because it reads them off each
+    // connection (`RL/tls.go:293-330`).
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the camouflage site never listened");
+    let site = TcpStream::connect(decoy).await.unwrap();
+    let shapes = zero_security::tls13::post_handshake::observe_all_with(
+        site,
+        REALITY_SNI,
+        zero_security::tls13::post_handshake::SiteTrust::Unverified,
+    )
+    .await
+    .expect("the camouflage site's handshake shapes");
+    assert!(
+        shapes.flight.len() >= 4,
+        "a flight of {} records is not one worth copying: {:?}",
+        shapes.flight.len(),
+        shapes.flight
+    );
+
+    // The server this workspace ships, on the same config, learning the site's
+    // shapes at start-up the way the runtime does — this test is also what
+    // says that learning path is wired up.
+    let (private_key, public_key) = oracle_x25519_keypair(&binary);
+    let (server_settings, _) = protocol_settings("vless", 0);
+    let mut zray_stream = transport("tcp");
+    zray_stream["security"] = json!("reality");
+    zray_stream["realitySettings"] = reality_server_settings(&private_key, decoy);
+    let server_port = free_port();
+    spawn_zray(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "reality-in",
+            "listen": "127.0.0.1",
+            "port": server_port,
+            "protocol": "vless",
+            "settings": server_settings,
+            "streamSettings": zray_stream,
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }));
+    assert!(
+        wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), server_port)).await,
+        "the Zray REALITY server never listened"
+    );
+
+    // A relay in front of it, watching what comes back.
+    let relay_port = free_port();
+    let (flights, _relay) = recording_relay(relay_port, server_port).await;
+
+    // An official Xray client, tunnelling through the relay.
+    let echo = echo_service().await;
+    let socks_port = free_port();
+    let _client = spawn_xray_reality_client(&binary, socks_port, relay_port, &public_key, None);
+    let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    assert!(wait_for(socks).await, "the Xray client never listened");
+
+    // The runtime asks the site for its shapes in the background, so the first
+    // connection may still be answered with this server's own sizes — which is
+    // what an operator sees for the first moments after start-up too. Keep
+    // asking until the client sees the site's.
+    let mut last = Vec::new();
+    let mut matched = false;
+    for attempt in 0..40u8 {
+        proxied_echo(socks, echo, 21 + attempt)
+            .await
+            .expect("the client's request came back through the tunnel");
+        if let Some(received) = latest_flight(&flights).await {
+            matched = received == shapes.flight;
+            last = received;
+            if matched {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        matched,
+        "the client received records of these sizes {last:?}, and the site it was imitating sends {:?}",
+        shapes.flight
+    );
+}
+
+/// A site whose flight cannot hold this server's certificate is refused, and
+/// refused as a server that cannot answer — not by quietly putting sizes of
+/// its own on the wire, and not by handing the visitor to the site either.
+///
+/// The case is real rather than synthetic: the ML-DSA-65 binding makes this
+/// server's certificate ~3.5 KB, which does not fit the certificate record of
+/// a site with a small one. REALITY's own server fails the write there and
+/// drops the connection (`RL/conn.go:553-555`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn reality_refuses_a_client_the_sites_flight_is_too_small_for() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!(
+        "oracle: {} (REALITY flight too small)",
+        oracle_version(&binary)
+    );
+
+    let (seed, verify) = oracle_mldsa65_keypair(&binary);
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the camouflage site never listened");
+    let site = TcpStream::connect(decoy).await.unwrap();
+    let shapes = zero_security::tls13::post_handshake::observe_all_with(
+        site,
+        REALITY_SNI,
+        zero_security::tls13::post_handshake::SiteTrust::Unverified,
+    )
+    .await
+    .expect("the camouflage site's handshake shapes");
+
+    let (private_key, public_key) = oracle_x25519_keypair(&binary);
+    let mut settings = reality_server_settings(&private_key, decoy);
+    settings["mldsa65Seed"] = json!(seed);
+    let server_config = reality::RealityServerConfig::from_xray_settings(&settings)
+        .expect("the REALITY server block parses");
+    let params = server_config.server_params();
+    let server_port = free_port();
+    let (outcomes, _server) = spawn_reality_server(params.clone(), server_port).await;
+    let relay_port = free_port();
+    let (flights, _relay) = recording_relay(relay_port, server_port).await;
+
+    let echo = echo_service().await;
+    let socks_port = free_port();
+    let _client =
+        spawn_xray_reality_client(&binary, socks_port, relay_port, &public_key, Some(&verify));
+    let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    assert!(wait_for(socks).await, "the Xray client never listened");
+
+    // The control: with nothing learned, this server answers with its own
+    // sizes and this client authenticates against it — which is what says the
+    // site's certificate record really is smaller than the one this server has
+    // to send. (The tunnel carrying traffic in this configuration is
+    // `reality_with_the_mldsa65_binding_matches_the_oracle`; this acceptor is
+    // the handshake path alone, so a request through it goes nowhere.)
+    let mut stream = socks_connect(socks, echo).await.unwrap();
+    stream.write_all(&[0u8; 4]).await.unwrap();
+    stream.flush().await.unwrap();
+    // The relay files a flight when its connection ends, so let it end.
+    drop(stream);
+    let natural = latest_flight(&flights)
+        .await
+        .expect("the relay recorded no handshake at all");
+    assert!(
+        natural.len() >= 4 && usize::from(natural[3]) > usize::from(shapes.flight[3]),
+        "this test needs the server's own certificate record to be bigger than \
+         the site's: its flight is {natural:?} and the site's is {:?}",
+        shapes.flight
+    );
+    assert!(
+        outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|outcome| outcome.starts_with("accepted")),
+        "the client should have authenticated against this server before the \
+         site's flight was filed"
+    );
+
+    // Now the site's flight, which cannot hold that certificate. The shapes
+    // are shared with the running listener through an `Arc`, which is how the
+    // runtime files what it learned at start-up under a server already
+    // accepting connections.
+    params.post_handshake.set_flight(REALITY_SNI, &shapes.flight);
+    params
+        .post_handshake
+        .set(REALITY_SNI, &shapes.post_handshake);
+
+    // Every authenticated connection from here on is refused: the site's
+    // certificate record cannot hold this server's certificate, and a flight
+    // with sizes of this implementation's own would be the fingerprint this
+    // padding exists to avoid.
+    let refused = proxied_echo(socks, echo, 23).await;
+    assert!(
+        refused.is_err(),
+        "a client was let through a server whose flight cannot be shaped like the site's"
+    );
+    assert_ne!(
+        latest_flight(&flights).await.unwrap_or_default(),
+        shapes.flight,
+        "the server sent the site's sizes anyway, with its own certificate in them"
+    );
+    // The server's own account of what it did, once it has done it.
+    let mut recorded = Vec::new();
+    for _ in 0..40 {
+        recorded = outcomes.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if recorded.iter().any(|outcome| outcome.starts_with("refused:")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        recorded.iter().any(|outcome| outcome.starts_with("refused:")),
+        "the server should have refused the connection, and said why: {recorded:?}"
+    );
+    assert!(
+        !recorded.iter().any(|outcome| outcome.starts_with("fell back")),
+        "an authenticated client must not be answered with the camouflage site: {recorded:?}"
+    );
+}
+
 /// The REALITY server's limits on who may connect: client version and clock
 /// (Xray's `minClientVer`, `maxClientVer`, `maxTimeDiff`) and the PROXY
 /// header it can send to its decoy (`xver`).

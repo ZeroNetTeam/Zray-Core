@@ -267,6 +267,68 @@ impl RecordCrypter {
         Ok(())
     }
 
+    /// Protect one record and pad it to exactly `wire_len` bytes on the wire.
+    ///
+    /// The plaintext is `content`, the inner type, then zero padding
+    /// (RFC 8446 §5.4), so the peer strips the zeros and reads the content
+    /// unchanged: what it sees is a record of the size somebody else's
+    /// server would have sent for the same message.
+    ///
+    /// This is what a REALITY server needs to put its handshake flight on the
+    /// wire in the sizes of the site it is imitating. `wire_len` counts the
+    /// header and tag. A `wire_len` too small to hold `content` is an error
+    /// and leaves `out` as it was — the caller decides what that means, and
+    /// Go's REALITY refuses the connection rather than send a flight whose
+    /// sizes give it away (`RL/conn.go:553-555`).
+    pub fn seal_padded_into<B: SealBuffer>(
+        &mut self,
+        content: &[u8],
+        inner_type: u8,
+        wire_len: usize,
+        out: &mut B,
+    ) -> Result<(), super::Failure> {
+        let overhead = 5 + 1 + TAG_LEN;
+        let padding = match wire_len.checked_sub(overhead + content.len()) {
+            Some(padding) if content.len() + 1 + padding <= MAX_PLAINTEXT => padding,
+            _ => {
+                return Err(malformed(format!(
+                    "a record of {wire_len} bytes cannot carry {} bytes of handshake",
+                    content.len()
+                )))
+            }
+        };
+        let nonce = self.next_nonce()?;
+
+        let header = record_header(CONTENT_APPDATA, 1 + content.len() + padding + TAG_LEN);
+        let start = out.filled_len();
+        out.reserve_more(wire_len);
+        out.append(&header);
+        out.append(content);
+        out.append(&[inner_type]);
+        const ZEROS: [u8; 256] = [0; 256];
+        let mut left = padding;
+        while left > 0 {
+            let step = left.min(ZEROS.len());
+            out.append(&ZEROS[..step]);
+            left -= step;
+        }
+
+        let sealed = {
+            let body = &mut out.as_mut_slice()[start + 5..];
+            self.seal_in_place(&nonce, &header, body)
+        };
+        match sealed {
+            Ok(tag) => out.append(&tag),
+            Err(_) => {
+                out.truncate_to(start);
+                return Err(malformed("seal failed"));
+            }
+        }
+
+        self.seq += 1;
+        Ok(())
+    }
+
     /// Append an application-data record of exactly `wire_len` bytes that
     /// carries nothing: its plaintext is the inner type and then zero padding
     /// (RFC 8446 §5.4), which the peer strips to find no content at all.
