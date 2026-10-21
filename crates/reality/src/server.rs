@@ -428,8 +428,16 @@ where
         .post_handshake
         .site(&hello.sni, alpn_index(&hello.alpn));
     if let Some(decoy) = params.decoy.as_deref() {
-        match read_live_flight(decoy, &hello.sni, &hello.alpn).await {
-            Ok(live) => shapes.flight = live,
+        match read_live_shapes(decoy, &hello.sni, &hello.alpn).await {
+            Ok(Some((flight, after))) => {
+                if let Some(flight) = flight {
+                    shapes.flight = Some(flight);
+                }
+                if let Some(after) = after {
+                    shapes.after = Some(after);
+                }
+            }
+            Ok(None) => {}
             Err(error) => {
                 // The site could not be reached. Go's server would have closed
                 // the connection (`RL/tls.go:168-172`); the port answers with
@@ -650,21 +658,21 @@ where
     Ok(stream)
 }
 
-/// Read the camouflage site's own flight, off a connection to the site.
+/// Read the camouflage site's own shapes, off a connection to the site.
 ///
-/// The sizes are the wire lengths of the records the site answered a
-/// ClientHello with, ServerHello first — the same thing the start-up probe
-/// learns (`zero_security::tls13::post_handshake`), asked of the site itself
-/// rather than of a record kept from earlier.
+/// Two things come back, and Go reads both off that one connection: the
+/// **flight** — the wire lengths of the records the site answered a
+/// ClientHello with, ServerHello first — and the **records it sends after
+/// the handshake** (`RL/tls.go:293-330`, `:404-421`).
 ///
 /// The site's certificate is not verified: the probe carries no application
 /// data, and the site is the one the operator chose as the camouflage, so
 /// requiring a public chain would leave every private-CA decoy unanswered.
-async fn read_live_flight(
+async fn read_live_shapes(
     decoy: &dyn DecoyDialer,
     server_name: &str,
     alpn: &[String],
-) -> Result<Option<Arc<[u16]>>, String> {
+) -> Result<Option<(Option<Arc<[u16]>>, Option<Arc<[u16]>>)>, String> {
     let site = decoy.dial().await?;
     // The site is asked with the protocols the client offered, so the answer
     // is the one that client would have got.
@@ -680,7 +688,13 @@ async fn read_live_flight(
     if observed.flight.is_empty() {
         return Ok(None);
     }
-    Ok(Some(Arc::from(observed.flight.as_slice())))
+    // Go reads both off that one connection: the flight it answers the hello
+    // with, and the records the site sends after the handshake
+    // (`RL/tls.go:293-330`, `:404-421`).
+    let flight = (!observed.flight.is_empty()).then(|| Arc::from(observed.flight.as_slice()));
+    let after = (!observed.post_handshake.is_empty())
+        .then(|| Arc::from(observed.post_handshake.as_slice()));
+    Ok(Some((flight, after)))
 }
 
 fn derive_auth_key(shared: &[u8; 32], salt: &[u8]) -> [u8; 32] {
@@ -1889,6 +1903,29 @@ mod tests {
         // The two replayed records, then the 4-byte reply in a record of its
         // own: header, payload, type byte, tag.
         assert_eq!(*sizes.lock().unwrap(), [255, 69, 5 + 4 + 1 + 16]);
+    }
+
+    /// The records the site sends after the handshake are read off the same
+    /// connection as the flight.
+    ///
+    /// Go reads both off the one connection it dialled (`RL/tls.go:293-330`,
+    /// `:404-421`), so a client is answered with the site's own records
+    /// rather than with what the site said at start-up.
+    #[tokio::test]
+    async fn the_post_handshake_records_are_read_off_the_site_too() {
+        let site = TestSite::start();
+        let (flight, after) = read_live_shapes(site.dialer.as_ref(), "example.test", &[])
+            .await
+            .expect("the site was reached")
+            .expect("the site answered");
+        assert!(
+            flight.is_some(),
+            "the site's flight was read off the connection"
+        );
+        assert!(
+            after.is_some(),
+            "the site's post-handshake records were read off the same connection"
+        );
     }
 
     /// The server answers with the record budget the site was found to have.
