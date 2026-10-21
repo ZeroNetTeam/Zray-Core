@@ -70,6 +70,12 @@ What is *not* closed is what the rows below still say.
   closes the connection (`RL/tls.go:168-172`) — a site that is down for a
   moment is not a reason for a REALITY listener to be down, but it is a
   difference (§1, §6);
+* the site is dialled twice rather than once, and the two connections are
+  different — Go forwards the *client's* hello to the site and reads the
+  site's answer off that one connection (`RL/tls.go:70-83`, `:168`), so the
+  site's flight is its answer to the visitor's own bytes; the port asks the
+  site with a hello of its own and dials again for the fallback relay, so
+  the two answers need not agree (§1, §3, §6);
 * cipher-suite choice follows the client, not the decoy — Go takes the suite
   from the *decoy's* ServerHello, and validates the decoy's key-share group
   before using it (`RL/tls.go:353-368`, `RL/handshake_server_tls13.go:102`).
@@ -1251,13 +1257,21 @@ rate can never hold a second's worth of credit, so the limit would bite sooner
 than the rate says. Both throttles do it (`ZR/throttle.rs`, `RB/fallback.rs`),
 and both are pinned by a test:
 
-1. **When the target is dialled.** Rust dials on fallback only
-   (`ZR/server.rs:2395-2431`); Go dials on every connection (`RL/tls.go:168`). For a
-   prober the visible difference is that a Zray fallback connection has no decoy
-   handshake already in progress, and the *timing* of the first bytes from the site
-   differs by the dial. For an operator it means a Zray inbound keeps working while
-   its decoy is down for *authenticated* clients, and fails the same way Go does for
-   everyone else (connection dropped, `ZR/server.rs:2426-2431`).
+1. **The site is dialled twice, not once.** Go dials the site once per
+   connection and uses that one connection for everything
+   (`RL/tls.go:168`): the client's hello is forwarded to it
+   (`RL/tls.go:70-83`), and the site's flight and post-handshake records are
+   read back off it (`RL/tls.go:293-330`, `:404-421`). The port dials it
+   twice — once to read the shapes, and again on the fallback path to relay
+   the visitor (`ZR/server.rs`) — and the two are different connections, so
+   the site's answer to the port's probe is not the answer to the visitor's
+   own bytes. For a prober the visible difference is the *timing*: the first
+   bytes from the site arrive after the port's own probe has finished, not
+   from the connection the visitor is on. For an operator it means a Zray
+   inbound keeps working while its site is down for *authenticated* clients,
+   where Go closes the connection (`RL/tls.go:168-172`); the fallback path
+   fails the same way Go does for everyone else (connection dropped,
+   `ZR/server.rs`).
 2. **An idle fallback session has a deadline.** The Rust relay uses
    `DEFAULT_IDLE_TIMEOUT = 300 s` (`ZR/relay.rs:39`, overridable by `policy.connIdle`,
    `ZR/relay.rs:52-64`) plus a 1 s half-close limit (`ZR/relay.rs:47`); Go's
