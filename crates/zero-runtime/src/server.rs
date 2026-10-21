@@ -482,6 +482,7 @@ impl InboundRuntime {
                 server_names: reality.server_names.clone(),
                 short_ids: reality.short_ids.clone(),
                 mldsa65_seed: reality.mldsa65_seed.as_ref().map(|seed| seed.0),
+                site_writes: None,
                 max_time_diff: Duration::from_millis(reality.max_time_diff_ms),
                 min_client_ver: reality.min_client_ver,
                 max_client_ver: reality.max_client_ver,

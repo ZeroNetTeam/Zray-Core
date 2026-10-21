@@ -181,6 +181,8 @@ pub struct Tap<S> {
     /// The first record *this* end wrote, kept whole: the ClientHello, when
     /// this end is the client.
     sent_first: Arc<Mutex<Vec<u8>>>,
+    /// Every byte this end wrote, in order.
+    sent_bytes: Arc<Mutex<Vec<u8>>>,
     /// The client's Finished has gone out, so what arrives now is
     /// post-handshake rather than part of the server's flight.
     finished_sent: bool,
@@ -241,6 +243,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tap<S> {
             let finished_sent = &mut this.finished_sent;
             let written = &this.written;
             let sent_first = &this.sent_first;
+            let sent_bytes = &this.sent_bytes;
             // The first record this end wrote is kept whole: it is the
             // ClientHello, which a test may want to forward somewhere.
             if sent_first
@@ -253,6 +256,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tap<S> {
                     kept.extend_from_slice(&buf[..count]);
                 }
             }
+            sent_bytes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(&buf[..count]);
             this.sent.feed(&buf[..count], |content_type, wire_len| {
                 *finished_sent |= content_type == CONTENT_APPDATA;
                 let mut written = written.lock().unwrap_or_else(|p| p.into_inner());
@@ -286,6 +293,12 @@ pub struct Taps {
     /// The first record this end wrote whole — the ClientHello, when this
     /// end is the client.
     pub sent_first: Arc<Mutex<Vec<u8>>>,
+    /// Every byte this end wrote, in order.
+    ///
+    /// A caller that hands this stream to somebody else — the REALITY
+    /// server forwarding a visitor's bytes to the camouflage site — can
+    /// then see exactly what was sent.
+    pub sent_bytes: Arc<Mutex<Vec<u8>>>,
 }
 
 /// Read the cipher suite and the key-share group out of a site's
@@ -442,6 +455,7 @@ pub fn tap_with_flight<S>(io: S) -> (Tap<S>, Taps) {
         written: Arc::new(Mutex::new(Vec::new())),
         server_hello: Arc::new(Mutex::new(Vec::new())),
         sent_first: Arc::new(Mutex::new(Vec::new())),
+        sent_bytes: Arc::new(Mutex::new(Vec::new())),
     };
     let tap = Tap {
         inner: io,
@@ -454,6 +468,7 @@ pub fn tap_with_flight<S>(io: S) -> (Tap<S>, Taps) {
         written: Arc::clone(&taps.written),
         server_hello: Arc::clone(&taps.server_hello),
         sent_first: Arc::clone(&taps.sent_first),
+        sent_bytes: Arc::clone(&taps.sent_bytes),
     };
     (tap, taps)
 }
@@ -573,7 +588,7 @@ where
 pub async fn observe_with_the_clients_hello<S>(
     io: S,
     hello: &[u8],
-) -> Result<(SiteShapes, Option<Tap<S>>), Failure>
+) -> Result<(SiteShapes, Option<Tap<S>>, Taps), Failure>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -621,6 +636,7 @@ where
         // Finished has to be written to it for the site to send the rest of
         // its flight.
         Some(tap),
+        taps,
     ))
 }
 

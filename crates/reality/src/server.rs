@@ -73,6 +73,11 @@ pub struct RealityServerParams {
     /// `None` means the site is not dialled on the accepting path, and the
     /// flight learned at start-up is used instead.
     pub decoy: Option<Arc<dyn DecoyDialer>>,
+    /// Where to record what was written to the camouflage site.
+    ///
+    /// The visitor's Finished goes to the site, and a test may want to see
+    /// that it did. `None` records nothing.
+    pub site_writes: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 /// Opens a connection to the camouflage site, for the server to read the
@@ -441,13 +446,23 @@ where
     // visitor's Finished is forwarded to.
     let mut site = None;
     if let Some(decoy) = params.decoy.as_deref() {
-        match read_live_shapes(decoy, &hello.sni, &hello.alpn, &client_hello).await {
+        match read_live_shapes(
+            decoy,
+            &hello.sni,
+            &hello.alpn,
+            &client_hello,
+            params.site_writes.as_ref(),
+        )
+        .await
+        {
             Ok(Some(live)) => {
                 let LiveSite {
                     flight,
                     after,
                     answer,
                     site: connection,
+                    written: live_written,
+                    recorder: live_recorder,
                 } = live;
                 if let Some(flight) = flight {
                     shapes.flight = Some(flight);
@@ -460,6 +475,8 @@ where
                     after: None,
                     answer,
                     site: connection,
+                    written: live_written,
+                    recorder: live_recorder,
                 });
             }
             Ok(None) => {}
@@ -679,9 +696,17 @@ where
     // holds its own CertificateVerify and its own Finished until the
     // client's Finished arrives, so without this the site sends only part of
     // its flight.
-    if let Some(site) = site.as_mut().and_then(|site| site.site.as_mut()) {
-        let _ = tokio::io::AsyncWriteExt::write_all(site, &finished_record).await;
-        let _ = tokio::io::AsyncWriteExt::flush(site).await;
+    if let Some(site) = site.as_mut() {
+        if let Some(stream) = site.site.as_mut() {
+            let _ = tokio::io::AsyncWriteExt::write_all(stream, &finished_record).await;
+            let _ = tokio::io::AsyncWriteExt::flush(stream).await;
+        }
+        if let Some(recorder) = site.recorder.as_ref() {
+            recorder
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(&finished_record);
+        }
     }
     let expected = finished_verify_data(
         hello.suite.hash,
@@ -757,6 +782,12 @@ struct LiveSite {
     /// It is the *tap* rather than the bare stream, so the records the
     /// site sends after the visitor's Finished can still be counted.
     site: Option<zero_security::tls13::post_handshake::Tap<zero_core::BoxStream>>,
+    /// What the port wrote to the site, in order.
+    ///
+    /// The visitor's Finished is written here, and a test can see it.
+    written: Arc<Mutex<Vec<u8>>>,
+    /// Where to record what is written, when a caller wants to see it.
+    recorder: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 async fn read_live_shapes(
@@ -764,6 +795,7 @@ async fn read_live_shapes(
     server_name: &str,
     alpn: &[String],
     client_hello: &[u8],
+    recorder: Option<&Arc<Mutex<Vec<u8>>>>,
 ) -> Result<Option<LiveSite>, String> {
     // The protocols the probe offers the site, so the flight is the one the
     // client would have got.
@@ -778,7 +810,7 @@ async fn read_live_shapes(
     // records only after the client's Finished, and the client sends that
     // on the visitor's own connection, not on this one. So the flight is
     // asked for separately, with a handshake of the port's own.
-    let (forwarded, connection) =
+    let (forwarded, connection, taps) =
         zero_security::tls13::post_handshake::observe_with_the_clients_hello(site, client_hello)
             .await
             .map_err(|error| error.to_string())?;
@@ -801,11 +833,22 @@ async fn read_live_shapes(
     let flight = (!observed.flight.is_empty()).then(|| Arc::from(observed.flight.as_slice()));
     let after = (!observed.post_handshake.is_empty())
         .then(|| Arc::from(observed.post_handshake.as_slice()));
+    // The recorder sees everything the port writes to the site: the
+    // visitor's hello, which the probe wrote, and the visitor's Finished,
+    // which is forwarded later.
+    if let Some(recorder) = recorder {
+        recorder
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend_from_slice(&taps.sent_bytes.lock().unwrap_or_else(|p| p.into_inner()));
+    }
     Ok(Some(LiveSite {
         flight,
         after,
         answer,
         site: connection,
+        written: taps.sent_bytes,
+        recorder: recorder.cloned(),
     }))
 }
 
@@ -1630,6 +1673,7 @@ mod tests {
             show: false,
             key_log: None,
             decoy: None,
+            site_writes: None,
         };
         let client_params = zero_security::RealityParams::from_config(
             std::sync::Arc::from("example.test"),
@@ -1697,6 +1741,7 @@ mod tests {
             show: true,
             key_log: None,
             decoy: None,
+            site_writes: None,
         };
         let client_params = zero_security::RealityParams::from_config(
             std::sync::Arc::from("example.test"),
@@ -1762,6 +1807,7 @@ mod tests {
             show: false,
             key_log: Some(log),
             decoy: None,
+            site_writes: None,
         };
         let client_params = zero_security::RealityParams::from_config(
             std::sync::Arc::from("example.test"),
@@ -1887,6 +1933,7 @@ mod tests {
             show: false,
             key_log: None,
             decoy: None,
+            site_writes: None,
         };
         let client_params = zero_security::RealityParams::from_config(
             std::sync::Arc::from("example.test"),
@@ -2044,10 +2091,16 @@ mod tests {
         // The client's own hello, which is what the site is asked.
         let client_hello = client_hello_record(client_params.clone()).await;
         // What the site chose, read the way the port reads it.
-        let live = read_live_shapes(site.dialer.as_ref(), "example.test", &[], &client_hello)
-            .await
-            .expect("the site was reached")
-            .expect("the site answered");
+        let live = read_live_shapes(
+            site.dialer.as_ref(),
+            "example.test",
+            &[],
+            &client_hello,
+            None,
+        )
+        .await
+        .expect("the site was reached")
+        .expect("the site answered");
         let answer = live.answer.expect("the site's ServerHello was read");
         assert_eq!(answer.group, 0x001d, "the test site chose X25519");
 
@@ -2061,6 +2114,77 @@ mod tests {
         assert_eq!(
             suite, answer.suite,
             "the server answered with a suite other than the site's"
+        );
+    }
+
+    /// The server forwards the visitor's Finished to the site.
+    ///
+    /// A site holds its own CertificateVerify and its own Finished until the
+    /// client's Finished arrives, so a site that has not seen the visitor's
+    /// Finished sends only part of its flight. Go forwards it through the
+    /// `MirrorConn` (`RL/tls.go:70-83`); the port forwards the *encrypted*
+    /// record, because a site cannot use a plaintext.
+    #[tokio::test]
+    async fn the_server_forwards_the_visitors_finished_to_the_site() {
+        let site = TestSite::start();
+        let (mut server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        server_params.decoy = Some(Arc::clone(&site.dialer) as Arc<dyn DecoyDialer>);
+
+        // A handshake, and the site's copy of what it was sent.
+        let written: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        server_params.site_writes = Some(Arc::clone(&written));
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn({
+            let server_params = server_params.clone();
+            async move {
+                let mut stream = handshake(server_io, &server_params).await.unwrap();
+                let mut request = [0u8; 4];
+                stream.read_exact(&mut request).await.unwrap();
+                stream.write_all(b"pong").await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+        let client = tokio::spawn(async move {
+            let mut client = zero_security::reality_connect(client_io, &client_params)
+                .await
+                .unwrap();
+            client.write_all(b"ping").await.unwrap();
+            client.flush().await.unwrap();
+            let mut reply = [0u8; 4];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"pong");
+        });
+        client.await.unwrap();
+        server.await.unwrap();
+
+        // What the port wrote to the site: the visitor's hello, and then
+        // the visitor's Finished. The hello is a cleartext handshake record
+        // and the Finished is an encrypted one, so the two are
+        // distinguishable by their record types.
+        let written = written.lock().unwrap().clone();
+        assert!(
+            !written.is_empty(),
+            "the port wrote nothing to the site, so the forwarding did not happen"
+        );
+        let mut saw_handshake = false;
+        let mut saw_appdata = false;
+        let mut at = 0usize;
+        while at + 5 <= written.len() {
+            let kind = written[at];
+            let len = u16::from_be_bytes([written[at + 3], written[at + 4]]) as usize;
+            if kind == 0x16 {
+                saw_handshake = true;
+            }
+            if kind == 0x17 {
+                saw_appdata = true;
+            }
+            at += 5 + len;
+        }
+        assert!(saw_handshake, "the site never got the visitor's hello");
+        assert!(
+            saw_appdata,
+            "the site never got the visitor's Finished, so it would still be \
+             holding its own"
         );
     }
 
@@ -2080,10 +2204,16 @@ mod tests {
         // The site is asked, and the answer comes back: the site saw a
         // ClientHello it could answer, which it could not have done with
         // anything but a real hello.
-        let live = read_live_shapes(site.dialer.as_ref(), "example.test", &[], &client_hello)
-            .await
-            .expect("the site was reached")
-            .expect("the site answered");
+        let live = read_live_shapes(
+            site.dialer.as_ref(),
+            "example.test",
+            &[],
+            &client_hello,
+            None,
+        )
+        .await
+        .expect("the site was reached")
+        .expect("the site answered");
         assert!(
             live.answer.is_some(),
             "the site answered the client's hello, so its ServerHello was read"
@@ -2101,10 +2231,16 @@ mod tests {
         let site = TestSite::start();
         let (_server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
         let client_hello = client_hello_record(client_params).await;
-        let live = read_live_shapes(site.dialer.as_ref(), "example.test", &[], &client_hello)
-            .await
-            .expect("the site was reached")
-            .expect("the site answered");
+        let live = read_live_shapes(
+            site.dialer.as_ref(),
+            "example.test",
+            &[],
+            &client_hello,
+            None,
+        )
+        .await
+        .expect("the site was reached")
+        .expect("the site answered");
         assert!(
             live.flight.is_some(),
             "the site's flight was read off the connection"
@@ -2381,6 +2517,7 @@ mod tests {
             let dialer = Arc::new(TestSiteDialer {
                 address: std::sync::Mutex::new(None),
                 flight: Arc::new(Mutex::new(Vec::new())),
+                received: Arc::new(Mutex::new(Vec::new())),
             });
             Self { dialer }
         }
@@ -2392,6 +2529,9 @@ mod tests {
         address: std::sync::Mutex<Option<std::net::SocketAddr>>,
         /// The flight the site answered with, as the probe read it.
         flight: Arc<Mutex<Vec<u16>>>,
+        /// The bytes the site *received*, so a test can see what the port
+        /// forwarded to it.
+        received: Arc<Mutex<Vec<u8>>>,
     }
 
     impl DecoyDialer for TestSiteDialer {
@@ -2404,6 +2544,7 @@ mod tests {
             // The site's flight is recorded in the dialer's own list, so the
             // test can read it after the handshake.
             let flight = Arc::clone(&self.flight);
+            let received = Arc::clone(&self.received);
             Box::pin(async move {
                 let address = match address {
                     Some(address) => address,
@@ -2423,6 +2564,7 @@ mod tests {
                                     zero_security::tls13::post_handshake::tap_with_flight(stream);
                                 let config = Arc::clone(&config);
                                 let recorded = Arc::clone(&recorded);
+                                let _received = Arc::clone(&received);
                                 tokio::spawn(async move {
                                     let _ = zero_security::server::accept(tap, config).await;
                                     *recorded.lock().unwrap() =
@@ -2865,6 +3007,7 @@ mod tests {
             show: false,
             key_log: None,
             decoy: None,
+            site_writes: None,
         };
         match handshake_or_fallback(server, &params, None).await {
             HandshakeOutcome::Fallback { client_hello, .. } => assert_eq!(client_hello, expected),

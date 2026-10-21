@@ -2313,7 +2313,7 @@ async fn the_site_answers_the_clients_own_hello() {
     let (_private_key, public_key) = oracle_x25519_keypair(&binary);
     let hello = client_hello_record(&public_key).await;
     let site = TcpStream::connect(decoy).await.unwrap();
-    let (forwarded, _connection) =
+    let (forwarded, _connection, _taps) =
         zero_security::tls13::post_handshake::observe_with_the_clients_hello(site, &hello)
             .await
             .expect("the site's answer to the client's hello");
@@ -2386,7 +2386,7 @@ async fn the_visitors_finished_reaches_the_site() {
 
     // The site is asked with the client's hello, and the connection is kept.
     let site = TcpStream::connect(decoy).await.unwrap();
-    let (forwarded, connection) =
+    let (forwarded, connection, _taps) =
         zero_security::tls13::post_handshake::observe_with_the_clients_hello(site, &hello)
             .await
             .expect("the site's answer to the client's hello");
