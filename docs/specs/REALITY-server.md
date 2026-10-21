@@ -115,22 +115,6 @@ What is *not* closed is what the rows below still say.
   visitor's bytes on it exactly as it does in Go: the fallback replays
   the bytes it consumed (`RB/fallback.rs`), so the difference is which
   connection they arrive on, not what they say (§1, §6);
-* the cipher suite and the key-share group are the *site's*, taken from its
-  ServerHello, as Go takes them (`RL/handshake_server_tls13.go:100-128`) —
-  and the whole handshake follows that one suite, because Go's fork of the
-  TLS server takes the suite from the site's ServerHello and nothing else:
-  the stock cipher-suite selection is commented out in it
-  (`RL/handshake_server_tls13.go:95-99`), so there is no mutual
-  negotiation and no client's-suite fallback. A client's preference is per
-  fingerprint, so the client's first choice and the site's routinely
-  differ —
-  and the site is asked with the *client's own* hello, forwarded verbatim,
-  as Go's `MirrorConn` does (`RL/tls.go:70-83`). So the answer is the site's
-  reply to the visitor. The visitor's Finished *is* forwarded to that same
-  connection afterwards, so the site sends the rest of its flight there too
-  (`the_visitors_finished_reaches_the_site`) — the flight the port copies
-  has already arrived by then, because a TLS 1.3 site sends its whole
-  flight in answer to the ClientHello (§3, §6);
 * the certificate is not byte-for-byte Go's — Go builds an Ed25519
   self-signed certificate with an *empty* name
   (`RL/handshake_server_tls13.go:81-85`) and one extra extension, whose OID
