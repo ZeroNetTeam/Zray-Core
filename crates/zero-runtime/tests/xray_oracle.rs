@@ -2462,6 +2462,104 @@ async fn spawn_reality_server(
     (outcomes, task)
 }
 
+/// The official Xray server copies the site's whole flight.
+///
+/// This is the measurement the port's own flight comparison rests on: the
+/// port copies the site's six records exactly, and it is claimed that Xray
+/// does the same. Nobody had checked.
+///
+/// It matters because of how the port could be made to ask the site once
+/// instead of twice. The site holds its CertificateVerify and its own
+/// Finished until the client's Finished arrives, so a server that copies
+/// the whole flight must have the site's last two records in hand when it
+/// writes its own flight — which, on a first connection, is only possible
+/// if it asks the site a second time, as the port does.
+///
+/// If Xray copies the whole flight, it must have the site's records by
+/// then, and the port's second dial is what Go does too, in effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn the_official_server_copies_the_sites_whole_flight() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the camouflage site never listened");
+
+    // The site's own flight, for comparison.
+    let site = TcpStream::connect(decoy).await.unwrap();
+    let shapes = zero_security::tls13::post_handshake::observe_all_with(
+        site,
+        REALITY_SNI,
+        zero_security::tls13::post_handshake::SiteTrust::Unverified,
+    )
+    .await
+    .expect("the camouflage site's handshake shapes");
+    assert!(
+        shapes.flight.len() >= 4,
+        "the site's flight was {} records, which is too few to compare",
+        shapes.flight.len()
+    );
+
+    // The official server, on a config of its own, with a relay in front of
+    // it so the flight the client sees can be read off the wire.
+    let (private_key, public_key) = oracle_x25519_keypair(&binary);
+    let (server_settings, _) = protocol_settings("vless", 0);
+    let mut oracle_stream = transport("tcp");
+    oracle_stream["security"] = json!("reality");
+    oracle_stream["realitySettings"] = reality_server_settings(&private_key, decoy);
+    let server_port = free_port();
+    let _oracle = spawn_oracle(
+        &binary,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "in",
+                "listen": "127.0.0.1",
+                "port": server_port,
+                "protocol": "vless",
+                "settings": server_settings,
+                "streamSettings": oracle_stream,
+            }],
+            "outbounds": [oracle_loopback_freedom()],
+        }),
+    );
+    assert!(
+        wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), server_port)).await,
+        "the Xray REALITY server never listened"
+    );
+
+    let relay_port = free_port();
+    let (flights, _relay) = recording_relay(relay_port, server_port).await;
+    let echo = echo_service().await;
+    let socks_port = free_port();
+    let _client = spawn_xray_reality_client(&binary, socks_port, relay_port, &public_key, None);
+    let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    assert!(wait_for(socks).await, "the Xray client never listened");
+
+    let mut last = Vec::new();
+    for attempt in 0..40u8 {
+        proxied_echo(socks, echo, 31 + attempt)
+            .await
+            .expect("the client's request came back through the tunnel");
+        if let Some(received) = latest_flight(&flights).await {
+            last = received;
+            if last == shapes.flight {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    eprintln!("the site's flight:   {:?}", shapes.flight);
+    eprintln!("the Xray server's:    {:?}", last);
+    assert_eq!(
+        last, shapes.flight,
+        "the official Xray server's flight differs from the site's"
+    );
+}
+
 /// An official Xray client with a SOCKS inbound, tunnelling VLESS over REALITY
 /// to `port`.
 fn spawn_xray_reality_client(

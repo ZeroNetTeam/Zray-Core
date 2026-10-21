@@ -1554,11 +1554,24 @@ available* (`RL/conn.go:532-549`: `padding = hc.handshakeLen[2];
 hc.handshakeLen[2] = 0`), so a record whose size is not yet known goes
 out unpadded.
 
-One thing the port does that Go does not, and should keep: it copies the
-site's flight *exactly*, and the differential test compares the two by
-list equality. So the restructuring has to preserve that — either the port
-learns the last two records' sizes before it writes its own flight, or it
-learns them and uses them for the next connection.
+The port copies the site's flight *exactly* — all six records — and so does
+the official Xray server: measured on 2026-10-21, the site's flight is
+`[1215, 6, 41, 905, 286, 58]` and the Xray server's is the same six
+records, byte for byte. That is checked by
+`the_official_server_copies_the_sites_whole_flight`, which was missing
+before and is the measurement the port's own flight comparison rests on.
+
+So the port's second dial is not a divergence from Go: it is how the same
+result is reached. The site holds its CertificateVerify and its own
+Finished until the client's Finished arrives, so a server that copies the
+whole flight must have the site's last two records in hand when it writes
+its own flight. The official server gets them from its one connection,
+because its `MirrorConn` forwards the visitor's bytes to the site
+(`RL/tls.go:70-83`) and the site's records are read back concurrently.
+
+The port asks the site a second time instead, and pays a round trip for
+it. What the port must keep is the *result* — the flight copied exactly —
+not the number of dials.
 
 The `reality` crate's own handshake against a test site takes 80 ms, and
 the in-process row — which does not dial the site at all — is the faster
