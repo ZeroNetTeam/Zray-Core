@@ -54,16 +54,13 @@ is the one that fails without it.
 | The fallback relay written twice (§6) | the runtime calls `reality::fallback::relay`; one implementation | `--test fallback` 8/8, `--test loopback_tls_interop` 26/26, `the_reality_server_limits_hold_against_the_oracles_client` |
 | A failed direction cancelling the other (§6) | the surviving direction gets a 250 ms grace to deliver what the peer already sent | `crates/reality/tests/fallback.rs::the_targets_answer_survives_the_write_to_the_target_failing` + the oracle's `the_record_size_limit_is_the_oracles_at_the_edges`, 20/20 runs |
 | `show` and `masterKeyLog` (§7) | both switches are read, and the handshake acts on them: a line per connection, and the traffic secrets in Go's order | `server::tests::the_show_switch_reports_what_the_client_sent` and `server::tests::the_key_log_writes_the_handshakes_traffic_secrets`; the key log's shape is compared against the official server's, over the official client, by `the_key_log_has_the_shape_the_officials_server_writes` |
+| The decoy's tolerance for records that advance nothing (§5) | the site is probed at start-up, and the answer is applied to the connections this server accepts | `ZS/ccs_probe.rs`; `server::tests::the_server_puts_up_with_what_the_site_puts_up_with` |
 
-What is *not* closed is what the rows below still say: the per-decoy
-ChangeCipherSpec probe, the decoy being dialled on the accepting path, and
-`type: unix`.
+What is *not* closed is what the rows below still say: the decoy being dialled
+on the accepting path, and `type: unix`.
 
 *MISSING (no Rust counterpart at all):*
 
-* the consecutive-useless-record counter (Go's `maxUselessRecords = 32`) and the
-  per-decoy budget learned by probing the site — `RL/common.go:70`,
-  `RL/conn.go:827-839`, `RL/record_detect.go:137-185`, `RL/tls.go:425-427` (§5);
 * `type`, and with it unix-socket `dest` and a bare-port `dest`
   (`XC/infra/conf/transport_internet.go:824-843`; both Rust readers go through
   `crates/zero-core/src/address.rs:173-186`) (§7);
@@ -92,11 +89,14 @@ ChangeCipherSpec probe, the decoy being dialled on the accepting path, and
 * the ML-DSA-65 extension uses OID 1.3 at a computed offset instead of Go's
   placeholder OID 0.0 at a fixed one — `crates/reality/src/server.rs:835-843`
   against `RL/handshake_server_tls13.go:82`; invisible to both clients (§3, §4);
-* the useless-record budget is the fixed 32, never the one learned from the
-  decoy — Go probes the site for how many non-advancing records it tolerates
-  and applies *that* (`RL/record_detect.go:137-185`, `RL/tls.go:425-427`); the
-  port counts to 32 and stops (`crates/zero-security/src/tls13/client.rs:723`,
-  `MAX_USELESS_RECORDS`) (§5);
+* the useless-record budget is learned from the decoy, but the probe is not
+  filed under the ALPN the client asked for — Go keys both numbers under
+  `dest + " " + sni + " " + alpn` and the accepting connection picks them up
+  by the ALPN *it* offered (`RL/tls.go:396-403`), so a decoy that answers
+  differently to an h2 client than to an http/1.1 one is copied per ALPN; the
+  port learns one budget per name and applies it to every client of that name
+  (`crates/zero-security/src/tls13/ccs_probe.rs`, `crates/reality/src/server.rs`)
+  (§5);
 * a session ticket or unknown post-handshake type from the peer is ignored, not
   alerted — `crates/zero-security/src/tls13/client.rs:925` against
   `RL/conn.go:1387-1398` (§5);
@@ -978,47 +978,47 @@ defence is the `maxTimeDiff` window of §2 — which is off by default.
 ### What the Rust code does
 
 The record stream that both ends use after the handshake (`Tls13Stream`,
-`ZS/client.rs:704-729`) implements the same *kinds* of tolerance, with different
-bounds:
+`ZS/client.rs`) implements the same *kinds* of tolerance, with the same bounds:
 
-* **CCS**: ignored at any time, and **not counted** (`ZS/client.rs:815`).
-* **Alerts**: `close_notify` ends the stream (`:816-824`); anything else is a hard
-  failure (`:823`).
-* **Empty application-data records**: tolerated as REALITY's ticket mimicry, bounded
-  at 256 consecutive records — `self.empty_records += 1; if self.empty_records > 256
-  { malformed("peer sent an implausible run of empty records") }`
-  (`ZS/client.rs:838-846`) — and reset by any record that carries data (`:847-848`).
-* **A cleartext handshake record after the handshake** is a hard failure
-  (`:825-828`), where Go would try to decrypt it; both end the connection.
-* **Post-handshake handshake messages** (`ZS/client.rs:893-929`): a KeyUpdate rolls
-  the read secret and is answered with a not-requesting KeyUpdate when the peer set
-  `update_requested`, rolling the write secret as well (`:905-923`) — the same
-  behaviour as `RL/conn.go:1401-1436`. NewSessionTicket and unknown types are
-  ignored silently (`:925`, "no resumption, ignored"), where Go alerts on a ticket
-  from a client and on any unexpected type.
-* **During the handshake**, `read_encrypted_handshake` skips CCS records with *no*
-  bound (`RB/server.rs:769-774`) and refuses anything that is not app-data
-  (`:775-777`). The unbounded loop is not unbounded in time: the whole inbound
-  handshake runs under `timeout(handshake_timeout(), …)` (`ZR/server.rs:2230-2234`),
-  default 60 s (`ZR/server.rs:208-216`), so a peer spamming CCS records is
-  eventually closed by the deadline rather than by a counter.
+* **CCS**: counted against the budget, as Go counts it (`RL/conn.go:793-795`).
+* **Alerts**: `close_notify` ends the stream; anything else is a hard failure.
+* **Empty application-data records**: counted against the budget, and reset by
+  any record that carries data — the same *consecutive* run Go counts
+  (`RL/conn.go:734-737`, `:803-811`).
+* **A cleartext handshake record after the handshake** is a hard failure, where
+  Go would try to decrypt it; both end the connection.
+* **Post-handshake handshake messages**: a KeyUpdate rolls the read secret and
+  is answered with a not-requesting KeyUpdate when the peer set
+  `update_requested`, rolling the write secret as well — the same behaviour as
+  `RL/conn.go:1401-1436`. NewSessionTicket and unknown types are ignored
+  silently, where Go alerts on a ticket from a client and on any unexpected
+  type.
+* **During the handshake**, `read_encrypted_handshake` skips CCS records
+  (`RB/server.rs`) and refuses anything that is not app-data. The loop is not
+  unbounded in time: the whole inbound handshake runs under
+  `timeout(handshake_timeout(), …)` (`ZR/server.rs`), default 60 s, so a peer
+  spamming CCS records is eventually closed by the deadline.
 
-**The per-decoy budget has no counterpart.** `DetectPostHandshakeRecordsLens`'s CCS
-probing is not ported: the Rust port learns only the decoy's post-handshake record
-*sizes* (`ZS/post_handshake.rs:161-178`, `ZR/server.rs:8956-9008`) and has no
-`GlobalMaxCSSMsgCount` equivalent, so a Zray REALITY server cannot match a decoy
-whose tolerance is not 32. Nothing in `crates/reality/src/` mentions a useless-record
-budget at all.
+**The budget is the decoy's.** The port asks the decoy how many records that
+advance nothing it tolerates, and answers with the same number, so a prober
+cannot count records to tell the two apart. The probe is Go's
+`CCSDetectConn` (`RL/record_detect.go:137-185`): the records go out in the
+middle of the handshake, where the site counts them, and the run that draws the
+site's objection names the limit (`ZS/ccs_probe.rs`). The runs are the ones Go
+sends — two, then fifteen more, then sixteen more — and the limits they name
+are one, sixteen and thirty-two; a site that objects at none of them tolerates
+all of them.
 
 **Status:**
 
 | Behaviour | Status | Evidence |
 |---|---|---|
-| Default budget of 32 consecutive useless records | **PORTED** | `RL/common.go:70`, `RL/conn.go:827-839` have no Rust counterpart; the only imported bound is 256 empty records (`ZS/client.rs:842`) |
-| Per-decoy learned budget (CCS probe) | **MISSING** | `RL/record_detect.go:137-185`, `RL/tls.go:425-427`; the Rust port has no probe and no field |
-| Empty-record handling | **PORTED** | Go counts them against `MaxUselessRecords` (32 by default, `RL/conn.go:803-811`); Rust allows 256 consecutive (`ZS/client.rs:838-846`) |
-| Session-ticket tolerance | **DIVERGENT** | Go never issues one (`XC/…/reality/config.go:32`) and alerts if a client sends one; Rust ignores any post-handshake type it does not know (`ZS/client.rs:925`) |
-| KeyUpdate | **PORTED** | `RL/conn.go:1401-1436` vs `ZS/client.rs:905-923`; Rust accepts `mlen >= 1` where Go requires exactly one byte, which is a widening, not a disagreement on the reply |
+| Default budget of 32 consecutive useless records | **PORTED** | `RL/common.go:70`, `RL/conn.go:827-839`; the port counts the same kinds of records against the same default (`ZS/client.rs`, `MAX_USELESS_RECORDS`) |
+| Per-decoy learned budget (CCS probe) | **PORTED** | `RL/record_detect.go:137-185`, `RL/tls.go:425-427`; the port probes the decoy at start-up (`ZS/ccs_probe.rs`, `ZR/server.rs`) and applies the answer to the connections it accepts (`RB/server.rs`, `Tls13Stream::set_max_useless_records`) |
+| The budget is filed per ALPN | **DIVERGENT** | Go keys it under `dest + " " + sni + " " + alpn` and the accepting connection picks it up by the ALPN it offered (`RL/tls.go:396-403`); the port learns one budget per name and applies it to every client of that name |
+| Empty-record handling | **PORTED** | Go counts them against `MaxUselessRecords` (32 by default, `RL/conn.go:803-811`); the port counts them against the same budget |
+| Session-ticket tolerance | **DIVERGENT** | Go never issues one (`XC/…/reality/config.go:32`) and alerts if a client sends one; the port ignores any post-handshake type it does not know |
+| KeyUpdate | **PORTED** | `RL/conn.go:1401-1436` vs `ZS/client.rs`; the port accepts `mlen >= 1` where Go requires exactly one byte, which is a widening, not a disagreement on the reply |
 | Replay / session-id cache | **PORTED (both absent)** | `RL/cache.go:14-43` is an x509 cache only; no cache exists in `crates/reality` |
 
 **Proved by.** `OR:1519-1601`

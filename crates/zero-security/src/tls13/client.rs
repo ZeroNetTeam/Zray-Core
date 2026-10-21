@@ -717,18 +717,24 @@ const OUTGOING_HIGH_WATER: usize = 4 * (MAX_PLAINTEXT + 5 + 1 + 16);
 /// progress may idle as long as it likes, while one that only emits
 /// placeholders is bounded.
 ///
-/// Go learns the number from the camouflage site and may raise it
-/// (`RL/tls.go:404-428`); the port has no probe for that, so it uses the
-/// default every real site with Go's TLS stack answers with.
+/// Go learns the number from the camouflage site and applies it to the
+/// connections it accepts (`RL/tls.go:425-427`); the port learns it the same
+/// way (see [`super::ccs_probe`]) and applies it through
+/// [`Tls13Stream::set_max_useless_records`]. This is the value to use when
+/// the site could not be asked, and the one every real site with Go's TLS
+/// stack answers with.
 pub const MAX_USELESS_RECORDS: u64 = 32;
 
-/// The record that trips [`MAX_USELESS_RECORDS`], as a failure a caller can
-/// name rather than one more `malformed`.
-fn too_many_useless_records() -> Failure {
+/// The failure that trips the useless-record limit, as a caller can name
+/// rather than one more `malformed`.
+///
+/// The limit is the stream's own, since Go's is (`RL/conn.go:831-833`:
+/// `MaxUselessRecords`), so the message names it rather than the default.
+fn too_many_useless_records(limit: u64) -> Failure {
     Failure::new(FailureKind::TlsAlert, Stage::TlsStarted)
         .with_confidence(Confidence::Confirmed)
         .with_detail(format!(
-            "peer sent more than {MAX_USELESS_RECORDS} consecutive non-advancing records \
+            "peer sent more than {limit} consecutive non-advancing records \
              (Go: alertUnexpectedMessage, \"tls: too many ignored records\")"
         ))
 }
@@ -772,6 +778,13 @@ pub struct Tls13Stream<S> {
     /// application data, change_cipher_spec. Reset by any record that does
     /// advance the stream; fatal past [`MAX_USELESS_RECORDS`].
     useless_records: u64,
+    /// How many records that advance nothing this stream tolerates.
+    ///
+    /// Go's is the same field (`RL/conn.go:32`, `:831-833`), and Go's server
+    /// sets it from what the camouflage site was found to answer with
+    /// (`RL/tls.go:425-427`), so that a REALITY server puts up with exactly
+    /// as many of them as the site it borrows its name from.
+    max_useless_records: u64,
 }
 
 impl<S> Tls13Stream<S> {
@@ -796,6 +809,7 @@ impl<S> Tls13Stream<S> {
             direct_read: false,
             direct_write: false,
             useless_records: 0,
+            max_useless_records: MAX_USELESS_RECORDS,
         }
     }
 
@@ -811,6 +825,15 @@ impl<S> Tls13Stream<S> {
                 .seal_empty_into(wire_len as usize, &mut self.outgoing)?;
         }
         Ok(())
+    }
+
+    /// Set how many records that advance nothing this stream tolerates.
+    ///
+    /// The value a camouflage site was found to answer with is the value a
+    /// REALITY server answers with, so that the two cannot be told apart by
+    /// how long they put up with a run of them (`RL/tls.go:425-427`).
+    pub fn set_max_useless_records(&mut self, limit: u64) {
+        self.max_useless_records = limit;
     }
 
     /// Enter Vision's authenticated direct-read mode. The protocol layer
@@ -962,8 +985,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
     /// warning without ending the stream — so the closure is the failure.
     fn count_useless_record(&mut self) -> Result<(), Failure> {
         self.useless_records += 1;
-        if self.useless_records > MAX_USELESS_RECORDS {
-            return Err(too_many_useless_records());
+        if self.useless_records > self.max_useless_records {
+            return Err(too_many_useless_records(self.max_useless_records));
         }
         Ok(())
     }
@@ -1561,7 +1584,10 @@ mod tests {
         seal.seal_into(b"live", CONTENT_APPDATA, &mut wire).unwrap();
         peer.write_all(&wire).await.unwrap();
         let error = stream.read(&mut [0u8; 4]).await.unwrap_err();
-        assert_eq!(error.to_string(), too_many_useless_records().to_string());
+        assert_eq!(
+            error.to_string(),
+            too_many_useless_records(MAX_USELESS_RECORDS).to_string()
+        );
 
         // A change_cipher_spec advances nothing either, so a run of them is
         // the same failure — the port ignored them without counting at all.
@@ -1576,7 +1602,10 @@ mod tests {
             .unwrap();
         peer.write_all(&wire).await.unwrap();
         let error = stream.read(&mut [0u8; 4]).await.unwrap_err();
-        assert_eq!(error.to_string(), too_many_useless_records().to_string());
+        assert_eq!(
+            error.to_string(),
+            too_many_useless_records(MAX_USELESS_RECORDS).to_string()
+        );
     }
 
     /// The bound is on a *consecutive* run: Go resets `retryCount` on any
@@ -1601,5 +1630,46 @@ mod tests {
             stream.read_exact(&mut got).await.unwrap();
             assert_eq!(got[0], round, "128 useless records between four writes");
         }
+    }
+
+    /// The limit is the stream's own, because the camouflage site's is.
+    ///
+    /// Go's server sets `MaxUselessRecords` from what the site was found to
+    /// answer with (`RL/tls.go:425-427`), so a REALITY server puts up with
+    /// exactly as many records that advance nothing as the site it borrows
+    /// its name from. A stream that always answered with 32 would be a
+    /// stream that could be told apart from a site that answers with a
+    /// different number.
+    #[tokio::test]
+    async fn the_limit_is_the_streams_own() {
+        let suite = CipherSuite::TLS_AES_128_GCM_SHA256;
+        let (mut peer, mut stream, mut seal) = stream_and_sealer(suite);
+        stream.set_max_useless_records(4);
+
+        // Four are tolerated, and the fifth is not.
+        let mut wire = Vec::new();
+        for _ in 0..4 {
+            seal.seal_empty_into(69, &mut wire).unwrap();
+        }
+        seal.seal_into(b"live", CONTENT_APPDATA, &mut wire).unwrap();
+        peer.write_all(&wire).await.unwrap();
+        let mut got = [0u8; 4];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"live", "the run the limit allows is answered");
+
+        let (mut peer, mut stream, mut seal) = stream_and_sealer(suite);
+        stream.set_max_useless_records(4);
+        let mut wire = Vec::new();
+        for _ in 0..5 {
+            seal.seal_empty_into(69, &mut wire).unwrap();
+        }
+        seal.seal_into(b"live", CONTENT_APPDATA, &mut wire).unwrap();
+        peer.write_all(&wire).await.unwrap();
+        let error = stream.read(&mut [0u8; 4]).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            too_many_useless_records(4).to_string(),
+            "the run past the limit is fatal, and the message names the limit"
+        );
     }
 }

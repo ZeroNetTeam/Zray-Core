@@ -102,6 +102,16 @@ struct Site {
     flight: Arc<[u16]>,
     /// Wire sizes of the records it sends after the handshake.
     after: Arc<[u16]>,
+    /// How many records that advance nothing the site tolerates before it
+    /// answers with an alert.
+    ///
+    /// The site is asked at start-up, and the answer is the site's own
+    /// patience: a REALITY server that put up with fewer useless records
+    /// than the site it borrows its name from would be a REALITY server that
+    /// can be told apart. Go learns the same number the same way
+    /// (`RL/record_detect.go:137-185`) and applies it to the connections it
+    /// accepts (`RL/tls.go:425-427`).
+    budget: Option<u64>,
 }
 
 /// What is known about one name, as the handshake path wants it.
@@ -109,6 +119,8 @@ struct Site {
 pub(super) struct SiteShapes {
     pub flight: Option<Arc<[u16]>>,
     pub after: Option<Arc<[u16]>>,
+    /// The site's budget for records that advance nothing, when it is known.
+    pub budget: Option<u64>,
 }
 
 impl PostHandshakeShapes {
@@ -122,6 +134,12 @@ impl PostHandshakeShapes {
     /// what was there (the post-handshake sizes stay).
     pub fn set_flight(&self, server_name: &str, wire_lens: &[u16]) {
         self.edit(server_name, |site| site.flight = wire_lens.into());
+    }
+
+    /// Remember how many records that advance nothing the site tolerates,
+    /// for `server_name`.
+    pub fn set_budget(&self, server_name: &str, budget: u64) {
+        self.edit(server_name, |site| site.budget = Some(budget));
     }
 
     fn edit(&self, server_name: &str, change: impl FnOnce(&mut Site)) {
@@ -146,6 +164,7 @@ impl PostHandshakeShapes {
             Some(site) => SiteShapes {
                 flight: Some(Arc::clone(&site.flight)).filter(|lens| !lens.is_empty()),
                 after: Some(Arc::clone(&site.after)).filter(|lens| !lens.is_empty()),
+                budget: site.budget,
             },
             None => SiteShapes::default(),
         }
@@ -540,6 +559,12 @@ where
         let _ = log.log_application_secrets(&hello.random, &client_app, &server_app);
     }
     let mut stream = Tls13Stream::new(io, hello.suite, client_app, server_app);
+    if let Some(budget) = shapes.budget {
+        // How long this server puts up with a run of records that advance
+        // nothing is how long the site it borrows its name from does, which
+        // is what the site was asked at start-up (`RL/tls.go:425-427`).
+        stream.set_max_useless_records(budget);
+    }
     if let Some(wire_lens) = shapes.after {
         // Where the real site would be sending its session tickets.
         stream.queue_empty_records(&wire_lens)?;
@@ -1705,6 +1730,57 @@ mod tests {
         // The two replayed records, then the 4-byte reply in a record of its
         // own: header, payload, type byte, tag.
         assert_eq!(*sizes.lock().unwrap(), [255, 69, 5 + 4 + 1 + 16]);
+    }
+
+    /// The server answers with the record budget the site was found to have.
+    ///
+    /// Go's server puts up with a run of records that advance nothing for as
+    /// long as the site it borrows its name from does, which is what the site
+    /// was asked at start-up (`RL/record_detect.go:137-185`,
+    /// `RL/tls.go:425-427`). A server that always answered with the default
+    /// would be a server that could be told apart from the site by how long
+    /// it tolerated the run.
+    #[tokio::test]
+    async fn the_server_puts_up_with_what_the_site_puts_up_with() {
+        // A site that tolerates two records that advance nothing.
+        let budget = 2u64;
+        let (server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        server_params
+            .post_handshake
+            .set_budget("example.test", budget);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut stream = handshake(server_io, &server_params).await.unwrap();
+            // The server reads until the run of records that advance nothing
+            // is one too long, which is what ends the connection.
+            let mut sink = [0u8; 64];
+            let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match stream.read(&mut sink).await {
+                        Ok(0) => return "the peer closed the connection".to_string(),
+                        Ok(_) => continue,
+                        Err(error) => return error.to_string(),
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| "the server waited for more".to_string());
+            outcome
+        });
+        let mut client = zero_security::reality_connect(client_io, &client_params)
+            .await
+            .unwrap();
+        // A run of records that advance nothing, one more than the budget
+        // allows.
+        for _ in 0..=budget {
+            client.queue_empty_records(&[69]).unwrap();
+        }
+        client.flush().await.unwrap();
+        let outcome = server.await.unwrap();
+        assert!(
+            outcome.contains(&format!("more than {budget} consecutive")),
+            "the server gave up with {outcome:?}, not with the run past its budget of {budget}"
+        );
     }
 
     /// One handshake against `server_params`, and the sizes of the records the

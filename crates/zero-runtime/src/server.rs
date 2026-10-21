@@ -9031,6 +9031,46 @@ fn learn_post_handshake(
                         "REALITY target did not answer in time; this inbound will copy neither its flight nor its session tickets. Check that the server can reach the target."
                     ),
                 }
+                // How many records that advance nothing the target tolerates.
+                // The server answers with the same number, so that it cannot
+                // be told apart from the target by how long it puts up with
+                // a run of them (`RL/record_detect.go:137-185`).
+                let budget = timeout(Duration::from_secs(30), async {
+                    zero_security::tls13::ccs_probe::probe_budget(
+                        || async {
+                            outbound::connect_direct_with_resolver(
+                                &destination,
+                                &zero_config::StreamSettings::default(),
+                                &resolver,
+                            )
+                            .await
+                            .map_err(|error| {
+                                zero_core::Failure::new(
+                                    zero_core::FailureKind::TcpRefused,
+                                    zero_core::Stage::SocketConnected,
+                                )
+                                .with_detail(error.to_string())
+                            })
+                        },
+                        &name,
+                    )
+                    .await
+                })
+                .await;
+                match budget {
+                    Ok(Some(budget)) => {
+                        debug!(%name, budget, "REALITY target's record budget learned");
+                        shapes.set_budget(&name, budget);
+                    }
+                    Ok(None) => debug!(
+                        %name,
+                        "REALITY target's record budget could not be learned; this inbound will use the default"
+                    ),
+                    Err(_) => debug!(
+                        %name,
+                        "REALITY target did not answer in time about its record budget; this inbound will use the default"
+                    ),
+                }
             });
         }
     }

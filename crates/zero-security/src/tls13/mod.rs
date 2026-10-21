@@ -18,6 +18,7 @@
 //! The wire behavior is specified in `docs/specs/tls13-core.md`, verified
 //! against the Go TLS fork Xray's REALITY servers actually run.
 
+pub mod ccs_probe;
 pub mod cert;
 pub mod client;
 pub mod hello;
