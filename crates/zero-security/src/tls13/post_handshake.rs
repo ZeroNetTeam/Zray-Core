@@ -43,6 +43,14 @@ use crate::tls::TlsParams;
 /// How long to keep listening after the handshake. Tickets arrive at once;
 /// the rest of the time is for a server that sends its HTTP/2 settings late.
 pub const LISTEN: Duration = Duration::from_secs(3);
+
+/// How long one read waits before the loop looks again.
+///
+/// The site sends its session ticket after the handshake, and the TLS layer
+/// buffers it: the tap sees the bytes, but the stream does not hand them
+/// over until the site sends more. A short bound lets the loop notice that
+/// the tap already has what it needs.
+const READ_SLICE: Duration = Duration::from_millis(50);
 /// The most records remembered. Sites send two to four; the client side of
 /// this stack refuses a long run of empty records, so the list stays short.
 pub const MAX_RECORDS: usize = 8;
@@ -187,7 +195,6 @@ pub struct Tap<S> {
     /// The first record *this* end wrote, kept whole: the ClientHello, when
     /// this end is the client.
     sent_first: Arc<Mutex<Vec<u8>>>,
-
 
     /// Every byte this end wrote, in order.
     sent_bytes: Arc<Mutex<Vec<u8>>>,
@@ -411,19 +418,46 @@ mod flight_end_tests {
             .expect("the site's certificate loads");
             let mut stream = server;
             let _ = crate::server::accept(&mut stream, config).await;
+            // The site keeps the connection open, as a real one does: it has
+            // nothing more to say until the client speaks again, and closing
+            // would hide the cost of a read that waits for silence.
+            let mut sink = [0u8; 4096];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut stream, &mut sink).await {
+                    Ok(n) if n > 0 => continue,
+                    _ => break,
+                }
+            }
         });
         let started = std::time::Instant::now();
-        let _ = observe_all_with(client, "example.test", SiteTrust::Unverified).await;
+        let shapes = observe_all_with(client, "example.test", SiteTrust::Unverified)
+            .await
+            .expect("the probe reads the site's flight");
         let elapsed = started.elapsed();
         server.await.unwrap();
         // The site sends its flight and its ticket and then has nothing more
         // to say, so a probe that reads until the site falls silent waits out
         // the whole listen time on every connection. On the accepting path
         // that is a per-connection cost, and a large one.
+        // The read is bounded, so a probe that waits for the site's
+        // silence costs the read's bound, not the listen time.
         assert!(
-            elapsed < Duration::from_millis(500),
-            "the probe waited {elapsed:?}, which is the listen time and not the \
-             cost of reading a flight"
+            elapsed < Duration::from_millis(150),
+            "the probe waited {elapsed:?}, which is the listen time and not \
+             the cost of reading a flight"
+        );
+        // And the flight it read is the whole one: the site's records and
+        // its ticket. A probe that stopped early would have a short list.
+        assert!(
+            !shapes.post_handshake.is_empty(),
+            "the probe did not read the site's ticket, so its flight is short"
+        );
+        // And the read is bounded: a read that waits for the site's
+        // silence waits out the whole listen time, and the site here keeps
+        // its connection open on purpose.
+        assert!(
+            READ_SLICE < LISTEN,
+            "the read's bound is the listen time, so a probe waits it out"
         );
     }
 }
@@ -683,13 +717,33 @@ where
             if complete {
                 break;
             }
-            match stream.read(&mut sink).await {
-                Ok(n) if n > 0 => continue,
-                _ => break,
+            match tokio::time::timeout(READ_SLICE, stream.read(&mut sink)).await {
+                Ok(Ok(n)) if n > 0 => continue,
+                _ => {
+                    // The read gave up. The tap may have the ticket by now
+                    // — the TLS layer buffers it, so the stream does not
+                    // hand it over — and the flight is then complete.
+                    let complete = !taps
+                        .post_handshake
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .is_empty();
+                    if complete {
+                        break;
+                    }
+                    // The site is silent and has said no more.
+                    break;
+                }
             }
         }
     })
     .await;
+    eprintln!(
+        "DEBUG flight={:?} post={:?} written={:?}",
+        taps.flight.lock().unwrap(),
+        taps.post_handshake.lock().unwrap(),
+        taps.written.lock().unwrap()
+    );
     let take = |list: &Arc<Mutex<Vec<u16>>>| list.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let answer = {
         let hello = taps.server_hello.lock().unwrap_or_else(|p| p.into_inner());

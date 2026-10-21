@@ -87,6 +87,12 @@ fn build_server_config(
             .with_single_cert(certificates, key)
             .map_err(|error| format!("invalid inbound TLS certificate/key: {error}"))?;
     config.alpn_protocols = alpn.iter().map(|value| value.as_bytes().to_vec()).collect();
+    // A real TLS 1.3 server sends session tickets after the handshake, and
+    // the camouflage site does too. A server that sent none would look
+    // different from every real one — and, worse, a probe that read a
+    // server with no tickets would see a flight one record short.
+    config.ticketer = rustls::crypto::ring::Ticketer::new()
+        .map_err(|error| format!("could not start the session ticketer: {error}"))?;
     Ok(Arc::new(config))
 }
 

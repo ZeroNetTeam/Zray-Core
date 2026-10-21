@@ -2082,6 +2082,49 @@ mod tests {
         assert_eq!(*sizes.lock().unwrap(), [255, 69, 5 + 4 + 1 + 16]);
     }
 
+    /// The site's answer arrives without waiting out the listen time.
+    ///
+    /// A site has nothing more to say until the client speaks again, so a
+    /// read that waits for the site's silence waits out the whole listen
+    /// time. On the accepting path that is a cost per connection, and the
+    /// port reads the site on every connection.
+    #[tokio::test]
+    async fn the_sites_answer_arrives_without_waiting_out_the_listen_time() {
+        let site = TestSite::start();
+        let (mut server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        server_params.decoy = Some(Arc::clone(&site.dialer) as Arc<dyn DecoyDialer>);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn({
+            let server_params = server_params.clone();
+            async move {
+                let mut stream = handshake(server_io, &server_params).await.unwrap();
+                let mut request = [0u8; 4];
+                stream.read_exact(&mut request).await.unwrap();
+                stream.write_all(b"pong").await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+        let client = tokio::spawn(async move {
+            let mut client = zero_security::reality_connect(client_io, &client_params)
+                .await
+                .unwrap();
+            client.write_all(b"ping").await.unwrap();
+            client.flush().await.unwrap();
+            let mut reply = [0u8; 4];
+            client.read_exact(&mut reply).await.unwrap();
+        });
+        let started = std::time::Instant::now();
+        client.await.unwrap();
+        server.await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "the handshake took {elapsed:?}, which is the listen time and not \
+             the cost of a handshake"
+        );
+    }
+
     /// The server answers with the cipher suite and the group the *site*
     /// chose.
     ///
