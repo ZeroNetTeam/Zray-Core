@@ -52,6 +52,12 @@ pub const MAX_RECORDS: usize = 8;
 /// sizes are dropped rather than kept for a decision nothing can make.
 pub const MAX_FLIGHT_RECORDS: usize = 8;
 
+/// How many bytes of what this end wrote are kept.
+///
+/// Enough for a ClientHello and a Finished, which is what the REALITY
+/// server forwards to the camouflage site.
+pub const MAX_SENT_BYTES: usize = 64 * 1024;
+
 /// What a camouflage site's handshake looks like from outside it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SiteShapes {
@@ -256,10 +262,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tap<S> {
                     kept.extend_from_slice(&buf[..count]);
                 }
             }
-            sent_bytes
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .extend_from_slice(&buf[..count]);
+            let mut sent = sent_bytes.lock().unwrap_or_else(|p| p.into_inner());
+            if sent.len() < MAX_SENT_BYTES {
+                let take = (MAX_SENT_BYTES - sent.len()).min(count);
+                sent.extend_from_slice(&buf[..take]);
+            }
             this.sent.feed(&buf[..count], |content_type, wire_len| {
                 *finished_sent |= content_type == CONTENT_APPDATA;
                 let mut written = written.lock().unwrap_or_else(|p| p.into_inner());
@@ -293,11 +300,15 @@ pub struct Taps {
     /// The first record this end wrote whole — the ClientHello, when this
     /// end is the client.
     pub sent_first: Arc<Mutex<Vec<u8>>>,
-    /// Every byte this end wrote, in order.
+    /// Every byte this end wrote, in order, up to [`MAX_SENT_BYTES`].
     ///
     /// A caller that hands this stream to somebody else — the REALITY
     /// server forwarding a visitor's bytes to the camouflage site — can
     /// then see exactly what was sent.
+    ///
+    /// Bounded, because the tap is a public type and a caller may put it
+    /// on a long-lived stream: without a cap, the list would grow with
+    /// every byte the connection carried.
     pub sent_bytes: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -371,6 +382,49 @@ pub fn parse_site_answer(record: &[u8]) -> Option<SiteAnswer> {
         });
     }
     None
+}
+
+#[cfg(test)]
+mod sent_bytes_tests {
+    use super::*;
+
+    /// What this end wrote is kept, up to a bound.
+    ///
+    /// The tap is a public type and a caller may put it on a long-lived
+    /// stream, so the list of what was written cannot grow with the
+    /// connection.
+    #[tokio::test]
+    async fn what_was_written_is_kept_up_to_a_bound() {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let (tap, taps) = tap_with_flight(client);
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut tap = tap;
+            // More than the cap, in several writes.
+            for _ in 0..8 {
+                tap.write_all(&vec![7u8; 32 * 1024]).await.unwrap();
+            }
+            tap.flush().await.unwrap();
+        });
+        let mut sink = [0u8; 4096];
+        let mut read = 0usize;
+        while read < 8 * 32 * 1024 {
+            let n = tokio::io::AsyncReadExt::read(&mut server, &mut sink)
+                .await
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            read += n;
+        }
+        writer.await.unwrap();
+        let sent = taps.sent_bytes.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            MAX_SENT_BYTES,
+            "the list of what was written is bounded"
+        );
+    }
 }
 
 #[cfg(test)]
