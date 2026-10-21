@@ -1520,7 +1520,8 @@ decoy".
 cd Zray-Core
 
 # 1. The REALITY differential suite: both mixed directions, ML-DSA-65, the
-#    limits, and the idle-keepalive case. Seven tests.
+#    limits, the idle-keepalive case, the flight copied record for record,
+#    and the wrong-key refusal. Nine tests.
 ZRAY_XRAY_BINARY=/usr/bin/xray \
   cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 reality
 
