@@ -36,9 +36,9 @@
 //! `zero-runtime::throttle::{Limit, Throttle}` and `zero-runtime::relay`, kept
 //! in step by construction: the runtime depends on this crate, so this crate
 //! cannot call back into it, and one documented port beats two copies that
-//! drift. The runtime still runs its own copy of all three for now — its
-//! `Xray client → Zray server` differential tests are what prove the behavior —
-//! and should be switched over to this module next.
+//! drift. The runtime's inbound runs this module — `relay_reality_fallback`
+//! calls `reality::fallback::relay` — and its `Xray client → Zray server`
+//! differential tests are what prove the behavior.
 //!
 //! The one place this port differs from the runtime's, both noted where they
 //! are made: [`Throttle`] reads through a zeroed window instead of carrying the

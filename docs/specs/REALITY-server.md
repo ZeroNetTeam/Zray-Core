@@ -1150,23 +1150,76 @@ if it had been dialled first — which is what
 (`the_hello_and_every_byte_after_it_reach_the_target_in_order`) asserts from both
 ends.
 
-**There are two copies of this relay at HEAD.** `crates/reality/src/fallback.rs` is
-the port moved into the REALITY crate, with its own `relay`
-(`RB/fallback.rs:286-356`), `FallbackLimit` (`:96-127`) and the same two defaults
-(`:60-75`), and it says so itself: "The Rust moved here is `zero-runtime/src/server.rs`
-→ `relay_reality_fallback` … The runtime still runs its own copy of all three for
-now" (`RB/fallback.rs:34-41`). The runtime copy (`ZR/server.rs:2395-2489`,
-`ZR/throttle.rs`, `ZR/relay.rs`) is the one an inbound actually executes today and
-the one the differential tests exercise; the new module has ten focused tests
-(`crates/reality/tests/fallback.rs`) but no caller in `zero-runtime` — a
-`grep` for `reality::fallback` in the runtime finds nothing. The two differ only in
-the two places `RB/fallback.rs:43-46` names: the moved `Throttle` reads through a
-zeroed window instead of the runtime's `unsafe { buf.assume_init }`
-(`ZR/throttle.rs:98-100`), and the moved relay keeps one read buffer per direction
-instead of the runtime's pooled, self-growing pair. This is duplication to be
-removed, not a behavioural divergence — but a reader of the code must know which
-copy their inbound runs.
+**One copy of this relay.** `crates/reality/src/fallback.rs` is the port, with its
+own `relay` (`RB/fallback.rs`), `FallbackLimit` and the two defaults, and it is the
+one an inbound runs: `relay_reality_fallback` calls `reality::fallback::relay`
+(`ZR/server.rs:2462`). The module's own note about the runtime "still running its
+own copy" is out of date — the runtime's copy was the `relay`/`Throttle` pair, and
+those now serve only the *other* protocols' relays (`ZR/server.rs:3512` and
+following), not REALITY's. The differences the module names between the two copies
+— the zeroed window instead of the runtime's `unsafe { buf.assume_init }`, and one
+read buffer per direction instead of a pooled, self-growing pair — are internal,
+and the REALITY path is the one the differential tests exercise.
 
+**Half-close.** `raw` is the client socket as a `CloseWriteConn` (`RL/tls.go:182-186`).
+When the client→target copy ends cleanly, the server calls `target.CloseWrite()` and
+leaves the other direction running; on a reset or error it closes the target
+(`RL/tls.go:276-285`). The download side does the same to the client socket:
+`io.Copy(underlying, …)` then `underlying.CloseWrite()` (`RL/tls.go:442-446`). A
+peer therefore sees a FIN, not a RST, in both directions. There is **no idle timeout
+and no overall deadline** on the fallback copies: to a prober, this is an ordinary
+long-lived TCP session with the site.
+
+**Rate limits.** `LimitFallback{AfterBytes, BytesPerSec, BurstBytesPerSec}`
+(`RL/common.go:540-544`) are applied through `NewRatelimitedConn`
+(`RL/tls.go:122-137`): a zero `BytesPerSec` disables the limit entirely, otherwise a
+token bucket of `BytesPerSec` with a burst of at least `BytesPerSec`
+(`burstBytesPerSec` is clamped *up* to `BytesPerSec`, `:127-130`). Only the *read*
+side of the wrapped connection is charged (`RatelimitedConn.Read`, `:110-120`), so
+wrapping the client socket limits uploads and wrapping the target socket limits
+downloads — the wrap sites are `io.Copy(target, NewRatelimitedConn(underlying, &config.LimitFallbackUpload))`
+(`:275`, `:437`) and `io.Copy(underlying, NewRatelimitedConn(target, &config.LimitFallbackDownload))`
+(`:442`). Counting starts at the first byte read through the wrapper, i.e. **after**
+the ClientHello, which was already mirrored to the target unthrottled; the first
+`AfterBytes` bytes of each direction are free (`:113-117`). Xray's defaults are all
+zeros — no limit (`XC/infra/conf/transport_internet.go:918-925`).
+
+### What the Rust code does
+
+**Dialling `dest`.** Only on the fallback path, in `relay_reality_fallback`
+(`ZR/server.rs:2395-2489`), called after `secure_inbound` returns
+`Secured::Fallback` (`ZR/server.rs:2237-2242`). An inbound with no `dest`/`target`
+logs and drops the connection (`ZR/server.rs:2407-2415`); a dial that fails logs and
+drops it (`:2418-2431`). An authenticated connection never dials the target at all
+(§3, divergence 1).
+
+**The PROXY header** is `zero_protocol::proxy_protocol::encode(reality.fallback_xver,
+Some(peer), local)` when `fallback_xver != 0` (`ZR/server.rs:2433-2441`), written
+before the replayed hello. `encode` (`crates/zero-protocol/src/proxy_protocol.rs:32-70`)
+produces for v1 `PROXY TCP4|TCP6 <src> <dst> <sport> <dport>\r\n` or
+`PROXY UNKNOWN\r\n` when the pair cannot be expressed, and for v2 the 12-byte
+signature, `0x21` (PROXY, STREAM), a family byte (`0x11` TCP4 / `0x21` TCP6), the
+2-byte address length and the addresses — the same layout go-proxyproto writes.
+`local` is the inbound's configured listen address and port
+(`ZR/server.rs:2219-2225`), i.e. the analogue of Go's `conn.LocalAddr()`. `xver`
+values outside 0..=2 are refused at parse time (`ZC/xray_json.rs:985-993`), and a
+PROXY header that cannot be written drops the connection (`ZR/server.rs:2436-2440`).
+
+**Replaying the ClientHello.** The port buffers deliberately: intake keeps every
+record byte it consumed while reassembling the hello (`RB/server.rs:472-522`) and
+`HandshakeOutcome::Fallback { client_hello }` carries them to the relay
+(`RB/server.rs:135-142`), which writes them to the target before starting the copies
+(`ZR/server.rs:2442-2451`). Bytes the client sent *after* the hello are still in the
+socket and follow in order, so the target sees exactly the stream it would have seen
+if it had been dialled first — which is what
+`crates/reality/tests/fallback.rs:284-319`
+(`the_hello_and_every_byte_after_it_reach_the_target_in_order`) asserts from both
+ends.
+
+**Half-close.** The relay copies both directions and, when one side reaches EOF,
+flushes and calls `poll_shutdown` on the other (`RB/fallback.rs`) — the equivalent
+of `CloseWrite()`. The remaining direction keeps running until it finishes, or
+until the half-close idle limit fires once it has gone quiet.
 **Half-close.** `relay(client, remote)` (`ZR/server.rs:2468`, `ZR/relay.rs:501-507`)
 copies both directions and, when one side reaches EOF, flushes and calls
 `poll_shutdown` on the other (`ZR/relay.rs:325-356`) — the equivalent of
@@ -1338,10 +1391,12 @@ decrypting one's own traffic. The port has the equivalent for its rustls path
 and now the writer for the REALITY handshake too: both readers read the field
 (`"none"`, empty and absent all mean off), `RB/keys.rs::KeyLog` appends the four
 NSS lines and says what writing them exposes, and
-`RB/config.rs::RealityServerConfig::key_log()` opens one per listener. What is
-still missing is the *call*: the two derivation points
-(`RL/handshake_server_tls13.go:884-893`, `:1031-1040`) are in `RB/server.rs`, which
-a separate workstream owns, so nothing writes a line yet. **PARTIAL.**
+`RB/config.rs::RealityServerConfig::key_log()` opens one per listener. The
+handshake writes them at the two derivation points
+(`RL/handshake_server_tls13.go:884-893`, `:1031-1040`), in Go's order and Go's
+format (`%s %x %x`), and the file's shape is compared against the file an
+official Xray REALITY server writes, over the same official client
+(`the_key_log_has_the_shape_the_officials_server_writes`). **PORTED.**
 
 ### Validation gaps, each with its consequence
 
