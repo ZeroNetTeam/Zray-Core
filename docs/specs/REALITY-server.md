@@ -100,6 +100,11 @@ What is *not* closed is what the rows below still say.
   server writes its own flight before it reads the visitor's Finished.
   The first dial therefore yields the suite, the group and the first
   four records; the second yields the two that were still in flight
+  (§1, §3, §6). Both dials, and the reads on them, are inside the
+  handshake's own 60-second deadline (`ZR/server.rs`,
+  `DEFAULT_HANDSHAKE_TIMEOUT`), which is Xray's policy default
+  (`XC/features/policy/policy.go:120`: `Handshake: time.Second * 60`) —
+  so a site that is slow costs the visitor time, not the listener
   (§1, §3, §6);
 * the cipher suite and the key-share group are the *site's*, taken from its
   ServerHello, as Go takes them (`RL/handshake_server_tls13.go:100-128`) —
