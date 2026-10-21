@@ -13,6 +13,137 @@
 //! the shipped uTLS corpus — not a sample, and not the handful someone
 //! remembered to list.
 
+/// REALITY over a carrier that cannot carry it is refused at compile time.
+///
+/// Xray refuses it: "REALITY only supports RAW, XHTTP and gRPC for now."
+/// (`XC/transport_internet.go:1779`). The port's `Transport::capabilities`
+/// already says the same — a WebSocket carrier hands back an HTTP wrapper,
+/// not the security connection Vision needs to splice into — but nothing
+/// consulted it.
+///
+/// A config the compiler accepts and the runtime cannot honour is the worst
+/// kind of divergence: the server starts, the client is answered by the
+/// camouflage site, and no error anywhere.
+#[test]
+fn reality_over_a_carrier_that_cannot_carry_it_is_refused() {
+    let reality = serde_json::json!({
+        "privateKey": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0",
+        "serverNames": ["example.com"],
+        "shortIds": [""],
+        "dest": "example.com:443",
+    });
+    let config = |network: &str, extra: serde_json::Value| {
+        let mut stream = serde_json::json!({
+            "network": network,
+            "security": "reality",
+            "realitySettings": reality,
+        });
+        if let (Some(object), Some(extra)) = (stream.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        serde_json::json!({
+            "inbounds": [{
+                "tag": "in", "listen": "127.0.0.1", "port": 8443,
+                "protocol": "vless",
+                "settings": {
+                    "clients": [{"id": "5783a3e7-e373-51cd-8642-c83782b807c5"}],
+                    "decryption": "none",
+                },
+                "streamSettings": stream,
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+        })
+    };
+
+    // The carriers Xray allows.
+    for (network, extra) in [
+        ("tcp", serde_json::Value::Null),
+        ("grpc", serde_json::Value::Null),
+    ] {
+        let compiled =
+            zero_config::compile_config(&config(network, extra), zero_core::GenerationId(1));
+        assert!(
+            compiled.is_ok(),
+            "REALITY over {network} must compile, as it does in Xray: {:?}",
+            compiled.err()
+        );
+    }
+
+    // And the ones it refuses.
+    for (network, extra) in [
+        ("ws", serde_json::json!({"wsSettings": {"path": "/x"}})),
+        (
+            "httpupgrade",
+            serde_json::json!({"httpupgradeSettings": {"path": "/x"}}),
+        ),
+    ] {
+        let compiled =
+            zero_config::compile_config(&config(network, extra), zero_core::GenerationId(1));
+        assert!(
+            compiled.is_err(),
+            "REALITY over {network} must be refused, as it is in Xray"
+        );
+    }
+}
+
+/// The same on the outbound side: a REALITY client over a carrier that
+/// cannot carry it is refused too.
+///
+/// Xray's rule is the same in both directions, and the port's capability
+/// said so before anything consulted it.
+#[test]
+fn reality_over_a_carrier_that_cannot_carry_it_is_refused_on_the_outbound_too() {
+    let reality = serde_json::json!({
+        "serverName": "example.com",
+        "publicKey": "F6PK1mARGsyeoVDKws76F0tNoIC1wd9sEG20c7yF2wY",
+        "shortId": "0123456789abcdef",
+        "fingerprint": "chrome",
+    });
+    let config = |network: &str, extra: serde_json::Value| {
+        let mut stream = serde_json::json!({
+            "network": network,
+            "security": "reality",
+            "realitySettings": reality,
+        });
+        if let (Some(object), Some(extra)) = (stream.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        serde_json::json!({
+            "outbounds": [{
+                "tag": "out", "protocol": "vless",
+                "settings": {"vnext": [{
+                    "address": "127.0.0.1", "port": 8443,
+                    "users": [{"id": "5783a3e7-e373-51cd-8642-c83782b807c5", "encryption": "none"}],
+                }]},
+                "streamSettings": stream,
+            }],
+        })
+    };
+
+    let compiled = zero_config::compile_config(
+        &config("tcp", serde_json::Value::Null),
+        zero_core::GenerationId(1),
+    );
+    assert!(
+        compiled.is_ok(),
+        "REALITY over tcp must compile: {:?}",
+        compiled.err()
+    );
+
+    let compiled = zero_config::compile_config(
+        &config("ws", serde_json::json!({"wsSettings": {"path": "/x"}})),
+        zero_core::GenerationId(1),
+    );
+    assert!(
+        compiled.is_err(),
+        "REALITY over ws must be refused on the outbound side too"
+    );
+}
+
 use zero_config::Fingerprint;
 use zero_security::{
     family_supports_reality, named_profile_supports_reality, FingerprintProfile,

@@ -522,6 +522,17 @@ fn parse_inbound(v: &Value, idx: usize, _out: &mut ParseOutput) -> R<Inbound> {
     }
     validate_inbound_transport(&transport, &path)?;
     let mut security = parse_inbound_security(v.get("streamSettings"), &path)?;
+    // REALITY needs a carrier that hands back the security connection, not
+    // an HTTP wrapper around it. Xray refuses the rest: "REALITY only
+    // supports RAW, XHTTP and gRPC for now."
+    // (`XC/transport_internet.go:1779`).
+    if matches!(&security, InboundSecurity::Reality(_))
+        && !transport.capabilities().supports_reality
+    {
+        return Err(format!(
+            "{path}.streamSettings.network: REALITY supports only the raw, xhttp and grpc carriers"
+        ));
+    }
     if let Transport::Xhttp(settings) = &mut transport {
         if settings.xhttp_mode == XhttpMode::Auto {
             settings.xhttp_mode = if matches!(&security, InboundSecurity::Reality(_)) {
@@ -4535,6 +4546,16 @@ fn parse_stream(v: &Value, path: &str, out: &mut ParseOutput) -> R<StreamSetting
     };
 
     let raw_http_header = parse_raw_http_header(v, path)?;
+
+    // REALITY needs a carrier that hands back the security connection, not
+    // an HTTP wrapper around it. Xray refuses the rest: "REALITY only
+    // supports RAW, XHTTP and gRPC for now."
+    // (`XC/transport_internet.go:1779`).
+    if matches!(&security, Security::Reality(_)) && !transport.capabilities().supports_reality {
+        return Err(format!(
+            "{path}.streamSettings.network: REALITY supports only the raw, xhttp and grpc carriers"
+        ));
+    }
 
     Ok(StreamSettings {
         transport,
