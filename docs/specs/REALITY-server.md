@@ -71,19 +71,22 @@ What is *not* closed is what the rows below still say.
   closes the connection (`RL/tls.go:168-172`) — a site that is down for a
   moment is not a reason for a REALITY listener to be down, but it is a
   difference (§1, §6);
-* the site is dialled twice per connection, and the flight comes from the
-  second — Go dials the site once and uses that one connection for
-  everything: the client's own hello is forwarded to it
-  (`RL/tls.go:70-83`), the site's flight and post-handshake records are
-  read back off it (`:293-330`, `:404-421`), and the *same* connection
-  carries the visitor's bytes in the other direction. The port dials it
-  twice: once to ask it with the client's hello — which is where the
-  cipher suite and the key-share group come from, and where the visitor's
-  Finished is forwarded so the site sends the rest of its flight
+* the site is dialled twice per connection, where Go dials it once — Go
+  uses that one connection for everything: the client's own hello is
+  forwarded to it (`RL/tls.go:70-83`), the site's records are read back
+  off it (`:293-330`, `:404-421`), and the *same* connection carries the
+  visitor's bytes in the other direction. The port dials it twice: once
+  with the client's own hello — which is where the cipher suite and the
+  key-share group come from, and where the visitor's Finished is
+  forwarded so the site sends the rest of its flight
   (`the_visitors_finished_reaches_the_site`) — and once more to ask for
-  the flight. The flight's *sizes* are the same whichever hello the site
-  answered, so the second dial's sizes are right; what differs is only
-  which hello the site's *content* was an answer to (§1, §3, §6);
+  the flight as a whole. The two answer different questions: the first is
+  the site's answer to the *visitor's* bytes, the second is the site's
+  complete flight. And the second is the better of the two, because Go's
+  flight is assembled from records that arrive concurrently with the
+  handshake, with the last two of them still guesses when the server's own
+  flight goes out — while the port's is the site's flight complete, from
+  a handshake that finished (§1, §3, §6);
 * the cipher suite and the key-share group are the *site's*, taken from its
   ServerHello, as Go takes them (`RL/handshake_server_tls13.go:100-128`) —
   and the site is asked with the *client's own* hello, forwarded verbatim,
