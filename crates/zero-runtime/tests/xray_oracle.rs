@@ -2224,6 +2224,141 @@ async fn latest_flight(flights: &Arc<Mutex<Vec<Vec<u16>>>>) -> Option<Vec<u16>> 
     None
 }
 
+/// The ClientHello a REALITY client writes, in full.
+///
+/// It is the client's own bytes, which is what the port forwards to the
+/// site — the same thing Go's `MirrorConn` does (`RL/tls.go:70-83`).
+async fn client_hello_record(public_key: &str) -> Vec<u8> {
+    // The public key, as the bytes the client is configured with.
+    let key = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(public_key)
+            .expect("the oracle's public key is base64url")
+            .try_into()
+            .expect("the oracle's public key is 32 bytes")
+    };
+    let short_id = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(REALITY_SHORT_ID)
+            .expect("the short id is base64url")
+    };
+    let params = zero_security::RealityParams::from_config(
+        std::sync::Arc::from(REALITY_SNI),
+        key,
+        &short_id,
+    );
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (tapped, taps) = zero_security::tls13::post_handshake::tap_with_flight(client_io);
+    // The server end keeps reading: a ClientHello with a hybrid share is
+    // larger than one read, and a client whose write blocks would never
+    // finish.
+    let server = tokio::spawn(async move {
+        let mut server_io = server_io;
+        let mut sink = [0u8; 4096];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut server_io, &mut sink).await {
+                Ok(n) if n > 0 => continue,
+                _ => break,
+            }
+        }
+    });
+    let client = tokio::spawn(async move {
+        let _ = zero_security::reality_connect(tapped, &params).await;
+    });
+    let hello = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let written = taps.sent_first.lock().unwrap().clone();
+            if !written.is_empty() {
+                break written;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the client wrote a hello");
+    client.abort();
+    server.abort();
+    hello
+}
+
+/// What the camouflage site answers to the *client's* own hello.
+///
+/// The port forwards the client's hello to the site, as Go's `MirrorConn`
+/// does (`RL/tls.go:70-83`), and reads the site's answer off that
+/// connection. This says what the answer is, against a real Xray decoy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn the_site_answers_the_clients_own_hello() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the camouflage site never listened");
+
+    // The site's answer to a probe's own hello, for comparison.
+    let site = TcpStream::connect(decoy).await.unwrap();
+    let probed = zero_security::tls13::post_handshake::observe_all_with(
+        site,
+        REALITY_SNI,
+        zero_security::tls13::post_handshake::SiteTrust::Unverified,
+    )
+    .await
+    .expect("the camouflage site's handshake shapes");
+
+    // And the site's answer to the client's own hello, forwarded verbatim.
+    let (_private_key, public_key) = oracle_x25519_keypair(&binary);
+    let hello = client_hello_record(&public_key).await;
+    let site = TcpStream::connect(decoy).await.unwrap();
+    let forwarded =
+        zero_security::tls13::post_handshake::observe_with_the_clients_hello(site, &hello)
+            .await
+            .expect("the site's answer to the client's hello");
+
+    // The site answers the client's own hello with the same cipher suite
+    // and the same key-share group it would have answered a probe with.
+    let answer = forwarded
+        .answer
+        .expect("the site did not answer the client's own hello");
+    assert_eq!(
+        answer.suite,
+        probed.answer.expect("the probe's answer").suite,
+        "the site chose a different suite for the client's hello"
+    );
+    assert_eq!(
+        answer.group,
+        probed.answer.expect("the probe's answer").group,
+        "the site chose a different group for the client's hello"
+    );
+
+    // The flight is *nearly* the same, and the difference is the point: a
+    // site sends its EncryptedExtensions and its Certificate eagerly, but
+    // holds its CertificateVerify and its own Finished until the client's
+    // Finished arrives. The port does not forward the visitor's Finished,
+    // so the last two records of the flight are not there.
+    //
+    // Go gets all of them, because its `MirrorConn` forwards every byte
+    // read from the visitor (`RL/tls.go:70-83`) and its connection to the
+    // site is the visitor's connection in the other direction.
+    assert!(
+        forwarded.flight.len() < probed.flight.len(),
+        "the forwarded flight was {} records and the probed one {}: the \
+         site's Finished is missing from the first, which is the difference \
+         this records",
+        forwarded.flight.len(),
+        probed.flight.len()
+    );
+    assert_eq!(
+        &forwarded.flight[..],
+        &probed.flight[..forwarded.flight.len()],
+        "the flight the site sent for the client's hello differs from the \
+         one it sent for the probe's"
+    );
+}
+
 /// The REALITY server this workspace has, on a loopback port, with a record of
 /// what it did with every connection it was given.
 async fn spawn_reality_server(

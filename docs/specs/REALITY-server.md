@@ -71,17 +71,22 @@ What is *not* closed is what the rows below still say.
   closes the connection (`RL/tls.go:168-172`) — a site that is down for a
   moment is not a reason for a REALITY listener to be down, but it is a
   difference (§1, §6);
-* the site is dialled twice per connection, and the two connections are
-  different — Go dials the site once and uses that one connection for
+* the site is dialled twice per connection, and the flight comes from the
+  second — Go dials the site once and uses that one connection for
   everything: the client's own hello is forwarded to it
   (`RL/tls.go:70-83`), the site's flight and post-handshake records are
   read back off it (`:293-330`, `:404-421`), and the *same* connection
-  carries the visitor's bytes in the other direction. The port dials it
-  twice: once to ask it with the client's hello — which is where the
-  cipher suite and the key-share group come from — and once more to ask
-  for the flight, because a site sends its encrypted records only to a
-  connection whose handshake completes, and the port does not forward the
-  visitor's Finished to it (§1, §3, §6);
+  carries the visitor's bytes in the other direction — so the visitor's
+  Finished reaches the site, and the site's own Finished comes back. The
+  port dials it twice: once to ask it with the client's hello, which is
+  where the cipher suite and the key-share group come from, and once more
+  to ask for the flight, because the port does not forward the visitor's
+  Finished to the site. Measured against a real Xray decoy, the site
+  answers the forwarded hello with the same suite and the same group, and
+  with the first four records of the flight — the ServerHello, the
+  compatibility CCS and two encrypted records — but not the last two: a
+  site holds its CertificateVerify and its own Finished until the client's
+  Finished arrives (`the_site_answers_the_clients_own_hello`) (§1, §3, §6);
 * the cipher suite and the key-share group are the *site's*, taken from its
   ServerHello, as Go takes them (`RL/handshake_server_tls13.go:100-128`) —
   and the site is asked with the *client's own* hello, forwarded verbatim,
