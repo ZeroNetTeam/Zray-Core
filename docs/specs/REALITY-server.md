@@ -50,7 +50,7 @@ is the one that fails without it.
 | Duplicate key share (§1) | the *first* share of a group wins, as both of Go's scans do | `server::tests::the_first_share_of_a_duplicated_group_is_the_one_that_counts` |
 | Gate order (§1) | seal, then client version, then clock, then short id, in Go's order | `server::tests::a_hello_that_fails_several_gates_is_refused_for_go_s_first_one` |
 | Cleartext record cap (§3) | 16384 + 2048 before the keys are negotiated, as `maxCiphertext` is | `zero-security/src/tls13/record.rs` (`MAX_CIPHERTEXT_BEFORE_TLS13`) + `server::tests::a_record_at_go_s_pre_negotiation_bound_is_read_then_relayed` and the oracle's `the_record_size_limit_is_the_oracles_at_the_edges` |
-| `shortIds: []`, `mldsa65Seed == privateKey`, 1–3 part versions, bare-port and unix `dest` (§7) | the rules Xray's JSON layer enforces, in both readers | `crates/reality/tests/config.rs` (five parity tests) + `crates/reality/src/config.rs` unit tests |
+| `shortIds: []`, `mldsa65Seed == privateKey`, 1–3 part versions, bare-port and unix `dest` (§7) | the rules Xray's JSON layer enforces, in both readers | `crates/reality/tests/config.rs` (eight parity tests) + `crates/reality/src/config.rs` unit tests |
 | The fallback relay written twice (§6) | the runtime calls `reality::fallback::relay`; one implementation | `--test fallback` 8/8, `--test loopback_tls_interop` 26/26, `the_reality_server_limits_hold_against_the_oracles_client` |
 | A failed direction cancelling the other (§6) | the surviving direction gets a 250 ms grace to deliver what the peer already sent | `crates/reality/tests/fallback.rs::the_targets_answer_survives_the_write_to_the_target_failing` + the oracle's `the_record_size_limit_is_the_oracles_at_the_edges`, 20/20 runs |
 | `show` and `masterKeyLog` (§7) | both switches are read, and the handshake acts on them: a line per connection, and the traffic secrets in Go's order | `server::tests::the_show_switch_reports_what_the_client_sent` and `server::tests::the_key_log_writes_the_handshakes_traffic_secrets`; the key log's shape is compared against the official server's, over the official client, by `the_key_log_has_the_shape_the_officials_server_writes` |
@@ -62,25 +62,15 @@ on the accepting path.
 
 *MISSING (no Rust counterpart at all):*
 
-* `"shortIds": []` is refused by Xray (`XC/infra/conf/transport_internet.go:884-886`)
-  and by `crates/reality/src/config.rs:144-150`, but accepted by the inbound path
-  `crates/zero-config/src/xray_json.rs:907-930` (§7);
-* `mldsa65Seed == privateKey` is refused by Xray
-  (`XC/infra/conf/transport_internet.go:904-906`) and unchecked by both Rust
-  readers (`crates/reality/src/config.rs:159-162`) (§7).
 
 *DIVERGENT (present but different):*
 
-* SNI matching is ASCII-case-insensitive — `crates/reality/src/server.rs:190-194`
-  against `RL/tls.go:211` (§1);
 * no `supported_versions` check — `crates/reality/src/server.rs:559-567` against
   `RL/tls.go:211` with `RL/handshake_server.go:180-196` (§1);
 * the camouflage target is not dialled on the accepting path —
   `crates/reality/src/server.rs:144-258` against `RL/tls.go:168` (§1, §6);
 * a duplicated key share: last wins — `crates/reality/src/server.rs:653-662` against
   `RL/tls.go:214-228` (§2);
-* gate order: shortId before version and clock —
-  `crates/reality/src/server.rs:232-251` against `RL/tls.go:257-262` (§2);
 * cipher-suite choice follows the client, not the decoy or a server list —
   `crates/reality/src/server.rs:559-567`, `:675-700` against
   `RL/handshake_server_tls13.go:102` (§3);
@@ -105,13 +95,6 @@ on the accepting path.
 * `burstBytesPerSec` below `bytesPerSec` is used as written instead of being raised —
   `crates/zero-runtime/src/throttle.rs:60-66`, documented at
   `crates/reality/src/fallback.rs:102-105`, against `RL/tls.go:127-130` (§6);
-* a missing `dest`/`target` is accepted silently —
-  `crates/zero-config/src/xray_json.rs:931-936` with
-  `crates/zero-runtime/src/server.rs:2407-2415` against
-  `XC/infra/conf/transport_internet.go:841-843` (§7);
-* `minClientVer`/`maxClientVer` require three dotted parts —
-  `crates/zero-config/src/xray_json.rs:951-968`, `crates/reality/src/config.rs:270-278`
-  against `XC/infra/conf/transport_internet.go:856-883` (§7);
 * both readers accept standard base64 as well as unpadded base64url for
   `privateKey` — `crates/zero-config/src/xray_json.rs:6581-6590` against
   `XC/infra/conf/transport_internet.go:850-855`: a superset, so no valid Xray config
@@ -257,24 +240,19 @@ also how a peer that vanishes mid-hello is handled. The runtime turns `Fallback`
 into `Secured::Fallback` (`ZR/server.rs:2375-2383`) and calls
 `relay_reality_fallback` (`ZR/server.rs:2395-2489`), which is §6.
 
-**Status: PORTED**, with four named differences:
+**Status: PORTED**, with three named differences:
 
-1. **SNI comparison is a superset.** Rust matches with
-   `name.eq_ignore_ascii_case(&hello.sni)` (`RB/server.rs:190-194`) where Go does an
-   exact map lookup (`RL/tls.go:211`). A config listing `www.example.com` therefore
-   also accepts `WWW.EXAMPLE.COM`. Harmless in practice (the selector that matters
-   is the sealed shortId) but it is a real difference in the accepted set.
-2. **No `supported_versions` check.** The Rust port never reads the extension; it
+1. **No `supported_versions` check.** The Rust port never reads the extension; it
    infers TLS 1.3 from finding a cipher suite it knows in the offered list
    (`RB/server.rs:559-567`). Go requires `c.vers == VersionTLS13` from
    `mutualVersion` (`RL/tls.go:211` with `RL/handshake_server.go:180-196`). A peer
    offering `TLS_AES_128_GCM_SHA256` without `supported_versions: 0x0304` is
    authenticated by Rust and handed to the decoy by Go.
-3. **The decoy is not dialled on this path.** `RL/tls.go:168` dials `dest` for every
+2. **The decoy is not dialled on this path.** `RL/tls.go:168` dials `dest` for every
    connection, authenticated or not; the Rust intake reaches
    `HandshakeOutcome::Accepted` without ever touching the target. The consequences
    are spelled out in §3 (record shaping) and §6 (what a prober sees).
-4. **Per-record bound before version negotiation.** Both bounds end in a fallback for
+3. **Per-record bound before version negotiation.** Both bounds end in a fallback for
    anything larger, and both now agree: the port applies Go's 18432
    (`ZS/record.rs:47`, `MAX_CIPHERTEXT_BEFORE_TLS13 = MAX_PLAINTEXT + 2048`)
    until the version is known (`RL/conn.go:707` with `RL/common.go:64-66`), and
@@ -450,13 +428,12 @@ the all-zero one.
    twice, so no honest client can reach the difference, but a probe could: the two
    implementations would authenticate against different points and only one would
    accept.
-2. **Order and explicitness of the gates.** Rust checks the shortId *before* the
-   version and clock (`RB/server.rs:232-251`); Go checks version and clock first
-   (`RL/tls.go:257-259`). It also refuses a session id that is not exactly 32 bytes
-   at parse time (`RB/server.rs:548-550`) where Go would try to open a
-   zero-filled 32-byte buffer — same outcome (fallback), clearer reason.
-   Because every failure is silent, the difference is observable only in timing and
-   in the server's own logs.
+2. **Explicitness of the gates.** Rust refuses a session id that is not exactly 32
+   bytes at parse time (`RB/server.rs`) where Go would try to open a zero-filled
+   32-byte buffer — same outcome (fallback), clearer reason. The *order* of the
+   gates is Go's: the version and the clock first (`RL/tls.go:257-259`), then the
+   shortId (`RB/server.rs`). Because every failure is silent, the difference is
+   observable only in timing and in the server's own logs.
 
 **Proved by.** `OR:1177-1187` and `OR:2115-2125`
 (`reality_with_the_mldsa65_binding_matches_the_oracle`) drive an unmodified Xray
@@ -1343,11 +1320,11 @@ turns JSON into the fields Xray hands to REALITY).
 | 4 | `xver` | uint64, default `0`; `1`/`2` write a PROXY header to the target (`RL/tls.go:174-180`); `>2` refused at parse time (`XC/…:844-846`) | **honoured** (`ZC/xray_json.rs:985-993`, `RB/config.rs:178-186`, used at `ZR/server.rs:2433-2441`) |
 | 5 | `server_names` | repeated string, must be non-empty (`XC/…:847-849`), compared exactly (`RL/tls.go:211`) | **honoured**, non-empty enforced (`ZC/xray_json.rs:896-906`, `RB/config.rs:109-119`); compared exactly — **PORTED** (§1) |
 | 6 | `private_key` | bytes(32), unpadded base64url (`XC/…:850-855`) | **honoured** (`ZC/xray_json.rs:6581-6590`, `RB/config.rs:231-241`); both readers also accept standard base64, a widening of the accepted set |
-| 7 | `min_client_ver` | bytes(3); JSON `"1.2.3"`, 1–3 dotted parts, each < 256 (`XC/…:856-869`); compared big-endian (`RL/tls.go:257`) | **honoured** (`RB/server.rs:265-267`); parsing requires exactly three parts — **DIVERGENT**, stricter (`ZC/xray_json.rs:951-968`, `RB/config.rs:260-278`) |
+| 7 | `min_client_ver` | bytes(3); JSON `"1.2.3"`, 1–3 dotted parts, each < 256 (`XC/…:856-869`); compared big-endian (`RL/tls.go:257`) | **honoured** (`RB/server.rs:265-267`); one to three dotted parts, as Xray reads them (`ZC/xray_json.rs`, `RB/config.rs`) |
 | 8 | `max_client_ver` | as above (`XC/…:870-883`, `RL/tls.go:258`) | as above |
 | 9 | `max_time_diff` | uint64 **milliseconds**, default `0` meaning *no clock check*; converted to a `Duration` at `XC/transport/internet/reality/config.go:29`, compared symmetrically at `RL/tls.go:259` | **honoured, same unit** (`ZC/xray_json.rs:1000-1003`, `RB/config.rs:170-175`, `ZR/server.rs:486`, check at `RB/server.rs:272-288`) |
-| 10 | `short_ids` | repeated bytes(8); JSON hex ≤ 16 chars, decoded into eight zero-padded bytes (`XC/…:887-896`); must be non-empty (`:884-886`); exact map match (`RL/tls.go:260`) | **honoured, exact and zero-padded** (`ZC/xray_json.rs:907-930`, `RB/config.rs:121-143`, `RB/server.rs:235-244`); the *non-empty* rule is **MISSING** on the inbound path (§ below) |
-| 11 | `mldsa65_seed` | bytes(32) unpadded base64url; must differ from `privateKey` (`XC/…:903-910`) | **honoured** (`ZC/xray_json.rs:937-950`, `RB/config.rs:159-162`, `ZR/server.rs:485`); the "must differ" rule is **MISSING** |
+| 10 | `short_ids` | repeated bytes(8); JSON hex ≤ 16 chars, decoded into eight zero-padded bytes (`XC/…:887-896`); must be non-empty (`:884-886`); exact map match (`RL/tls.go:260`) | **honoured, exact and zero-padded** (`ZC/xray_json.rs`, `RB/config.rs:121-143`, `RB/server.rs:235-244`); the *non-empty* rule is honoured by **both** readers (§ below) |
+| 11 | `mldsa65_seed` | bytes(32) unpadded base64url; must differ from `privateKey` (`XC/…:903-910`) | **honoured** (`ZC/xray_json.rs`, `RB/config.rs:159-162`, `ZR/server.rs:485`); the "must differ" rule is honoured by **both** readers, which compare the bytes rather than the strings Xray compares (§ below) |
 | 12 | `limit_fallback_upload` | `{after_bytes, bytes_per_sec, burst_bytes_per_sec}`, all default `0` = unlimited (`XC/…:918-921`) | **honoured** (`ZC/xray_json.rs:969-984`, `RB/config.rs:280-299`, `ZR/server.rs:2455-2467`) with the burst-clamp difference of §6 |
 | 13 | `limit_fallback_download` | as above (`XC/…:922-925`) | as above |
 | 14 | `masterKeyLog` | string, a file path; the handshake's TLS 1.3 traffic secrets are appended to it in NSS format (`XC/…:926-931`, `RL/handshake_server_tls13.go:884-893`, `:1031-1040`) | **honoured** (`ZC/xray_json.rs`, `RB/config.rs:326-336`); the file is opened once per listener and every handshake appends to it, and a path that cannot be opened is reported and the listener runs without one — Xray does the same (`XC/transport/internet/reality/config.go:66-71`), and a debugging aid is not a reason for a listener to be down |
@@ -1399,19 +1376,18 @@ official Xray REALITY server writes, over the same official client
 
 ### Validation gaps, each with its consequence
 
-* **`"shortIds": []` is accepted on the inbound path.** Xray refuses an empty list
-  with ``empty "shortIds"`` (`XC/…:884-886`) and the standalone Rust reader refuses
-  it too (`RB/config.rs:144-150`), but `ZC/xray_json.rs:907-930` only requires the
-  key to be an array and never tests emptiness. A server started with
-  `"shortIds": []` comes up healthy and sends *every* client to the decoy, because
-  the fold over an empty list is `Choice::from(0)` (`RB/server.rs:235-237`). This is
-  the most consequential gap in this section: it is a silent misconfiguration with
-  the same shape as a censor's probe succeeding.
-* **`mldsa65Seed == privateKey` is not refused.** Xray rejects it at parse time
-  (`XC/…:904-906`); neither reader compares the two, so an operator can configure a
-  server whose ML-DSA binding adds nothing (the seed is the HMAC key material's
-  neighbour, and reusing one secret in two roles is exactly what the check exists to
-  prevent). **MISSING.**
+* **`"shortIds": []` is refused by both readers.** Xray refuses an empty list with
+  ``empty "shortIds"`` (`XC/…:884-886`); the compiler refuses it
+  (`ZC/xray_json.rs`) and so does the standalone reader (`RB/config.rs`). A server
+  started with `"shortIds": []` would come up healthy and send *every* client to
+  the decoy, because the fold over an empty list is `Choice::from(0)`
+  (`RB/server.rs:235-237`) — the same shape as a censor's probe succeeding.
+  **PORTED.**
+* **`mldsa65Seed == privateKey` is refused by both readers.** Xray rejects it at
+  parse time (`XC/…:904-906`); the compiler compares the two
+  (`ZC/xray_json.rs`) and so does the standalone reader (`RB/config.rs`), which
+  compares the bytes rather than the strings Xray compares — the same value, and
+  a stricter test of it. **PORTED.**
 * **A missing `dest`/`target` is now refused by both readers.** Xray requires it on
   a server block (`XC/…:841-843`) — and chooses the *role* by its presence (`:812`,
   `:926`). The compiler used to accept the block and leave the target unset, and the
@@ -1448,11 +1424,10 @@ both readers by `the_readers_agree_about_a_camouflage_target_they_cannot_dial`
 (`crates/reality/tests/config.rs`), together with a target that is not
 `host:port`; the unix shapes are driven by
 `the_readers_agree_about_a_unix_socket_target` and by
-`crates/zero-runtime/tests/reality_unix_target.rs`. Nothing yet drives
-`"shortIds": []` or
-`mldsa65Seed == privateKey` through `zero_config` and asserts that the config is
-refused, though both readers refuse them today. The rest of the table is either
-proven or read.
+`crates/zero-runtime/tests/reality_unix_target.rs`; `"shortIds": []` and
+`mldsa65Seed == privateKey` are driven through `zero_config` and through this
+crate's reader by `the_readers_agree_about_the_refusals_that_matter_most`. The
+rest of the table is either proven or read.
 
 _Unit reminder for operators:_ `maxTimeDiff` is **milliseconds** in JSON (both
 implementations), and `afterBytes` / `bytesPerSec` / `burstBytesPerSec` are **bytes

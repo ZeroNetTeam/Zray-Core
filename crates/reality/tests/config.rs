@@ -292,6 +292,52 @@ fn the_readers_agree_about_a_camouflage_target_they_cannot_dial() {
     }
 }
 
+/// Both readers refuse a server block that Xray refuses.
+///
+/// Two of Xray's refusals are the ones that matter most, because each lets a
+/// server come up healthy and then do something other than what the operator
+/// asked for:
+///
+/// * an empty `shortIds` — a server with no selector authenticates nobody,
+///   and every client is handed to the camouflage site instead;
+/// * an `mldsa65Seed` equal to the `privateKey` — the ML-DSA-65 binding adds
+///   nothing, because the two roles share one secret.
+///
+/// The compiler is the path an inbound actually runs, so these are driven
+/// through it as well as through this crate's reader.
+#[test]
+fn the_readers_agree_about_the_refusals_that_matter_most() {
+    for (what, extra) in [
+        ("an empty shortIds", json!({"shortIds": []})),
+        (
+            "an mldsa65Seed equal to the privateKey",
+            json!({"mldsa65Seed": "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0"}),
+        ),
+    ] {
+        let mut settings = server_settings();
+        let object = settings.as_object_mut().expect("object");
+        for (key, value) in extra.as_object().expect("object") {
+            object.insert(key.clone(), value.clone());
+        }
+
+        let compiler =
+            zero_config::compile_config(&document(&settings), zero_core::GenerationId(1))
+                .err()
+                .unwrap_or_else(|| panic!("the configuration compiler accepted {what}"));
+        assert!(
+            compiler.contains("shortIds") || compiler.contains("mldsa65Seed"),
+            "{what} was refused for the wrong reason: {compiler}"
+        );
+        let mine = RealityServerConfig::from_xray_settings(&settings)
+            .err()
+            .unwrap_or_else(|| panic!("this crate accepted {what}"));
+        assert!(
+            mine.contains("shortIds") || mine.contains("mldsa65Seed"),
+            "{what} was refused for the wrong reason: {mine}"
+        );
+    }
+}
+
 /// The two readers agree on a unix-socket target, and both carry it as the
 /// path it was written as.
 ///
