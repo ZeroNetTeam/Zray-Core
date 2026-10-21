@@ -124,6 +124,15 @@ pub struct PostHandshakeShapes(Mutex<Vec<Site>>);
 #[derive(Debug, Default, Clone)]
 struct Site {
     name: Box<str>,
+    /// The ALPN index the site's shapes are filed under, as Go files them
+    /// (`RL/tls.go:396-403`).
+    ///
+    /// Go's key is `dest + " " + sni + " " + alpn`, where the last part is
+    /// 0 for a client that offered no ALPN, 2 for one that offered h2 first
+    /// and 1 for anything else. A site that answers an h2 client
+    /// differently from an http/1.1 one is copied per protocol, so the
+    /// port's key is the same index rather than the name alone.
+    alpn: u8,
     /// Wire sizes of the site's first-flight records, ServerHello first.
     flight: Arc<[u16]>,
     /// Wire sizes of the records it sends after the handshake.
@@ -152,29 +161,33 @@ pub(super) struct SiteShapes {
 impl PostHandshakeShapes {
     /// Remember the post-handshake record sizes for `server_name`, replacing
     /// what was there. The first flight learned for the name, if any, stays.
-    pub fn set(&self, server_name: &str, wire_lens: &[u16]) {
-        self.edit(server_name, |site| site.after = wire_lens.into());
+    pub fn set(&self, server_name: &str, alpn: u8, wire_lens: &[u16]) {
+        self.edit(server_name, alpn, |site| site.after = wire_lens.into());
     }
 
     /// Remember the first flight's record sizes for `server_name`, replacing
     /// what was there (the post-handshake sizes stay).
-    pub fn set_flight(&self, server_name: &str, wire_lens: &[u16]) {
-        self.edit(server_name, |site| site.flight = wire_lens.into());
+    pub fn set_flight(&self, server_name: &str, alpn: u8, wire_lens: &[u16]) {
+        self.edit(server_name, alpn, |site| site.flight = wire_lens.into());
     }
 
     /// Remember how many records that advance nothing the site tolerates,
     /// for `server_name`.
-    pub fn set_budget(&self, server_name: &str, budget: u64) {
-        self.edit(server_name, |site| site.budget = Some(budget));
+    pub fn set_budget(&self, server_name: &str, alpn: u8, budget: u64) {
+        self.edit(server_name, alpn, |site| site.budget = Some(budget));
     }
 
-    fn edit(&self, server_name: &str, change: impl FnOnce(&mut Site)) {
+    fn edit(&self, server_name: &str, alpn: u8, change: impl FnOnce(&mut Site)) {
         let mut sites = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        match sites.iter_mut().find(|site| &*site.name == server_name) {
+        match sites
+            .iter_mut()
+            .find(|site| &*site.name == server_name && site.alpn == alpn)
+        {
             Some(site) => change(site),
             None => {
                 let mut site = Site {
                     name: server_name.into(),
+                    alpn,
                     ..Site::default()
                 };
                 change(&mut site);
@@ -184,9 +197,12 @@ impl PostHandshakeShapes {
     }
 
     /// What is known about `server_name`, for one handshake.
-    pub(super) fn site(&self, server_name: &str) -> SiteShapes {
+    pub(super) fn site(&self, server_name: &str, alpn: u8) -> SiteShapes {
         let sites = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        match sites.iter().find(|site| &*site.name == server_name) {
+        match sites
+            .iter()
+            .find(|site| &*site.name == server_name && site.alpn == alpn)
+        {
             Some(site) => SiteShapes {
                 flight: Some(Arc::clone(&site.flight)).filter(|lens| !lens.is_empty()),
                 after: Some(Arc::clone(&site.after)).filter(|lens| !lens.is_empty()),
@@ -217,6 +233,12 @@ struct ClientHelloInfo {
     /// and then a peer that cannot open a single record.
     hybrid: Option<HybridShare>,
     sni: String,
+    /// The protocols the client offered, in the order it offered them.
+    ///
+    /// Go files the shapes it learned per ALPN and picks the entry by the
+    /// client's own list (`RL/tls.go:396-403`), so a site that answers an
+    /// h2 client differently from an http/1.1 one is copied per protocol.
+    alpn: Vec<String>,
     suite: CipherSuite,
 }
 
@@ -402,9 +424,11 @@ where
     // keeps the answer, which is the same flight unless the site's certificate
     // has changed size since — and a server that cannot reach the site at
     // all is the case the live read handles and the cached one cannot.
-    let mut shapes = params.post_handshake.site(&hello.sni);
+    let mut shapes = params
+        .post_handshake
+        .site(&hello.sni, alpn_index(&hello.alpn));
     if let Some(decoy) = params.decoy.as_deref() {
-        match read_live_flight(decoy, &hello.sni).await {
+        match read_live_flight(decoy, &hello.sni, &hello.alpn).await {
             Ok(live) => shapes.flight = live,
             Err(error) => {
                 // The site could not be reached. Go's server would have closed
@@ -639,12 +663,17 @@ where
 async fn read_live_flight(
     decoy: &dyn DecoyDialer,
     server_name: &str,
+    alpn: &[String],
 ) -> Result<Option<Arc<[u16]>>, String> {
     let site = decoy.dial().await?;
-    let observed = zero_security::tls13::post_handshake::observe_all_with(
+    // The site is asked with the protocols the client offered, so the answer
+    // is the one that client would have got.
+    let protocols: Vec<&str> = alpn.iter().map(String::as_str).collect();
+    let observed = zero_security::tls13::post_handshake::observe_all_with_alpn(
         site,
         server_name,
         zero_security::tls13::post_handshake::SiteTrust::Unverified,
+        &protocols,
     )
     .await
     .map_err(|error| error.to_string())?;
@@ -843,6 +872,7 @@ fn parse_client_hello(message: Vec<u8>) -> Result<ClientHelloInfo, Failure> {
         return Err(reality_error("ClientHello extensions are truncated"));
     }
     let mut sni = None;
+    let mut alpn = None;
     let mut standalone_x25519 = None;
     let mut hybrid = None;
     let mut tls13_offered = false;
@@ -856,6 +886,8 @@ fn parse_client_hello(message: Vec<u8>) -> Result<ClientHelloInfo, Failure> {
         at += len;
         if typ == 0 {
             sni = parse_sni(body);
+        } else if typ == 16 {
+            alpn = parse_alpn(body);
         } else if typ == 43 {
             tls13_offered |= offers_tls13(body);
         } else if typ == 51 {
@@ -895,6 +927,7 @@ fn parse_client_hello(message: Vec<u8>) -> Result<ClientHelloInfo, Failure> {
         auth_key_share,
         hybrid,
         sni: sni.ok_or_else(|| reality_error("ClientHello has no SNI"))?,
+        alpn: alpn.unwrap_or_default(),
         suite,
     })
 }
@@ -937,6 +970,48 @@ fn parse_sni(body: &[u8]) -> Option<String> {
     std::str::from_utf8(body.get(5..5 + name_len)?)
         .ok()
         .map(str::to_string)
+}
+
+/// The protocols a client offered, in the order it offered them.
+///
+/// The `application_layer_protocol_negotiation` extension is a list of
+/// length-prefixed names (RFC 7301 §3.1). A malformed one is read as no
+/// protocols at all, which is what Go's own reader does with a list it
+/// cannot walk.
+fn parse_alpn(body: &[u8]) -> Option<Vec<String>> {
+    if body.len() < 2 {
+        return None;
+    }
+    let list_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    if list_len + 2 > body.len() {
+        return None;
+    }
+    let mut protocols = Vec::new();
+    let mut at = 2usize;
+    let end = 2 + list_len;
+    while at < end {
+        let name_len = *body.get(at)? as usize;
+        at += 1;
+        let name = std::str::from_utf8(body.get(at..at + name_len)?).ok()?;
+        protocols.push(name.to_string());
+        at += name_len;
+    }
+    Some(protocols)
+}
+
+/// The ALPN index the site's shapes are filed under, as Go files them.
+///
+/// Go's key is `dest + " " + sni + " " + alpn`, where the last part is 0 for
+/// a client that offered no ALPN, 2 for one that offered h2 first, and 1 for
+/// anything else (`RL/tls.go:396-403`). An *index* and not the list of
+/// protocols, because Go files a bucket: a client that offered `http/1.1`
+/// first gets the http/1.1 answer whichever else it offered.
+fn alpn_index(protocols: &[String]) -> u8 {
+    match protocols.split_first() {
+        None => 0,
+        Some((first, _)) if first == "h2" => 2,
+        Some(_) => 1,
+    }
 }
 
 /// Split a `key_share` extension into the standalone X25519 share and the
@@ -1788,9 +1863,11 @@ mod tests {
     #[tokio::test]
     async fn the_sites_post_handshake_records_are_replayed_by_size() {
         let (server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
-        server_params.post_handshake.set("example.test", &[255, 69]);
+        server_params
+            .post_handshake
+            .set("example.test", 2, &[255, 69]);
         // A different name's sizes are not this name's.
-        server_params.post_handshake.set("other.test", &[1000]);
+        server_params.post_handshake.set("other.test", 2, &[1000]);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
             let mut stream = handshake(server_io, &server_params).await.unwrap();
@@ -1829,7 +1906,7 @@ mod tests {
         let (server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
         server_params
             .post_handshake
-            .set_budget("example.test", budget);
+            .set_budget("example.test", 2, budget);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
             let mut stream = handshake(server_io, &server_params).await.unwrap();
@@ -1921,7 +1998,7 @@ mod tests {
         let cached = cached_flight();
         server_params
             .post_handshake
-            .set_flight("example.test", &cached);
+            .set_flight("example.test", 2, &cached);
         server_params.decoy = Some(Arc::clone(&site.dialer) as Arc<dyn DecoyDialer>);
 
         let seen = flight_sizes(&server_params, &client_params).await;
@@ -2081,6 +2158,72 @@ mod tests {
         }
     }
 
+    /// The ALPN index is Go's, and it is a bucket.
+    ///
+    /// Go files the shapes it learned under `dest + " " + sni + " " + alpn`,
+    /// where the last part is 0 for a client that offered no ALPN, 2 for one
+    /// that offered h2 first, and 1 for anything else
+    /// (`RL/tls.go:396-403`). A client that offered `http/1.1` first is
+    /// therefore in the same bucket as one that offered only `http/1.1`.
+    #[test]
+    fn the_alpn_index_is_go_s_bucket() {
+        let protocols = |list: &[&str]| list.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(alpn_index(&[]), 0, "no ALPN is 0");
+        assert_eq!(
+            alpn_index(&protocols(&["h2", "http/1.1"])),
+            2,
+            "h2 first is 2"
+        );
+        assert_eq!(alpn_index(&protocols(&["http/1.1"])), 1, "http/1.1 is 1");
+        assert_eq!(
+            alpn_index(&protocols(&["http/1.1", "h2"])),
+            1,
+            "http/1.1 first is 1, whatever else was offered"
+        );
+        assert_eq!(
+            alpn_index(&protocols(&["spdy/3"])),
+            1,
+            "an unknown protocol is 1"
+        );
+    }
+
+    /// The shapes a client gets are the ones filed under *its* ALPN.
+    ///
+    /// A site can answer an h2 client differently from an http/1.1 one, so
+    /// the port learns the site three ways and hands each client the answer
+    /// that matches what it asked for.
+    #[test]
+    fn a_client_gets_the_shapes_filed_under_its_alpn() {
+        let shapes = PostHandshakeShapes::default();
+        shapes.set_flight("example.test", 2, &[200, 200]);
+        shapes.set_flight("example.test", 1, &[100, 100]);
+        shapes.set_flight("example.test", 0, &[50, 50]);
+
+        let h2 = shapes.site("example.test", 2);
+        let http1 = shapes.site("example.test", 1);
+        let none = shapes.site("example.test", 0);
+        assert_eq!(
+            h2.flight.as_deref(),
+            Some(&[200u16, 200][..]),
+            "the h2 client's own answer"
+        );
+        assert_eq!(
+            http1.flight.as_deref(),
+            Some(&[100u16, 100][..]),
+            "the http/1.1 client's own answer"
+        );
+        assert_eq!(
+            none.flight.as_deref(),
+            Some(&[50u16, 50][..]),
+            "the client that offered no ALPN"
+        );
+        // A name with no answer of its own has none.
+        assert!(
+            shapes.site("other.test", 2).flight.is_none(),
+            "another name has no shapes"
+        );
+    }
+
     /// The site's TLS configuration.
     fn site_config() -> Arc<rustls::ServerConfig> {
         const CERT: &[u8] = include_bytes!("../../zero-runtime/tests/fixtures/loopback-cert.pem");
@@ -2146,14 +2289,14 @@ mod tests {
         ];
         server_params
             .post_handshake
-            .set_flight("example.test", &learned);
+            .set_flight("example.test", 2, &learned);
         assert_eq!(flight_sizes(&server_params, &client_params).await, learned);
 
         // The same server, a name nothing was learned for.
         let (untouched_params, _) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
         untouched_params
             .post_handshake
-            .set_flight("other.test", &learned);
+            .set_flight("other.test", 2, &learned);
         assert_eq!(
             flight_sizes(&untouched_params, &client_params).await,
             natural
@@ -2173,7 +2316,7 @@ mod tests {
         elsewhere.extend([natural[2] + 64, natural[3] + 512, natural[4], natural[5]]);
         server_params
             .post_handshake
-            .set_flight("example.test", &elsewhere);
+            .set_flight("example.test", 2, &elsewhere);
         assert_eq!(
             flight_sizes(&server_params, &client_params).await,
             natural,
@@ -2185,7 +2328,9 @@ mod tests {
         let (odd_ccs, _) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
         let mut not_six: Vec<u16> = vec![natural[0], 32];
         not_six.extend([natural[2], natural[3], natural[4], natural[5]]);
-        odd_ccs.post_handshake.set_flight("example.test", &not_six);
+        odd_ccs
+            .post_handshake
+            .set_flight("example.test", 2, &not_six);
         assert_eq!(flight_sizes(&odd_ccs, &client_params).await, natural);
     }
 
@@ -2201,7 +2346,7 @@ mod tests {
         too_small[3] = natural[3] - 128;
         server_params
             .post_handshake
-            .set_flight("example.test", &too_small);
+            .set_flight("example.test", 2, &too_small);
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let client = tokio::spawn(async move {

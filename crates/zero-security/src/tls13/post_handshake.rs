@@ -262,9 +262,27 @@ pub async fn observe_all_with<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    observe_all_with_alpn(io, server_name, trust, &["h2", "http/1.1"]).await
+}
+
+/// The same, with the protocols the probe offers the site.
+///
+/// A site can answer an h2 client differently from an http/1.1 one, so
+/// Go probes it three ways — with no ALPN, with http/1.1, and with
+/// h2 and http/1.1 — and files what it learned under the protocol the
+/// *client* used (`RL/record_detect.go:21-62`, `RL/tls.go:396-403`).
+pub async fn observe_all_with_alpn<S>(
+    io: S,
+    server_name: &str,
+    trust: SiteTrust,
+    alpn: &[&str],
+) -> Result<SiteShapes, Failure>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let (tap, taps) = tap_with_flight(io);
     let params = TlsParams::new(server_name)
-        .with_alpn(&["h2", "http/1.1"])
+        .with_alpn(alpn)
         .with_profile(FingerprintProfile::Chrome)
         .with_insecure(trust == SiteTrust::Unverified);
     let mut stream = crate::tls::connect(tap, &params).await?;

@@ -2529,12 +2529,15 @@ async fn reality_refuses_a_client_the_sites_flight_is_too_small_for() {
     // are shared with the running listener through an `Arc`, which is how the
     // runtime files what it learned at start-up under a server already
     // accepting connections.
+    // The Xray client offers h2 and http/1.1, so it is handed the shapes
+    // filed under that index — the same one the runtime would have learned
+    // for it.
     params
         .post_handshake
-        .set_flight(REALITY_SNI, &shapes.flight);
+        .set_flight(REALITY_SNI, 2, &shapes.flight);
     params
         .post_handshake
-        .set(REALITY_SNI, &shapes.post_handshake);
+        .set(REALITY_SNI, 2, &shapes.post_handshake);
 
     // Every authenticated connection from here on is refused: the site's
     // certificate record cannot hold this server's certificate, and a flight

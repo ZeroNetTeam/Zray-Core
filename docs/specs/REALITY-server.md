@@ -57,6 +57,7 @@ is the one that fails without it.
 | The decoy's tolerance for records that advance nothing (§5) | the site is probed at start-up, and the answer is applied to the connections this server accepts | `ZS/ccs_probe.rs`; `server::tests::the_server_puts_up_with_what_the_site_puts_up_with` |
 | A unix-socket camouflage target (§7) | the target is dialled as a socket, and an unauthenticated visitor is handed to it | `crates/zero-runtime/tests/reality_unix_target.rs` |
 | The site is dialled for every connection, and its flight read off that connection (§1, §3) | the flight the client sees is the site's, read live, as Go's is | `server::tests::the_flight_is_read_off_the_site_on_every_connection` |
+| The site's shapes are filed per ALPN, and the client is handed the ones that match (§3, §5) | the site is asked three ways, and a client gets the answer for the ALPN it offered | `server::tests::the_alpn_index_is_go_s_bucket` and `server::tests::a_client_gets_the_shapes_filed_under_its_alpn` |
 
 What is *not* closed is what the rows below still say.
 
@@ -81,14 +82,6 @@ What is *not* closed is what the rows below still say.
 * the ML-DSA-65 extension uses OID 1.3 at a computed offset instead of Go's
   placeholder OID 0.0 at a fixed one — `crates/reality/src/server.rs:835-843`
   against `RL/handshake_server_tls13.go:82`; invisible to both clients (§3, §4);
-* the useless-record budget is learned from the decoy, but the probe is not
-  filed under the ALPN the client asked for — Go keys both numbers under
-  `dest + " " + sni + " " + alpn` and the accepting connection picks them up
-  by the ALPN *it* offered (`RL/tls.go:396-403`), so a decoy that answers
-  differently to an h2 client than to an http/1.1 one is copied per ALPN; the
-  port learns one budget per name and applies it to every client of that name
-  (`crates/zero-security/src/tls13/ccs_probe.rs`, `crates/reality/src/server.rs`)
-  (§5);
 * a session ticket or unknown post-handshake type from the peer is ignored, not
   alerted — `crates/zero-security/src/tls13/client.rs:925` against
   `RL/conn.go:1387-1398` (§5);
@@ -1000,7 +993,7 @@ all of them.
 |---|---|---|
 | Default budget of 32 consecutive useless records | **PORTED** | `RL/common.go:70`, `RL/conn.go:827-839`; the port counts the same kinds of records against the same default (`ZS/client.rs`, `MAX_USELESS_RECORDS`) |
 | Per-decoy learned budget (CCS probe) | **PORTED** | `RL/record_detect.go:137-185`, `RL/tls.go:425-427`; the port probes the decoy at start-up (`ZS/ccs_probe.rs`, `ZR/server.rs`) and applies the answer to the connections it accepts (`RB/server.rs`, `Tls13Stream::set_max_useless_records`) |
-| The budget is filed per ALPN | **DIVERGENT** | Go keys it under `dest + " " + sni + " " + alpn` and the accepting connection picks it up by the ALPN it offered (`RL/tls.go:396-403`); the port learns one budget per name and applies it to every client of that name |
+| The budget is filed per ALPN | **PORTED** | Go keys it under `dest + " " + sni + " " + alpn` and the accepting connection picks it up by the ALPN it offered (`RL/tls.go:396-403`); the port files it under the same index — 0 for no ALPN, 2 for h2 first, 1 otherwise — and the client is handed the answer that matches (`RB/server.rs`, `alpn_index`) |
 | Empty-record handling | **PORTED** | Go counts them against `MaxUselessRecords` (32 by default, `RL/conn.go:803-811`); the port counts them against the same budget |
 | Session-ticket tolerance | **DIVERGENT** | Go never issues one (`XC/…/reality/config.go:32`) and alerts if a client sends one; the port ignores any post-handshake type it does not know |
 | KeyUpdate | **PORTED** | `RL/conn.go:1401-1436` vs `ZS/client.rs`; the port accepts `mlen >= 1` where Go requires exactly one byte, which is a widening, not a disagreement on the reply |

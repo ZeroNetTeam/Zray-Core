@@ -9036,6 +9036,47 @@ const POST_HANDSHAKE_NAMES: usize = 8;
 /// Nothing waits on this. Until a site has answered, and for good if it never
 /// does, the inbound sends a flight of its own sizes and no extra records
 /// after a handshake, which is how every inbound behaved before.
+/// The three ways the camouflage site is asked about its handshake, and the
+/// key each answer is filed under.
+///
+/// Go probes the site three times per name — with no ALPN, with http/1.1, and
+/// with h2 and http/1.1 (`RL/record_detect.go:21-62`) — and files what it
+/// learned under `dest + " " + sni + " " + alpn`, where the last part is
+/// 0 for a client that offered no ALPN, 2 for one that offered h2 first, and
+/// 1 for anything else (`RL/tls.go:396-403`). The accepting connection picks
+/// the entry by the ALPN *it* offered, so a site that answers an h2 client
+/// differently from an http/1.1 one is copied per protocol.
+fn alpn_probes() -> [AlpnProbe; 3] {
+    [
+        AlpnProbe {
+            index: 0,
+            protocols: Vec::new(),
+        },
+        AlpnProbe {
+            index: 1,
+            protocols: vec!["http/1.1"],
+        },
+        AlpnProbe {
+            index: 2,
+            protocols: vec!["h2", "http/1.1"],
+        },
+    ]
+}
+
+/// One way of asking the site, and the key its answer is filed under.
+struct AlpnProbe {
+    /// The key the answer is filed under: Go's ALPN index, which is 0 for a
+    /// client that offered no ALPN, 2 for one that offered h2 first, and 1
+    /// for anything else (`RL/tls.go:396-403`).
+    ///
+    /// An *index* and not the list of protocols, because Go files a bucket:
+    /// a client that offered `http/1.1` first gets the http/1.1 answer
+    /// whichever else it offered.
+    index: u8,
+    /// The protocols the probe offers the site.
+    protocols: Vec<&'static str>,
+}
+
 fn learn_post_handshake(
     config: &RuntimeConfig,
     inbounds: &[InboundRuntime],
@@ -9066,86 +9107,100 @@ fn learn_post_handshake(
             let resolver = Arc::clone(resolver);
             let destination = Destination::tcp(address.clone(), port);
             runtime.spawn(async move {
-                let learned = timeout(Duration::from_secs(15), async {
-                    let site = outbound::connect_direct_with_resolver(
-                        &destination,
-                        &zero_config::StreamSettings::default(),
-                        &resolver,
-                    )
-                    .await?;
-                    // Unverified on purpose: this connection carries no
-                    // application data, the site is the operator's own choice
-                    // of camouflage, and requiring a public chain would leave
-                    // every private-CA or self-signed decoy unshaped — which
-                    // Go's REALITY handles, since it reads these sizes off the
-                    // live connection without verifying anything.
-                    zero_security::tls13::post_handshake::observe_all_with(
-                        site,
-                        &name,
-                        zero_security::tls13::post_handshake::SiteTrust::Unverified,
-                    )
-                    .await
-                })
-                .await;
-                match learned {
-                    Ok(Ok(learned)) => {
-                        debug!(
+                // The site is asked three ways, as Go asks it
+                // (`RL/record_detect.go:21-62`): with no ALPN, with http/1.1,
+                // and with h2 and http/1.1. A site can answer an h2 client
+                // differently from an http/1.1 one, and the answer is filed
+                // under the protocol the *client* used
+                // (`RL/tls.go:396-403`).
+                for alpn in alpn_probes() {
+                    let learned = timeout(Duration::from_secs(15), async {
+                        let site = outbound::connect_direct_with_resolver(
+                            &destination,
+                            &zero_config::StreamSettings::default(),
+                            &resolver,
+                        )
+                        .await?;
+                        // Unverified on purpose: this connection carries no
+                        // application data, the site is the operator's own choice
+                        // of camouflage, and requiring a public chain would leave
+                        // every private-CA or self-signed decoy unshaped — which
+                        // Go's REALITY handles, since it reads these sizes off the
+                        // live connection without verifying anything.
+                        zero_security::tls13::post_handshake::observe_all_with_alpn(
+                            site,
+                            &name,
+                            zero_security::tls13::post_handshake::SiteTrust::Unverified,
+                            &alpn.protocols,
+                        )
+                        .await
+                    })
+                    .await;
+                    match learned {
+                        Ok(Ok(learned)) => {
+                            debug!(
+                                %name,
+                                alpn = ?alpn.protocols,
+                                flight = ?learned.flight,
+                                post_handshake = ?learned.post_handshake,
+                                "REALITY target's handshake shapes learned"
+                            );
+                            shapes.set_flight(&name, alpn.index, &learned.flight);
+                            shapes.set(&name, alpn.index, &learned.post_handshake);
+                        }
+                        Ok(Err(error)) => warn!(
+                            %name, %error,
+                            "REALITY target did not complete a handshake; this inbound will copy neither its flight nor its session tickets. Check that the target serves this name."
+                        ),
+                        Err(_) => warn!(
                             %name,
-                            flight = ?learned.flight,
-                            post_handshake = ?learned.post_handshake,
-                            "REALITY target's handshake shapes learned"
-                        );
-                        shapes.set_flight(&name, &learned.flight);
-                        shapes.set(&name, &learned.post_handshake);
+                            "REALITY target did not answer in time; this inbound will copy neither its flight nor its session tickets. Check that the server can reach the target."
+                        ),
                     }
-                    Ok(Err(error)) => warn!(
-                        %name, %error,
-                        "REALITY target did not complete a handshake; this inbound will copy neither its flight nor its session tickets. Check that the target serves this name."
-                    ),
-                    Err(_) => warn!(
-                        %name,
-                        "REALITY target did not answer in time; this inbound will copy neither its flight nor its session tickets. Check that the server can reach the target."
-                    ),
-                }
-                // How many records that advance nothing the target tolerates.
-                // The server answers with the same number, so that it cannot
-                // be told apart from the target by how long it puts up with
-                // a run of them (`RL/record_detect.go:137-185`).
-                let budget = timeout(Duration::from_secs(30), async {
-                    zero_security::tls13::ccs_probe::probe_budget(
-                        || async {
-                            outbound::connect_direct_with_resolver(
-                                &destination,
-                                &zero_config::StreamSettings::default(),
-                                &resolver,
-                            )
-                            .await
-                            .map_err(|error| {
-                                zero_core::Failure::new(
-                                    zero_core::FailureKind::TcpRefused,
-                                    zero_core::Stage::SocketConnected,
+
+                    // How many records that advance nothing the target
+                    // tolerates. The server answers with the same number, so
+                    // that it cannot be told apart from the target by how long
+                    // it puts up with a run of them
+                    // (`RL/record_detect.go:137-185`). The probe asks the
+                    // site the same way Go does, with the protocol the client
+                    // would have used.
+                    let budget = timeout(Duration::from_secs(30), async {
+                        zero_security::tls13::ccs_probe::probe_budget(
+                            || async {
+                                outbound::connect_direct_with_resolver(
+                                    &destination,
+                                    &zero_config::StreamSettings::default(),
+                                    &resolver,
                                 )
-                                .with_detail(error.to_string())
-                            })
-                        },
-                        &name,
-                    )
-                    .await
-                })
-                .await;
-                match budget {
-                    Ok(Some(budget)) => {
-                        debug!(%name, budget, "REALITY target's record budget learned");
-                        shapes.set_budget(&name, budget);
+                                .await
+                                .map_err(|error| {
+                                    zero_core::Failure::new(
+                                        zero_core::FailureKind::TcpRefused,
+                                        zero_core::Stage::SocketConnected,
+                                    )
+                                    .with_detail(error.to_string())
+                                })
+                            },
+                            &name,
+                        )
+                        .await
+                    })
+                    .await;
+                    match budget {
+                        Ok(Some(budget)) => {
+                            debug!(%name, budget, "REALITY target's record budget learned");
+                            shapes.set_budget(&name, alpn.index, budget);
+                        }
+                        Ok(None) => debug!(
+                            %name,
+                            "REALITY target's record budget could not be learned; this inbound will use the default"
+                        ),
+                        Err(_) => debug!(
+                            %name,
+                            "REALITY target did not answer in time about its record budget; this inbound will use the default"
+                        ),
                     }
-                    Ok(None) => debug!(
-                        %name,
-                        "REALITY target's record budget could not be learned; this inbound will use the default"
-                    ),
-                    Err(_) => debug!(
-                        %name,
-                        "REALITY target did not answer in time about its record budget; this inbound will use the default"
-                    ),
                 }
             });
         }

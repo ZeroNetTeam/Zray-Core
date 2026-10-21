@@ -112,10 +112,10 @@ impl InProcessServer {
                     Ok(learned) => {
                         params
                             .post_handshake
-                            .set_flight(server_name, &learned.flight);
+                            .set_flight(server_name, 0, &learned.flight);
                         params
                             .post_handshake
-                            .set(server_name, &learned.post_handshake);
+                            .set(server_name, 0, &learned.post_handshake);
                         Shapes::Learned {
                             flight: learned.flight,
                             post_handshake: learned.post_handshake,
