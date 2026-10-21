@@ -89,7 +89,10 @@ What is *not* closed is what the rows below still say.
   flight is assembled from records that arrive concurrently with the
   handshake, with the last two of them still guesses when the server's own
   flight goes out — while the port's is the site's flight complete, from
-  a handshake that finished. The one thing the port's flight is not is
+  a handshake that finished. That is proved rather than argued: the
+  differential test `reality_flight_record_sizes_match_the_camouflage_site`
+  measures the site's own flight and compares it with the one the client
+  receives, by list equality, through a real Xray client. The one thing the port's flight is not is
   the site's answer to the *visitor's* hello: it is the site's answer to
   a probe's, which offers the same protocols and the same session-id
   length, so the sizes agree for every site that answers alike — but a
