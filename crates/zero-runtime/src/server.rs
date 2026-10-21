@@ -2422,28 +2422,51 @@ impl Server {
         let zero_config::InboundSecurity::Reality(reality) = security else {
             return;
         };
-        let Some(target) = reality.target.clone() else {
-            self.stats.failed.fetch_add(1, Ordering::Relaxed);
-            debug!(
-                %peer,
-                error = %failure,
-                "REALITY handshake rejected without a fallback target"
-            );
-            return;
-        };
-        let destination = Destination::tcp(target.0, target.1);
-        let resolver = self.resolver();
-        let remote = match outbound::connect_direct_with_resolver(
-            &destination,
-            &zero_config::StreamSettings::default(),
-            &resolver,
-        )
-        .await
-        {
-            Ok(remote) => remote,
-            Err(error) => {
+        // The target is a host and a port, or a unix socket path: Xray's
+        // `type` decides which, and the fallback relay dials whichever it is
+        // (`infra/conf/transport_internet.go:820-838`, `RL/tls.go:168`).
+        let (destination, remote) = match reality.target.clone() {
+            Some(zero_config::RealityTarget::Host(address, port)) => {
+                let target = (address, port);
+                let destination = Destination::tcp(target.0, target.1);
+                let resolver = self.resolver();
+                let remote = match outbound::connect_direct_with_resolver(
+                    &destination,
+                    &zero_config::StreamSettings::default(),
+                    &resolver,
+                )
+                .await
+                {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                        debug!(%peer, error = %error, "REALITY fallback target connection failed");
+                        return;
+                    }
+                };
+                (destination, remote)
+            }
+            Some(zero_config::RealityTarget::Unix(path)) => {
+                let remote = match connect_unix(&path).await {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                        debug!(%peer, error = %error, "REALITY fallback target connection failed");
+                        return;
+                    }
+                };
+                (
+                    Destination::tcp(Address::parse_host("localhost"), 0),
+                    remote,
+                )
+            }
+            None => {
                 self.stats.failed.fetch_add(1, Ordering::Relaxed);
-                debug!(%peer, error = %error, "REALITY fallback target connection failed");
+                debug!(
+                    %peer,
+                    error = %failure,
+                    "REALITY handshake rejected without a fallback target"
+                );
                 return;
             }
         };
@@ -8980,7 +9003,12 @@ fn learn_post_handshake(
         else {
             continue;
         };
-        let Some((address, port)) = reality.target.clone() else {
+        // The site is asked about its shapes over a TCP connection, so a unix
+        // target is not asked: the shapes would come from a socket the
+        // operator's own site serves, which is the same place the fallback
+        // goes, but the shapes are learned over TLS and a unix socket carries
+        // no certificate to speak of.
+        let Some(zero_config::RealityTarget::Host(address, port)) = reality.target.clone() else {
             continue;
         };
         let names = reality.server_names.iter().filter(|name| !name.is_empty());
@@ -10000,6 +10028,87 @@ mod tests {
 }
 
 /// Xray's `limitFallbackUpload` / `limitFallbackDownload` as the fallback relay
+/// Dial a Linux abstract socket, whose name is the leading NUL byte and the
+/// name itself.
+///
+/// Neither Tokio nor socket2 has a call for one, so the socket is made
+/// directly: `connect(2)` on an `AF_UNIX` address whose first byte is NUL
+/// names the abstract namespace.
+#[cfg(unix)]
+fn connect_abstract(name: &str) -> std::io::Result<tokio::net::UnixStream> {
+    let mut address = Vec::with_capacity(name.len() + 1);
+    address.push(0u8);
+    address.extend_from_slice(name.as_bytes());
+    // `sockaddr_un` is a family byte followed by the path.
+    let mut sockaddr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    sockaddr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if address.len() > sockaddr.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the abstract socket name is too long",
+        ));
+    }
+    for (slot, byte) in sockaddr.sun_path.iter_mut().zip(address.iter()) {
+        *slot = *byte as libc::c_char;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let connected = unsafe {
+        libc::connect(
+            fd,
+            &sockaddr as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if connected < 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    // The socket is already connected; it is handed to Tokio, which wants it
+    // non-blocking.
+    use std::os::fd::FromRawFd;
+    let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    std_stream
+        .set_nonblocking(true)
+        .map_err(|_| std::io::Error::last_os_error())?;
+    tokio::net::UnixStream::from_std(std_stream).map_err(|_| std::io::Error::last_os_error())
+}
+
+/// Dial a unix socket, as Xray's `type: "unix"` target is dialled.
+///
+/// The path is used as written: a leading `@` is Linux's abstract socket
+/// namespace (`infra/conf/transport_internet.go:826-831`), and anything else
+/// is a filesystem path.
+async fn connect_unix(path: &str) -> Result<zero_core::BoxStream, String> {
+    #[cfg(unix)]
+    {
+        use tokio::net::UnixStream;
+        let stream = if let Some(name) = path.strip_prefix('@') {
+            // An abstract socket has no path on the filesystem: its name is
+            // the leading NUL byte and the name itself. Neither Tokio nor
+            // socket2 has a call for one, so the socket is made directly.
+            match connect_abstract(name) {
+                Ok(stream) => stream,
+                Err(error) => return Err(format!("connecting to {path:?}: {error}")),
+            }
+        } else {
+            match UnixStream::connect(path).await {
+                Ok(stream) => stream,
+                Err(error) => return Err(format!("connecting to {path:?}: {error}")),
+            }
+        };
+        Ok(boxed(stream))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err("this platform has no unix sockets, so the target cannot be dialled".to_string())
+    }
+}
+
 /// in `reality` takes them: the same three numbers, in the type the relay and
 /// the settings reader share, so neither side can pass the upload limit where
 /// the download limit belongs without the compiler noticing.

@@ -3554,12 +3554,28 @@ pub struct InboundTlsConfig {
     pub reject_unknown_sni: bool,
 }
 
+/// The camouflage target, in whichever of the two kinds Xray dials.
+///
+/// `type: "unix"` makes the target a path; anything else makes it a host and
+/// a port (`infra/conf/transport_internet.go:820-838`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RealityTarget {
+    /// A host and a port.
+    Host(Address, u16),
+    /// A unix socket: a filesystem path, or an abstract socket's `@name`.
+    Unix(Box<str>),
+}
+
 #[derive(Debug, Clone)]
 pub struct InboundRealityConfig {
     pub server_names: Box<[Box<str>]>,
     pub private_key: [u8; 32],
     pub short_ids: Box<[Box<[u8]>]>,
-    pub target: Option<(Address, u16)>,
+    /// The camouflage target, in whichever of the two kinds Xray dials.
+    ///
+    /// Xray's `type: "unix"` makes the target a path; anything else makes it
+    /// a host and a port (`infra/conf/transport_internet.go:820-838`).
+    pub target: Option<RealityTarget>,
     /// Xray's `mldsa65Seed`: the server signs every handshake with an
     /// ML-DSA-65 key made from this seed, so a client holding the matching
     /// `mldsa65Verify` key can tell the real server from one that merely

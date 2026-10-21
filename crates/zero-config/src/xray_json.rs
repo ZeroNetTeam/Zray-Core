@@ -946,7 +946,12 @@ fn parse_inbound_security(settings: Option<&Value>, path: &str) -> R<InboundSecu
             // answers a censor's probe with a silent nothing, which is the
             // opposite of the protocol's purpose. The reason for a shape that
             // cannot be dialled comes from `parse_reality_target`.
-            let target = match reality.get("dest").or_else(|| reality.get("target")) {
+            // Xray picks the target's kind from `type` when it is written, and
+            // infers it from the dest's shape when it is not
+            // (`infra/conf/transport_internet.go:820-838`): a dest that starts
+            // with `@` or `/` is a unix socket, a bare number is a port on
+            // localhost, and anything else must be host:port.
+            let dest = match reality.get("dest").or_else(|| reality.get("target")) {
                 None | Some(Value::Null) => {
                     return Err(format!(
                         "{path}: reality dest is required: an unauthenticated visitor has to be \
@@ -957,12 +962,18 @@ fn parse_inbound_security(settings: Option<&Value>, path: &str) -> R<InboundSecu
                     let text = value
                         .as_str()
                         .ok_or_else(|| format!("{path}: reality dest must be a string"))?;
-                    Some(
-                        parse_reality_target(text)
-                            .map_err(|reason| format!("{path}: reality {reason}"))?,
-                    )
+                    text.to_string()
                 }
             };
+            let kind = match reality.get("type") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(text)) => Some(text.clone()),
+                Some(_) => return Err(format!("{path}: reality type must be \"tcp\" or \"unix\"")),
+            };
+            let target = Some(
+                parse_reality_target(&dest, kind.as_deref())
+                    .map_err(|reason| format!("{path}: reality {reason}"))?,
+            );
             // The two diagnostics switches are shape-checked the way Xray's own
             // JSON decode checks them (`infra/conf/transport_internet.go:781-782`)
             // and then have nowhere to go: this core's REALITY settings carry
@@ -6735,33 +6746,52 @@ fn parse_reality_pubkey(s: &str) -> Result<[u8; 32], String> {
 }
 
 /// Xray's `dest` / `target` for a REALITY server
-/// (`infra/conf/transport_internet.go:820-843`): a bare port means
-/// `localhost:<port>`, anything else must be host:port. A unix-socket path is a
-/// real Xray feature this core does not dial yet, so it is refused rather than
-/// resolved as a host name.
-fn parse_reality_target(text: &str) -> Result<(Address, u16), String> {
+/// (`infra/conf/transport_internet.go:815-843`).
+///
+/// The kind comes from `type` when the operator wrote one, and is inferred
+/// from the dest's shape when they did not: a dest that starts with `@` or
+/// `/` is a unix socket, a bare number is a port on localhost, and anything
+/// else must be host:port. A dest that is neither — and no `type` to say
+/// what it is — is what Xray refuses with "please fill in a valid value for
+/// \"target\"".
+///
+/// The two kinds are returned apart, because the fallback relay dials them
+/// differently: one is a host and a port, the other a path.
+fn parse_reality_target(text: &str, kind: Option<&str>) -> Result<RealityTarget, String> {
     let text = text.trim();
-    if let Some(name) = text.strip_prefix('@') {
-        return Err(format!(
-            "dest {text:?} is an abstract unix socket (Linux, \"@{name}\"), which this core cannot \
-             dial: the fallback relay speaks TCP only. Use a host:port dest."
-        ));
-    }
-    if text.starts_with('/') {
-        return Err(format!(
-            "dest {text:?} is a unix socket path (Xray's `type: \"unix\"`), which this core cannot \
-             dial: the fallback relay speaks TCP only. Use a host:port dest."
-        ));
+    let unix = match kind {
+        Some("unix") => true,
+        Some("tcp") => false,
+        Some(other) => {
+            return Err(format!(
+                "type {other:?} is not \"tcp\" or \"unix\", which are the only kinds Xray dials"
+            ))
+        }
+        // No `type` written: the shape of the dest decides, exactly as Xray
+        // decides (`infra/conf/transport_internet.go:823-838`).
+        None => text.starts_with('@') || text.starts_with('/'),
+    };
+    if unix {
+        // An abstract socket is `@name` on Linux; a path is `/path`. Xray
+        // keeps the text as written and hands it to `net.Dial`
+        // (`RL/tls.go:168`).
+        if text.is_empty() {
+            return Err("dest is empty, so there is no socket to dial".into());
+        }
+        return Ok(RealityTarget::Unix(text.into()));
     }
     if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return text
+        let port = text
             .parse::<u16>()
-            .map(|port| (Address::parse_host("localhost"), port))
-            .map_err(|_| format!("dest {text:?} is not a port"));
+            .map_err(|_| format!("dest {text:?} is not a port"))?;
+        return Ok(RealityTarget::Host(Address::parse_host("localhost"), port));
     }
-    zero_core::address::split_host_port(text)
-        .map(|(host, port)| (Address::parse_host(host), port))
-        .ok_or_else(|| format!("dest {text:?} is not host:port"))
+    match zero_core::address::split_host_port(text) {
+        Some((host, port)) => Ok(RealityTarget::Host(Address::parse_host(host), port)),
+        None => Err(format!(
+            "dest {text:?} is not host:port, a port, or a unix socket path"
+        )),
+    }
 }
 
 /// Xray's `minClientVer` / `maxClientVer`: one to three dot-separated decimal

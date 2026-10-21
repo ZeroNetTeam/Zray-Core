@@ -50,20 +50,18 @@ is the one that fails without it.
 | Duplicate key share (§1) | the *first* share of a group wins, as both of Go's scans do | `server::tests::the_first_share_of_a_duplicated_group_is_the_one_that_counts` |
 | Gate order (§1) | seal, then client version, then clock, then short id, in Go's order | `server::tests::a_hello_that_fails_several_gates_is_refused_for_go_s_first_one` |
 | Cleartext record cap (§3) | 16384 + 2048 before the keys are negotiated, as `maxCiphertext` is | `zero-security/src/tls13/record.rs` (`MAX_CIPHERTEXT_BEFORE_TLS13`) + `server::tests::a_record_at_go_s_pre_negotiation_bound_is_read_then_relayed` and the oracle's `the_record_size_limit_is_the_oracles_at_the_edges` |
-| `shortIds: []`, `mldsa65Seed == privateKey`, 1–3 part versions, bare-port and unix `dest` (§7) | the rules Xray's JSON layer enforces, in both readers | `crates/reality/tests/config.rs` (four parity tests) + `crates/reality/src/config.rs` unit tests |
+| `shortIds: []`, `mldsa65Seed == privateKey`, 1–3 part versions, bare-port and unix `dest` (§7) | the rules Xray's JSON layer enforces, in both readers | `crates/reality/tests/config.rs` (five parity tests) + `crates/reality/src/config.rs` unit tests |
 | The fallback relay written twice (§6) | the runtime calls `reality::fallback::relay`; one implementation | `--test fallback` 8/8, `--test loopback_tls_interop` 26/26, `the_reality_server_limits_hold_against_the_oracles_client` |
 | A failed direction cancelling the other (§6) | the surviving direction gets a 250 ms grace to deliver what the peer already sent | `crates/reality/tests/fallback.rs::the_targets_answer_survives_the_write_to_the_target_failing` + the oracle's `the_record_size_limit_is_the_oracles_at_the_edges`, 20/20 runs |
 | `show` and `masterKeyLog` (§7) | both switches are read, and the handshake acts on them: a line per connection, and the traffic secrets in Go's order | `server::tests::the_show_switch_reports_what_the_client_sent` and `server::tests::the_key_log_writes_the_handshakes_traffic_secrets`; the key log's shape is compared against the official server's, over the official client, by `the_key_log_has_the_shape_the_officials_server_writes` |
 | The decoy's tolerance for records that advance nothing (§5) | the site is probed at start-up, and the answer is applied to the connections this server accepts | `ZS/ccs_probe.rs`; `server::tests::the_server_puts_up_with_what_the_site_puts_up_with` |
+| A unix-socket camouflage target (§7) | the target is dialled as a socket, and an unauthenticated visitor is handed to it | `crates/zero-runtime/tests/reality_unix_target.rs` |
 
 What is *not* closed is what the rows below still say: the decoy being dialled
-on the accepting path, and `type: unix`.
+on the accepting path.
 
 *MISSING (no Rust counterpart at all):*
 
-* `type`, and with it unix-socket `dest` and a bare-port `dest`
-  (`XC/infra/conf/transport_internet.go:824-843`; both Rust readers go through
-  `crates/zero-core/src/address.rs:173-186`) (§7);
 * `"shortIds": []` is refused by Xray (`XC/infra/conf/transport_internet.go:884-886`)
   and by `crates/reality/src/config.rs:144-150`, but accepted by the inbound path
   `crates/zero-config/src/xray_json.rs:907-930` (§7);
@@ -1340,8 +1338,8 @@ turns JSON into the fields Xray hands to REALITY).
 | # | Field | Xray semantics, default, unit | Rust |
 |---|---|---|---|
 | 1 | `show` | bool, default `false`; enables `RL`'s diagnostics, which include `AuthKey[:16]`, the decoded client version/shortId and record lengths (`RL/tls.go:164-166`, `:238-256`, `:331-333`) | **parsed and printed** — both readers read the switch and refuse a non-bool, as Xray's decode does; the handshake writes one line per connection naming the peer, the client version, the clock, the short id and whether the client was let through (`RB/server.rs`, `report_line`). The report line is `keys::ClientReport`, the one shape it takes here, and Xray's `AuthKey[:16]` is deliberately absent from it (`crates/zero-runtime/tests/log_privacy.rs`) |
-| 2 | `dest` (alias `target`) | string, required for a server; bare port ⇒ `localhost:PORT` (`XC/…:818-822`, `:833-835`); `@`/`/` prefix ⇒ `type: "unix"` (`:824-832`) | **host:port and bare port honoured** (`ZC/xray_json.rs`, `RB/config.rs`), and a missing `dest` is now refused by **both** readers, as Xray refuses it (`XC/…:841-843`); a `/path` or `@name` unix socket is refused **by name** rather than dialled, with the reason in the message — the fallback relay speaks TCP only (`crates/reality/tests/config.rs`) |
-| 3 | `type` | `"tcp"` or `"unix"`, inferred from `dest`, handed to `DialContext` (`RL/tls.go:168`) | **MISSING, and refused instead** — `type` is not read; a `dest` shape that would make Xray set `"unix"` is refused by both readers, each naming the shape it saw |
+| 2 | `dest` (alias `target`) | string, required for a server; bare port ⇒ `localhost:PORT` (`XC/…:818-822`, `:833-835`); `@`/`/` prefix ⇒ `type: "unix"` (`:824-832`) | **host:port, bare port and unix socket honoured** (`ZC/xray_json.rs`, `RB/config.rs`), and a missing `dest` is refused by **both** readers, as Xray refuses it (`XC/…:841-843`); a dest that is neither shape is refused by name, with the reason in the message (`crates/reality/tests/config.rs`) |
+| 3 | `type` | `"tcp"` or `"unix"`, inferred from `dest` when not written, handed to `DialContext` (`RL/tls.go:168`) | **honoured** — both readers read it, refuse a kind that is neither, and infer it from the dest's shape exactly as Xray does (`XC/…:820-838`); a unix target is dialled as a socket, an abstract one included (`ZR/server.rs`) |
 | 4 | `xver` | uint64, default `0`; `1`/`2` write a PROXY header to the target (`RL/tls.go:174-180`); `>2` refused at parse time (`XC/…:844-846`) | **honoured** (`ZC/xray_json.rs:985-993`, `RB/config.rs:178-186`, used at `ZR/server.rs:2433-2441`) |
 | 5 | `server_names` | repeated string, must be non-empty (`XC/…:847-849`), compared exactly (`RL/tls.go:211`) | **honoured**, non-empty enforced (`ZC/xray_json.rs:896-906`, `RB/config.rs:109-119`); compared exactly — **PORTED** (§1) |
 | 6 | `private_key` | bytes(32), unpadded base64url (`XC/…:850-855`) | **honoured** (`ZC/xray_json.rs:6581-6590`, `RB/config.rs:231-241`); both readers also accept standard base64, a widening of the accepted set |
@@ -1354,8 +1352,9 @@ turns JSON into the fields Xray hands to REALITY).
 | 13 | `limit_fallback_download` | as above (`XC/…:922-925`) | as above |
 | 14 | `masterKeyLog` | string, a file path; the handshake's TLS 1.3 traffic secrets are appended to it in NSS format (`XC/…:926-931`, `RL/handshake_server_tls13.go:884-893`, `:1031-1040`) | **honoured** (`ZC/xray_json.rs`, `RB/config.rs:326-336`); the file is opened once per listener and every handshake appends to it, and a path that cannot be opened is reported and the listener runs without one — Xray does the same (`XC/transport/internet/reality/config.go:66-71`), and a debugging aid is not a reason for a listener to be down |
 
-**Status: PORTED for 11 of the 13 server-side fields** — `dest` (host:port and bare
-port, with the shapes that cannot be dialled refused by name), `xver`,
+**Status: PORTED for 13 of the 13 server-side fields** — `dest` (host:port, bare
+port and unix socket, with the shapes that cannot be dialled refused by name),
+`type`, `xver`,
 `server_names`, `private_key`, `min_client_ver`, `max_client_ver`, `max_time_diff`,
 `short_ids` (exactly), `mldsa65_seed`, and both fallback limits — plus the two
 diagnostics switches `show` and `masterKeyLog`, which both readers now *read* (a
@@ -1365,7 +1364,7 @@ whether the client was let through (`RB/server.rs`, `report_line`), and
 `masterKeyLog` writes the handshake's and the application's traffic secrets in
 Go's order (`RB/keys.rs`, `log_handshake_secrets` and `log_application_secrets`).
 Neither line carries the key that proved the client: what a client authenticates
-with is exactly what a log must not hold. `type` stays **MISSING**. The client-only
+with is exactly what a log must not hold. The client-only
 fields of the same proto are
 accepted and ignored on purpose. The five validation
 gaps below matter more than the field list, because each of them lets a
@@ -1421,13 +1420,13 @@ official Xray REALITY server writes, over the same official client
   protocol's purpose. `crates/reality/tests/config.rs::the_readers_agree_about_a_camouflage_target_they_cannot_dial`
   drives it, and the shapes below, through both readers. **PORTED.**
 * **A `dest` this port cannot dial is refused by name, not resolved as a host.**
-  Xray accepts `@`/`/` unix sockets and dials them (`XC/…:824-832`, `type: "unix"`);
-  the fallback relay here speaks TCP only, so both readers refuse both unix shapes,
-  and any `dest` that is neither `host:port` nor a bare port, with a message that
-  names the shape and the reason — resolving `/run/decoy.sock` as a host name would
-  fail at DNS time, for a reason that names nothing. A bare-port `dest` *is*
-  supported, by both
-  (`crates/reality/tests/config.rs::both_readers_treat_a_bare_port_dest_as_localhost`).
+  A `dest` that is neither `host:port`, nor a bare port, nor a unix socket is
+  refused by both readers, with a message that names the shape and the reason —
+  resolving `/run/decoy.sock` as a host name would fail at DNS time, for a reason
+  that names nothing. A bare-port `dest` *is* supported, by both
+  (`crates/reality/tests/config.rs::both_readers_treat_a_bare_port_dest_as_localhost`),
+  and so is a unix socket, which is dialled as one
+  (`crates/zero-runtime/tests/reality_unix_target.rs`).
   **REFUSED, deliberately.**
 * **Unknown keys are ignored** by both readers (no key-set validation), which
   matches `encoding/json`'s behaviour in Xray (`XC/infra/conf/transport_internet.go:780-805`
@@ -1446,8 +1445,11 @@ table above.
 
 **Still to test.** A missing `dest` is no longer one of them: it is driven through
 both readers by `the_readers_agree_about_a_camouflage_target_they_cannot_dial`
-(`crates/reality/tests/config.rs`), together with both unix shapes and a target that
-is not `host:port`. Nothing yet drives `"shortIds": []` or
+(`crates/reality/tests/config.rs`), together with a target that is not
+`host:port`; the unix shapes are driven by
+`the_readers_agree_about_a_unix_socket_target` and by
+`crates/zero-runtime/tests/reality_unix_target.rs`. Nothing yet drives
+`"shortIds": []` or
 `mldsa65Seed == privateKey` through `zero_config` and asserts that the config is
 refused, though both readers refuse them today. The rest of the table is either
 proven or read.

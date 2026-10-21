@@ -151,8 +151,14 @@ fn both_readers_agree_on_one_reality_block() {
         "limitFallbackDownload"
     );
 
-    let (host, port) = mine.target.expect("dest was read");
-    let (address, compiled_port) = compiled.target.expect("the compiler read dest");
+    let (host, port) = match mine.target.expect("dest was read") {
+        reality::CamouflageTarget::Host(host, port) => (host, port),
+        other => panic!("a bare port is a host and a port, not {other:?}"),
+    };
+    let (address, compiled_port) = match compiled.target.expect("the compiler read dest") {
+        zero_config::RealityTarget::Host(address, port) => (address, port),
+        other => panic!("a bare port is a host and a port, not {other:?}"),
+    };
     assert_eq!(
         (&*host, port),
         (address.to_string().as_str(), compiled_port),
@@ -247,17 +253,13 @@ fn the_readers_agree_on_which_blocks_are_refused() {
 
 #[test]
 fn the_readers_agree_about_a_camouflage_target_they_cannot_dial() {
-    // Every one of these is a `dest` Xray accepts — it dials unix sockets and
-    // picks the role by the field's presence (`infra/conf/transport_internet.go:812-843`)
-    // — and none is reachable from here: the fallback relay speaks TCP only.
-    // Refusing with a reason that names the target matters as much as refusing:
-    // a server that came up with no target would answer a censor's probe with a
-    // silent nothing, which is the opposite of the protocol's purpose, and the
+    // Every one of these is a `dest` neither reader can use. Refusing with a
+    // reason that names the target matters as much as refusing: a server that
+    // came up with no target would answer a censor's probe with a silent
+    // nothing, which is the opposite of the protocol's purpose, and the
     // operator would have no line to read that says so.
     for (what, written) in [
         ("no dest at all", None),
-        ("a unix socket path", Some(json!("/run/decoy.sock"))),
-        ("an abstract unix socket", Some(json!("@decoy"))),
         ("a host with no port", Some(json!("example.com"))),
         ("a dest that is not a string", Some(json!(8443))),
     ] {
@@ -286,6 +288,37 @@ fn the_readers_agree_about_a_camouflage_target_they_cannot_dial() {
         assert!(
             mine.contains("dest"),
             "{what} was refused for the wrong reason: {mine}"
+        );
+    }
+}
+
+/// The two readers agree on a unix-socket target, and both carry it as the
+/// path it was written as.
+///
+/// Xray dials unix sockets (`infra/conf/transport_internet.go:824-832`), so a
+/// target that names one is a target, not a host name that would fail to
+/// resolve.
+#[test]
+fn the_readers_agree_about_a_unix_socket_target() {
+    for written in ["/run/decoy.sock", "@decoy"] {
+        let mut settings = server_settings();
+        settings
+            .as_object_mut()
+            .expect("object")
+            .insert("dest".into(), json!(written));
+
+        let compiled = compiled(&settings);
+        let mine =
+            RealityServerConfig::from_xray_settings(&settings).expect("this crate parses it");
+        assert_eq!(
+            compiled.target,
+            Some(zero_config::RealityTarget::Unix(written.into())),
+            "the compiler's unix target"
+        );
+        assert_eq!(
+            mine.target,
+            Some(reality::CamouflageTarget::Unix(written.into())),
+            "this crate's unix target"
         );
     }
 }
@@ -364,8 +397,14 @@ fn both_readers_treat_a_bare_port_dest_as_localhost() {
         .insert("dest".into(), json!("8443"));
     let compiled = compiled(&settings);
     let mine = RealityServerConfig::from_xray_settings(&settings).expect("this crate parses it");
-    let (address, port) = compiled.target.expect("the compiler read dest");
-    let (host, mine_port) = mine.target.expect("this crate read dest");
+    let (address, port) = match compiled.target.expect("the compiler read dest") {
+        zero_config::RealityTarget::Host(address, port) => (address, port),
+        other => panic!("the compiler's target is {other:?}"),
+    };
+    let (host, mine_port) = match mine.target.expect("this crate read dest") {
+        reality::CamouflageTarget::Host(host, port) => (host, port),
+        other => panic!("this crate's target is {other:?}"),
+    };
     assert_eq!((address.to_string().as_str(), port), ("localhost", 8443));
     assert_eq!((&*host, mine_port), ("localhost", 8443));
 }

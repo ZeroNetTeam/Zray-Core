@@ -45,8 +45,21 @@ use crate::server::RealityServerParams;
 /// defaults.
 pub use crate::fallback::FallbackLimit;
 
+/// The camouflage site, in whichever of the two kinds Xray dials.
+///
+/// `type: "unix"` makes the target a path; anything else makes it a host and
+/// a port (`infra/conf/transport_internet.go:820-838`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CamouflageTarget {
+    /// A host and a port.
+    Host(Box<str>, u16),
+    /// A unix socket: a filesystem path, or an abstract socket's `@name`.
+    Unix(Box<str>),
+}
+
 /// Everything a REALITY server listener needs, parsed from `realitySettings`.
 #[derive(Clone)]
+
 pub struct RealityServerConfig {
     /// Xray's `show`: report, per connection that gets as far as opening a
     /// REALITY seal, the peer's address and the client fields its session id
@@ -81,7 +94,7 @@ pub struct RealityServerConfig {
     /// something else in front of this listener handles the fallback — a REALITY
     /// server with nowhere to send an unauthenticated visitor answers a probe
     /// with a silent nothing, which is the opposite of the protocol's purpose.
-    pub target: Option<(Box<str>, u16)>,
+    pub target: Option<CamouflageTarget>,
     /// Xray's `mldsa65Seed`: 32 secret bytes that make the server sign every
     /// handshake with an ML-DSA-65 key, so a client holding the matching
     /// `mldsa65Verify` key can tell the real server from one that merely knows
@@ -201,7 +214,7 @@ impl RealityServerConfig {
         // A server whose fallback has nowhere to go answers a probe with a
         // silent nothing, so the missing case is refused here rather than
         // discovered by an operator under censorship.
-        let target = match object.get("dest").or_else(|| object.get("target")) {
+        let dest = match object.get("dest").or_else(|| object.get("target")) {
             None | Some(Value::Null) => {
                 return Err(
                     "realitySettings.dest is required: an unauthenticated visitor has to be \
@@ -213,9 +226,18 @@ impl RealityServerConfig {
                 let text = value
                     .as_str()
                     .ok_or_else(|| "realitySettings.dest must be a string".to_string())?;
-                Some(parse_target(text)?)
+                text.to_string()
             }
         };
+        // Xray takes the kind from `type` when the operator wrote one, and
+        // infers it from the dest's shape when they did not
+        // (`infra/conf/transport_internet.go:820-838`).
+        let kind = match object.get("type") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(_) => return Err("realitySettings.type must be \"tcp\" or \"unix\"".into()),
+        };
+        let target = Some(parse_target(&dest, kind.as_deref())?);
 
         let mldsa65_seed = match object.get("mldsa65Seed").and_then(Value::as_str) {
             None | Some("") => None,
@@ -423,25 +445,29 @@ fn client_version(
 /// `dest` as Xray reads it: `host:port`, a bare port on localhost, or a unix
 /// socket path — which this port refuses by name rather than resolving as a host
 /// name (`XC/infra/conf/transport_internet.go:812-843`).
-fn parse_target(text: &str) -> Result<(Box<str>, u16), String> {
+fn parse_target(text: &str, kind: Option<&str>) -> Result<CamouflageTarget, String> {
     let text = text.trim();
-    if let Some(name) = text.strip_prefix('@') {
-        // Xray's `type: "unix"` on Linux, as an abstract socket: a name in the
-        // kernel's namespace rather than a file to bind (`:824-832`). Refused
-        // loudly, and refused as *its own* shape, so that an operator who wrote
-        // `@decoy` is not told their host name is malformed.
-        return Err(format!(
-            "realitySettings.dest {text:?} is an abstract unix socket (Linux, \"@{name}\"), which \
-             this server cannot dial: the fallback relay speaks TCP only, so an unauthenticated \
-             visitor would have nowhere to go. Use a host:port dest."
-        ));
-    }
-    if text.starts_with('/') {
-        return Err(format!(
-            "realitySettings.dest {text:?} is a unix socket path (Xray's `type: \"unix\"`), which \
-             this server cannot dial: the fallback relay speaks TCP only, so an unauthenticated \
-             visitor would have nowhere to go. Use a host:port dest."
-        ));
+    let unix = match kind {
+        Some("unix") => true,
+        Some("tcp") => false,
+        Some(other) => {
+            return Err(format!(
+                "realitySettings.type {other:?} is not \"tcp\" or \"unix\", which are the only \
+                 kinds Xray dials"
+            ))
+        }
+        // No `type` written: the shape of the dest decides, as Xray decides
+        // (`infra/conf/transport_internet.go:823-838`).
+        None => text.starts_with('@') || text.starts_with('/'),
+    };
+    if unix {
+        // An abstract socket is `@name` on Linux; a path is `/path`. Xray
+        // keeps the text as written and hands it to `net.Dial`
+        // (`RL/tls.go:168`).
+        if text.is_empty() {
+            return Err("realitySettings.dest is empty, so there is no socket to dial".into());
+        }
+        return Ok(CamouflageTarget::Unix(Box::from(text)));
     }
     if text.bytes().all(|byte| byte.is_ascii_digit()) && !text.is_empty() {
         // Xray turns a bare port into `localhost:<port>`
@@ -449,11 +475,14 @@ fn parse_target(text: &str) -> Result<(Box<str>, u16), String> {
         let port: u16 = text
             .parse()
             .map_err(|_| format!("realitySettings.dest {text:?} is not a port"))?;
-        return Ok((Box::from("localhost"), port));
+        return Ok(CamouflageTarget::Host(Box::from("localhost"), port));
     }
-    zero_core::address::split_host_port(text)
-        .map(|(host, port)| (Box::from(host), port))
-        .ok_or_else(|| format!("realitySettings.dest {text:?} is not host:port"))
+    match zero_core::address::split_host_port(text) {
+        Some((host, port)) => Ok(CamouflageTarget::Host(Box::from(host), port)),
+        None => Err(format!(
+            "realitySettings.dest {text:?} is not host:port, a port, or a unix socket path"
+        )),
+    }
 }
 
 fn fallback_limit(
@@ -506,8 +535,10 @@ mod tests {
             config.server_names.as_ref(),
             &[Box::from("example.com"), Box::from("www.example.com")]
         );
-        let (host, port) = config.target.clone().expect("dest was read");
-        assert_eq!((&*host, port), ("example.com", 443));
+        match config.target.clone().expect("dest was read") {
+            CamouflageTarget::Host(host, port) => assert_eq!((&*host, port), ("example.com", 443)),
+            other => panic!("the target is {other:?}"),
+        }
         assert_eq!(config.max_time_diff, Duration::from_millis(60_000));
         assert_eq!(config.min_client_ver, Some([1, 0, 0]));
         assert_eq!(config.max_client_ver, Some([26, 3, 27]));
@@ -554,8 +585,10 @@ mod tests {
             .expect("object")
             .insert("dest".into(), json!("8443"));
         let config = RealityServerConfig::from_xray_settings(&value).expect("a bare port");
-        let (host, port) = config.target.expect("dest is required, so it is set");
-        assert_eq!((&*host, port), ("localhost", 8443));
+        match config.target.expect("dest is required, so it is set") {
+            CamouflageTarget::Host(host, port) => assert_eq!((&*host, port), ("localhost", 8443)),
+            other => panic!("the target is {other:?}"),
+        }
     }
 
     #[test]
@@ -571,30 +604,67 @@ mod tests {
     }
 
     #[test]
-    fn the_two_unix_socket_shapes_are_refused_as_their_own_shapes() {
-        // Xray dials both (`transport_internet.go:824-832`): a filesystem socket
-        // and, on Linux, an abstract one. Neither can be reached by a fallback
-        // relay that only speaks TCP, so the operator is told which of the two
-        // they wrote and why it cannot work — resolving `@decoy` as a host name
+    fn the_two_unix_socket_shapes_are_read_as_their_own_shapes() {
+        // Xray dials both (`transport_internet.go:824-832`): a filesystem
+        // socket and, on Linux, an abstract one. The kind comes from the
+        // dest's shape when no `type` is written, and from `type` when one
+        // is, so a dest that names a path is a path — not a host name that
         // would fail at DNS time, minutes later, for a reason that names
         // nothing.
-        for (written, expected) in [
-            ("/run/decoy.sock", "unix socket path"),
-            ("@decoy", "abstract unix socket"),
-        ] {
+        for (written, expected) in [("/run/decoy.sock", "/run/decoy.sock"), ("@decoy", "@decoy")] {
             let mut value = settings();
             value
                 .as_object_mut()
                 .expect("object")
                 .insert("dest".into(), json!(written));
-            let error = RealityServerConfig::from_xray_settings(&value)
-                .expect_err("a unix socket target cannot be dialled");
-            assert!(error.contains(expected), "{written}: {error}");
-            assert!(
-                error.contains("TCP only"),
-                "{written}: the reason has to be in the message: {error}"
+            let config = RealityServerConfig::from_xray_settings(&value)
+                .expect("a unix socket target is read, not refused");
+            assert_eq!(
+                config.target,
+                Some(CamouflageTarget::Unix(expected.into())),
+                "{written}: the socket is carried as written"
             );
         }
+    }
+
+    /// `type` says which kind the dest is, and it is honoured.
+    #[test]
+    fn the_type_field_says_which_kind_the_dest_is() {
+        // `type: "unix"` with a path: the path, as written.
+        let mut value = settings();
+        {
+            let object = value.as_object_mut().expect("object");
+            object.insert("dest".into(), json!("/run/decoy.sock"));
+            object.insert("type".into(), json!("unix"));
+        }
+        let config = RealityServerConfig::from_xray_settings(&value).expect("parses");
+        assert_eq!(
+            config.target,
+            Some(CamouflageTarget::Unix("/run/decoy.sock".into()))
+        );
+
+        // `type: "tcp"` with a host:port: the host and the port.
+        let mut value = settings();
+        {
+            let object = value.as_object_mut().expect("object");
+            object.insert("dest".into(), json!("example.com:443"));
+            object.insert("type".into(), json!("tcp"));
+        }
+        let config = RealityServerConfig::from_xray_settings(&value).expect("parses");
+        assert_eq!(
+            config.target,
+            Some(CamouflageTarget::Host("example.com".into(), 443))
+        );
+
+        // A kind Xray does not have is refused by name.
+        let mut value = settings();
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("type".into(), json!("udp"));
+        let error = RealityServerConfig::from_xray_settings(&value)
+            .expect_err("udp is not a kind Xray dials");
+        assert!(error.contains("type"), "{error}");
     }
 
     #[test]
@@ -691,12 +761,11 @@ mod tests {
                 "limitFallbackUpload",
                 json!({"limitFallbackUpload": {"afterBytes": "ten"}}),
             ),
-            // A camouflage target Xray accepts but this port cannot dial is
-            // refused as its own shape, not as a host name that failed to
-            // resolve: the difference is what an operator reads at startup.
+            // A camouflage target that is neither a host and a port nor a
+            // socket is refused as its own shape, not as a host name that
+            // failed to resolve: the difference is what an operator reads at
+            // startup.
             ("dest", json!({"dest": null})),
-            ("dest", json!({"dest": "/run/decoy.sock"})),
-            ("dest", json!({"dest": "@decoy"})),
             ("dest", json!({"dest": "example.com"})),
             ("dest", json!({"dest": 8443})),
             ("show", json!({"show": "yes"})),
