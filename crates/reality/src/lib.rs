@@ -44,8 +44,11 @@
 //! let params = config.server_params();
 //! assert_eq!(params.server_names.as_ref(), [Box::from("example.com")]);
 //! assert_eq!(
-//!     config.target.as_ref().map(|(host, port)| (&**host, *port)),
-//!     Some(("example.com", 443))
+//!     config.target,
+//!     Some(reality::CamouflageTarget::Host(
+//!         "example.com".into(),
+//!         443
+//!     ))
 //! );
 //! # Ok::<(), String>(())
 //! ```
