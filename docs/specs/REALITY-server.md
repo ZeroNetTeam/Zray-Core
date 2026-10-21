@@ -70,7 +70,10 @@ What is *not* closed is what the rows below still say.
 * a site that cannot be reached is a fallback to the cached flight, where Go
   closes the connection (`RL/tls.go:168-172`) — a site that is down for a
   moment is not a reason for a REALITY listener to be down, but it is a
-  difference (§1, §6);
+  difference. It is only observable by an *authenticated* visitor: an
+  unauthenticated one is relayed to the site, and the fallback drops the
+  connection when the site cannot be dialled (`ZR/server.rs`), which is what
+  Go does for every visitor (§1, §6);
 * the site is dialled twice per connection, where Go dials it once — Go
   uses that one connection for everything: the client's own hello is
   forwarded to it (`RL/tls.go:70-83`), the site's records are read back
