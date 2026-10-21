@@ -72,6 +72,14 @@ pub struct CertParts<'a> {
     /// sequence. Xray uses that value for its optional ML-DSA-65 REALITY
     /// certificate binding.
     pub first_extension: Option<&'a [u8]>,
+    /// Where the first extension's value starts, in the certificate's own
+    /// bytes.
+    ///
+    /// Go writes the ML-DSA-65 signature at a *fixed* offset
+    /// (`RL/handshake_server_tls13.go:157`: `cert[126:]`), so whether that
+    /// offset is the extension's value is what decides whether a client can
+    /// read the signature back out of the extension.
+    pub first_extension_offset: Option<usize>,
 }
 
 /// Walk a leaf certificate and extract `CertParts`.
@@ -105,12 +113,19 @@ pub fn parse_leaf(cert: &[u8]) -> Result<CertParts<'_>, Failure> {
     let mut at = 0usize;
     let mut spki: Option<&[u8]> = None;
     let mut first_extension: Option<&[u8]> = None;
+    let mut first_extension_offset: Option<usize> = None;
     while at < tbs_body.len() {
         let el = tlv(tbs_body, at)?;
         if el.tag == 0x30 {
             spki = Some(el.content);
         } else if el.tag == 0xa3 && first_extension.is_none() {
-            first_extension = parse_first_extension_value(el.content)?;
+            if let Some((value, offset)) = parse_first_extension_value(el.content)? {
+                // The offset is relative to the explicit extensions; the
+                // certificate's own base is the outer SEQUENCE's content.
+                first_extension_offset =
+                    Some((el.content.as_ptr() as usize - outer.content.as_ptr() as usize) + offset);
+                first_extension = Some(value);
+            }
         }
         at = el.end;
     }
@@ -132,10 +147,13 @@ pub fn parse_leaf(cert: &[u8]) -> Result<CertParts<'_>, Failure> {
         spki_key,
         signature,
         first_extension,
+        first_extension_offset,
     })
 }
 
-fn parse_first_extension_value(explicit_extensions: &[u8]) -> Result<Option<&[u8]>, Failure> {
+fn parse_first_extension_value(
+    explicit_extensions: &[u8],
+) -> Result<Option<(&[u8], usize)>, Failure> {
     let extensions = tlv(explicit_extensions, 0)?;
     if extensions.tag != 0x30 || extensions.end != explicit_extensions.len() {
         return Err(malformed(
@@ -145,6 +163,8 @@ fn parse_first_extension_value(explicit_extensions: &[u8]) -> Result<Option<&[u8
     if extensions.content.is_empty() {
         return Ok(None);
     }
+    // The offset of the value, relative to the start of the explicit
+    // extensions — the caller adds its own base.
     let extension = tlv(extensions.content, 0)?;
     if extension.tag != 0x30 {
         return Err(malformed("certificate extension is not a SEQUENCE"));
@@ -163,7 +183,11 @@ fn parse_first_extension_value(explicit_extensions: &[u8]) -> Result<Option<&[u8
     if value.tag != 0x04 || value.end != extension.content.len() {
         return Err(malformed("certificate extension has no OCTET STRING value"));
     }
-    Ok(Some(value.content))
+    // The value's start, relative to the explicit extensions: the SEQUENCE
+    // header, the extension's SEQUENCE header, the OID and the OCTET
+    // STRING's header.
+    let value_at = value.content.as_ptr() as usize - explicit_extensions.as_ptr() as usize;
+    Ok(Some((value.content, value_at)))
 }
 
 fn bit_string_content(content: &[u8]) -> Result<&[u8], Failure> {

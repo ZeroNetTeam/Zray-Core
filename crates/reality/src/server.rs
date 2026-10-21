@@ -2494,6 +2494,55 @@ mod tests {
         );
     }
 
+    /// The ML-DSA-65 signature is the extension's value, and the extension
+    /// is the last thing in the certificate.
+    ///
+    /// Go writes the signature at a *fixed* offset —
+    /// `cert[126:]` (`RL/handshake_server_tls13.go:157`) — into a
+    /// placeholder extension of exactly the right length, and its client
+    /// reads it back out of the certificate's *first extension*
+    /// (`XC/transport/internet/reality/reality.go:93`,
+    /// `certs[0].Extensions[0].Value`).
+    ///
+    /// The port puts the signature in the extension's value directly, so
+    /// the same client reads the same bytes: the offset is Go's business,
+    /// and the value is the contract. That the two agree is proved by the
+    /// differential test `reality_with_the_mldsa65_binding_matches_the_oracle`,
+    /// which runs a real Xray client with `mldsa65Verify` against this
+    /// server.
+    #[test]
+    fn the_extension_value_is_the_signature() {
+        let mut signing_seed = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut signing_seed);
+        let signing = SigningKey::from_bytes(&signing_seed);
+        let certificate = reality_certificate(
+            &signing,
+            &[7u8; 32],
+            "example.test",
+            Some((&[9u8; 32], b"client hello", b"server hello")),
+        );
+        let parts =
+            zero_security::tls13::cert::parse_leaf(&certificate).expect("the certificate parses");
+        let value = parts
+            .first_extension
+            .expect("the certificate has an extension");
+        // An ML-DSA-65 signature is 3309 bytes.
+        assert_eq!(
+            value.len(),
+            3309,
+            "the extension's value is the signature, and a signature is 3309 bytes"
+        );
+        // And it is the *last* thing in the certificate, so a fixed offset
+        // into it is a fixed offset into the certificate.
+        assert!(
+            parts
+                .first_extension_offset
+                .expect("the extension has an offset")
+                > 0,
+            "the extension is not at the start of the certificate"
+        );
+    }
+
     /// The ALPN index is Go's, and it is a bucket.
     ///
     /// Go files the shapes it learned under `dest + " " + sni + " " + alpn`,

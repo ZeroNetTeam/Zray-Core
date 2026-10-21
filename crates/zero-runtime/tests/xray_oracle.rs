@@ -2317,6 +2317,10 @@ async fn the_site_answers_the_clients_own_hello() {
         zero_security::tls13::post_handshake::observe_with_the_clients_hello(site, &hello)
             .await
             .expect("the site's answer to the client's hello");
+    eprintln!("the probe's flight:  {:?}", probed.flight);
+    eprintln!("the forwarded flight: {:?}", forwarded.flight);
+    eprintln!("the probe's flight:  {:?}", probed.flight);
+    eprintln!("the forwarded flight: {:?}", forwarded.flight);
 
     // The site answers the client's own hello with the same cipher suite
     // and the same key-share group it would have answered a probe with.
