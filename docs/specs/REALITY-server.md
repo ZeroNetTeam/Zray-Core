@@ -58,7 +58,7 @@ is the one that fails without it.
 | A unix-socket camouflage target (§7) | the target is dialled as a socket, and an unauthenticated visitor is handed to it | `crates/zero-runtime/tests/reality_unix_target.rs` |
 | The site is dialled for every connection, and its shapes read off that connection (§1, §3) | the flight and the post-handshake records the client sees are the site's, read live, as Go's are | `server::tests::the_flight_is_read_off_the_site_on_every_connection` and `server::tests::the_post_handshake_records_are_read_off_the_site_too` |
 | The site's shapes are filed per ALPN, and the client is handed the ones that match (§3, §5) | the site is asked three ways, and a client gets the answer for the ALPN it offered | `server::tests::the_alpn_index_is_go_s_bucket` and `server::tests::a_client_gets_the_shapes_filed_under_its_alpn` |
-| The cipher suite and the key-share group are the site's (§3) | the server answers with the suite and the group the site chose, read off the site's ServerHello, as Go does — and the site is asked with the client's own hello, forwarded verbatim, so the answer is the site's reply to the visitor | `server::tests::the_sites_suite_and_group_are_the_ones_answered_with` |
+| The cipher suite and the key-share group are the site's (§3) | the server answers with the suite and the group the site chose, read off the site's ServerHello, as Go does — and the site is asked with the client's own hello, forwarded verbatim, so the answer is the site's reply to the visitor. The suite is the *negotiated* one throughout: the transcript's hash, the key schedule, the flight, the Finished and the record layer all use it, because a client negotiates against what the ServerHello says and not against what it prefers | `server::tests::the_sites_suite_and_group_are_the_ones_answered_with`, `server::tests::the_port_answers_with_the_sites_suite_and_not_the_clients`, and the differential `the_server_accepts_a_client_with_any_fingerprint` |
 
 What is *not* closed is what the rows below still say.
 
@@ -117,6 +117,13 @@ What is *not* closed is what the rows below still say.
   connection they arrive on, not what they say (§1, §6);
 * the cipher suite and the key-share group are the *site's*, taken from its
   ServerHello, as Go takes them (`RL/handshake_server_tls13.go:100-128`) —
+  and the whole handshake follows that one suite, because Go's fork of the
+  TLS server takes the suite from the site's ServerHello and nothing else:
+  the stock cipher-suite selection is commented out in it
+  (`RL/handshake_server_tls13.go:95-99`), so there is no mutual
+  negotiation and no client's-suite fallback. A client's preference is per
+  fingerprint, so the client's first choice and the site's routinely
+  differ —
   and the site is asked with the *client's own* hello, forwarded verbatim,
   as Go's `MirrorConn` does (`RL/tls.go:70-83`). So the answer is the site's
   reply to the visitor. The visitor's Finished *is* forwarded to that same
