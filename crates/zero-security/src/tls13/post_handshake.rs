@@ -738,12 +738,6 @@ where
         }
     })
     .await;
-    eprintln!(
-        "DEBUG flight={:?} post={:?} written={:?}",
-        taps.flight.lock().unwrap(),
-        taps.post_handshake.lock().unwrap(),
-        taps.written.lock().unwrap()
-    );
     let take = |list: &Arc<Mutex<Vec<u16>>>| list.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let answer = {
         let hello = taps.server_hello.lock().unwrap_or_else(|p| p.into_inner());
