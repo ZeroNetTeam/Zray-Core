@@ -1239,6 +1239,90 @@ async fn vless_over_reality_grpc_matches_the_oracle() {
     xray_client_to_zray_reality_server(&binary, "grpc", None, None).await;
 }
 
+/// A REALITY share link becomes an outbound that carries a payload.
+///
+/// A link is how an operator moves a configuration between clients, and the
+/// chain is only as good as its last step: a link that parses, and an
+/// outbound that compiles, and then a tunnel that carries nothing. This
+/// runs the whole chain against the official Xray server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn a_reality_share_link_becomes_an_outbound_that_carries_a_payload() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the camouflage site never listened");
+
+    let (private_key, public_key) = oracle_x25519_keypair(&binary);
+
+    // The official server, on the same decoy. It speaks Vision, because the
+    // link asks for it and the two ends have to agree: a Vision client
+    // against a plain server completes the handshake and then
+    // desynchronises on the first padded record.
+    let (mut server_settings, _) = protocol_settings("vless", 0);
+    for client in server_settings["clients"].as_array_mut().unwrap() {
+        client["flow"] = json!("xtls-rprx-vision");
+    }
+    let mut oracle_stream = transport("tcp");
+    oracle_stream["security"] = json!("reality");
+    oracle_stream["realitySettings"] = reality_server_settings(&private_key, decoy);
+    let server_port = free_port();
+    let _oracle = spawn_oracle(
+        &binary,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "in",
+                "listen": "127.0.0.1",
+                "port": server_port,
+                "protocol": "vless",
+                "settings": server_settings,
+                "streamSettings": oracle_stream,
+            }],
+            "outbounds": [oracle_loopback_freedom()],
+        }),
+    );
+    assert!(
+        wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), server_port)).await,
+        "the Xray REALITY server never listened"
+    );
+
+    // The link, with the public key the server holds and the short id the
+    // server accepts.
+    let link = format!(
+        "vless://{UUID}@127.0.0.1:{server_port}         ?security=reality&sni={REALITY_SNI}&fp=chrome\
+         &pbk={public_key}&sid={REALITY_SHORT_ID}\
+         &flow=xtls-rprx-vision&type=tcp&encryption=none#Link"
+    );
+
+    // The client, with its outbound built from the link alone.
+    let socks_port = free_port();
+    spawn_zray(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": socks_port,
+            "protocol": "socks",
+        }],
+        "outbounds": zero_config::presets::outbounds_from_links([link]),
+    }));
+    let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    assert!(
+        wait_for(socks).await,
+        "the Zray SOCKS inbound never listened"
+    );
+
+    // And the payload comes back.
+    let echo = echo_service().await;
+    proxied_echo(socks, echo, 11)
+        .await
+        .expect("the payload came back through the link's outbound");
+}
+
 /// The `zray` binary, started from a config *file* with a REALITY inbound,
 /// serves an Xray client.
 ///
