@@ -66,14 +66,10 @@ What is *not* closed is what the rows below still say.
 
 *DIVERGENT (present but different):*
 
-* no `supported_versions` check — `crates/reality/src/server.rs:559-567` against
-  `RL/tls.go:211` with `RL/handshake_server.go:180-196` (§1);
 * a site that cannot be reached is a fallback to the cached flight, where Go
   closes the connection (`RL/tls.go:168-172`) — a site that is down for a
   moment is not a reason for a REALITY listener to be down, but it is a
   difference (§1, §6);
-* a duplicated key share: last wins — `crates/reality/src/server.rs:653-662` against
-  `RL/tls.go:214-228` (§2);
 * cipher-suite choice follows the client, not the decoy or a server list —
   `crates/reality/src/server.rs:559-567`, `:675-700` against
   `RL/handshake_server_tls13.go:102` (§3);
@@ -234,15 +230,13 @@ also how a peer that vanishes mid-hello is handled. The runtime turns `Fallback`
 into `Secured::Fallback` (`ZR/server.rs:2375-2383`) and calls
 `relay_reality_fallback` (`ZR/server.rs:2395-2489`), which is §6.
 
-**Status: PORTED**, with three named differences:
+**Status: PORTED**, with two named differences. The `supported_versions`
+extension *is* read: a hello that offers a TLS 1.3 suite without
+`supported_versions: 0x0304` is not TLS 1.3 to Go either (`RL/tls.go:211` with
+`RL/handshake_server.go:180-196`), so both hand it to the decoy
+(`server::tests::a_hello_without_supported_versions_is_not_tls13_enough`).
 
-1. **No `supported_versions` check.** The Rust port never reads the extension; it
-   infers TLS 1.3 from finding a cipher suite it knows in the offered list
-   (`RB/server.rs:559-567`). Go requires `c.vers == VersionTLS13` from
-   `mutualVersion` (`RL/tls.go:211` with `RL/handshake_server.go:180-196`). A peer
-   offering `TLS_AES_128_GCM_SHA256` without `supported_versions: 0x0304` is
-   authenticated by Rust and handed to the decoy by Go.
-2. **The decoy is dialled on this path, and the site's shapes are read off
+1. **The decoy is dialled on this path, and the site's shapes are read off
    that connection.** `RL/tls.go:168` dials `dest` for every connection,
    authenticated or not, and reads the site's own flight *and* the records it
    sends after the handshake off it (`:293-330`, `:404-421`). The port does
@@ -419,16 +413,15 @@ change to it: both implementations accept exactly the selectors configured, and
 zero-padding rule that makes `"ab"` and `"ab000000000000"` one selector and `""`
 the all-zero one.
 
-**Status: PORTED**, with two differences worth naming:
+**Status: PORTED**, with one difference worth naming. A duplicated key share
+resolves the same way in both: the loops in `RL/tls.go:214-228` `break` on the
+first acceptable share, and so does the port — every `key_share` extension is
+read, and the *first* acceptable share of each group is the one that counts
+(`RB/server.rs`). RFC 8446 §4.2.8 forbids offering a group twice, so no honest
+client can reach the difference, but a probe could — and both implementations
+authenticate against the same point.
 
-1. **Duplicate key shares: first wins in Go, last wins in Rust.** Both loops in
-   `RL/tls.go:214-228` `break` on the first acceptable share; `parse_key_shares`
-   assigns on every match, so the *last* standalone share (and the last hybrid) is
-   the one used (`RB/server.rs:653-662`). RFC 8446 §4.2.8 forbids offering a group
-   twice, so no honest client can reach the difference, but a probe could: the two
-   implementations would authenticate against different points and only one would
-   accept.
-2. **Explicitness of the gates.** Rust refuses a session id that is not exactly 32
+1. **Explicitness of the gates.** Rust refuses a session id that is not exactly 32
    bytes at parse time (`RB/server.rs`) where Go would try to open a zero-filled
    32-byte buffer — same outcome (fallback), clearer reason. The *order* of the
    gates is Go's: the version and the clock first (`RL/tls.go:257-259`), then the
