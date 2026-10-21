@@ -93,7 +93,14 @@ What is *not* closed is what the rows below still say.
   the site's answer to the *visitor's* hello: it is the site's answer to
   a probe's, which offers the same protocols and the same session-id
   length, so the sizes agree for every site that answers alike — but a
-  site that varies its answer on anything else would be seen (§1, §3, §6);
+  site that varies its answer on anything else would be seen. And the
+  second dial cannot be dropped, because the first cannot have the
+  flight's last two records in time: the site holds its CertificateVerify
+  and its own Finished until the client's Finished arrives, and the
+  server writes its own flight before it reads the visitor's Finished.
+  The first dial therefore yields the suite, the group and the first
+  four records; the second yields the two that were still in flight
+  (§1, §3, §6);
 * the cipher suite and the key-share group are the *site's*, taken from its
   ServerHello, as Go takes them (`RL/handshake_server_tls13.go:100-128`) —
   and the site is asked with the *client's own* hello, forwarded verbatim,
