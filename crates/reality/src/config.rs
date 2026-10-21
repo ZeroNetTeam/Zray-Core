@@ -385,14 +385,18 @@ fn decode_x25519_private_key(text: &str) -> Result<[u8; 32], String> {
         })
 }
 
-/// The two engines Xray and this workspace's config compiler accept: URL-safe
-/// without padding (what `xray x25519` prints) and the standard alphabet.
+/// The one encoding Xray accepts: URL-safe base64 without padding, which is
+/// what `base64.RawURLEncoding` decodes (`XC/infra/conf/transport_internet.go:853`,
+/// `:907`, `:943`, `:957`).
+///
+/// The standard alphabet and the padded form are *not* accepted, because Xray
+/// refuses them: a key that is valid here and invalid there is a config that
+/// works on one and breaks on the other, and the operator finds out when they
+/// move it.
 fn decode_base64_any(text: &str) -> Option<Vec<u8>> {
     use base64::Engine as _;
-    let text = text.trim();
     base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(text)
-        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(text))
+        .decode(text.trim())
         .ok()
 }
 
@@ -786,6 +790,44 @@ mod tests {
                 error.contains(field),
                 "{field} was refused for the wrong reason: {error}"
             );
+        }
+    }
+
+    /// Only the encoding Xray accepts is accepted: unpadded base64url.
+    ///
+    /// Xray decodes `privateKey` and `mldsa65Seed` with
+    /// `base64.RawURLEncoding` (`XC/infra/conf/transport_internet.go:853`,
+    /// `:907`), so the standard alphabet, the padded form and hex are all
+    /// refused there. A key that is valid here and invalid there is a config
+    /// that works on one and breaks on the other.
+    #[test]
+    fn only_the_encoding_xray_accepts_is_accepted() {
+        // The key the other tests use, which is what `xray x25519` prints.
+        const KEY: &str = "OFD5I7z1nN2rJ0AB1z8o_9W3PpNr6uCkOoDo4Ea0lG0";
+        let mut value = settings();
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("privateKey".into(), json!(KEY));
+        RealityServerConfig::from_xray_settings(&value).expect("the url-safe key is accepted");
+
+        // The same 32 bytes, in the standard alphabet — padded and unpadded.
+        let standard = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([
+                0x38, 0x50, 0xf9, 0x23, 0xbc, 0xf5, 0x9c, 0xdd, 0xab, 0x27, 0x40, 0x01, 0xd7, 0x3f,
+                0x40, 0xff, 0xd5, 0xb7, 0x3e, 0x93, 0x6b, 0xea, 0xe0, 0xa4, 0x3a, 0x80, 0xe8, 0xe0,
+                0x46, 0xb4, 0x94, 0x6d,
+            ])
+        };
+        for written in [standard.as_str(), standard.trim_end_matches('=')] {
+            let mut value = settings();
+            value
+                .as_object_mut()
+                .expect("object")
+                .insert("privateKey".into(), json!(written));
+            RealityServerConfig::from_xray_settings(&value)
+                .expect_err("the standard alphabet is refused, as Xray refuses it");
         }
     }
 

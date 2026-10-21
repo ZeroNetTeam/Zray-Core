@@ -6729,11 +6729,12 @@ fn override_port(e: ResolverEndpoint, port: u16) -> ResolverEndpoint {
 
 fn parse_reality_pubkey(s: &str) -> Result<[u8; 32], String> {
     use base64::Engine;
+    // The one encoding Xray accepts: URL-safe base64 without padding
+    // (`XC/infra/conf/transport_internet.go:943`). The standard alphabet, the
+    // padded form and hex are refused, as Xray refuses them.
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s)
-        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(s))
-        .or_else(|_| parse_hex(s).map_err(|_| base64::DecodeError::InvalidLength(0)))
-        .map_err(|_| format!("reality publicKey is not base64 or hex: {s:?}"))?;
+        .map_err(|_| format!("reality publicKey is not valid base64: {s:?}"))?;
     if bytes.len() != 32 {
         return Err(format!(
             "reality publicKey must be 32 bytes, got {}",
@@ -6823,9 +6824,11 @@ fn parse_reality_client_version(text: &str) -> Result<[u8; 3], String> {
 
 fn parse_reality_private_key(s: &str) -> Result<[u8; 32], String> {
     use base64::Engine;
+    // The one encoding Xray accepts: URL-safe base64 without padding
+    // (`XC/infra/conf/transport_internet.go:853`). The standard alphabet and
+    // the padded form are refused, as Xray refuses them.
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s)
-        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(s))
         .map_err(|_| "reality privateKey is not valid base64".to_string())?;
     bytes
         .try_into()

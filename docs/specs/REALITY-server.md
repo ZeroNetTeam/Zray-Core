@@ -98,10 +98,6 @@ What is *not* closed is what the rows below still say.
   itself, which is why the port's certificate is smaller (§3, §4);
 * a fallback session has a 300 s idle deadline where Go has none —
   `crates/zero-runtime/src/relay.rs:39`, `:47` against `RL/tls.go:271-286`, `:442` (§6);
-* both readers accept standard base64 as well as unpadded base64url for
-  `privateKey` — `crates/zero-config/src/xray_json.rs:6581-6590` against
-  `XC/infra/conf/transport_internet.go:850-855`: a superset, so no valid Xray config
-  breaks (§7);
 
 > The crate split matters for reading the rest: the server handshake now lives in
 > `crates/reality/src/server.rs` (it was moved there out of
@@ -1338,7 +1334,7 @@ turns JSON into the fields Xray hands to REALITY).
 | 3 | `type` | `"tcp"` or `"unix"`, inferred from `dest` when not written, handed to `DialContext` (`RL/tls.go:168`) | **honoured** — both readers read it, refuse a kind that is neither, and infer it from the dest's shape exactly as Xray does (`XC/…:820-838`); a unix target is dialled as a socket, an abstract one included (`ZR/server.rs`) |
 | 4 | `xver` | uint64, default `0`; `1`/`2` write a PROXY header to the target (`RL/tls.go:174-180`); `>2` refused at parse time (`XC/…:844-846`) | **honoured** (`ZC/xray_json.rs:985-993`, `RB/config.rs:178-186`, used at `ZR/server.rs:2433-2441`) |
 | 5 | `server_names` | repeated string, must be non-empty (`XC/…:847-849`), compared exactly (`RL/tls.go:211`) | **honoured**, non-empty enforced (`ZC/xray_json.rs:896-906`, `RB/config.rs:109-119`); compared exactly — **PORTED** (§1) |
-| 6 | `private_key` | bytes(32), unpadded base64url (`XC/…:850-855`) | **honoured** (`ZC/xray_json.rs:6581-6590`, `RB/config.rs:231-241`); both readers also accept standard base64, a widening of the accepted set |
+| 6 | `private_key` | bytes(32), unpadded base64url (`XC/…:850-855`) | **honoured** (`ZC/xray_json.rs`, `RB/config.rs`); the *one* encoding Xray accepts is the one accepted here — `base64.RawURLEncoding` and nothing wider, so a key that works here works there |
 | 7 | `min_client_ver` | bytes(3); JSON `"1.2.3"`, 1–3 dotted parts, each < 256 (`XC/…:856-869`); compared big-endian (`RL/tls.go:257`) | **honoured** (`RB/server.rs:265-267`); one to three dotted parts, as Xray reads them (`ZC/xray_json.rs`, `RB/config.rs`) |
 | 8 | `max_client_ver` | as above (`XC/…:870-883`, `RL/tls.go:258`) | as above |
 | 9 | `max_time_diff` | uint64 **milliseconds**, default `0` meaning *no clock check*; converted to a `Duration` at `XC/transport/internet/reality/config.go:29`, compared symmetrically at `RL/tls.go:259` | **honoured, same unit** (`ZC/xray_json.rs:1000-1003`, `RB/config.rs:170-175`, `ZR/server.rs:486`, check at `RB/server.rs:272-288`) |
