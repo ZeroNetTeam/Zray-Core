@@ -2646,6 +2646,116 @@ async fn the_official_server_answers_the_same_fingerprints_the_port_does() {
 /// The site's certificate is what the client must see. The port's own
 /// certificate is a different one, and a client that saw it would learn
 /// that the site is not behind this port.
+/// This workspace's client refuses an official Xray server that refuses it,
+/// and sends no tunnel data.
+///
+/// The other direction of the differential suite: the port's *client* against
+/// the official server, with a public key the server has never held. The
+/// server falls back to the camouflage site, and the client is shown the
+/// site's certificate — whose HMAC does not verify.
+///
+/// Xray's client would crawl the site over the same connection, so that the
+/// refusal looks like ordinary site traffic. This client refuses instead:
+/// sending proxy data into a connection it has not authenticated leaks the
+/// tunnel to whoever is on the other end, and a refused connection looks
+/// like a network failure, which is harder to tell apart.
+///
+/// The observable is the same as on the server side: the client refuses,
+/// and it wrote one record — the ClientHello. Not even the Finished, because
+/// a TLS 1.3 client verifies the server's certificate before it sends its
+/// own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn this_clients_refusal_matches_the_official_servers_fallback() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the camouflage site never listened");
+
+    let (private_key, _public_key) = oracle_x25519_keypair(&binary);
+
+    // The official server, on the same decoy.
+    let (server_settings, _) = protocol_settings("vless", 0);
+    let mut oracle_stream = transport("tcp");
+    oracle_stream["security"] = json!("reality");
+    oracle_stream["realitySettings"] = reality_server_settings(&private_key, decoy);
+    let server_port = free_port();
+    let _oracle = spawn_oracle(
+        &binary,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "in",
+                "listen": "127.0.0.1",
+                "port": server_port,
+                "protocol": "vless",
+                "settings": server_settings,
+                "streamSettings": oracle_stream,
+            }],
+            "outbounds": [oracle_loopback_freedom()],
+        }),
+    );
+    assert!(
+        wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), server_port)).await,
+        "the Xray REALITY server never listened"
+    );
+
+    // This client believes a public key the server has never held.
+    let (_other_private, other_public) = oracle_x25519_keypair(&binary);
+    let key = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&other_public)
+            .expect("the oracle's public key is base64url")
+            .try_into()
+            .expect("the oracle's public key is 32 bytes")
+    };
+    let short_id = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(REALITY_SHORT_ID)
+            .expect("the short id is base64url")
+    };
+    let params = zero_security::RealityParams::from_config(
+        std::sync::Arc::from(REALITY_SNI),
+        key,
+        &short_id,
+    );
+
+    let server_address = SocketAddr::new("127.0.0.1".parse().unwrap(), server_port);
+    let socket = TcpStream::connect(server_address).await.unwrap();
+    let (tapped, taps) = zero_security::tls13::post_handshake::tap_with_flight(socket);
+    let outcome = zero_security::reality_connect(tapped, &params).await;
+    assert!(
+        outcome.is_err(),
+        "the client accepted a server it did not authenticate"
+    );
+
+    // What the client wrote: the ClientHello, and nothing else.
+    let written = taps.sent_bytes.lock().unwrap().clone();
+    assert!(!written.is_empty(), "the client wrote nothing at all");
+    let mut records = Vec::new();
+    let mut at = 0usize;
+    while at + 5 <= written.len() {
+        let kind = written[at];
+        let len = u16::from_be_bytes([written[at + 3], written[at + 4]]) as usize;
+        records.push((kind, len));
+        at += 5 + len;
+    }
+    assert_eq!(
+        records.len(),
+        1,
+        "the client wrote {records:?}, and a tunnel's bytes would be more"
+    );
+    assert_eq!(
+        records[0].0, 0x16,
+        "the one record the client wrote is a handshake record"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs an Xray binary; see the module documentation"]
 async fn a_plain_client_is_handed_to_the_camouflage_site() {
