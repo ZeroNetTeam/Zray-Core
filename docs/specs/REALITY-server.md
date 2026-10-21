@@ -134,7 +134,10 @@ What is *not* closed is what the rows below still say.
   `first_extension`), so neither looks at the OID, and neither looks at the
   name. Go writes the signature at a fixed offset into its placeholder
   (`RL/handshake_server_tls13.go:157`: `cert[126:]`); the port puts it in
-  the extension's value, and the *value* is the contract (§3, §4);
+  the extension's value, and the *value* is the contract. The name is
+  where the port is the more faithful of the two: Go's certificate says
+  nothing about the name, while the port's carries the SNI the visitor
+  asked for — which is the name the site would have presented (§3, §4);
 
 > The crate split matters for reading the rest: the server handshake now lives in
 > `crates/reality/src/server.rs` (it was moved there out of
