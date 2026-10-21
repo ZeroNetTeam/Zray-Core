@@ -437,17 +437,30 @@ where
     // What the site chose, if it could be asked: the cipher suite and the
     // key-share group from its ServerHello, as Go takes them
     // (`RL/handshake_server_tls13.go:100-128`).
-    let mut site_answer = None;
+    // The site, if it could be asked: its answer, and the connection the
+    // visitor's Finished is forwarded to.
+    let mut site = None;
     if let Some(decoy) = params.decoy.as_deref() {
         match read_live_shapes(decoy, &hello.sni, &hello.alpn, &client_hello).await {
-            Ok(Some((flight, after, answer))) => {
+            Ok(Some(live)) => {
+                let LiveSite {
+                    flight,
+                    after,
+                    answer,
+                    site: connection,
+                } = live;
                 if let Some(flight) = flight {
                     shapes.flight = Some(flight);
                 }
                 if let Some(after) = after {
                     shapes.after = Some(after);
                 }
-                site_answer = answer;
+                site = Some(LiveSite {
+                    flight: None,
+                    after: None,
+                    answer,
+                    site: connection,
+                });
             }
             Ok(None) => {}
             Err(error) => {
@@ -468,7 +481,7 @@ where
         hello,
         auth_key,
         shapes,
-        site_answer,
+        site,
         params.mldsa65_seed,
         params.key_log.as_ref(),
     )
@@ -534,7 +547,7 @@ async fn complete_handshake<S>(
     hello: ClientHelloInfo,
     auth_key: [u8; 32],
     shapes: SiteShapes,
-    site_answer: Option<zero_security::tls13::post_handshake::SiteAnswer>,
+    mut site: Option<LiveSite>,
     mldsa65_seed: Option<[u8; 32]>,
     key_log: Option<&Arc<crate::keys::KeyLog>>,
 ) -> Result<Tls13Stream<S>, Failure>
@@ -556,6 +569,7 @@ where
     // Go searches the client's shares for the group's
     // (`RL/tls.go:216-228`), and a client that offered only one group
     // cannot complete a handshake in the other.
+    let site_answer = site.as_ref().and_then(|site| site.answer);
     let site_group = site_answer.map(|answer| answer.group);
     let offered = match site_group {
         Some(0x001d) => offered_x25519,
@@ -658,8 +672,17 @@ where
         .await
         .map_err(|error| Failure::from_io(&error, Stage::TlsStarted))?;
 
-    let client_finished =
-        read_encrypted_handshake(&mut io, hello.suite, &schedule.client_hs_traffic).await?;
+    let (client_finished, finished_record) =
+        read_encrypted_handshake_raw(&mut io, hello.suite, &schedule.client_hs_traffic).await?;
+    // The visitor's Finished goes to the site too, as Go's `MirrorConn`
+    // forwards every byte read from the visitor (`RL/tls.go:70-83`). A site
+    // holds its own CertificateVerify and its own Finished until the
+    // client's Finished arrives, so without this the site sends only part of
+    // its flight.
+    if let Some(site) = site.as_mut().and_then(|site| site.site.as_mut()) {
+        let _ = tokio::io::AsyncWriteExt::write_all(site, &finished_record).await;
+        let _ = tokio::io::AsyncWriteExt::flush(site).await;
+    }
     let expected = finished_verify_data(
         hello.suite.hash,
         &schedule.client_hs_traffic,
@@ -718,19 +741,30 @@ where
 /// The site's certificate is not verified: the probe carries no application
 /// data, and the site is the one the operator chose as the camouflage, so
 /// requiring a public chain would leave every private-CA decoy unanswered.
+/// The site's answer, and the connection it was given on.
+///
+/// The connection is handed back because the visitor's Finished has to be
+/// forwarded to it: a site holds its own CertificateVerify and its own
+/// Finished until the client's Finished arrives, so without that the site
+/// sends only part of its flight. Go's `MirrorConn` forwards every byte
+/// read from the visitor (`RL/tls.go:70-83`), and this is the same thing.
+struct LiveSite {
+    flight: Option<Arc<[u16]>>,
+    after: Option<Arc<[u16]>>,
+    answer: Option<zero_security::tls13::post_handshake::SiteAnswer>,
+    /// The connection the site was asked on, if it is still open.
+    ///
+    /// It is the *tap* rather than the bare stream, so the records the
+    /// site sends after the visitor's Finished can still be counted.
+    site: Option<zero_security::tls13::post_handshake::Tap<zero_core::BoxStream>>,
+}
+
 async fn read_live_shapes(
     decoy: &dyn DecoyDialer,
     server_name: &str,
     alpn: &[String],
     client_hello: &[u8],
-) -> Result<
-    Option<(
-        Option<Arc<[u16]>>,
-        Option<Arc<[u16]>>,
-        Option<zero_security::tls13::post_handshake::SiteAnswer>,
-    )>,
-    String,
-> {
+) -> Result<Option<LiveSite>, String> {
     // The protocols the probe offers the site, so the flight is the one the
     // client would have got.
     let protocols: Vec<&str> = alpn.iter().map(String::as_str).collect();
@@ -744,11 +778,11 @@ async fn read_live_shapes(
     // records only after the client's Finished, and the client sends that
     // on the visitor's own connection, not on this one. So the flight is
     // asked for separately, with a handshake of the port's own.
-    let answer =
+    let (forwarded, connection) =
         zero_security::tls13::post_handshake::observe_with_the_clients_hello(site, client_hello)
             .await
-            .map_err(|error| error.to_string())?
-            .answer;
+            .map_err(|error| error.to_string())?;
+    let answer = forwarded.answer;
     let site = decoy.dial().await?;
     let observed = zero_security::tls13::post_handshake::observe_all_with_alpn(
         site,
@@ -767,7 +801,12 @@ async fn read_live_shapes(
     let flight = (!observed.flight.is_empty()).then(|| Arc::from(observed.flight.as_slice()));
     let after = (!observed.post_handshake.is_empty())
         .then(|| Arc::from(observed.post_handshake.as_slice()));
-    Ok(Some((flight, after, answer)))
+    Ok(Some(LiveSite {
+        flight,
+        after,
+        answer,
+        site: connection,
+    }))
 }
 
 fn derive_auth_key(shared: &[u8; 32], salt: &[u8]) -> [u8; 32] {
@@ -1304,11 +1343,17 @@ fn seal_flight_record(
         })
 }
 
-async fn read_encrypted_handshake<S>(
+/// The same, and the record's bytes as they came off the wire.
+///
+/// The *encrypted* record is what a camouflage site needs: a site holds its
+/// own CertificateVerify and its own Finished until the client's Finished
+/// arrives, so the port has to be able to forward the visitor's Finished to
+/// the site for the site's last records to come back.
+async fn read_encrypted_handshake_raw<S>(
     io: &mut S,
     suite: CipherSuite,
     secret: &[u8],
-) -> Result<Vec<u8>, Failure>
+) -> Result<(Vec<u8>, Vec<u8>), Failure>
 where
     S: AsyncRead + Unpin,
 {
@@ -1343,6 +1388,10 @@ where
             return Err(reality_error("client Finished is not encrypted"));
         }
         let (inner_type, plaintext_len) = crypter.open_in_place(&header, &mut body)?;
+        // The record as it came off the wire, before it was opened.
+        let mut raw = Vec::with_capacity(5 + body.len());
+        raw.extend_from_slice(&header);
+        raw.extend_from_slice(&body);
         let plaintext = &body[..plaintext_len];
         if inner_type != CONTENT_HANDSHAKE || plaintext.len() < 4 || plaintext[0] != 20 {
             return Err(reality_error(format!(
@@ -1357,7 +1406,7 @@ where
         if len + 4 != plaintext.len() {
             return Err(reality_error("client Finished length is invalid"));
         }
-        return Ok(plaintext[4..].to_vec());
+        return Ok((plaintext[4..].to_vec(), raw));
     }
 }
 
@@ -1995,12 +2044,11 @@ mod tests {
         // The client's own hello, which is what the site is asked.
         let client_hello = client_hello_record(client_params.clone()).await;
         // What the site chose, read the way the port reads it.
-        let (_, _, answer) =
-            read_live_shapes(site.dialer.as_ref(), "example.test", &[], &client_hello)
-                .await
-                .expect("the site was reached")
-                .expect("the site answered");
-        let answer = answer.expect("the site's ServerHello was read");
+        let live = read_live_shapes(site.dialer.as_ref(), "example.test", &[], &client_hello)
+            .await
+            .expect("the site was reached")
+            .expect("the site answered");
+        let answer = live.answer.expect("the site's ServerHello was read");
         assert_eq!(answer.group, 0x001d, "the test site chose X25519");
 
         // The client is answered, and the ServerHello it gets names the
@@ -2032,13 +2080,12 @@ mod tests {
         // The site is asked, and the answer comes back: the site saw a
         // ClientHello it could answer, which it could not have done with
         // anything but a real hello.
-        let (_, _, answer) =
-            read_live_shapes(site.dialer.as_ref(), "example.test", &[], &client_hello)
-                .await
-                .expect("the site was reached")
-                .expect("the site answered");
+        let live = read_live_shapes(site.dialer.as_ref(), "example.test", &[], &client_hello)
+            .await
+            .expect("the site was reached")
+            .expect("the site answered");
         assert!(
-            answer.is_some(),
+            live.answer.is_some(),
             "the site answered the client's hello, so its ServerHello was read"
         );
     }
@@ -2054,17 +2101,16 @@ mod tests {
         let site = TestSite::start();
         let (_server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
         let client_hello = client_hello_record(client_params).await;
-        let (flight, after, _answer) =
-            read_live_shapes(site.dialer.as_ref(), "example.test", &[], &client_hello)
-                .await
-                .expect("the site was reached")
-                .expect("the site answered");
+        let live = read_live_shapes(site.dialer.as_ref(), "example.test", &[], &client_hello)
+            .await
+            .expect("the site was reached")
+            .expect("the site answered");
         assert!(
-            flight.is_some(),
+            live.flight.is_some(),
             "the site's flight was read off the connection"
         );
         assert!(
-            after.is_some(),
+            live.after.is_some(),
             "the site's post-handshake records were read off the same connection"
         );
     }

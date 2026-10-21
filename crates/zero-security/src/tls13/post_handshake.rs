@@ -570,7 +570,10 @@ where
 /// with the site, because the client — not the port — holds the ECDHE
 /// private key. What is read is the site's ServerHello, which names the
 /// suite and the group, and the sizes of the records that follow.
-pub async fn observe_with_the_clients_hello<S>(io: S, hello: &[u8]) -> Result<SiteShapes, Failure>
+pub async fn observe_with_the_clients_hello<S>(
+    io: S,
+    hello: &[u8],
+) -> Result<(SiteShapes, Option<Tap<S>>), Failure>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -608,11 +611,17 @@ where
         let server_hello = taps.server_hello.lock().unwrap_or_else(|p| p.into_inner());
         parse_site_answer(&server_hello)
     };
-    Ok(SiteShapes {
-        answer,
-        flight: take(&taps.flight),
-        post_handshake: take(&taps.post_handshake),
-    })
+    Ok((
+        SiteShapes {
+            answer,
+            flight: take(&taps.flight),
+            post_handshake: take(&taps.post_handshake),
+        },
+        // The connection is handed back with the answer: the caller's
+        // Finished has to be written to it for the site to send the rest of
+        // its flight.
+        Some(tap),
+    ))
 }
 
 /// Handshake with the site behind `io` and return the wire sizes of the

@@ -2313,7 +2313,7 @@ async fn the_site_answers_the_clients_own_hello() {
     let (_private_key, public_key) = oracle_x25519_keypair(&binary);
     let hello = client_hello_record(&public_key).await;
     let site = TcpStream::connect(decoy).await.unwrap();
-    let forwarded =
+    let (forwarded, _connection) =
         zero_security::tls13::post_handshake::observe_with_the_clients_hello(site, &hello)
             .await
             .expect("the site's answer to the client's hello");
@@ -2356,6 +2356,67 @@ async fn the_site_answers_the_clients_own_hello() {
         &probed.flight[..forwarded.flight.len()],
         "the flight the site sent for the client's hello differs from the \
          one it sent for the probe's"
+    );
+}
+
+/// The visitor's Finished reaches the site, and the site's last records
+/// follow it.
+///
+/// A site holds its own CertificateVerify and its own Finished until the
+/// client's Finished arrives, so a site that has not seen the visitor's
+/// Finished sends only part of its flight. Go's `MirrorConn` forwards every
+/// byte read from the visitor (`RL/tls.go:70-83`), and the port forwards the
+/// visitor's Finished too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn the_visitors_finished_reaches_the_site() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the camouflage site never listened");
+    let (_private_key, public_key) = oracle_x25519_keypair(&binary);
+    let hello = client_hello_record(&public_key).await;
+
+    // The site is asked with the client's hello, and the connection is kept.
+    let site = TcpStream::connect(decoy).await.unwrap();
+    let (forwarded, connection) =
+        zero_security::tls13::post_handshake::observe_with_the_clients_hello(site, &hello)
+            .await
+            .expect("the site's answer to the client's hello");
+    assert!(
+        forwarded.flight.len() < 6,
+        "the site sent {} records before the visitor's Finished: {:?}",
+        forwarded.flight.len(),
+        forwarded.flight
+    );
+
+    // The visitor's Finished goes to the site, and the site's own last
+    // records follow it.
+    let mut connection = connection.expect("the connection was handed back");
+    tokio::io::AsyncWriteExt::write_all(&mut connection, &hello)
+        .await
+        .expect("the Finished reaches the site");
+    tokio::io::AsyncWriteExt::flush(&mut connection)
+        .await
+        .expect("the Finished is flushed");
+    let mut sink = [0u8; 512];
+    let mut got = 0usize;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut connection, &mut sink).await {
+                Ok(n) if n > 0 => got += n,
+                _ => break,
+            }
+        }
+    })
+    .await;
+    assert!(
+        got > 0,
+        "the site sent nothing after the visitor's Finished, so it is still \
+         holding its own Finished"
     );
 }
 
