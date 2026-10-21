@@ -89,7 +89,11 @@ What is *not* closed is what the rows below still say.
   flight is assembled from records that arrive concurrently with the
   handshake, with the last two of them still guesses when the server's own
   flight goes out — while the port's is the site's flight complete, from
-  a handshake that finished (§1, §3, §6);
+  a handshake that finished. The one thing the port's flight is not is
+  the site's answer to the *visitor's* hello: it is the site's answer to
+  a probe's, which offers the same protocols and the same session-id
+  length, so the sizes agree for every site that answers alike — but a
+  site that varies its answer on anything else would be seen (§1, §3, §6);
 * the cipher suite and the key-share group are the *site's*, taken from its
   ServerHello, as Go takes them (`RL/handshake_server_tls13.go:100-128`) —
   and the site is asked with the *client's own* hello, forwarded verbatim,
