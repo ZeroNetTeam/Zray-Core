@@ -232,6 +232,13 @@ struct ClientHelloInfo {
     /// the wrong one produces a valid-looking hello, a completed ServerHello,
     /// and then a peer that cannot open a single record.
     hybrid: Option<HybridShare>,
+    /// Whether the client offered a standalone X25519 key share.
+    ///
+    /// The site's group can only be copied if the client offered a share for
+    /// it: Go searches the client's shares for the group's
+    /// (`RL/tls.go:216-228`), and a client that offered only the hybrid
+    /// cannot complete a handshake in the plain group.
+    offered_x25519: bool,
     sni: String,
     /// The protocols the client offered, in the order it offered them.
     ///
@@ -427,15 +434,20 @@ where
     let mut shapes = params
         .post_handshake
         .site(&hello.sni, alpn_index(&hello.alpn));
+    // What the site chose, if it could be asked: the cipher suite and the
+    // key-share group from its ServerHello, as Go takes them
+    // (`RL/handshake_server_tls13.go:100-128`).
+    let mut site_answer = None;
     if let Some(decoy) = params.decoy.as_deref() {
         match read_live_shapes(decoy, &hello.sni, &hello.alpn).await {
-            Ok(Some((flight, after))) => {
+            Ok(Some((flight, after, answer))) => {
                 if let Some(flight) = flight {
                     shapes.flight = Some(flight);
                 }
                 if let Some(after) = after {
                     shapes.after = Some(after);
                 }
+                site_answer = answer;
             }
             Ok(None) => {}
             Err(error) => {
@@ -456,6 +468,7 @@ where
         hello,
         auth_key,
         shapes,
+        site_answer,
         params.mldsa65_seed,
         params.key_log.as_ref(),
     )
@@ -521,6 +534,7 @@ async fn complete_handshake<S>(
     hello: ClientHelloInfo,
     auth_key: [u8; 32],
     shapes: SiteShapes,
+    site_answer: Option<zero_security::tls13::post_handshake::SiteAnswer>,
     mldsa65_seed: Option<[u8; 32]>,
     key_log: Option<&Arc<crate::keys::KeyLog>>,
 ) -> Result<Tls13Stream<S>, Failure>
@@ -532,7 +546,28 @@ where
     let server_seed = zeroize::Zeroizing::new(server_seed);
     let server_public =
         x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*server_seed)).to_bytes();
-    let (server_share, mut handshake_shared) = if let Some(hybrid) = hello.hybrid {
+    // Whether the client offered a share for the plain and the hybrid group,
+    // which decides whether the site's group can be copied at all.
+    let offered_x25519 = hello.offered_x25519;
+    let offered_hybrid = hello.hybrid.is_some();
+    // The group comes first, because the share has to be *for* that group.
+    //
+    // The site's group is copied only if the client offered a share for it:
+    // Go searches the client's shares for the group's
+    // (`RL/tls.go:216-228`), and a client that offered only one group
+    // cannot complete a handshake in the other.
+    let site_group = site_answer.map(|answer| answer.group);
+    let offered = match site_group {
+        Some(0x001d) => offered_x25519,
+        Some(0x11ec) => offered_hybrid,
+        _ => false,
+    };
+    let use_hybrid = match site_group {
+        Some(group) if offered => group == 0x11ec,
+        _ => offered_hybrid,
+    };
+    let (server_share, mut handshake_shared) = if use_hybrid {
+        let hybrid = hello.hybrid.as_ref().expect("the hybrid share was offered");
         // The hybrid group's ECDH uses the X25519 key carried *inside* that
         // share, not the standalone one the REALITY tag was checked against.
         let x25519_shared = x25519_dalek::x25519(*server_seed, hybrid.x25519);
@@ -558,12 +593,23 @@ where
         (server_public.to_vec(), x25519_shared.to_vec())
     };
 
-    let group = if server_share.len() == 1088 + 32 {
-        0x11ec
-    } else {
-        0x001d
+    // The group and the suite are the site's, as Go takes them: the site
+    // chose the group in its ServerHello, and Go answers with the same one
+    // (`RL/handshake_server_tls13.go:100-128`). A server that answered with
+    // a different group than the site chose is a server that says it is not
+    // the site.
+    //
+    // The *key* is ours either way: Go uses the client's share with its own
+    // private key, and so does the port.
+    let site_suite = site_answer.map(|answer| answer.suite);
+    let group = if use_hybrid { 0x11ec } else { 0x001d };
+    let suite = match site_suite {
+        // The site chose a suite the client offered, so it is one the port
+        // knows; a suite the port does not know falls back to the client's.
+        Some(id) => CipherSuite::by_id(id).unwrap_or(hello.suite),
+        None => hello.suite,
     };
-    let server_hello = build_server_hello(&hello.session_id, hello.suite, group, &server_share);
+    let server_hello = build_server_hello(&hello.session_id, suite, group, &server_share);
     // What the camouflage site's own flight looked like, if it can be copied
     // at all: our ServerHello has to be the size the site's was, or there is
     // no record-for-record shape to reproduce and the flight goes out as
@@ -676,7 +722,14 @@ async fn read_live_shapes(
     decoy: &dyn DecoyDialer,
     server_name: &str,
     alpn: &[String],
-) -> Result<Option<(Option<Arc<[u16]>>, Option<Arc<[u16]>>)>, String> {
+) -> Result<
+    Option<(
+        Option<Arc<[u16]>>,
+        Option<Arc<[u16]>>,
+        Option<zero_security::tls13::post_handshake::SiteAnswer>,
+    )>,
+    String,
+> {
     let site = decoy.dial().await?;
     // The site is asked with the protocols the client offered, so the answer
     // is the one that client would have got.
@@ -698,7 +751,7 @@ async fn read_live_shapes(
     let flight = (!observed.flight.is_empty()).then(|| Arc::from(observed.flight.as_slice()));
     let after = (!observed.post_handshake.is_empty())
         .then(|| Arc::from(observed.post_handshake.as_slice()));
-    Ok(Some((flight, after)))
+    Ok(Some((flight, after, observed.answer)))
 }
 
 fn derive_auth_key(shared: &[u8; 32], salt: &[u8]) -> [u8; 32] {
@@ -943,6 +996,7 @@ fn parse_client_hello(message: Vec<u8>) -> Result<ClientHelloInfo, Failure> {
         random,
         session_id,
         auth_key_share,
+        offered_x25519: standalone_x25519.is_some(),
         hybrid,
         sni: sni.ok_or_else(|| reality_error("ClientHello has no SNI"))?,
         alpn: alpn.unwrap_or_default(),
@@ -1909,6 +1963,40 @@ mod tests {
         assert_eq!(*sizes.lock().unwrap(), [255, 69, 5 + 4 + 1 + 16]);
     }
 
+    /// The server answers with the cipher suite and the group the *site*
+    /// chose.
+    ///
+    /// Go takes both from the site's ServerHello
+    /// (`RL/handshake_server_tls13.go:100-128`), and a server that answered
+    /// with a different suite or group than the site chose is a server that
+    /// says it is not the site.
+    #[tokio::test]
+    async fn the_sites_suite_and_group_are_the_ones_answered_with() {
+        let site = TestSite::start();
+        let (mut server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        server_params.decoy = Some(Arc::clone(&site.dialer) as Arc<dyn DecoyDialer>);
+
+        // What the site chose, read the way the port reads it.
+        let (_, _, answer) = read_live_shapes(site.dialer.as_ref(), "example.test", &[])
+            .await
+            .expect("the site was reached")
+            .expect("the site answered");
+        let answer = answer.expect("the site's ServerHello was read");
+        assert_eq!(answer.group, 0x001d, "the test site chose X25519");
+
+        // The client is answered, and the ServerHello it gets names the
+        // site's group and suite.
+        let (group, suite) = server_hello_choice(&server_params, &client_params).await;
+        assert_eq!(
+            group, answer.group,
+            "the server answered with a group other than the site's"
+        );
+        assert_eq!(
+            suite, answer.suite,
+            "the server answered with a suite other than the site's"
+        );
+    }
+
     /// The records the site sends after the handshake are read off the same
     /// connection as the flight.
     ///
@@ -1918,7 +2006,7 @@ mod tests {
     #[tokio::test]
     async fn the_post_handshake_records_are_read_off_the_site_too() {
         let site = TestSite::start();
-        let (flight, after) = read_live_shapes(site.dialer.as_ref(), "example.test", &[])
+        let (flight, after, _answer) = read_live_shapes(site.dialer.as_ref(), "example.test", &[])
             .await
             .expect("the site was reached")
             .expect("the site answered");
@@ -1985,6 +2073,41 @@ mod tests {
 
     /// One handshake against `server_params`, and the sizes of the records the
     /// client received before it sent its Finished — the server's flight.
+    /// The key-share group and the cipher suite in the ServerHello the
+    /// client was answered with.
+    async fn server_hello_choice(
+        server_params: &RealityServerParams,
+        client_params: &zero_security::RealityParams,
+    ) -> (u16, u16) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn({
+            let server_params = server_params.clone();
+            async move {
+                let mut stream = handshake(server_io, &server_params).await.unwrap();
+                let mut request = [0u8; 4];
+                stream.read_exact(&mut request).await.unwrap();
+                stream.write_all(b"pong").await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+        // The tap keeps the client's first record — the ServerHello it was
+        // answered with.
+        let (tapped, taps) = zero_security::tls13::post_handshake::tap_with_flight(client_io);
+        let mut client = zero_security::reality_connect(tapped, client_params)
+            .await
+            .unwrap();
+        client.write_all(b"ping").await.unwrap();
+        client.flush().await.unwrap();
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"pong");
+        server.await.unwrap();
+        let hello = taps.server_hello.lock().unwrap().clone();
+        let answer = zero_security::tls13::post_handshake::parse_site_answer(&hello)
+            .expect("the ServerHello the client was answered with parses");
+        (answer.group, answer.suite)
+    }
+
     async fn flight_sizes(
         server_params: &RealityServerParams,
         client_params: &zero_security::RealityParams,

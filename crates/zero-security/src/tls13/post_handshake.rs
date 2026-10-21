@@ -55,12 +55,33 @@ pub const MAX_FLIGHT_RECORDS: usize = 8;
 /// What a camouflage site's handshake looks like from outside it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SiteShapes {
+    /// The cipher suite the site chose, and the key-share group it chose.
+    ///
+    /// Go takes both from the site's ServerHello
+    /// (`RL/handshake_server_tls13.go:100-128`), which is why they are
+    /// here: a server that answered with a different suite than the site
+    /// would have answered with is a server that says it is not the site.
+    pub answer: Option<SiteAnswer>,
     /// Wire sizes of the records the site sent before the client's Finished,
     /// in order: its ServerHello, its compatibility ChangeCipherSpec, then
     /// the records of its encrypted flight.
     pub flight: Vec<u16>,
     /// Wire sizes of the records it sent after the handshake, in order.
     pub post_handshake: Vec<u16>,
+}
+
+/// The suite and the key-share group the site chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SiteAnswer {
+    /// The cipher suite the site selected.
+    pub suite: u16,
+    /// The key-share group the site selected: `0x001d` for X25519,
+    /// `0x11ec` for X25519MLKEM768.
+    pub group: u16,
+    /// The site's key share, which the port does *not* use — Go uses the
+    /// client's share with its own private key, and so does the port
+    /// (`RL/handshake_server_tls13.go:108-128`).
+    pub key_share_len: usize,
 }
 
 /// Finds record boundaries in a TLS byte stream that arrives in arbitrary
@@ -96,6 +117,53 @@ impl RecordWalker {
     }
 }
 
+/// Keeps the bytes of the first record of a stream.
+///
+/// The site's ServerHello is the one thing a REALITY server has to read off
+/// the site: it names the cipher suite and the key-share group the site
+/// chose, and Go takes both from it (`RL/tls.go:353-368`,
+/// `RL/handshake_server_tls13.go:100-128`). A walker that only counts
+/// records cannot answer that, so this one keeps the first record's bytes.
+#[derive(Default)]
+struct FirstRecord {
+    /// The header, then the body, once both have arrived.
+    bytes: Vec<u8>,
+    /// How many body bytes are still wanted.
+    body_left: usize,
+    /// Whether the header has arrived.
+    have_header: bool,
+    /// Whether the record is complete.
+    done: bool,
+}
+
+impl FirstRecord {
+    /// Feed the next bytes; returns the whole record once it is complete.
+    fn feed(&mut self, data: &[u8]) -> Option<&[u8]> {
+        if self.done {
+            return Some(&self.bytes);
+        }
+        let mut at = 0;
+        if !self.have_header {
+            let take = (5 - self.bytes.len()).min(data.len());
+            self.bytes.extend_from_slice(&data[..take]);
+            at = take;
+            if self.bytes.len() < 5 {
+                return None;
+            }
+            self.have_header = true;
+            self.body_left = u16::from_be_bytes([self.bytes[3], self.bytes[4]]) as usize;
+        }
+        let take = self.body_left.min(data.len() - at);
+        self.bytes.extend_from_slice(&data[at..at + take]);
+        self.body_left -= take;
+        if self.body_left == 0 {
+            self.done = true;
+            return Some(&self.bytes);
+        }
+        None
+    }
+}
+
 /// Sits under the TLS client and watches record headers go by in both
 /// directions.
 #[doc(hidden)]
@@ -103,6 +171,13 @@ pub struct Tap<S> {
     inner: S,
     sent: RecordWalker,
     received: RecordWalker,
+    /// The site's first record — its ServerHello — kept whole.
+    ///
+    /// It names the cipher suite and the key-share group the site chose,
+    /// which is what Go takes from it (`RL/tls.go:353-368`).
+    first: FirstRecord,
+    /// Where the captured ServerHello is kept.
+    server_hello: Arc<Mutex<Vec<u8>>>,
     /// The client's Finished has gone out, so what arrives now is
     /// post-handshake rather than part of the server's flight.
     finished_sent: bool,
@@ -124,6 +199,13 @@ impl<S: AsyncRead + Unpin> AsyncRead for Tap<S> {
         let finished_sent = this.finished_sent;
         let flight = &this.flight;
         let sizes = &this.sizes;
+        let captured = this.first.feed(&buf.filled()[before..]);
+        if let Some(record) = captured {
+            let mut kept = this.server_hello.lock().unwrap_or_else(|p| p.into_inner());
+            if kept.is_empty() {
+                kept.extend_from_slice(record);
+            }
+        }
         this.received
             .feed(&buf.filled()[before..], |content_type, wire_len| {
                 if !finished_sent {
@@ -183,6 +265,150 @@ pub struct Taps {
     pub post_handshake: Arc<Mutex<Vec<u16>>>,
     /// The sizes of the records this end wrote.
     pub written: Arc<Mutex<Vec<u16>>>,
+    /// The site's first record whole — its ServerHello.
+    pub server_hello: Arc<Mutex<Vec<u8>>>,
+}
+
+/// Read the cipher suite and the key-share group out of a site's
+/// ServerHello.
+///
+/// The record is the site's first one, header and all. Go parses the same
+/// thing off its mirrored connection (`RL/tls.go:353-368`) and takes the
+/// suite and the group from it (`RL/handshake_server_tls13.go:100-128`).
+///
+/// A ServerHello that does not parse is not an answer: the site's suite
+/// and group are then simply not known, and the caller falls back to what
+/// it has.
+pub fn parse_site_answer(record: &[u8]) -> Option<SiteAnswer> {
+    // A TLS record: a 5-byte header and the handshake message.
+    if record.len() < 5 {
+        return None;
+    }
+    let body = &record[5..];
+    // The handshake message: a type byte and a 3-byte length.
+    if body.len() < 4 || body[0] != 2 {
+        return None;
+    }
+    let mut at = 4usize;
+    // legacy_version, random, session id, cipher suite, compression.
+    at = at.checked_add(2 + 32)?;
+    let sid_len = *body.get(at)? as usize;
+    at += 1 + sid_len;
+    let suite = u16::from_be_bytes([*body.get(at)?, *body.get(at + 1)?]);
+    at += 2;
+    at += 1; // compression method
+             // The extensions.
+    let ext_total = u16::from_be_bytes([*body.get(at)?, *body.get(at + 1)?]) as usize;
+    at += 2;
+    let end = at.checked_add(ext_total)?;
+    if end > body.len() {
+        return None;
+    }
+    while at + 4 <= end {
+        let etype = u16::from_be_bytes([body[at], body[at + 1]]);
+        let elen = u16::from_be_bytes([body[at + 2], body[at + 3]]) as usize;
+        at += 4;
+        let ext = body.get(at..at + elen)?;
+        at += elen;
+        if etype != 51 {
+            continue;
+        }
+        // ServerHello carries the one selected share directly, with no
+        // vector length in front of it.
+        if ext.len() < 4 {
+            return None;
+        }
+        let group = u16::from_be_bytes([ext[0], ext[1]]);
+        let klen = u16::from_be_bytes([ext[2], ext[3]]) as usize;
+        if ext.len() != 4 + klen {
+            return None;
+        }
+        // Go accepts only two groups from the site
+        // (`RL/tls.go:357-360`): X25519 with a 32-byte share, and
+        // X25519MLKEM768 with a ciphertext of 1088 bytes plus the X25519
+        // half. Anything else is not an answer Go would act on, so it is
+        // not an answer here either.
+        let known = (group == 0x001d && klen == 32) || (group == 0x11ec && klen == 1088 + 32);
+        if !known {
+            return None;
+        }
+        return Some(SiteAnswer {
+            suite,
+            group,
+            key_share_len: klen,
+        });
+    }
+    None
+}
+
+#[cfg(test)]
+mod site_answer_tests {
+    use super::*;
+
+    /// A ServerHello record, as the site sends it.
+    fn server_hello_record(suite: u16, group: u16, key: &[u8]) -> Vec<u8> {
+        let mut message = vec![2u8, 0, 0, 0];
+        message.extend_from_slice(&[0x03, 0x03]); // legacy version
+        message.extend_from_slice(&[0u8; 32]); // random
+        message.push(0); // no session id
+        message.extend_from_slice(&suite.to_be_bytes());
+        message.push(0); // no compression
+                         // The extensions: supported_versions and key_share.
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&43u16.to_be_bytes());
+        ext.extend_from_slice(&2u16.to_be_bytes());
+        ext.extend_from_slice(&[0x03, 0x04]);
+        ext.extend_from_slice(&51u16.to_be_bytes());
+        ext.extend_from_slice(&((4 + key.len()) as u16).to_be_bytes());
+        ext.extend_from_slice(&group.to_be_bytes());
+        ext.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        ext.extend_from_slice(key);
+        message.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        message.extend_from_slice(&ext);
+        let len = message.len() - 4;
+        message[1..4].copy_from_slice(&[0, (len >> 8) as u8, len as u8]);
+        // A record header around it.
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+        record.extend_from_slice(&message);
+        record
+    }
+
+    /// The site's suite and group are read off its ServerHello.
+    ///
+    /// Go takes both from the site's answer
+    /// (`RL/handshake_server_tls13.go:100-128`), so a server that answered
+    /// with a different suite than the site would have answered with is a
+    /// server that says it is not the site.
+    #[test]
+    fn the_sites_suite_and_group_are_read_off_its_server_hello() {
+        let record = server_hello_record(0x1301, 0x001d, &[9u8; 32]);
+        let answer = parse_site_answer(&record).expect("the ServerHello parses");
+        assert_eq!(answer.suite, 0x1301, "TLS_AES_128_GCM_SHA256");
+        assert_eq!(answer.group, 0x001d, "X25519");
+        assert_eq!(answer.key_share_len, 32);
+    }
+
+    /// The hybrid group is read just as the plain one is.
+    #[test]
+    fn the_hybrid_group_is_read_too() {
+        let record = server_hello_record(0x1302, 0x11ec, &[7u8; 1088 + 32]);
+        let answer = parse_site_answer(&record).expect("the ServerHello parses");
+        assert_eq!(answer.suite, 0x1302, "TLS_AES_256_GCM_SHA384");
+        assert_eq!(answer.group, 0x11ec, "X25519MLKEM768");
+        assert_eq!(answer.key_share_len, 1088 + 32);
+    }
+
+    /// Something that is not a ServerHello is not an answer.
+    #[test]
+    fn a_record_that_is_not_a_server_hello_is_no_answer() {
+        assert!(parse_site_answer(&[]).is_none());
+        assert!(parse_site_answer(&[0x16, 0x03, 0x01, 0x00, 0x05]).is_none());
+        // A handshake message of the wrong type.
+        let mut record = server_hello_record(0x1301, 0x001d, &[9u8; 32]);
+        record[5] = 1; // not a ServerHello
+        assert!(parse_site_answer(&record).is_none());
+    }
 }
 
 /// Put a tap on `io` and get both lists it collects.
@@ -195,15 +421,18 @@ pub fn tap_with_flight<S>(io: S) -> (Tap<S>, Taps) {
         flight: Arc::new(Mutex::new(Vec::new())),
         post_handshake: Arc::new(Mutex::new(Vec::new())),
         written: Arc::new(Mutex::new(Vec::new())),
+        server_hello: Arc::new(Mutex::new(Vec::new())),
     };
     let tap = Tap {
         inner: io,
         sent: RecordWalker::default(),
         received: RecordWalker::default(),
+        first: FirstRecord::default(),
         finished_sent: false,
         flight: Arc::clone(&taps.flight),
         sizes: Arc::clone(&taps.post_handshake),
         written: Arc::clone(&taps.written),
+        server_hello: Arc::clone(&taps.server_hello),
     };
     (tap, taps)
 }
@@ -293,7 +522,12 @@ where
     })
     .await;
     let take = |list: &Arc<Mutex<Vec<u16>>>| list.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let answer = {
+        let hello = taps.server_hello.lock().unwrap_or_else(|p| p.into_inner());
+        parse_site_answer(&hello)
+    };
     Ok(SiteShapes {
+        answer,
         flight: take(&taps.flight),
         post_handshake: take(&taps.post_handshake),
     })

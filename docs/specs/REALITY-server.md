@@ -58,6 +58,7 @@ is the one that fails without it.
 | A unix-socket camouflage target (§7) | the target is dialled as a socket, and an unauthenticated visitor is handed to it | `crates/zero-runtime/tests/reality_unix_target.rs` |
 | The site is dialled for every connection, and its shapes read off that connection (§1, §3) | the flight and the post-handshake records the client sees are the site's, read live, as Go's are | `server::tests::the_flight_is_read_off_the_site_on_every_connection` and `server::tests::the_post_handshake_records_are_read_off_the_site_too` |
 | The site's shapes are filed per ALPN, and the client is handed the ones that match (§3, §5) | the site is asked three ways, and a client gets the answer for the ALPN it offered | `server::tests::the_alpn_index_is_go_s_bucket` and `server::tests::a_client_gets_the_shapes_filed_under_its_alpn` |
+| The cipher suite and the key-share group are the site's (§3) | the server answers with the suite and the group the site chose, read off the site's ServerHello, as Go does | `server::tests::the_sites_suite_and_group_are_the_ones_answered_with` |
 
 What is *not* closed is what the rows below still say.
 
@@ -76,17 +77,14 @@ What is *not* closed is what the rows below still say.
   site's flight is its answer to the visitor's own bytes; the port asks the
   site with a hello of its own and dials again for the fallback relay, so
   the two answers need not agree (§1, §3, §6);
-* cipher-suite choice follows the client, not the decoy — Go takes the suite
-  from the *decoy's* ServerHello, and validates the decoy's key-share group
-  before using it (`RL/tls.go:353-368`, `RL/handshake_server_tls13.go:102`).
-  What makes that answer the *client's* is the `MirrorConn`: the client's own
-  ClientHello is forwarded to the decoy (`RL/tls.go:70-83`), so the decoy
-  answers the client's offer and the suite it picks is one the client
-  offered. The port's probe sends a hello of its own instead, and the port
-  takes the first suite the *client* offered that it knows, and picks its own
-  key-share group (`crates/reality/src/server.rs`) (§3). The two agree for a
-  client whose first known suite is also the decoy's preference, and differ
-  for one where it is not;
+* the cipher suite and the key-share group are the *site's*, taken from its
+  ServerHello, as Go takes them (`RL/handshake_server_tls13.go:100-128`) —
+  but the site is asked with a hello of the port's own rather than the
+  client's, because the port does not forward the client's hello to it the
+  way Go's `MirrorConn` does (`RL/tls.go:70-83`). The suite and the group
+  are therefore the ones the site would have chosen for the port's offer,
+  which is the same as the client's offer in the common case and not the
+  same in every case (§3, §6);
 * the ML-DSA-65 extension uses OID 1.3 at a computed offset instead of Go's
   placeholder OID 0.0 at a fixed one — `crates/reality/src/server.rs` against
   `RL/handshake_server_tls13.go:82`. Invisible to both clients, and provably
@@ -637,11 +635,19 @@ sequence a real server produces (`RB/server.rs:1129-1164` asserts
   for a hybrid share, ML-KEM-768 encapsulation against the client's key, with
   `share = mlkem_ciphertext || server_x25519_public` and
   `shared = mlkem_shared || x25519_shared` (`RB/server.rs:307-331`) — the same
-  concatenation order as Go. The group in the ServerHello is derived from the share
-  length (1088 + 32 ⇒ `0x11ec`, otherwise `0x001d`, `RB/server.rs:333-337`).
-* **Cipher suite**: the first suite in the client's list that
-  `CipherSuite::by_id` knows (`RB/server.rs:559-567`) — client preference, not the
-  decoy's choice and not a server preference list. See the divergences below.
+  concatenation order as Go. The group in the ServerHello is the *site's* —
+  the group it selected in its ServerHello (`RL/handshake_server_tls13.go:100-128`)
+  — but only when the client offered a share for that group, since Go searches
+  the client's shares for it (`RL/tls.go:216-228`) and a client that offered
+  only one group cannot complete a handshake in the other. The *key* is ours
+  either way: Go uses the client's share with its own private key, and so does
+  the port (`RB/server.rs`).
+* **Cipher suite**: the *site's*, read off its ServerHello — the suite it
+  selected there (`RL/handshake_server_tls13.go:100-128`), falling back to the
+  first suite in the client's list that `CipherSuite::by_id` knows when the
+  site could not be asked or chose one the port does not know
+  (`RB/server.rs`). A server that answered with a different suite than the
+  site would have answered with is a server that says it is not the site.
 * **Key schedule**: `Transcript::new` → ClientHello → ServerHello
   (`RB/server.rs:341-343`), then `establish_handshake_secrets` (`:344-345`) and,
   after the server Finished, `establish_application_secrets` (`:393`); the Finished
