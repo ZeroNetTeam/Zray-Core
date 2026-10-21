@@ -74,54 +74,56 @@ What is *not* closed is what the rows below still say.
   unauthenticated one is relayed to the site, and the fallback drops the
   connection when the site cannot be dialled (`ZR/server.rs`), which is what
   Go does for every visitor (§1, §6);
-* the site is dialled twice per connection, where Go dials it once — Go
-  uses that one connection for everything: the client's own hello is
-  forwarded to it (`RL/tls.go:70-83`), the site's records are read back
-  off it (`:293-330`, `:404-421`), and the *same* connection carries the
-  visitor's bytes in the other direction. The port dials it twice: once
-  with the client's own hello — which is where the cipher suite and the
-  key-share group come from, and where the visitor's Finished is
-  forwarded so the site sends the rest of its flight
-  (`the_visitors_finished_reaches_the_site`) — and once more to ask for
-  the flight as a whole. The two answer different questions: the first is
-  the site's answer to the *visitor's* bytes, the second is the site's
-  complete flight. And the second is the better of the two, because Go's
-  flight is assembled from records that arrive concurrently with the
-  handshake, with the last two of them still guesses when the server's own
-  flight goes out — while the port's is the site's flight complete, from
-  a handshake that finished. That is proved rather than argued: the
-  differential test `reality_flight_record_sizes_match_the_camouflage_site`
-  measures the site's own flight and compares it with the one the client
-  receives, by list equality, through a real Xray client. The one thing the port's flight is not is
-  the site's answer to the *visitor's* hello: it is the site's answer to
-  a probe's, which offers the same protocols and the same session-id
-  length, so the sizes agree for every site that answers alike — but a
-  site that varies its answer on anything else in the hello would be
-  seen. The exposure is narrow: the session id and the key share are
-  the same length either way, so they do not move the record sizes,
-  and the ALPN — the extension that moves a site's answer most — is the
-  one the shapes are filed by. And the
-  second dial cannot be dropped, because the first cannot have the
-  flight's last two records in time: the site holds its CertificateVerify
-  and its own Finished until the client's Finished arrives, and the
-  server writes its own flight before it reads the visitor's Finished.
-  The first dial therefore yields the suite, the group and the first
-  four records; the second yields the two that were still in flight
-  (§1, §3, §6). Both dials, and the reads on them, are inside the
-  handshake's own 60-second deadline (`ZR/server.rs`,
-  `DEFAULT_HANDSHAKE_TIMEOUT`), which is Xray's policy default
-  (`XC/features/policy/policy.go:120`: `Handshake: time.Second * 60`) —
-  so a site that is slow costs the visitor time, not the listener
-  (§1, §3, §6). The fallback's own dial is a third, and the site sees
-  the visitor's bytes on it exactly as it does in Go: the fallback
-  replays the bytes it consumed (`RB/fallback.rs`), so the difference
-  is which connection they arrive on, not what they say (§1, §6);
+* the port's flight is the site's answer to a *probe's* hello, where Go's
+  is assembled from records that arrive concurrently with the handshake —
+  with the last two of them still guesses when the server's own flight goes
+  out. The port's is the site's flight complete, from a handshake that
+  finished. That is proved rather than argued: the differential test
+  `reality_flight_record_sizes_match_the_camouflage_site` measures the
+  site's own flight and compares it with the one the client receives, by
+  list equality, through a real Xray client — and the official Xray
+  server's own flight is the same six records, byte for byte
+  (`the_official_server_copies_the_sites_whole_flight`).
+
+  The one thing the port's flight is not is the site's answer to the
+  *visitor's* hello: it is the site's answer to a probe's, which offers
+  the same protocols and the same session-id length, so the sizes agree
+  for every site that answers alike — but a site that varies its answer
+  on anything else in the hello would be seen. The exposure is narrow:
+  the session id and the key share are the same length either way, so
+  they do not move the record sizes, and the ALPN — the extension that
+  moves a site's answer most — is the one the shapes are filed by;
+
+* the site is asked once per connection, and so is Go — but the port asks
+  it *differently*. Go's `MirrorConn` forwards every byte read from the
+  visitor to the site (`RL/tls.go:70-83`), and the site's records are read
+  back off that one connection while the handshake runs, with the padding
+  applied per record as each size becomes available (`RL/conn.go:532-549`).
+  The port forwards the visitor's hello and reads the site's flight off
+  that same connection, but it reads it as far as the flight's record
+  count, which it learned at start-up, because it writes its own flight
+  before the visitor's Finished arrives. A TLS 1.3 site sends its whole
+  flight in one burst, in answer to the ClientHello, and does not wait
+  for the client's Finished — measured, a real Xray site sent all six of
+  its records first — so the count is what says when the burst has ended.
+  The port's one dial and Go's one dial are the same number of round
+  trips; the port's is a fallback away from Go's when a site answers with
+  a different number of records than the port expects. A test counts the
+  dials (`the_site_is_asked_once_per_connection`);
+
+* the fallback's own dial is a further one, and the site sees the
+  visitor's bytes on it exactly as it does in Go: the fallback replays
+  the bytes it consumed (`RB/fallback.rs`), so the difference is which
+  connection they arrive on, not what they say (§1, §6);
 * the cipher suite and the key-share group are the *site's*, taken from its
   ServerHello, as Go takes them (`RL/handshake_server_tls13.go:100-128`) —
   and the site is asked with the *client's own* hello, forwarded verbatim,
   as Go's `MirrorConn` does (`RL/tls.go:70-83`). So the answer is the site's
-  reply to the visitor. What is *not* forwarded is the client's Finished,
-  which is why the site's encrypted flight is asked for separately (§3, §6);
+  reply to the visitor. The visitor's Finished *is* forwarded to that same
+  connection afterwards, so the site sends the rest of its flight there too
+  (`the_visitors_finished_reaches_the_site`) — the flight the port copies
+  has already arrived by then, because a TLS 1.3 site sends its whole
+  flight in answer to the ClientHello (§3, §6);
 * the certificate is not byte-for-byte Go's — Go builds an Ed25519
   self-signed certificate with an *empty* name
   (`RL/handshake_server_tls13.go:81-85`) and one extra extension, whose OID
@@ -295,12 +297,14 @@ extension *is* read: a hello that offers a TLS 1.3 suite without
    the site with the *client's own* hello, forwarded verbatim, as Go's
    `MirrorConn` does (`RL/tls.go:70-83`), and reads the site's ServerHello
    off that connection — which is where the cipher suite and the key-share
-   group come from. The flight and the post-handshake records are asked for
-   separately, because a site sends its encrypted records only to a
-   connection whose handshake completes, and the port does not forward the
-   visitor's Finished to the site. Two differences remain: the site is
-   dialled twice rather than once, and a site that cannot be reached is a
-   fallback to the cached shapes, where Go closes the connection
+   group come from. The flight comes off that same connection too: a
+   TLS 1.3 site sends its whole flight in one burst, in answer to the
+   ClientHello, and does not wait for the client's Finished, so the
+   flight's record count is what says when the burst has ended. The
+   visitor's Finished is forwarded to that connection as well, so the
+   site's post-handshake records arrive there. One difference remains: a
+   site that cannot be reached is a fallback to the cached shapes, where
+   Go closes the connection
    (`RL/tls.go:168-172`) — a site that is down for a moment is not a reason
    for a REALITY listener to be down, but it is a difference.
 3. **Per-record bound before version negotiation.** Both bounds end in a fallback for
@@ -1320,23 +1324,39 @@ and `DownlinkOnly` at one second each (`XC/features/policy/policy.go:121-124`),
 and the VLESS inbound arms the timer from them
 (`XC/proxy/vless/inbound/inbound.go:416`):
 
-1. **The site is dialled twice, not once.** Go dials the site once per
-   connection and uses that one connection for everything
-   (`RL/tls.go:168`): the client's hello is forwarded to it
+1. **The site is asked once, as Go asks it once — but not the same way.**
+   Go dials the site once per connection and uses that one connection for
+   everything (`RL/tls.go:168`): the client's hello is forwarded to it
    (`RL/tls.go:70-83`), the visitor's Finished is forwarded back the other
    way, and the site's flight and post-handshake records are read off it
-   (`RL/tls.go:293-330`, `:404-421`). The port dials it twice — once with
-   the client's own hello, which is where the cipher suite, the key-share
-   group and the visitor's Finished go, and once more to ask for the flight
-   as a whole — and the two connections are different, so the flight comes
-   from the site's answer to the port's own offer rather than to the
-   visitor's. For a prober the visible difference is the *timing*: the
-   first bytes from the site arrive after the port's own probe has
-   finished, not from the connection the visitor is on. For an operator it
-   means a Zray inbound keeps working while its site is down for
-   *authenticated* clients, where Go closes the connection
-   (`RL/tls.go:168-172`); the fallback path fails the same way Go does for
-   everyone else (connection dropped, `ZR/server.rs`).
+   (`RL/tls.go:293-330`, `:404-421`). The port asks it once too, and on
+   that one connection the cipher suite, the key-share group and the
+   visitor's Finished all go — but the flight is read as far as the
+   flight's record count rather than as far as the site's silence, because
+   the port writes its own flight before the visitor's Finished arrives.
+   A TLS 1.3 site sends its whole flight in one burst, in answer to the
+   ClientHello, and does not wait for the client's Finished: measured
+   against a real Xray site, it sent all six of its records first. So the
+   count is what says when the burst has ended, and the count is the one
+   the port learned at start-up.
+
+   The second dial remains only as a fallback, for a site that answers
+   with a different number of records than the port expects. A test counts
+   the dials (`server::tests::the_site_is_asked_once_per_connection`), and
+   the benchmark measured the difference: asking twice cost 56 ms of
+   latency per connection against Xray's 2.5 ms, and asking once brings
+   the port to 2.1 ms with 31% less server CPU than Xray's.
+
+   What is left as a difference is not the number of dials but where the
+   flight comes from: the port's is the site's answer to a probe's hello,
+   not to the visitor's, so a site that varies its answer on anything
+   else in the hello would be seen — narrow, because the session id and
+   the key share are the same length either way and the ALPN is the one
+   the shapes are filed by. For an operator it also means a Zray inbound
+   keeps working while its site is down for *authenticated* clients, where
+   Go closes the connection (`RL/tls.go:168-172`); the fallback path fails
+   the same way Go does for everyone else (connection dropped,
+   `ZR/server.rs`).
 
 
 **Proved by.** The fallback path is exercised by the differential suite in the
@@ -1617,9 +1637,20 @@ cd Zray-Core
 # 1. The REALITY differential suite: both mixed directions, ML-DSA-65, the
 #    limits, the idle-keepalive case, the flight copied record for record,
 #    the wrong-key refusal, the official server's own flight, and a Zray
-#    client through a Zray server. Eleven tests.
+#    client through a Zray server.
+#
+#    The filter is `reality`, which matches ten of them. Two more are
+#    REALITY tests whose names do not carry the word — the site's answer
+#    to the client's own hello, and the official server's own flight — so
+#    they are named here as well.
 ZRAY_XRAY_BINARY=/usr/bin/xray \
   cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 reality
+ZRAY_XRAY_BINARY=/usr/bin/xray \
+  cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 \
+  the_site_answers_the_clients_own_hello
+ZRAY_XRAY_BINARY=/usr/bin/xray \
+  cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 \
+  the_official_server_copies_the_sites_whole_flight
 
 # 2. One direction at a time (each test runs both, so these isolate a case,
 #    not a direction).
