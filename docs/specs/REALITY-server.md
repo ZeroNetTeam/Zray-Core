@@ -1284,7 +1284,11 @@ limits, with one named difference. The burst is clamped up to the rate, as Go
 does (`RL/tls.go:127-130`): a bucket whose capacity is smaller than its refill
 rate can never hold a second's worth of credit, so the limit would bite sooner
 than the rate says. Both throttles do it (`ZR/throttle.rs`, `RB/fallback.rs`),
-and both are pinned by a test:
+and both are pinned by a test. The idle deadline is Xray's own default too —
+`SessionDefault()` has `ConnectionIdle: time.Second * 300` and `UplinkOnly`
+and `DownlinkOnly` at one second each (`XC/features/policy/policy.go:121-124`),
+and the VLESS inbound arms the timer from them
+(`XC/proxy/vless/inbound/inbound.go:416`):
 
 1. **The site is dialled twice, not once.** Go dials the site once per
    connection and uses that one connection for everything
@@ -1303,17 +1307,6 @@ and both are pinned by a test:
    *authenticated* clients, where Go closes the connection
    (`RL/tls.go:168-172`); the fallback path fails the same way Go does for
    everyone else (connection dropped, `ZR/server.rs`).
-2. **Nothing.** The Rust relay uses `DEFAULT_IDLE_TIMEOUT = 300 s`
-   (`ZR/relay.rs:39`, overridable by `policy.connIdle`, `ZR/relay.rs:52-64`)
-   plus a 1 s half-close limit (`ZR/relay.rs:47`), and those are Xray's own
-   defaults: `SessionDefault()` has `ConnectionIdle: time.Second * 300` and
-   `UplinkOnly` and `DownlinkOnly` at one second each
-   (`XC/features/policy/policy.go:121-124`), and the VLESS inbound — which
-   is where a REALITY server lives — arms the timer from them
-   (`XC/proxy/vless/inbound/inbound.go:416`). The RL fork's own fallback
-   copies have no timeout of their own (`RL/tls.go:271-286`, `:442`), but
-   they run inside that inbound, so the policy's timer governs them there
-   too.
 
 
 **Proved by.** The fallback path is exercised by the differential suite in the
