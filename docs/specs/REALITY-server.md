@@ -105,8 +105,6 @@ What is *not* closed is what the rows below still say.
   (`server::tests::the_mldsa65_certificate_is_the_size_go_makes_it`). The
   two OIDs encode to the same length, so the extension — and with it the
   certificate — is the same size either way (§3, §4);
-* a fallback session has a 300 s idle deadline where Go has none —
-  `crates/zero-runtime/src/relay.rs:39`, `:47` against `RL/tls.go:271-286`, `:442` (§6);
 
 > The crate split matters for reading the rest: the server handshake now lives in
 > `crates/reality/src/server.rs` (it was moved there out of
@@ -1275,7 +1273,7 @@ scripted to release its answer only after the relay's write to it has failed —
 removing the grace period makes that test fail.
 
 **Status: PORTED** for dialling, the PROXY header, the hello replay and the rate
-limits, with two named differences. The burst is clamped up to the rate, as Go
+limits, with one named difference. The burst is clamped up to the rate, as Go
 does (`RL/tls.go:127-130`): a bucket whose capacity is smaller than its refill
 rate can never hold a second's worth of credit, so the limit would bite sooner
 than the rate says. Both throttles do it (`ZR/throttle.rs`, `RB/fallback.rs`),
@@ -1284,24 +1282,31 @@ and both are pinned by a test:
 1. **The site is dialled twice, not once.** Go dials the site once per
    connection and uses that one connection for everything
    (`RL/tls.go:168`): the client's hello is forwarded to it
-   (`RL/tls.go:70-83`), and the site's flight and post-handshake records are
-   read back off it (`RL/tls.go:293-330`, `:404-421`). The port dials it
-   twice — once to read the shapes, and again on the fallback path to relay
-   the visitor (`ZR/server.rs`) — and the two are different connections, so
-   the site's answer to the port's probe is not the answer to the visitor's
-   own bytes. For a prober the visible difference is the *timing*: the first
-   bytes from the site arrive after the port's own probe has finished, not
-   from the connection the visitor is on. For an operator it means a Zray
-   inbound keeps working while its site is down for *authenticated* clients,
-   where Go closes the connection (`RL/tls.go:168-172`); the fallback path
-   fails the same way Go does for everyone else (connection dropped,
-   `ZR/server.rs`).
-2. **An idle fallback session has a deadline.** The Rust relay uses
-   `DEFAULT_IDLE_TIMEOUT = 300 s` (`ZR/relay.rs:39`, overridable by `policy.connIdle`,
-   `ZR/relay.rs:52-64`) plus a 1 s half-close limit (`ZR/relay.rs:47`); Go's
-   fallback copies have no timeout at all (`RL/tls.go:271-286`, `:442`). A prober
-   that opens a session and says nothing therefore sees it closed after five minutes
-   by a Zray server and held open indefinitely by an Xray one.
+   (`RL/tls.go:70-83`), the visitor's Finished is forwarded back the other
+   way, and the site's flight and post-handshake records are read off it
+   (`RL/tls.go:293-330`, `:404-421`). The port dials it twice — once with
+   the client's own hello, which is where the cipher suite, the key-share
+   group and the visitor's Finished go, and once more to ask for the flight
+   as a whole — and the two connections are different, so the flight comes
+   from the site's answer to the port's own offer rather than to the
+   visitor's. For a prober the visible difference is the *timing*: the
+   first bytes from the site arrive after the port's own probe has
+   finished, not from the connection the visitor is on. For an operator it
+   means a Zray inbound keeps working while its site is down for
+   *authenticated* clients, where Go closes the connection
+   (`RL/tls.go:168-172`); the fallback path fails the same way Go does for
+   everyone else (connection dropped, `ZR/server.rs`).
+2. **Nothing.** The Rust relay uses `DEFAULT_IDLE_TIMEOUT = 300 s`
+   (`ZR/relay.rs:39`, overridable by `policy.connIdle`, `ZR/relay.rs:52-64`)
+   plus a 1 s half-close limit (`ZR/relay.rs:47`), and those are Xray's own
+   defaults: `SessionDefault()` has `ConnectionIdle: time.Second * 300` and
+   `UplinkOnly` and `DownlinkOnly` at one second each
+   (`XC/features/policy/policy.go:121-124`), and the VLESS inbound — which
+   is where a REALITY server lives — arms the timer from them
+   (`XC/proxy/vless/inbound/inbound.go:416`). The RL fork's own fallback
+   copies have no timeout of their own (`RL/tls.go:271-286`, `:442`), but
+   they run inside that inbound, so the policy's timer governs them there
+   too.
 
 
 **Proved by.** The fallback path is exercised by the differential suite in the
