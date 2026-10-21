@@ -1429,14 +1429,16 @@ only supports RAW, XHTTP and gRPC for now" (`XC/transport_internet.go:1779`).
 The port refuses the same two — a WebSocket and an HTTPUpgrade carrier — on
 both the inbound and the outbound side, and says so when it does.
 
-Of the three carriers Xray allows, **raw** and **gRPC** are carried end to end
-by the differential suite (`vless_over_reality_raw_tcp_matches_the_oracle`,
-`vless_over_reality_grpc_matches_the_oracle`, each in both directions).
-**XHTTP** is not: the differential harness has no HTTP/2 or HTTP/3 server to
-run it against, so the port's XHTTP carrier is exercised only by the
-transport's own tests, not against a real Xray peer. That is a gap in the
-harness, not a known divergence — but it is a gap, and it is named here rather
-than left for a reader to assume away.
+All three carriers Xray allows are carried end to end by the differential
+suite, in both directions — the port's client against the official Xray
+server, and the official client against the port's server:
+`vless_over_reality_raw_tcp_matches_the_oracle`,
+`vless_over_reality_grpc_matches_the_oracle` and
+`vless_over_reality_xhttp_matches_the_oracle`.
+
+XHTTP is the hardest of the three: it is HTTP/2 with a split-mode framing,
+so the carrier has to carry a TLS 1.3 handshake inside an HTTP request
+stream and the two ends have to agree on the mode. It works.
 
 | # | Field | Xray semantics, default, unit | Rust |
 |---|---|---|---|

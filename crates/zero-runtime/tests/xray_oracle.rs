@@ -439,6 +439,10 @@ fn transport(name: &str) -> Value {
             "httpupgradeSettings": {"path": "/tunnel", "host": "oracle.example"}
         }),
         "grpc" => json!({"network": "grpc", "grpcSettings": {"serviceName": "TunnelService"}}),
+        "xhttp" => json!({
+            "network": "xhttp",
+            "xhttpSettings": {"path": "/tunnel", "mode": "stream-one", "host": "oracle.example"}
+        }),
         other => panic!("unsupported transport {other}"),
     }
 }
@@ -1233,6 +1237,26 @@ async fn vless_over_reality_grpc_matches_the_oracle() {
     );
     zray_client_to_xray_reality_server(&binary, "grpc", None, None).await;
     xray_client_to_zray_reality_server(&binary, "grpc", None, None).await;
+}
+
+/// REALITY over XHTTP, end to end.
+///
+/// The third carrier Xray allows for REALITY. It is the hardest of the
+/// three: XHTTP is HTTP/2 or HTTP/3 with a split-mode framing, so the
+/// carrier has to carry a TLS 1.3 handshake inside an HTTP request
+/// stream, and the two ends have to agree on the mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn vless_over_reality_xhttp_matches_the_oracle() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!(
+        "oracle: {} (VLESS/REALITY over XHTTP)",
+        oracle_version(&binary)
+    );
+    zray_client_to_xray_reality_server(&binary, "xhttp", None, None).await;
+    xray_client_to_zray_reality_server(&binary, "xhttp", None, None).await;
 }
 
 /// The combination the working Iranian configuration actually uses.
