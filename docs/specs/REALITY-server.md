@@ -1565,6 +1565,29 @@ ZRAY_XRAY_BINARY=/usr/bin/xray \
   ./target/release/reality-handshake-bench
 ```
 
+### The config surface
+
+Xray's server-side `realitySettings` has fifteen fields. The port reads all
+fifteen, and honours them:
+
+| field | what the port does with it |
+|---|---|
+| `privateKey` | the server's X25519 key, base64 as Xray writes it |
+| `serverNames` | the SNI allowlist; a hello naming another site is refused |
+| `shortIds` | the session selectors; a hello with another is refused |
+| `target`, `dest`, `type` | the camouflage site, as a host:port, a unix path, or the old `dest`/`type` pair |
+| `maxTimeDiff` | how far the client's clock may differ, in milliseconds |
+| `minClientVer`, `maxClientVer` | the client's version gate; a client outside it is refused |
+| `mldsa65Seed` | the ML-DSA-65 signing seed, when the site is pinned |
+| `masterKeyLog` | the file the handshake's TLS 1.3 secrets are appended to |
+| `show` | whether the handshake's fields are printed |
+| `xver` | the version the fallback announces |
+| `limitFallbackUpload`, `limitFallbackDownload` | the fallback's rate and ceiling |
+
+The client's side is the same: `serverName`, `publicKey`, `shortId`,
+`fingerprint`, `mldsa65Verify` and `spiderX` are all read. `spiderX` is the
+one the port does not act on, and §8 of the client spec says why.
+
 ## 9. How to prove parity
 
 A Zray-to-Zray handshake proves that Zray agrees with itself, which is worth
