@@ -600,14 +600,36 @@ where
     // cannot complete a handshake in the other.
     let site_answer = site.as_ref().and_then(|site| site.answer);
     let site_group = site_answer.map(|answer| answer.group);
-    let offered = match site_group {
-        Some(0x001d) => offered_x25519,
-        Some(0x11ec) => offered_hybrid,
-        _ => false,
-    };
+    // The group is the site's, and only the site's: Go answers with the
+    // group the site chose (`RL/handshake_server_tls13.go:100-128`, where
+    // `hs.hello` is the site's ServerHello) and looks for the client's key
+    // share *for that group* (`:107-111`). A client that sent no share for
+    // it leaves Go with no peer data, and the handshake fails.
+    //
+    // Answering with a different group — one the site did not choose — is
+    // what a censor compares: a server whose key share names a different
+    // group than the site's is a server that is not the site. So the port
+    // refuses rather than answering with a group of its own choosing.
+    //
+    // A site that chose a group the port does not implement is refused for
+    // the same reason: the port cannot answer with that group, and it will
+    // not pretend to be the site with another one.
     let use_hybrid = match site_group {
-        Some(group) if offered => group == 0x11ec,
-        _ => offered_hybrid,
+        Some(0x001d) if offered_x25519 => false,
+        Some(0x11ec) if offered_hybrid => true,
+        Some(0x001d) | Some(0x11ec) => {
+            return Err(reality_error(
+                "the client sent no key share for the camouflage site's group",
+            ));
+        }
+        Some(_) => {
+            return Err(reality_error(
+                "the camouflage site chose a key-share group this server cannot use",
+            ));
+        }
+        // No site to copy: the client decides, as it does in a plain
+        // handshake.
+        None => offered_hybrid,
     };
     let (server_share, mut handshake_shared) = if use_hybrid {
         let hybrid = hello.hybrid.as_ref().expect("the hybrid share was offered");
@@ -2193,6 +2215,101 @@ mod tests {
         assert_eq!(
             dials, 1,
             "the port asked the site {dials} times for one connection"
+        );
+    }
+
+    /// A client with no key share for the site's group is refused.
+    ///
+    /// The group is the site's, because the site's ServerHello names it and
+    /// Go answers with the same one
+    /// (`RL/handshake_server_tls13.go:100-128`). Go then looks for the
+    /// client's key share *for that group* (`:107-111`), and a client that
+    /// sent none leaves it with no peer data — the handshake fails.
+    ///
+    /// Answering with a different group is what a censor compares: a server
+    /// whose key share names a group the site did not choose is a server
+    /// that is not the site. So the port refuses rather than answering with
+    /// a group of its own choosing.
+    ///
+    /// The case is built directly, because no browser sends it: every
+    /// browser sends the standalone share. A server still has to survive
+    /// one, and the only way to know it does is to try.
+    #[tokio::test]
+    async fn a_client_with_no_share_for_the_sites_group_is_refused() {
+        let site = TestSite::start();
+        let (mut server_params, _client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        server_params.decoy = Some(Arc::clone(&site.dialer) as Arc<dyn DecoyDialer>);
+
+        // The site answers with the plain group.
+        let site_io = site.dialer.dial().await.unwrap();
+        let observed = zero_security::tls13::post_handshake::observe_all_with_alpn(
+            site_io,
+            "example.test",
+            zero_security::tls13::post_handshake::SiteTrust::Unverified,
+            &["h2", "http/1.1"],
+        )
+        .await
+        .expect("the site's shapes");
+        let answer = observed.answer.expect("the site answered");
+        let site_group = answer.group;
+
+        // The client sent a share for the hybrid group only.
+        let hello = ClientHelloInfo {
+            message: vec![],
+            random: [0u8; 32],
+            session_id: [0u8; 32],
+            auth_key_share: [7u8; 32],
+            // The client sent a share for the hybrid group only.
+            hybrid: Some(HybridShare {
+                mlkem_key: vec![9u8; 1184],
+                x25519: [7u8; 32],
+            }),
+            offered_x25519: false,
+            sni: "example.test".into(),
+            alpn: vec!["h2".into()],
+            suite: CipherSuite::TLS_AES_128_GCM_SHA256,
+        };
+        // The site's group is one the client did not offer, so the port has
+        // to refuse.
+        // The client's shares: the hybrid one only, so the site's group is
+        // not among them.
+        assert!(
+            !(site_group == 0x001d && hello.offered_x25519)
+                && !(site_group == 0x11ec && hello.hybrid.is_some()),
+            "the client's shares do not include the site's group"
+        );
+
+        // The handshake is refused rather than answered with another group.
+        let (_client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let refused = tokio::time::timeout(Duration::from_secs(5), async {
+            let site = LiveSite {
+                flight: None,
+                after: None,
+                answer: Some(answer),
+                site: None,
+                written: Arc::new(Mutex::new(Vec::new())),
+                recorder: None,
+            };
+            let result = complete_handshake(
+                server_io,
+                hello,
+                [0u8; 32],
+                SiteShapes::default(),
+                Some(site),
+                None,
+                None,
+            )
+            .await;
+            match &result {
+                Ok(_) => "the handshake was not refused".to_string(),
+                Err(error) => format!("{error}"),
+            }
+        })
+        .await;
+        let refused = refused.expect("the refusal was reached");
+        assert!(
+            refused.contains("no key share for the camouflage site's group"),
+            "the handshake was refused, but not for the right reason: {refused}"
         );
     }
 
