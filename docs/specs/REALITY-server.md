@@ -216,8 +216,10 @@ Xray's log, not for the wire; the socket is already a pipe.
 
 ### What the Rust code does
 
-`handshake_or_fallback` (`RB/server.rs:159-258`) reads the hello itself and never
-dials anything before it decides (`RB/server.rs:166-179`). Intake is
+`handshake_or_fallback` (`RB/server.rs`) reads the hello itself and dials
+nothing before it has decided the visitor is a client; only then is the
+camouflage site dialled, to read its flight off (see the difference below).
+Intake is
 `read_client_hello_record` (`RB/server.rs:468-525`): it consumes records until one
 handshake message is complete, accumulating the record bytes in `record` (which is
 what a fallback replays) and the message bytes in `message`. A record whose type is
@@ -1107,8 +1109,8 @@ zeros — no limit (`XC/infra/conf/transport_internet.go:918-925`).
 (`ZR/server.rs:2395-2489`), called after `secure_inbound` returns
 `Secured::Fallback` (`ZR/server.rs:2237-2242`). An inbound with no `dest`/`target`
 logs and drops the connection (`ZR/server.rs:2407-2415`); a dial that fails logs and
-drops it (`:2418-2431`). An authenticated connection never dials the target at all
-(§3, divergence 1).
+drops it (`:2418-2431`). An authenticated connection dials the target only to
+read the site's flight off it (§3, difference 2).
 
 **The PROXY header** is `zero_protocol::proxy_protocol::encode(reality.fallback_xver,
 Some(peer), local)` when `fallback_xver != 0` (`ZR/server.rs:2433-2441`), written
@@ -1173,8 +1175,8 @@ zeros — no limit (`XC/infra/conf/transport_internet.go:918-925`).
 (`ZR/server.rs:2395-2489`), called after `secure_inbound` returns
 `Secured::Fallback` (`ZR/server.rs:2237-2242`). An inbound with no `dest`/`target`
 logs and drops the connection (`ZR/server.rs:2407-2415`); a dial that fails logs and
-drops it (`:2418-2431`). An authenticated connection never dials the target at all
-(§3, divergence 1).
+drops it (`:2418-2431`). An authenticated connection dials the target only to
+read the site's flight off it (§3, difference 2).
 
 **The PROXY header** is `zero_protocol::proxy_protocol::encode(reality.fallback_xver,
 Some(peer), local)` when `fallback_xver != 0` (`ZR/server.rs:2433-2441`), written
