@@ -108,6 +108,8 @@ pub struct Tap<S> {
     finished_sent: bool,
     flight: Arc<Mutex<Vec<u16>>>,
     sizes: Arc<Mutex<Vec<u16>>>,
+    /// The sizes of the records *this* end wrote.
+    written: Arc<Mutex<Vec<u16>>>,
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Tap<S> {
@@ -150,10 +152,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tap<S> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let result = Pin::new(&mut this.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(written)) = result {
+        if let Poll::Ready(Ok(count)) = result {
             let finished_sent = &mut this.finished_sent;
-            this.sent.feed(&buf[..written], |content_type, _| {
+            let written = &this.written;
+            this.sent.feed(&buf[..count], |content_type, wire_len| {
                 *finished_sent |= content_type == CONTENT_APPDATA;
+                let mut written = written.lock().unwrap_or_else(|p| p.into_inner());
+                if written.len() < MAX_FLIGHT_RECORDS {
+                    written.push(wire_len as u16);
+                }
             });
         }
         result
@@ -174,6 +181,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tap<S> {
 pub struct Taps {
     pub flight: Arc<Mutex<Vec<u16>>>,
     pub post_handshake: Arc<Mutex<Vec<u16>>>,
+    /// The sizes of the records this end wrote.
+    pub written: Arc<Mutex<Vec<u16>>>,
 }
 
 /// Put a tap on `io` and get both lists it collects.
@@ -185,6 +194,7 @@ pub fn tap_with_flight<S>(io: S) -> (Tap<S>, Taps) {
     let taps = Taps {
         flight: Arc::new(Mutex::new(Vec::new())),
         post_handshake: Arc::new(Mutex::new(Vec::new())),
+        written: Arc::new(Mutex::new(Vec::new())),
     };
     let tap = Tap {
         inner: io,
@@ -193,6 +203,7 @@ pub fn tap_with_flight<S>(io: S) -> (Tap<S>, Taps) {
         finished_sent: false,
         flight: Arc::clone(&taps.flight),
         sizes: Arc::clone(&taps.post_handshake),
+        written: Arc::clone(&taps.written),
     };
     (tap, taps)
 }

@@ -62,6 +62,7 @@ pub mod server;
 
 pub use config::{CamouflageTarget, RealityServerConfig};
 pub use fallback::{FallbackError, FallbackLimit, FallbackOutcome, FallbackPolicy, Transferred};
+pub use server::DecoyDialer;
 pub use server::{
     handshake_or_fallback, HandshakeOutcome, PostHandshakeShapes, RealityServerParams,
 };

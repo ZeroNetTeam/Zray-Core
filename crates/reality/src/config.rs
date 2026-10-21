@@ -334,6 +334,7 @@ impl RealityServerConfig {
             post_handshake: Default::default(),
             show: self.show,
             key_log: None,
+            decoy: None,
         }
     }
 

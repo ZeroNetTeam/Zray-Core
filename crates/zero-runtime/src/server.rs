@@ -448,7 +448,7 @@ impl TideInbound {
 }
 
 impl InboundRuntime {
-    fn compile(inbound: &zero_config::Inbound) -> Self {
+    fn compile(inbound: &zero_config::Inbound, resolver: &Arc<zero_dns::Resolver>) -> Self {
         let tls = match &inbound.security {
             zero_config::InboundSecurity::Tls(tls)
                 if tls.extra_identities.is_empty() && !tls.reject_unknown_sni =>
@@ -502,6 +502,17 @@ impl InboundRuntime {
                         }
                     },
                 },
+                // Go dials the camouflage site for every connection and reads
+                // the site's own flight off that connection
+                // (`RL/tls.go:168`, `:293-330`), so the flight a client sees
+                // is the site's, read live. The dial lives here, because the
+                // resolver and its deadline are this runtime's.
+                decoy: reality.target.as_ref().map(|target| {
+                    Arc::new(RuntimeDecoy {
+                        target: target.clone(),
+                        resolver: Arc::clone(resolver),
+                    }) as Arc<dyn reality::DecoyDialer>
+                }),
             }),
             _ => None,
         };
@@ -851,6 +862,43 @@ async fn read_proxy_header(
                 last = seen;
             }
         }
+    }
+}
+
+/// Dials the camouflage site, for the REALITY server to read the site's own
+/// flight off.
+///
+/// The site is dialled with this runtime's resolver, so the site's name is
+/// resolved the way every other destination is, and the dial carries the
+/// same deadline.
+struct RuntimeDecoy {
+    target: zero_config::RealityTarget,
+    resolver: Arc<zero_dns::Resolver>,
+}
+
+impl reality::DecoyDialer for RuntimeDecoy {
+    fn dial(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<zero_core::BoxStream, String>> + Send>,
+    > {
+        let target = self.target.clone();
+        let resolver = Arc::clone(&self.resolver);
+        Box::pin(async move {
+            match &target {
+                zero_config::RealityTarget::Host(address, port) => {
+                    let destination = Destination::tcp(address.clone(), *port);
+                    outbound::connect_direct_with_resolver(
+                        &destination,
+                        &zero_config::StreamSettings::default(),
+                        &resolver,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                }
+                zero_config::RealityTarget::Unix(path) => connect_unix(path).await,
+            }
+        })
     }
 }
 
@@ -1459,7 +1507,7 @@ impl Server {
         let inbounds: Vec<_> = config
             .inbounds
             .iter()
-            .map(InboundRuntime::compile)
+            .map(|inbound| InboundRuntime::compile(inbound, &resolver))
             .collect();
         learn_post_handshake(&config, &inbounds, &resolver);
         ServerState {

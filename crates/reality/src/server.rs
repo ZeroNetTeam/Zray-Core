@@ -61,6 +61,32 @@ pub struct RealityServerParams {
     ///
     /// A secret on disk, on purpose; `None` writes nothing.
     pub key_log: Option<Arc<crate::keys::KeyLog>>,
+    /// How the camouflage site is reached, when it is reached at all.
+    ///
+    /// Go's server dials the site for *every* connection, authenticated or
+    /// not (`RL/tls.go:168`), and reads the site's own flight off that
+    /// connection — so the flight the client sees is the site's, read live,
+    /// rather than one learned earlier. This hook is that dial: the caller
+    /// owns the resolver and the deadline, and hands back a connection to
+    /// the site.
+    ///
+    /// `None` means the site is not dialled on the accepting path, and the
+    /// flight learned at start-up is used instead.
+    pub decoy: Option<Arc<dyn DecoyDialer>>,
+}
+
+/// Opens a connection to the camouflage site, for the server to read the
+/// site's own flight off.
+///
+/// The caller owns the resolver, the dial and its deadline; this is only the
+/// shape of what it hands back.
+pub trait DecoyDialer: Send + Sync {
+    /// Connect to the site and return the connection.
+    fn dial(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<zero_core::BoxStream, String>> + Send>,
+    >;
 }
 
 impl std::fmt::Debug for RealityServerParams {
@@ -368,7 +394,31 @@ where
         };
     }
 
-    let shapes = params.post_handshake.site(&hello.sni);
+    // The site's own flight, read off a connection to the site.
+    //
+    // Go dials the site for every connection and reads the flight off that
+    // connection (`RL/tls.go:168`, `:293-330`), so the flight the client sees
+    // is the site's, read live. The port asks the site at start-up instead and
+    // keeps the answer, which is the same flight unless the site's certificate
+    // has changed size since — and a server that cannot reach the site at
+    // all is the case the live read handles and the cached one cannot.
+    let mut shapes = params.post_handshake.site(&hello.sni);
+    if let Some(decoy) = params.decoy.as_deref() {
+        match read_live_flight(decoy, &hello.sni).await {
+            Ok(live) => shapes.flight = live,
+            Err(error) => {
+                // The site could not be reached. Go's server would have closed
+                // the connection (`RL/tls.go:168-172`); the port answers with
+                // what it learned at start-up, which is the flight it would
+                // have used anyway.
+                tracing::debug!(
+                    %error,
+                    "REALITY camouflage site could not be reached for its live flight; \
+                     the flight learned at start-up is used instead"
+                );
+            }
+        }
+    }
     match complete_handshake(
         io,
         hello,
@@ -574,6 +624,34 @@ where
             .map_err(|error| Failure::from_io(&error, Stage::TlsStarted))?;
     }
     Ok(stream)
+}
+
+/// Read the camouflage site's own flight, off a connection to the site.
+///
+/// The sizes are the wire lengths of the records the site answered a
+/// ClientHello with, ServerHello first — the same thing the start-up probe
+/// learns (`zero_security::tls13::post_handshake`), asked of the site itself
+/// rather than of a record kept from earlier.
+///
+/// The site's certificate is not verified: the probe carries no application
+/// data, and the site is the one the operator chose as the camouflage, so
+/// requiring a public chain would leave every private-CA decoy unanswered.
+async fn read_live_flight(
+    decoy: &dyn DecoyDialer,
+    server_name: &str,
+) -> Result<Option<Arc<[u16]>>, String> {
+    let site = decoy.dial().await?;
+    let observed = zero_security::tls13::post_handshake::observe_all_with(
+        site,
+        server_name,
+        zero_security::tls13::post_handshake::SiteTrust::Unverified,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if observed.flight.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::from(observed.flight.as_slice())))
 }
 
 fn derive_auth_key(shared: &[u8; 32], salt: &[u8]) -> [u8; 32] {
@@ -1339,6 +1417,7 @@ mod tests {
             post_handshake: Default::default(),
             show: false,
             key_log: None,
+            decoy: None,
         };
         let client_params = zero_security::RealityParams::from_config(
             std::sync::Arc::from("example.test"),
@@ -1405,6 +1484,7 @@ mod tests {
             post_handshake: Default::default(),
             show: true,
             key_log: None,
+            decoy: None,
         };
         let client_params = zero_security::RealityParams::from_config(
             std::sync::Arc::from("example.test"),
@@ -1469,6 +1549,7 @@ mod tests {
             post_handshake: Default::default(),
             show: false,
             key_log: Some(log),
+            decoy: None,
         };
         let client_params = zero_security::RealityParams::from_config(
             std::sync::Arc::from("example.test"),
@@ -1593,6 +1674,7 @@ mod tests {
             post_handshake: Default::default(),
             show: false,
             key_log: None,
+            decoy: None,
         };
         let client_params = zero_security::RealityParams::from_config(
             std::sync::Arc::from("example.test"),
@@ -1814,6 +1896,230 @@ mod tests {
         flight
     }
 
+    /// The site is dialled for every connection, and the flight the client
+    /// sees is the site's, read live off that connection.
+    ///
+    /// Go dials the site for *every* connection, authenticated or not
+    /// (`RL/tls.go:168`), and reads the site's own flight off that connection
+    /// (`:293-330`), so what the client sees is the site's flight read now
+    /// rather than one read earlier. A site that changes its certificate size
+    /// between two connections is followed by Go and not by a cached flight.
+    ///
+    /// The test's site answers with a flight of one size, and the server is
+    /// given a *different* cached flight. What the client sees must be the
+    /// site's, not the cached one.
+    #[tokio::test]
+    async fn the_flight_is_read_off_the_site_on_every_connection() {
+        // A site that answers with a flight of its own.
+        let site = TestSite::start();
+        let (mut server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        // A cached flight, shaped so that it *could* be copied: the first
+        // record is the ServerHello, whose size must match this server's own
+        // ServerHello for the plan to be used at all. A flight that cannot
+        // be copied would leave the server's own sizes on the wire either
+        // way, and the test could not tell the two apart.
+        let cached = cached_flight();
+        server_params
+            .post_handshake
+            .set_flight("example.test", &cached);
+        server_params.decoy = Some(Arc::clone(&site.dialer) as Arc<dyn DecoyDialer>);
+
+        let seen = flight_sizes(&server_params, &client_params).await;
+        // The site records its flight as its handshake ends, which is a
+        // moment after the probe read it.
+        let mut site_flight = Vec::new();
+        for _ in 0..200 {
+            site_flight = site.dialer.flight.lock().unwrap().clone();
+            if !site_flight.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !site_flight.is_empty(),
+            "the site's own flight was not recorded, so the comparison says nothing"
+        );
+        // The cached flight's first record is this server's own ServerHello
+        // size, so it *could* be copied: the encrypted record that follows
+        // would have been padded to the cached 1000 bytes. The site's own
+        // flight has a different first record — a real site answers with a
+        // ServerHello of its own size — so the live flight is not copyable
+        // and the sizes on the wire are this server's own.
+        //
+        // That is the proof that the site was read: without the live read
+        // the cached flight would have been copied, and the encrypted record
+        // would have been 1000 bytes.
+        assert_ne!(
+            seen[3], cached[2],
+            "the encrypted record was padded to the cached flight's size, so the cached \
+             flight was used and the site was not read"
+        );
+    }
+
+    /// A site that cannot be reached does not stop the server: the flight
+    /// learned at start-up is used instead.
+    ///
+    /// Go closes the connection when the site cannot be dialled
+    /// (`RL/tls.go:168-172`). The port answers with the flight it learned
+    /// earlier, which is the flight it would have used anyway — a site that
+    /// is down for a moment is not a reason for a REALITY listener to be down.
+    #[tokio::test]
+    async fn a_site_that_cannot_be_reached_does_not_stop_the_server() {
+        let (mut server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        server_params.decoy = Some(Arc::new(UnreachableDecoy));
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut stream = handshake(server_io, &server_params).await.unwrap();
+            let mut request = [0u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            stream.write_all(b"pong").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        let mut client = zero_security::reality_connect(client_io, &client_params)
+            .await
+            .unwrap();
+        client.write_all(b"ping").await.unwrap();
+        client.flush().await.unwrap();
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"pong", "the server answered anyway");
+        server.await.unwrap();
+    }
+
+    /// A camouflage site the probe can read a flight off.
+    ///
+    /// It is a real TLS 1.3 server, so the flight the probe reads is the
+    /// flight a client would see.
+    struct TestSite {
+        dialer: Arc<TestSiteDialer>,
+    }
+
+    impl TestSite {
+        /// Start a site on a loopback port.
+        fn start() -> Self {
+            let dialer = Arc::new(TestSiteDialer {
+                address: std::sync::Mutex::new(None),
+                flight: Arc::new(Mutex::new(Vec::new())),
+            });
+            Self { dialer }
+        }
+    }
+
+    /// The dialer for [`TestSite`]: it starts the site on the first dial and
+    /// hands the connection over.
+    struct TestSiteDialer {
+        address: std::sync::Mutex<Option<std::net::SocketAddr>>,
+        /// The flight the site answered with, as the probe read it.
+        flight: Arc<Mutex<Vec<u16>>>,
+    }
+
+    impl DecoyDialer for TestSiteDialer {
+        fn dial(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<zero_core::BoxStream, String>> + Send>,
+        > {
+            let address = *self.address.lock().unwrap();
+            // The site's flight is recorded in the dialer's own list, so the
+            // test can read it after the handshake.
+            let flight = Arc::clone(&self.flight);
+            Box::pin(async move {
+                let address = match address {
+                    Some(address) => address,
+                    None => {
+                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let address = listener.local_addr().map_err(|error| error.to_string())?;
+                        let recorded = Arc::clone(&flight);
+                        tokio::spawn(async move {
+                            let config = site_config();
+                            while let Ok((stream, _)) = listener.accept().await {
+                                // The tap is on the site's side, so the
+                                // records it saw written are the site's own
+                                // flight — what the probe reads off it.
+                                let (tap, taps) =
+                                    zero_security::tls13::post_handshake::tap_with_flight(stream);
+                                let config = Arc::clone(&config);
+                                let recorded = Arc::clone(&recorded);
+                                tokio::spawn(async move {
+                                    let _ = zero_security::server::accept(tap, config).await;
+                                    *recorded.lock().unwrap() =
+                                        taps.written.lock().unwrap().clone();
+                                });
+                            }
+                        });
+                        address
+                    }
+                };
+                let stream = tokio::net::TcpStream::connect(address)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                // The connection is tapped on the probe's side, so what the
+                // tap saw *arrive* is the site's flight: the ServerHello, the
+                // compatibility ChangeCipherSpec, and the encrypted records
+                // that follow it.
+                let (tap, taps) = zero_security::tls13::post_handshake::tap_with_flight(stream);
+                let recorded = Arc::clone(&flight);
+                tokio::spawn(async move {
+                    // The probe's handshake is over by the time the site has
+                    // sent its flight, so the list is complete a moment
+                    // later.
+                    for _ in 0..400 {
+                        if recorded.lock().unwrap().len() >= 3 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    // The tap is on the probe's side of the connection, so
+                    // the records it saw *arrive* are the site's flight.
+                    *recorded.lock().unwrap() = taps.flight.lock().unwrap().clone();
+                });
+                Ok(Box::pin(tap) as zero_core::BoxStream)
+            })
+        }
+    }
+
+    /// The site's TLS configuration.
+    fn site_config() -> Arc<rustls::ServerConfig> {
+        const CERT: &[u8] = include_bytes!("../../zero-runtime/tests/fixtures/loopback-cert.pem");
+        const KEY: &[u8] = include_bytes!("../../zero-runtime/tests/fixtures/loopback-key.pem");
+        zero_security::server::server_config(CERT, KEY, &["h2".into()])
+            .expect("the site's certificate loads")
+    }
+
+    /// A flight of the right shape for this server, but a different size
+    /// from any site's.
+    ///
+    /// The first record has to be the ServerHello, whose size is this
+    /// server's own ServerHello plus its five-byte header, or the flight
+    /// cannot be copied at all — and a flight that cannot be copied leaves
+    /// the server's own sizes on the wire whether or not the site was read.
+    fn cached_flight() -> Vec<u16> {
+        let hello = 5 + build_server_hello(
+            &[0u8; 32],
+            zero_security::tls13::CipherSuite::TLS_AES_128_GCM_SHA256,
+            0x001d,
+            &[0u8; 32],
+        )
+        .len();
+        vec![hello as u16, 6, 1000]
+    }
+
+    /// A dialer whose site cannot be reached.
+    struct UnreachableDecoy;
+
+    impl DecoyDialer for UnreachableDecoy {
+        fn dial(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<zero_core::BoxStream, String>> + Send>,
+        > {
+            Box::pin(async { Err("the site is down".to_string()) })
+        }
+    }
+
     /// The sizes a site's flight is copied in, and the three cases that decide
     /// whether it can be copied at all.
     #[tokio::test]
@@ -1986,6 +2292,7 @@ mod tests {
             post_handshake: Default::default(),
             show: false,
             key_log: None,
+            decoy: None,
         };
         match handshake_or_fallback(server, &params, None).await {
             HandshakeOutcome::Fallback { client_hello, .. } => assert_eq!(client_hello, expected),

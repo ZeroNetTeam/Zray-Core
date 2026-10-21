@@ -43,3 +43,7 @@ tracing-subscriber = { workspace = true }
 # evasion layer produces, so the handshake is exercised on a stream that does
 # not deliver a record at a time.
 zero-evasion = { workspace = true }
+# The test's camouflage site is a real TLS 1.3 server, so the flight the
+# server reads off it is the flight a client would see.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }

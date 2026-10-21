@@ -56,9 +56,9 @@ is the one that fails without it.
 | `show` and `masterKeyLog` (§7) | both switches are read, and the handshake acts on them: a line per connection, and the traffic secrets in Go's order | `server::tests::the_show_switch_reports_what_the_client_sent` and `server::tests::the_key_log_writes_the_handshakes_traffic_secrets`; the key log's shape is compared against the official server's, over the official client, by `the_key_log_has_the_shape_the_officials_server_writes` |
 | The decoy's tolerance for records that advance nothing (§5) | the site is probed at start-up, and the answer is applied to the connections this server accepts | `ZS/ccs_probe.rs`; `server::tests::the_server_puts_up_with_what_the_site_puts_up_with` |
 | A unix-socket camouflage target (§7) | the target is dialled as a socket, and an unauthenticated visitor is handed to it | `crates/zero-runtime/tests/reality_unix_target.rs` |
+| The site is dialled for every connection, and its flight read off that connection (§1, §3) | the flight the client sees is the site's, read live, as Go's is | `server::tests::the_flight_is_read_off_the_site_on_every_connection` |
 
-What is *not* closed is what the rows below still say: the decoy being dialled
-on the accepting path.
+What is *not* closed is what the rows below still say.
 
 *MISSING (no Rust counterpart at all):*
 
@@ -67,8 +67,12 @@ on the accepting path.
 
 * no `supported_versions` check — `crates/reality/src/server.rs:559-567` against
   `RL/tls.go:211` with `RL/handshake_server.go:180-196` (§1);
-* the camouflage target is not dialled on the accepting path —
-  `crates/reality/src/server.rs:144-258` against `RL/tls.go:168` (§1, §6);
+* the camouflage target is dialled on the accepting path, but the site's
+  flight is read for the flight only — Go reads the site's *whole* reply off
+  that connection and copies its record sizes (`RL/tls.go:293-330`), while the
+  port asks the site for the flight and keeps the rest from what it learned
+  at start-up; a site that cannot be reached is a fallback to the cached
+  flight, where Go closes the connection (`RL/tls.go:168-172`) (§1, §6);
 * a duplicated key share: last wins — `crates/reality/src/server.rs:653-662` against
   `RL/tls.go:214-228` (§2);
 * cipher-suite choice follows the client, not the decoy or a server list —
@@ -99,9 +103,6 @@ on the accepting path.
   `privateKey` — `crates/zero-config/src/xray_json.rs:6581-6590` against
   `XC/infra/conf/transport_internet.go:850-855`: a superset, so no valid Xray config
   breaks (§7);
-* the fallback relay exists twice, in `crates/reality/src/fallback.rs:26-46` (moved,
-  with ten tests) and `crates/zero-runtime/src/server.rs:2395-2489` (what the runtime
-  runs) — duplication to remove, not a difference in bytes (§6).
 
 > The crate split matters for reading the rest: the server handshake now lives in
 > `crates/reality/src/server.rs` (it was moved there out of
@@ -248,10 +249,17 @@ into `Secured::Fallback` (`ZR/server.rs:2375-2383`) and calls
    `mutualVersion` (`RL/tls.go:211` with `RL/handshake_server.go:180-196`). A peer
    offering `TLS_AES_128_GCM_SHA256` without `supported_versions: 0x0304` is
    authenticated by Rust and handed to the decoy by Go.
-2. **The decoy is not dialled on this path.** `RL/tls.go:168` dials `dest` for every
-   connection, authenticated or not; the Rust intake reaches
-   `HandshakeOutcome::Accepted` without ever touching the target. The consequences
-   are spelled out in §3 (record shaping) and §6 (what a prober sees).
+2. **The decoy is dialled on this path, and the site's flight is read off
+   that connection.** `RL/tls.go:168` dials `dest` for every connection,
+   authenticated or not, and reads the site's own flight off it
+   (`:293-330`). The port does the same: the dial is the caller's, and the
+   site is asked for the flight, so what the client sees is the site's, read
+   now. Two differences remain. The port reads the flight *only* — the
+   post-handshake records it sends are the ones it learned at start-up, where
+   Go reads them off the same connection. And a site that cannot be reached is
+   a fallback to the cached flight, where Go closes the connection
+   (`RL/tls.go:168-172`): a site that is down for a moment is not a reason
+   for a REALITY listener to be down, but it is a difference.
 3. **Per-record bound before version negotiation.** Both bounds end in a fallback for
    anything larger, and both now agree: the port applies Go's 18432
    (`ZS/record.rs:47`, `MAX_CIPHERTEXT_BEFORE_TLS13 = MAX_PLAINTEXT + 2048`)
