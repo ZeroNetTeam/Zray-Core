@@ -71,12 +71,17 @@ What is *not* closed is what the rows below still say.
   closes the connection (`RL/tls.go:168-172`) — a site that is down for a
   moment is not a reason for a REALITY listener to be down, but it is a
   difference (§1, §6);
-* the site is dialled twice rather than once, and the two connections are
-  different — Go forwards the *client's* hello to the site and reads the
-  site's answer off that one connection (`RL/tls.go:70-83`, `:168`), so the
-  site's flight is its answer to the visitor's own bytes; the port asks the
-  site with a hello of its own and dials again for the fallback relay, so
-  the two answers need not agree (§1, §3, §6);
+* the site is dialled twice per connection, and the two connections are
+  different — Go dials the site once and uses that one connection for
+  everything: the client's own hello is forwarded to it
+  (`RL/tls.go:70-83`), the site's flight and post-handshake records are
+  read back off it (`:293-330`, `:404-421`), and the *same* connection
+  carries the visitor's bytes in the other direction. The port dials it
+  twice: once to ask it with the client's hello — which is where the
+  cipher suite and the key-share group come from — and once more to ask
+  for the flight, because a site sends its encrypted records only to a
+  connection whose handshake completes, and the port does not forward the
+  visitor's Finished to it (§1, §3, §6);
 * the cipher suite and the key-share group are the *site's*, taken from its
   ServerHello, as Go takes them (`RL/handshake_server_tls13.go:100-128`) —
   and the site is asked with the *client's own* hello, forwarded verbatim,
@@ -243,16 +248,21 @@ extension *is* read: a hello that offers a TLS 1.3 suite without
 `RL/handshake_server.go:180-196`), so both hand it to the decoy
 (`server::tests::a_hello_without_supported_versions_is_not_tls13_enough`).
 
-1. **The decoy is dialled on this path, and the site's shapes are read off
+1. **The decoy is dialled on this path, and the site's answer is read off
    that connection.** `RL/tls.go:168` dials `dest` for every connection,
    authenticated or not, and reads the site's own flight *and* the records it
-   sends after the handshake off it (`:293-330`, `:404-421`). The port does
-   the same: the dial is the caller's, and the site is asked for both, so
-   what the client sees is the site's, read now. One difference remains: a
-   site that cannot be reached is a fallback to the cached shapes, where Go
-   closes the connection (`RL/tls.go:168-172`) — a site that is down for a
-   moment is not a reason for a REALITY listener to be down, but it is a
-   difference.
+   sends after the handshake off it (`:293-330`, `:404-421`). The port asks
+   the site with the *client's own* hello, forwarded verbatim, as Go's
+   `MirrorConn` does (`RL/tls.go:70-83`), and reads the site's ServerHello
+   off that connection — which is where the cipher suite and the key-share
+   group come from. The flight and the post-handshake records are asked for
+   separately, because a site sends its encrypted records only to a
+   connection whose handshake completes, and the port does not forward the
+   visitor's Finished to the site. Two differences remain: the site is
+   dialled twice rather than once, and a site that cannot be reached is a
+   fallback to the cached shapes, where Go closes the connection
+   (`RL/tls.go:168-172`) — a site that is down for a moment is not a reason
+   for a REALITY listener to be down, but it is a difference.
 3. **Per-record bound before version negotiation.** Both bounds end in a fallback for
    anything larger, and both now agree: the port applies Go's 18432
    (`ZS/record.rs:47`, `MAX_CIPHERTEXT_BEFORE_TLS13 = MAX_PLAINTEXT + 2048`)
