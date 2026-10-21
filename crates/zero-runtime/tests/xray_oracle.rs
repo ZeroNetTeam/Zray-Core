@@ -1214,6 +1214,27 @@ async fn vless_over_reality_raw_tcp_matches_the_oracle() {
     xray_client_to_zray_reality_server(&binary, "tcp", None, None).await;
 }
 
+/// REALITY over gRPC, end to end.
+///
+/// Xray allows REALITY over three carriers — raw, xhttp and gRPC — and
+/// refuses the rest (`XC/transport_internet.go:1779`). The port refuses the
+/// same two now, so the ones it allows have to be shown to work: a carrier
+/// the port accepts and cannot carry is a config that starts and then
+/// answers the client with the camouflage site.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn vless_over_reality_grpc_matches_the_oracle() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!(
+        "oracle: {} (VLESS/REALITY over gRPC)",
+        oracle_version(&binary)
+    );
+    zray_client_to_xray_reality_server(&binary, "grpc", None, None).await;
+    xray_client_to_zray_reality_server(&binary, "grpc", None, None).await;
+}
+
 /// The combination the working Iranian configuration actually uses.
 ///
 /// PLAN-02 §2 identifies `sni` choice, REALITY and Vision as the load-bearing
