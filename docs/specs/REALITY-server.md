@@ -71,14 +71,16 @@ What is *not* closed is what the rows below still say.
   moment is not a reason for a REALITY listener to be down, but it is a
   difference (§1, §6);
 * cipher-suite choice follows the client, not the decoy — Go takes the suite
-  from the *decoy's* ServerHello, which it reads off the mirrored connection
-  (`RL/tls.go:353-368`, `RL/handshake_server_tls13.go:102`), and even
-  validates the decoy's key-share group before using it
-  (`RL/tls.go:357-360`); the port takes the first suite the *client* offered
-  that it knows, and picks its own key-share group
-  (`crates/reality/src/server.rs`) (§3). A client is therefore answered with
-  the suite it asked for rather than the one the site chose, which a probe
-  comparing the two answers can see;
+  from the *decoy's* ServerHello, and validates the decoy's key-share group
+  before using it (`RL/tls.go:353-368`, `RL/handshake_server_tls13.go:102`).
+  What makes that answer the *client's* is the `MirrorConn`: the client's own
+  ClientHello is forwarded to the decoy (`RL/tls.go:70-83`), so the decoy
+  answers the client's offer and the suite it picks is one the client
+  offered. The port's probe sends a hello of its own instead, and the port
+  takes the first suite the *client* offered that it knows, and picks its own
+  key-share group (`crates/reality/src/server.rs`) (§3). The two agree for a
+  client whose first known suite is also the decoy's preference, and differ
+  for one where it is not;
 * the ML-DSA-65 extension uses OID 1.3 at a computed offset instead of Go's
   placeholder OID 0.0 at a fixed one — `crates/reality/src/server.rs:835-843`
   against `RL/handshake_server_tls13.go:82`; invisible to both clients (§3, §4);
