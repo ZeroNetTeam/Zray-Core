@@ -2199,6 +2199,39 @@ mod tests {
         }
     }
 
+    /// The ML-DSA-65 certificate is the same size as Go's.
+    ///
+    /// Go's server signs into the certificate at a *fixed* offset
+    /// (`RL/handshake_server_tls13.go:157`: `cert[126:]`), which only works
+    /// because the certificate carries an extension of the right length: the
+    /// ML-DSA-65 signature is 3309 bytes, and Go's placeholder extension
+    /// holds 3309 dummy bytes. The port puts the signature in the
+    /// extension's value instead, so the two certificates are the same size
+    /// and a client comparing them sees no difference.
+    #[test]
+    fn the_mldsa65_certificate_is_the_size_go_makes_it() {
+        let mut signing_seed = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut signing_seed);
+        let signing = SigningKey::from_bytes(&signing_seed);
+        let auth_key = [7u8; 32];
+
+        let plain = reality_certificate(&signing, &auth_key, "example.test", None);
+        let bound = reality_certificate(
+            &signing,
+            &auth_key,
+            "example.test",
+            Some((&[9u8; 32], b"client hello", b"server hello")),
+        );
+        // The signature is 3309 bytes, and the extension's framing adds 21:
+        // the OID, the octet string's header, the extension's sequence and
+        // the extensions' sequence and their lengths.
+        assert_eq!(
+            bound.len() - plain.len(),
+            3330,
+            "the binding adds the 3309-byte signature and its framing"
+        );
+    }
+
     /// The ALPN index is Go's, and it is a bucket.
     ///
     /// Go files the shapes it learned under `dest + " " + sni + " " + alpn`,

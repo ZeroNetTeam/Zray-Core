@@ -93,9 +93,12 @@ What is *not* closed is what the rows below still say.
   so: Go's client reads the certificate's *first* extension's value
   positionally (`XC/transport/internet/reality/reality.go:92-96`,
   `certs[0].Extensions[0].Value`), and so does the port
-  (`ZS/cert.rs`, `first_extension`), so neither looks at the OID. Go's
-  extension holds 3309 dummy bytes where the port's holds the signature
-  itself, which is why the port's certificate is smaller (§3, §4);
+  (`ZS/cert.rs`, `first_extension`), so neither looks at the OID. What the
+  two differ in is the extension's *content*: Go's holds 3309 dummy bytes
+  where the port's holds the ML-DSA-65 signature, which is also 3309 bytes
+  (`server::tests::the_mldsa65_certificate_is_the_size_go_makes_it`). The
+  two OIDs encode to the same length, so the extension — and with it the
+  certificate — is the same size either way (§3, §4);
 * a fallback session has a 300 s idle deadline where Go has none —
   `crates/zero-runtime/src/relay.rs:39`, `:47` against `RL/tls.go:271-286`, `:442` (§6);
 
