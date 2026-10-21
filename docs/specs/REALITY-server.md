@@ -1423,6 +1423,12 @@ port reads the field and honours it on the server path. In this section only,
 `XC/…:line` is short for `XC/infra/conf/transport_internet.go:line` (the file that
 turns JSON into the fields Xray hands to REALITY).
 
+**The carrier.** REALITY needs a carrier that hands back the security
+connection, not an HTTP wrapper around it, and Xray refuses the rest: "REALITY
+only supports RAW, XHTTP and gRPC for now" (`XC/transport_internet.go:1779`).
+The port refuses the same two — a WebSocket and an HTTPUpgrade carrier — on
+both the inbound and the outbound side, and says so when it does.
+
 | # | Field | Xray semantics, default, unit | Rust |
 |---|---|---|---|
 | 1 | `show` | bool, default `false`; enables `RL`'s diagnostics, which include `AuthKey[:16]`, the decoded client version/shortId and record lengths (`RL/tls.go:164-166`, `:238-256`, `:331-333`) | **parsed and printed** — both readers read the switch and refuse a non-bool, as Xray's decode does; the handshake writes one line per connection naming the peer, the client version, the clock, the short id and whether the client was let through (`RB/server.rs`, `report_line`). The report line is `keys::ClientReport`, the one shape it takes here, and Xray's `AuthKey[:16]` is deliberately absent from it (`crates/zero-runtime/tests/log_privacy.rs`) |
