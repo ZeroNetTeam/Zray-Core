@@ -1106,6 +1106,18 @@ bytes it already sent, so the failure is indistinguishable from the site's ordin
 behaviour. Both implementations do that; they differ in *when* the target is dialled
 and in how long the resulting session may live.
 
+The port's fallback is covered end to end, against a real Xray binary serving the
+camouflage site:
+
+* a client with the *wrong* public key is refused rather than silently relayed, so
+  that tunnel traffic never goes into a connection the censor controls
+  (`a_wrong_reality_public_key_is_refused_rather_than_silently_relayed`);
+* a *plain* client — one that never tries REALITY, as a browser or a scanner would
+  make — is handed to the site, and is shown the site's own certificate
+  (`a_plain_client_is_handed_to_the_camouflage_site`). A client that saw the
+  port's own temporary certificate would learn that the site is not behind this
+  port, so the test checks that it does not.
+
 ### What the official Go code does
 
 **Dialling `dest`.** Once, at the very top of `Server`, for every connection,
