@@ -76,7 +76,9 @@ pub struct RealityServerParams {
     /// Where to record what was written to the camouflage site.
     ///
     /// The visitor's Finished goes to the site, and a test may want to see
-    /// that it did. `None` records nothing.
+    /// that it did. `None` records nothing, which is what production does:
+    /// the cost is one branch per connection, and the recorder observes the
+    /// real path rather than a test's own dialer.
     pub site_writes: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
