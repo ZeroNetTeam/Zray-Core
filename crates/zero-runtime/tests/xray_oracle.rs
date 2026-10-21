@@ -2338,15 +2338,15 @@ async fn the_site_answers_the_clients_own_hello() {
         "the site chose a different group for the client's hello"
     );
 
-    // The flight is *nearly* the same, and the difference is the point: a
-    // site sends its EncryptedExtensions and its Certificate eagerly, but
-    // holds its CertificateVerify and its own Finished until the client's
-    // Finished arrives. The port does not forward the visitor's Finished,
-    // so the last two records of the flight are not there.
+    // The flight is *nearly* the same, and the difference is the port's, not
+    // the site's: a site sends its whole flight eagerly — measured, the site
+    // sent all six records before the client's Finished — but the port's
+    // forwarded read stops at the ServerHello, so the last two records are
+    // not there.
     //
-    // Go gets all of them, because its `MirrorConn` forwards every byte
-    // read from the visitor (`RL/tls.go:70-83`) and its connection to the
-    // site is the visitor's connection in the other direction.
+    // Go gets all of them, because it reads the site's whole flight off the
+    // connection the visitor's hello went out on, and that connection is
+    // also where the visitor's Finished goes.
     assert!(
         forwarded.flight.len() < probed.flight.len(),
         "the forwarded flight was {} records and the probed one {}: the \

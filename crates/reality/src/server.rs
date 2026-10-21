@@ -453,11 +453,16 @@ where
     // visitor's Finished is forwarded to.
     let mut site = None;
     if let Some(decoy) = params.decoy.as_deref() {
+        // How many records the site's flight has, as the port learned it.
+        // The site sends them in one burst, and the count is what says when
+        // the burst has ended.
+        let expected = shapes.flight.as_ref().map(|flight| flight.len());
         match read_live_shapes(
             decoy,
             &hello.sni,
             &hello.alpn,
             &client_hello,
+            expected,
             params.site_writes.as_ref(),
         )
         .await
@@ -802,6 +807,7 @@ async fn read_live_shapes(
     server_name: &str,
     alpn: &[String],
     client_hello: &[u8],
+    expected: Option<usize>,
     recorder: Option<&Arc<Mutex<Vec<u8>>>>,
 ) -> Result<Option<LiveSite>, String> {
     // The protocols the probe offers the site, so the flight is the one the
@@ -813,33 +819,58 @@ async fn read_live_shapes(
     // reply to the visitor. Go does the same, by forwarding the client's
     // bytes through the `MirrorConn` (`RL/tls.go:70-83`).
     //
-    // The *flight* is a different question: the site sends its encrypted
-    // records only after the client's Finished, and the client sends that
-    // on the visitor's own connection, not on this one. So the flight is
-    // asked for separately, with a handshake of the port's own.
+    // The site's *flight* comes off the same connection. A TLS 1.3 site
+    // sends its whole flight in one burst, in answer to the ClientHello —
+    // measured against a real Xray site, it sent all six records before the
+    // client's Finished arrived — so the count of records says when the
+    // burst has ended, and the flight needs no second connection.
     let (forwarded, connection, taps) =
-        zero_security::tls13::post_handshake::observe_with_the_clients_hello(site, client_hello)
+        zero_security::tls13::post_handshake::observe_with_the_clients_hello_for(
+            site,
+            client_hello,
+            expected,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let answer = forwarded.answer;
+    // The site's flight, if the burst came out whole. A site that answered
+    // with fewer records than the port expected — because its certificate
+    // has changed size since the port learned it — leaves the port to ask
+    // again, with a handshake of its own, which is what it did always.
+    let (flight, after) = match expected {
+        // The burst came out whole: the site's flight needs no second
+        // connection. The records it sends after the handshake are on that
+        // connection too, but the port has not asked for them here — the
+        // site's own ticket arrives with the visitor's Finished, and the
+        // port reads it off the same connection.
+        Some(count) if !forwarded.flight.is_empty() && forwarded.flight.len() >= count => {
+            (Some(Arc::from(forwarded.flight.as_slice())), None)
+        }
+        // The site answered with fewer records than the port expected, or
+        // the port did not know how many to expect: ask again, with a
+        // handshake of the port's own, which is what it did always.
+        _ => {
+            let site = decoy.dial().await?;
+            let observed = zero_security::tls13::post_handshake::observe_all_with_alpn(
+                site,
+                server_name,
+                zero_security::tls13::post_handshake::SiteTrust::Unverified,
+                &protocols,
+            )
             .await
             .map_err(|error| error.to_string())?;
-    let answer = forwarded.answer;
-    let site = decoy.dial().await?;
-    let observed = zero_security::tls13::post_handshake::observe_all_with_alpn(
-        site,
-        server_name,
-        zero_security::tls13::post_handshake::SiteTrust::Unverified,
-        &protocols,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    if observed.flight.is_empty() {
-        return Ok(None);
-    }
-    // Go reads both off that one connection: the flight it answers the hello
-    // with, and the records the site sends after the handshake
-    // (`RL/tls.go:293-330`, `:404-421`).
-    let flight = (!observed.flight.is_empty()).then(|| Arc::from(observed.flight.as_slice()));
-    let after = (!observed.post_handshake.is_empty())
-        .then(|| Arc::from(observed.post_handshake.as_slice()));
+            if observed.flight.is_empty() {
+                return Ok(None);
+            }
+            // Go reads both off that one connection: the flight it answers the
+            // hello with, and the records the site sends after the handshake
+            // (`RL/tls.go:293-330`, `:404-421`).
+            let flight = Some(Arc::from(observed.flight.as_slice()));
+            let after = (!observed.post_handshake.is_empty())
+                .then(|| Arc::from(observed.post_handshake.as_slice()));
+            (flight, after)
+        }
+    };
     // The recorder sees everything the port writes to the site: the
     // visitor's hello, which the probe wrote, and the visitor's Finished,
     // which is forwarded later.
@@ -2082,6 +2113,77 @@ mod tests {
         assert_eq!(*sizes.lock().unwrap(), [255, 69, 5 + 4 + 1 + 16]);
     }
 
+    /// The port asks the site once per connection.
+    ///
+    /// The site's flight comes off the same connection the visitor's hello
+    /// went out on: a TLS 1.3 site sends its whole flight in one burst, in
+    /// answer to the ClientHello, so the count of records says when the
+    /// burst has ended. Asking a second time costs a whole TLS handshake
+    /// with the site, and the benchmark measured that at about half a
+    /// connection's worth of latency.
+    #[tokio::test]
+    async fn the_site_is_asked_once_per_connection() {
+        let site = TestSite::start();
+        let (mut server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        server_params.decoy = Some(Arc::clone(&site.dialer) as Arc<dyn DecoyDialer>);
+        // The port knows how many records the site's flight has, as it
+        // learned it at start-up. The learning is what the runtime does
+        // before the listener is up.
+        // The site starts on the first dial, so it is asked once here to
+        // bring it up, and the learning follows. The count is reset after,
+        // so only the connection's own dials are counted.
+        let _ = site.dialer.dial().await;
+        *site.dialer.dials.lock().unwrap() = 0;
+        let site_address = site
+            .dialer
+            .address
+            .lock()
+            .unwrap()
+            .expect("the site is listening");
+        let probe = zero_security::tls13::post_handshake::observe_all_with_alpn(
+            tokio::net::TcpStream::connect(site_address).await.unwrap(),
+            "example.test",
+            zero_security::tls13::post_handshake::SiteTrust::Unverified,
+            &["h2", "http/1.1"],
+        )
+        .await
+        .expect("the site's shapes");
+        // The ALPN index the port files the site's shapes under: a client
+        // that offers h2 first is index 2, as Go files them
+        // (`RL/tls.go:396-403`).
+        server_params
+            .post_handshake
+            .set_flight("example.test", 2, &probe.flight);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn({
+            let server_params = server_params.clone();
+            async move {
+                let mut stream = handshake(server_io, &server_params).await.unwrap();
+                let mut request = [0u8; 4];
+                stream.read_exact(&mut request).await.unwrap();
+                stream.write_all(b"pong").await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+        let client = tokio::spawn(async move {
+            let mut client = zero_security::reality_connect(client_io, &client_params)
+                .await
+                .unwrap();
+            client.write_all(b"ping").await.unwrap();
+            client.flush().await.unwrap();
+            let mut reply = [0u8; 4];
+            client.read_exact(&mut reply).await.unwrap();
+        });
+        client.await.unwrap();
+        server.await.unwrap();
+        let dials = *site.dialer.dials.lock().unwrap();
+        assert_eq!(
+            dials, 1,
+            "the port asked the site {dials} times for one connection"
+        );
+    }
+
     /// The site's answer arrives without waiting out the listen time.
     ///
     /// A site has nothing more to say until the client speaks again, so a
@@ -2146,6 +2248,7 @@ mod tests {
             "example.test",
             &[],
             &client_hello,
+            None,
             None,
         )
         .await
@@ -2260,6 +2363,7 @@ mod tests {
             &[],
             &client_hello,
             None,
+            None,
         )
         .await
         .expect("the site was reached")
@@ -2286,6 +2390,7 @@ mod tests {
             "example.test",
             &[],
             &client_hello,
+            None,
             None,
         )
         .await
@@ -2565,9 +2670,10 @@ mod tests {
         /// Start a site on a loopback port.
         fn start() -> Self {
             let dialer = Arc::new(TestSiteDialer {
-                address: std::sync::Mutex::new(None),
+                address: Arc::new(std::sync::Mutex::new(None)),
                 flight: Arc::new(Mutex::new(Vec::new())),
                 received: Arc::new(Mutex::new(Vec::new())),
+                dials: Arc::new(Mutex::new(0)),
             });
             Self { dialer }
         }
@@ -2576,12 +2682,15 @@ mod tests {
     /// The dialer for [`TestSite`]: it starts the site on the first dial and
     /// hands the connection over.
     struct TestSiteDialer {
-        address: std::sync::Mutex<Option<std::net::SocketAddr>>,
+        address: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>>,
         /// The flight the site answered with, as the probe read it.
         flight: Arc<Mutex<Vec<u16>>>,
         /// The bytes the site *received*, so a test can see what the port
         /// forwarded to it.
         received: Arc<Mutex<Vec<u8>>>,
+        /// How many times the site was dialled, so a test can see how many
+        /// times the port asks it.
+        dials: Arc<Mutex<u32>>,
     }
 
     impl DecoyDialer for TestSiteDialer {
@@ -2595,7 +2704,10 @@ mod tests {
             // test can read it after the handshake.
             let flight = Arc::clone(&self.flight);
             let received = Arc::clone(&self.received);
+            let dials = Arc::clone(&self.dials);
+            let self_address = Arc::clone(&self.address);
             Box::pin(async move {
+                *dials.lock().unwrap() += 1;
                 let address = match address {
                     Some(address) => address,
                     None => {
@@ -2603,6 +2715,8 @@ mod tests {
                             .await
                             .map_err(|error| error.to_string())?;
                         let address = listener.local_addr().map_err(|error| error.to_string())?;
+                        // The address is kept, so a test can find the site.
+                        *self_address.lock().unwrap() = Some(address);
                         let recorded = Arc::clone(&flight);
                         tokio::spawn(async move {
                             let config = site_config();

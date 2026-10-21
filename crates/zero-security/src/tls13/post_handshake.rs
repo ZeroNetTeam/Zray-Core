@@ -773,6 +773,30 @@ pub async fn observe_with_the_clients_hello<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    observe_with_the_clients_hello_for(io, hello, None).await
+}
+
+/// The same, with the caller saying how many records the site's flight has.
+///
+/// A TLS 1.3 site sends its whole flight in one burst, in answer to the
+/// ClientHello: its ServerHello, its compatibility ChangeCipherSpec, and
+/// then its EncryptedExtensions, its Certificate, its CertificateVerify
+/// with its own Finished, and its session ticket. It does not wait for the
+/// client's Finished to send them — measured against a real Xray site, the
+/// site sent all six records before the client's Finished arrived.
+///
+/// So the caller's connection to the site can yield the whole flight, and
+/// the count is what says when the burst has ended. `expected` is that
+/// count; `None` reads only as far as the ServerHello, which is what a
+/// caller that wants the answer and nothing else asks for.
+pub async fn observe_with_the_clients_hello_for<S>(
+    io: S,
+    hello: &[u8],
+    expected: Option<usize>,
+) -> Result<(SiteShapes, Option<Tap<S>>, Taps), Failure>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let (mut tap, taps) = tap_with_flight(io);
     // The client's hello goes to the site first, and the site's answer is
     // read off the same connection.
@@ -782,19 +806,26 @@ where
     tokio::io::AsyncWriteExt::flush(&mut tap)
         .await
         .map_err(|error| Failure::from_io(&error, Stage::TlsStarted))?;
-    // The site's ServerHello is all that is wanted here, and it is the
-    // site's *first* record — so the read stops as soon as it has arrived.
-    // The site would go on to wait for the client's Finished, which never
-    // comes on this connection, so waiting the full listen time would only
-    // add to every connection's cost.
+    // The read stops when the site's flight is complete: its ServerHello
+    // first, and then the rest of the records the caller expects. The site
+    // sends them in one burst and then waits, so a read that waited for the
+    // site's silence would wait out the whole listen time on every
+    // connection — and the site is read on every connection.
     let mut sink = [0u8; 512];
     let _ = tokio::time::timeout(LISTEN, async {
-        while taps
-            .server_hello
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_empty()
-        {
+        loop {
+            let seen = taps.flight.lock().unwrap_or_else(|p| p.into_inner()).len();
+            let done = match expected {
+                None => !taps
+                    .server_hello
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_empty(),
+                Some(count) => seen >= count,
+            };
+            if done {
+                break;
+            }
             match tokio::io::AsyncReadExt::read(&mut tap, &mut sink).await {
                 Ok(n) if n > 0 => continue,
                 _ => break,
