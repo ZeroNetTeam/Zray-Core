@@ -15,7 +15,7 @@
 //!
 //! The server then puts its own flight on the wire in the sizes learned for
 //! the first group, and sends empty records of the sizes learned for the
-//! second ([`super::server::PostHandshakeShapes`]).
+//! second (the `PostHandshakeShapes` of the `reality` crate).
 //!
 //! The rule it keeps: only sizes are learned. Nothing the site sent is kept,
 //! replayed or decrypted for use, and the connection is closed afterwards.

@@ -1,7 +1,7 @@
 //! A REALITY server's configuration, in Xray's own JSON shape.
 //!
 //! A server that wants REALITY should not have to hand-build
-//! [`RealityServerParams`](crate::server::RealityServerParams), and it should
+//! [`RealityServerParams`], and it should
 //! not have to depend on the whole configuration compiler to read one block of
 //! settings. This module turns the `realitySettings` object Xray documents —
 //! the same one `xray run` reads — into a typed value, with Xray's field names,
@@ -21,9 +21,10 @@
 //! accepted an empty `shortIds` would authenticate nobody while looking
 //! healthy — every client would be quietly handed to the camouflage site.
 //!
-//! The fields map one to one onto
-//! [`zero_config::InboundRealityConfig`], and `crates/reality/tests/config.rs`
-//! compares the two parses field by field so the copies cannot drift.
+//! The fields map one to one onto the configuration compiler's own
+//! `InboundRealityConfig`, and `crates/reality/tests/config.rs` compares the
+//! two parses field by field so the copies cannot drift. The compiler is a
+//! dev-dependency here, so the link is by name rather than a path into it.
 //!
 //! Both of Xray's diagnostic switches are read as well: `show` (#1) and
 //! `masterKeyLog` (#31), the two fields an operator turns on to see inside a
@@ -119,7 +120,7 @@ pub struct RealityServerConfig {
     /// (`XC/transport_internet/reality/config.go:61-64`).
     ///
     /// This is a debugging switch and not a diagnostic trail:
-    /// [`KeyLog`](crate::keys::KeyLog) documents what a reader of that file can
+    /// [`KeyLog`] documents what a reader of that file can
     /// do, which is decrypt every session of every user of this server for as
     /// long as it is being written. Open it once per listener with
     /// [`Self::key_log`] rather than once per connection, and delete the file

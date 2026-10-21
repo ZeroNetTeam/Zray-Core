@@ -20,8 +20,8 @@
 //!
 //! `compress_certificate` is advertised only because the handshake can read
 //! what it invites: a server may answer with a brotli-compressed Certificate
-//! message, and `client::handshake` inflates it (see
-//! [`offers_certificate_compression`]).
+//! message, and `client::handshake` inflates it (see the
+//! `offers_certificate_compression` helper in this module).
 
 use ml_kem::{
     kem::{Kem, KeyExport},
