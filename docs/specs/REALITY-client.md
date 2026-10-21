@@ -786,8 +786,8 @@ tunnel, and the certificate check is the only place the fallback is
 detectable. A crawler would have to reproduce Xray's behaviour *exactly* to
 be indistinguishable, and one that is subtly different is a fingerprint in
 its own right; refusing is both safer and harder to tell apart, because a
-refused connection looks like a network failure. `spiderX` and `spiderY` are
-parsed and ignored.
+refused connection looks like a network failure. `spiderX` is parsed and ignored, and
+`spiderY` is not read at all.
 
 If any §4 check fails, the REALITY server never writes its own handshake; the TCP stream
 becomes a direct pipe client↔`dest` (`RL/tls.go:281-296` upload side, `:443-457`
