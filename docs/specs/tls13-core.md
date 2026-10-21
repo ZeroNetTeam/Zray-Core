@@ -580,3 +580,7 @@ REALITY certificate = rcgen self-signed Ed25519 cert where signatureValue is rep
 9. Alerts + close_notify (§3.6).
 10. End-to-end test: handshake against (a) the shoes REALITY server and (b) a stock
     `rustls`/OpenSSL TLS 1.3 server (this flushes out §6.2/§6.4 divergences).
+    Both are done: the differential suite in `crates/zero-runtime/tests/xray_oracle.rs`
+    covers (a) against a real Xray REALITY server in both directions, and
+    `server::tests::the_client_handshakes_with_a_stock_tls13_server` covers (b)
+    against a plain `rustls` server with no REALITY in it.

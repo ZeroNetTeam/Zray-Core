@@ -2543,6 +2543,48 @@ mod tests {
         );
     }
 
+    /// The TLS client works against a *stock* TLS 1.3 server.
+    ///
+    /// The checklist in `docs/specs/tls13-core.md` asks for it: the
+    /// handshake must flush out the divergences in what may be skipped
+    /// (§6.2, §6.4) against a server that is not this workspace's. The
+    /// server here is a plain `rustls` one, with a certificate from the
+    /// test fixtures and no REALITY in it at all.
+    #[tokio::test]
+    async fn the_client_handshakes_with_a_stock_tls13_server() {
+        let config = site_config();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut stream = zero_security::server::accept(server_io, config)
+                .await
+                .expect("the stock server accepts");
+            let mut request = [0u8; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut request)
+                .await
+                .expect("the request arrives");
+            tokio::io::AsyncWriteExt::write_all(&mut stream, b"pong")
+                .await
+                .expect("the reply goes out");
+            tokio::io::AsyncWriteExt::flush(&mut stream)
+                .await
+                .expect("the reply is flushed");
+        });
+        // The client's hello is a browser's, and the server is told to
+        // expect nothing more.
+        let params = zero_security::tls::TlsParams::new("example.test")
+            .with_alpn(&["h2"])
+            .with_insecure(true);
+        let mut client = zero_security::tls::connect(client_io, &params)
+            .await
+            .expect("the client completes the handshake with a stock server");
+        client.write_all(b"ping").await.unwrap();
+        client.flush().await.unwrap();
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"pong", "the stock server's reply comes back");
+        server.await.unwrap();
+    }
+
     /// The ALPN index is Go's, and it is a bucket.
     ///
     /// Go files the shapes it learned under `dest + " " + sni + " " + alpn`,
