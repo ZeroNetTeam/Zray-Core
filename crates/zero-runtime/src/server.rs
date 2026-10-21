@@ -9063,6 +9063,48 @@ fn alpn_probes() -> [AlpnProbe; 3] {
     ]
 }
 
+/// The three probes are Go's three, filed under Go's three keys.
+///
+/// Go asks the site with no ALPN, with http/1.1, and with h2 and http/1.1
+/// (`RL/record_detect.go:21-62`), and files the answers under the ALPN
+/// *index* — 0 for a client that offered none, 2 for one that offered h2
+/// first, 1 for anything else (`RL/tls.go:396-403`).
+///
+/// The indexes and the protocols have to agree: a probe filed under one
+/// index and offering another's protocols would hand a client the answer
+/// to a question it did not ask.
+#[test]
+fn the_three_probes_are_go_s_three() {
+    let probes = alpn_probes();
+    assert_eq!(probes.len(), 3, "Go probes the site three ways");
+    assert_eq!(probes[0].index, 0, "no ALPN is index 0");
+    assert!(
+        probes[0].protocols.is_empty(),
+        "index 0 offers no protocol at all"
+    );
+    assert_eq!(probes[1].index, 1, "http/1.1 is index 1");
+    assert_eq!(probes[1].protocols, vec!["http/1.1"]);
+    assert_eq!(probes[2].index, 2, "h2 and http/1.1 is index 2");
+    assert_eq!(probes[2].protocols, vec!["h2", "http/1.1"]);
+
+    // And each probe's protocols must produce the index it is filed under,
+    // by the same rule the accepting connection uses.
+    for probe in &probes {
+        let offered: Vec<String> = probe.protocols.iter().map(|p| p.to_string()).collect();
+        let index = match offered.split_first() {
+            None => 0,
+            Some((first, _)) if first == "h2" => 2,
+            Some(_) => 1,
+        };
+        assert_eq!(
+            index, probe.index,
+            "the probe offering {:?} must be filed under the index the \
+             client with those protocols would look up",
+            probe.protocols
+        );
+    }
+}
+
 /// One way of asking the site, and the key its answer is filed under.
 struct AlpnProbe {
     /// The key the answer is filed under: Go's ALPN index, which is 0 for a
