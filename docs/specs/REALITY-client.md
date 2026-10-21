@@ -782,10 +782,15 @@ random `Referer`s and `padding` cookies (`XC/reality.go:183-275`) — this
 client **aborts the connection** when the certificate's HMAC does not verify
 (`ZS/reality.rs`: `FailureKind::RealityFallback`).
 
-**Proved by.** `reality::server::tests::a_client_the_server_never_authenticated_writes_no_application_data`
+**Proved by.** Two tests, one on each side of the protocol:
+
+* `reality::server::tests::a_client_the_server_never_authenticated_writes_no_application_data`
 drives a client that believes a public key the server has never held, and
 checks two things: the client refuses, and it wrote *one* record — the
-ClientHello. Not even the Finished: a TLS 1.3 client verifies the server's
+ClientHello;
+* `xray_oracle::this_clients_refusal_matches_the_official_servers_fallback`
+does the same against the *official* Xray server, so the refusal is
+measured against the implementation it is diverging from. Not even the Finished: a TLS 1.3 client verifies the server's
 certificate before it sends its own Finished, so a client that refuses the
 certificate stops there, and anything a tunnel would carry comes after
 that. The property is over-determined — the server refuses the client for
