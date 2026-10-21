@@ -53,7 +53,7 @@ is the one that fails without it.
 | `shortIds: []`, `mldsa65Seed == privateKey`, 1–3 part versions, bare-port and unix `dest` (§7) | the rules Xray's JSON layer enforces, in both readers | `crates/reality/tests/config.rs` (four parity tests) + `crates/reality/src/config.rs` unit tests |
 | The fallback relay written twice (§6) | the runtime calls `reality::fallback::relay`; one implementation | `--test fallback` 8/8, `--test loopback_tls_interop` 26/26, `the_reality_server_limits_hold_against_the_oracles_client` |
 | A failed direction cancelling the other (§6) | the surviving direction gets a 250 ms grace to deliver what the peer already sent | `crates/reality/tests/fallback.rs::the_targets_answer_survives_the_write_to_the_target_failing` + the oracle's `the_record_size_limit_is_the_oracles_at_the_edges`, 20/20 runs |
-| `show` and `masterKeyLog` (§7) | both switches are read, and the handshake acts on them: a line per connection, and the traffic secrets in Go's order | `server::tests::the_show_switch_reports_what_the_client_sent` and `server::tests::the_key_log_writes_the_handshakes_traffic_secrets` |
+| `show` and `masterKeyLog` (§7) | both switches are read, and the handshake acts on them: a line per connection, and the traffic secrets in Go's order | `server::tests::the_show_switch_reports_what_the_client_sent` and `server::tests::the_key_log_writes_the_handshakes_traffic_secrets`; the key log's shape is compared against the official server's, over the official client, by `the_key_log_has_the_shape_the_officials_server_writes` |
 
 What is *not* closed is what the rows below still say: the per-decoy
 ChangeCipherSpec probe, the decoy being dialled on the accepting path, and
@@ -1562,11 +1562,13 @@ test behind it. In rough order of how much they matter:
     differently, only the combination would show it.
 11. **Vision *and* ML-DSA-65 together.** `OR:1197-1210` covers Vision over REALITY
     and `OR:2115-2125` covers ML-DSA-65, but not both in one connection.
-12. **`masterKeyLog` on a REALITY inbound** (§7): the switch is implemented and
-    unit-tested (`server::tests::the_key_log_writes_the_handshakes_traffic_secrets`
-    asserts the four lines), but no test compares the file Xray writes against
-    the file this port writes, and no test decrypts a captured session with
-    either.
+12. **`masterKeyLog` on a REALITY inbound** (§7): the switch is implemented, and
+    the file's shape — the labels, their order, the field count, the field
+    lengths — is compared against the file an official Xray REALITY server
+    writes, over the same official client (`the_key_log_has_the_shape_the_
+    officials_server_writes`). What is still missing is a test that decrypts a
+    captured session with either file, and a comparison of the secret *values*
+    for one handshake, which would need both servers to share a handshake.
 
 A useful discipline for whoever writes these: for cases 1–4, the test is a raw
 socket that writes a hand-built ClientHello (no TLS stack) and asserts the *decoy*

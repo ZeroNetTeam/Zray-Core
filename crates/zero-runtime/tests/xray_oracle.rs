@@ -2830,3 +2830,185 @@ async fn the_record_size_limit_is_the_oracles_at_the_edges() {
         );
     }
 }
+
+/// The key log an official Xray REALITY server writes, and the one this port
+/// writes, have the same shape.
+///
+/// The `masterKeyLog` file is what an operator uses to decrypt a captured
+/// session, so a line in a different order, or a field in a different place,
+/// makes the file useless to the tool that reads it — and a line that is
+/// missing makes the capture undecryptable in the first place. What the two
+/// handshakes cannot share is the secret values themselves, since they are
+/// different handshakes; what they must share is the labels, their order, the
+/// number of fields per line, and the length of each field.
+///
+/// The comparison is against the official implementation, not against the
+/// specification, because the specification is what the official
+/// implementation does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn the_key_log_has_the_shape_the_officials_server_writes() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    let echo = echo_service().await;
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the REALITY decoy never listened");
+
+    let directory = std::env::temp_dir().join(format!(
+        "zray-keylog-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let official_log = directory.join("official.log");
+    let port_log = directory.join("port.log");
+
+    // ── The official server ─────────────────────────────────────────────
+    let (private_key, public_key) = oracle_x25519_keypair(&binary);
+    let (server_settings, _) = protocol_settings("vless", 0);
+    let mut official_stream = transport("tcp");
+    official_stream["security"] = json!("reality");
+    let mut official_reality = reality_server_settings(&private_key, decoy);
+    official_reality["masterKeyLog"] = json!(official_log.to_str().unwrap());
+    official_stream["realitySettings"] = official_reality;
+
+    let official_port = free_port();
+    let _official = spawn_oracle(
+        &binary,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "reality-in",
+                "listen": "127.0.0.1",
+                "port": official_port,
+                "protocol": "vless",
+                "settings": server_settings,
+                "streamSettings": official_stream,
+            }],
+            "outbounds": [{"protocol": "freedom"}],
+        }),
+    );
+    let official_address = SocketAddr::new("127.0.0.1".parse().unwrap(), official_port);
+    assert!(
+        wait_for(official_address).await,
+        "the official REALITY server never listened"
+    );
+
+    // ── This port's server, on the same config ──────────────────────────
+    let (port_private_key, port_public_key) = oracle_x25519_keypair(&binary);
+    let (port_settings, _) = protocol_settings("vless", 0);
+    let mut port_stream = transport("tcp");
+    port_stream["security"] = json!("reality");
+    let mut port_reality = reality_server_settings(&port_private_key, decoy);
+    port_reality["masterKeyLog"] = json!(port_log.to_str().unwrap());
+    port_stream["realitySettings"] = port_reality;
+
+    let server_port = free_port();
+    spawn_zray(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "reality-in",
+            "listen": "127.0.0.1",
+            "port": server_port,
+            "protocol": "vless",
+            "settings": port_settings,
+            "streamSettings": port_stream,
+        }],
+        "outbounds": [{"protocol": "freedom"}],
+    }));
+    let port_address = SocketAddr::new("127.0.0.1".parse().unwrap(), server_port);
+    assert!(
+        wait_for(port_address).await,
+        "this port's REALITY server never listened"
+    );
+
+    // ── The same official client, against each ──────────────────────────
+    for (server, key) in [
+        (official_address, &public_key),
+        (port_address, &port_public_key),
+    ] {
+        let socks_port = free_port();
+        let _client = spawn_xray_reality_client(&binary, socks_port, server.port(), key, None);
+        let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+        assert!(wait_for(socks).await, "the official client never listened");
+        proxied_echo(socks, echo, 7)
+            .await
+            .expect("the client's request came back through the tunnel");
+    }
+
+    // Give the server a moment to flush what the handshake produced.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let official = read_key_log(&official_log);
+    let port = read_key_log(&port_log);
+    let _ = std::fs::remove_dir_all(&directory);
+
+    assert!(
+        !official.is_empty(),
+        "the official server wrote no key log at {official_log:?}"
+    );
+    assert_eq!(
+        port.iter()
+            .map(|line| line.label.as_str())
+            .collect::<Vec<_>>(),
+        official
+            .iter()
+            .map(|line| line.label.as_str())
+            .collect::<Vec<_>>(),
+        "the two key logs hold different labels, or in a different order"
+    );
+    assert_eq!(
+        port.iter().map(|line| line.random_len).collect::<Vec<_>>(),
+        official
+            .iter()
+            .map(|line| line.random_len)
+            .collect::<Vec<_>>(),
+        "the two key logs hold a different client random"
+    );
+    assert_eq!(
+        port.iter().map(|line| line.secret_len).collect::<Vec<_>>(),
+        official
+            .iter()
+            .map(|line| line.secret_len)
+            .collect::<Vec<_>>(),
+        "the two key logs hold secrets of different lengths"
+    );
+}
+
+/// One line of a key log, read as far as its shape goes.
+struct KeyLogLine {
+    label: String,
+    /// The length of the client random, in hex characters.
+    random_len: usize,
+    /// The length of the secret, in hex characters.
+    secret_len: usize,
+}
+
+/// Read a key log file into its lines' shapes.
+fn read_key_log(path: &std::path::Path) -> Vec<KeyLogLine> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(
+                fields.len(),
+                3,
+                "a key log line must hold a label, a random and a secret: {line:?}"
+            );
+            KeyLogLine {
+                label: fields[0].to_string(),
+                random_len: fields[1].len(),
+                secret_len: fields[2].len(),
+            }
+        })
+        .collect()
+}
