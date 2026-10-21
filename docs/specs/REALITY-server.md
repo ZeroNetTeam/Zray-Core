@@ -108,7 +108,10 @@ What is *not* closed is what the rows below still say.
   `DEFAULT_HANDSHAKE_TIMEOUT`), which is Xray's policy default
   (`XC/features/policy/policy.go:120`: `Handshake: time.Second * 60`) —
   so a site that is slow costs the visitor time, not the listener
-  (§1, §3, §6);
+  (§1, §3, §6). The fallback's own dial is a third, and the site sees
+  the visitor's bytes on it exactly as it does in Go: the fallback
+  replays the bytes it consumed (`RB/fallback.rs`), so the difference
+  is which connection they arrive on, not what they say (§1, §6);
 * the cipher suite and the key-share group are the *site's*, taken from its
   ServerHello, as Go takes them (`RL/handshake_server_tls13.go:100-128`) —
   and the site is asked with the *client's own* hello, forwarded verbatim,
