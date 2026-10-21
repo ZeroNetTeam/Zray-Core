@@ -660,11 +660,23 @@ where
     let flight = FlightPlan::for_hello(shapes.flight.as_deref(), &server_hello);
     write_clear_record(&mut io, &server_hello).await?;
 
-    let mut transcript = Transcript::new(hello.suite.hash);
+    // The transcript's hash, the key schedule and the flight are all the
+    // *suite's* — the one the ServerHello named, which is the site's. Go
+    // takes the suite from the site's ServerHello and nothing else: the
+    // stock selection is commented out in REALITY's fork of the TLS server
+    // (`RL/handshake_server_tls13.go:102`), so there is no mutual
+    // negotiation and no client's-suite fallback.
+    //
+    // Using the client's suite here instead would desynchronise the
+    // handshake whenever the two differ: the client derives the traffic
+    // secrets with the suite the ServerHello named, and a server that used
+    // the other one would produce a Finished the client cannot verify — and
+    // a Finished of a different length, which does not fit the site's
+    // record.
+    let mut transcript = Transcript::new(suite.hash);
     transcript.update(&hello.message);
     transcript.update(&server_hello);
-    let schedule =
-        establish_handshake_secrets(hello.suite, &handshake_shared, &transcript.snapshot());
+    let schedule = establish_handshake_secrets(suite, &handshake_shared, &transcript.snapshot());
     handshake_shared.zeroize();
 
     let mut signing_seed = [0u8; 32];
@@ -680,7 +692,7 @@ where
             .map(|seed| (seed, hello.message.as_slice(), server_hello.as_slice())),
     );
     let encrypted_flight = build_encrypted_flight(
-        hello.suite,
+        suite,
         &schedule.server_hs_traffic,
         &mut transcript,
         &certificate,
@@ -702,7 +714,7 @@ where
         .map_err(|error| Failure::from_io(&error, Stage::TlsStarted))?;
 
     let (client_finished, finished_record) =
-        read_encrypted_handshake_raw(&mut io, hello.suite, &schedule.client_hs_traffic).await?;
+        read_encrypted_handshake_raw(&mut io, suite, &schedule.client_hs_traffic).await?;
     // The visitor's Finished goes to the site too, as Go's `MirrorConn`
     // forwards every byte read from the visitor (`RL/tls.go:70-83`). A site
     // holds its own CertificateVerify and its own Finished until the
@@ -721,7 +733,7 @@ where
         }
     }
     let expected = finished_verify_data(
-        hello.suite.hash,
+        suite.hash,
         &schedule.client_hs_traffic,
         &transcript.snapshot(),
     );
@@ -746,7 +758,7 @@ where
         );
         let _ = log.log_application_secrets(&hello.random, &client_app, &server_app);
     }
-    let mut stream = Tls13Stream::new(io, hello.suite, client_app, server_app);
+    let mut stream = Tls13Stream::new(io, suite, client_app, server_app);
     // This end is the server, so a session ticket arriving from the client is
     // refused rather than ignored, as Go refuses it
     // (`RL/handshake_client_tls13.go:855-858`).
@@ -2181,6 +2193,66 @@ mod tests {
         assert_eq!(
             dials, 1,
             "the port asked the site {dials} times for one connection"
+        );
+    }
+
+    /// The port answers with the suite the *site* chose.
+    ///
+    /// The site's ServerHello names the suite, and REALITY's fork of the
+    /// TLS server takes the suite from there and nothing else
+    /// (`RL/handshake_server_tls13.go:102`; the stock selection is
+    /// commented out in that fork). So the suite is the site's, and the
+    /// whole handshake — the transcript's hash, the key schedule, the
+    /// flight, the Finished and the record layer — has to use that one
+    /// suite and not the client's.
+    ///
+    /// The client's own preference is per fingerprint, and it is not always
+    /// the site's: an Xray client with the safari fingerprint leads with
+    /// SHA-384, and the site may answer with SHA-256. The differential
+    /// suite covers that case with a real client
+    /// (`the_server_accepts_a_client_with_any_fingerprint`); this one
+    /// checks the port's own choice, which is what the difference turns on.
+    #[tokio::test]
+    async fn the_port_answers_with_the_sites_suite_and_not_the_clients() {
+        let site = TestSite::start();
+        let (mut server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        server_params.decoy = Some(Arc::clone(&site.dialer) as Arc<dyn DecoyDialer>);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn({
+            let server_params = server_params.clone();
+            async move {
+                let mut stream = handshake(server_io, &server_params).await.unwrap();
+                let mut request = [0u8; 4];
+                stream.read_exact(&mut request).await.unwrap();
+                stream.write_all(b"pong").await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+        // The ServerHello the port sent, so the test can see which suite it
+        // answered with.
+        let (tapped, taps) = zero_security::tls13::post_handshake::tap_with_flight(client_io);
+        let client = tokio::spawn(async move {
+            let mut client = zero_security::reality_connect(tapped, &client_params)
+                .await
+                .expect("the client completes the handshake");
+            client.write_all(b"ping").await.unwrap();
+            client.flush().await.unwrap();
+            let mut reply = [0u8; 4];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"pong", "the server answered anyway");
+        });
+        client.await.unwrap();
+        server.await.unwrap();
+        let answer = zero_security::tls13::post_handshake::parse_site_answer(
+            &taps.server_hello.lock().unwrap(),
+        )
+        .expect("the ServerHello was read");
+        // The suite the site chose, which is the one the port must use.
+        // The site's own preference is SHA-256.
+        assert_eq!(
+            answer.suite, 0x1301,
+            "the port answered with the suite the site chose"
         );
     }
 

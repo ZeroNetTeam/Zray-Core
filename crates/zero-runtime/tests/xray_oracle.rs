@@ -2560,6 +2560,143 @@ async fn the_official_server_copies_the_sites_whole_flight() {
     );
 }
 
+/// An Xray client with the safari fingerprint, against an *official* Xray
+/// REALITY server, with the same decoy.
+///
+/// The companion to `the_server_accepts_a_client_with_any_fingerprint`: if
+/// the official server also refuses that client, then the port is faithful
+/// and the client-and-site combination is what cannot work. If the
+/// official server accepts it, the port is refusing something Xray accepts,
+/// which is a divergence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn the_official_server_answers_the_same_fingerprints_the_port_does() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the camouflage site never listened");
+
+    let (private_key, public_key) = oracle_x25519_keypair(&binary);
+
+    // The official server, on the same decoy.
+    let (server_settings, _) = protocol_settings("vless", 0);
+    let mut oracle_stream = transport("tcp");
+    oracle_stream["security"] = json!("reality");
+    oracle_stream["realitySettings"] = reality_server_settings(&private_key, decoy);
+    let server_port = free_port();
+    let _oracle = spawn_oracle(
+        &binary,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "in",
+                "listen": "127.0.0.1",
+                "port": server_port,
+                "protocol": "vless",
+                "settings": server_settings,
+                "streamSettings": oracle_stream,
+            }],
+            "outbounds": [oracle_loopback_freedom()],
+        }),
+    );
+    assert!(
+        wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), server_port)).await,
+        "the Xray REALITY server never listened"
+    );
+
+    let echo = echo_service().await;
+    for fingerprint in ["chrome", "firefox", "safari", "edge", "ios", "random"] {
+        let socks_port = free_port();
+        let _client = spawn_xray_reality_client_with(
+            &binary,
+            socks_port,
+            server_port,
+            &public_key,
+            None,
+            fingerprint,
+        );
+        let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+        assert!(
+            wait_for(socks).await,
+            "the Xray client with the {fingerprint} fingerprint never listened"
+        );
+        let outcome = proxied_echo(socks, echo, 5).await;
+        eprintln!(
+            "the official server and the {fingerprint} client: {}",
+            match &outcome {
+                Ok(()) => "the payload came back".to_string(),
+                Err(reason) => format!("refused: {reason}"),
+            }
+        );
+    }
+}
+
+/// The port's server accepts an Xray client with any fingerprint.
+///
+/// The fingerprint is what makes the client's hello look like a browser's,
+/// and a server that accepts only one of them is a server that a real
+/// client with another cannot use. The port does not look at it — the
+/// authentication is the tag in the session id — but "the port does not
+/// look at it" is a claim, and a client that is refused would show it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn the_server_accepts_a_client_with_any_fingerprint() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the camouflage site never listened");
+
+    let (private_key, public_key) = oracle_x25519_keypair(&binary);
+    let (server_settings, _) = protocol_settings("vless", 0);
+    let mut server_stream = transport("tcp");
+    server_stream["security"] = json!("reality");
+    server_stream["realitySettings"] = reality_server_settings(&private_key, decoy);
+    let server_port = free_port();
+    spawn_zray(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "reality-in",
+            "listen": "127.0.0.1",
+            "port": server_port,
+            "protocol": "vless",
+            "settings": server_settings,
+            "streamSettings": server_stream,
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }));
+    assert!(
+        wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), server_port)).await,
+        "the Zray REALITY server never listened"
+    );
+
+    let echo = echo_service().await;
+    for fingerprint in ["chrome", "firefox", "safari", "edge", "ios", "random"] {
+        let socks_port = free_port();
+        let _client = spawn_xray_reality_client_with(
+            &binary,
+            socks_port,
+            server_port,
+            &public_key,
+            None,
+            fingerprint,
+        );
+        let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+        assert!(
+            wait_for(socks).await,
+            "the Xray client with the {fingerprint} fingerprint never listened"
+        );
+        proxied_echo(socks, echo, 3).await.unwrap_or_else(|reason| {
+            panic!("the {fingerprint} client's request did not come back: {reason}")
+        });
+    }
+}
+
 /// A Zray client through a Zray REALITY server, end to end.
 ///
 /// The differential suite puts an Xray binary on one side of every mixed
@@ -2654,10 +2791,27 @@ fn spawn_xray_reality_client(
     public_key: &str,
     mldsa: Option<&str>,
 ) -> Oracle {
+    spawn_xray_reality_client_with(binary, socks_port, port, public_key, mldsa, "chrome")
+}
+
+/// The same, with the client naming a different fingerprint.
+///
+/// The fingerprint is what makes the client's hello look like a browser's,
+/// and a server that only accepts one of them is a server that a real
+/// client with another cannot use.
+fn spawn_xray_reality_client_with(
+    binary: &str,
+    socks_port: u16,
+    port: u16,
+    public_key: &str,
+    mldsa: Option<&str>,
+    fingerprint: &str,
+) -> Oracle {
     let (_, client_settings) = protocol_settings("vless", port);
     let mut client_stream = transport("tcp");
     client_stream["security"] = json!("reality");
     client_stream["realitySettings"] = reality_client_settings(public_key);
+    client_stream["realitySettings"]["fingerprint"] = json!(fingerprint);
     if let Some(verify) = mldsa {
         client_stream["realitySettings"]["mldsa65Verify"] = json!(verify);
     }
