@@ -96,7 +96,11 @@ What is *not* closed is what the rows below still say.
   the site's answer to the *visitor's* hello: it is the site's answer to
   a probe's, which offers the same protocols and the same session-id
   length, so the sizes agree for every site that answers alike — but a
-  site that varies its answer on anything else would be seen. And the
+  site that varies its answer on anything else in the hello would be
+  seen. The exposure is narrow: the session id and the key share are
+  the same length either way, so they do not move the record sizes,
+  and the ALPN — the extension that moves a site's answer most — is the
+  one the shapes are filed by. And the
   second dial cannot be dropped, because the first cannot have the
   flight's last two records in time: the site holds its CertificateVerify
   and its own Finished until the client's Finished arrives, and the
