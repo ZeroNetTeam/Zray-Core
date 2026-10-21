@@ -436,6 +436,22 @@ fn stage_of(uploaded: u64, downloaded: u64) -> Stage {
 /// `assume_init` the bytes its window read. Zeroing one read window is noise on
 /// a prober's traffic, and a fresh crate is a bad place to add an `unsafe` the
 /// safe API already covers.
+/// The credit a throttle's bucket can hold: the burst, or a second's worth
+/// when no burst is named.
+///
+/// A burst *below* the rate is raised to the rate, as Go does
+/// (`RL/tls.go:127-130`): a bucket whose capacity is smaller than its refill
+/// rate can never hold a second's worth of credit, so the limit would bite
+/// sooner than the rate says.
+fn capacity_of(limit: &FallbackLimit) -> f64 {
+    let burst = if limit.burst_bytes_per_sec == 0 {
+        limit.bytes_per_sec
+    } else {
+        limit.burst_bytes_per_sec
+    };
+    burst.max(limit.bytes_per_sec) as f64
+}
+
 pub struct Throttle<S> {
     inner: S,
     limit: FallbackLimit,
@@ -450,7 +466,7 @@ pub struct Throttle<S> {
 impl<S> Throttle<S> {
     /// Read from `inner` under `limit`.
     pub fn new(inner: S, limit: FallbackLimit) -> Self {
-        let capacity = Self::capacity_of(&limit);
+        let capacity = capacity_of(&limit);
         Self {
             inner,
             limit,
@@ -463,16 +479,13 @@ impl<S> Throttle<S> {
 
     /// The credit that can build up: the burst, or a second's worth when no
     /// burst is named.
-    fn capacity_of(limit: &FallbackLimit) -> f64 {
-        if limit.burst_bytes_per_sec == 0 {
-            limit.bytes_per_sec as f64
-        } else {
-            limit.burst_bytes_per_sec as f64
-        }
-    }
-
+    ///
+    /// A burst *below* the rate is raised to the rate, as Go does
+    /// (`RL/tls.go:127-130`): a bucket whose capacity is smaller than its
+    /// refill rate can never hold a second's worth of credit, so the limit
+    /// would bite sooner than the rate says.
     fn capacity(&self) -> f64 {
-        Self::capacity_of(&self.limit)
+        capacity_of(&self.limit)
     }
 
     fn refill(&mut self) {
@@ -893,6 +906,36 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
 
+    /// A burst below the rate is raised to the rate, as Go does.
+    ///
+    /// Go clamps it (`RL/tls.go:127-130`): a bucket whose capacity is
+    /// smaller than its refill rate can never hold a second's worth of
+    /// credit, so the limit would bite sooner than the rate says. A burst
+    /// of zero still means "a second's worth", which is the same value.
+    #[test]
+    fn a_burst_below_the_rate_is_raised_to_it() {
+        let below = FallbackLimit::new(0, 64 * 1024, 1024);
+        assert_eq!(
+            capacity_of(&below),
+            64.0 * 1024.0,
+            "a burst of 1024 with a rate of 64 KiB holds a second's worth"
+        );
+        let at = FallbackLimit::new(0, 64 * 1024, 64 * 1024);
+        assert_eq!(capacity_of(&at), 64.0 * 1024.0);
+        let above = FallbackLimit::new(0, 64 * 1024, 128 * 1024);
+        assert_eq!(
+            capacity_of(&above),
+            128.0 * 1024.0,
+            "a burst above the rate is used as written"
+        );
+        let unset = FallbackLimit::new(0, 64 * 1024, 0);
+        assert_eq!(
+            capacity_of(&unset),
+            64.0 * 1024.0,
+            "no burst named is a second's worth"
+        );
+    }
+
     fn addr(text: &str) -> SocketAddr {
         text.parse().expect("a socket address literal")
     }
@@ -1042,25 +1085,25 @@ mod tests {
     #[tokio::test]
     async fn after_the_free_prefix_the_rate_is_held() {
         // The failure this prevents: a limit a probe walks straight through.
-        // 1000 bytes free, then 4000 more at 2000 per second with a 500 byte
-        // burst: 500 go at once and the other 3500 take about 1.75 seconds.
-        let limit = FallbackLimit::new(1000, 2000, 500);
+        // 1000 bytes free, then 4000 more at 2000 per second with a 2000
+        // byte burst: 2000 go at once and the other 2000 take about a second.
+        let limit = FallbackLimit::new(1000, 2000, 2000);
         let elapsed = time_to_move(5000, limit).await;
         assert!(
-            elapsed >= Duration::from_millis(1500) && elapsed < Duration::from_secs(4),
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(3),
             "{elapsed:?}"
         );
     }
 
     #[tokio::test]
     async fn a_named_burst_is_the_credit_that_builds_up() {
-        // No burst means one second's worth; a smaller burst must mean a
-        // smaller burst, or a configured burst is a lie.
-        let limit = FallbackLimit::new(0, 8000, 1000);
-        let elapsed = time_to_move(3000, limit).await;
-        // 1000 at once, the other 2000 at 8000 per second: a quarter second.
+        // No burst means one second's worth; a burst *above* the rate is the
+        // credit that builds up.
+        let limit = FallbackLimit::new(0, 8000, 16000);
+        let elapsed = time_to_move(20000, limit).await;
+        // 16000 at once, the other 4000 at 8000 per second: half a second.
         assert!(
-            elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(3),
+            elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(3),
             "{elapsed:?}"
         );
     }

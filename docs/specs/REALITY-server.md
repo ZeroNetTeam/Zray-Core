@@ -87,13 +87,8 @@ What is *not* closed is what the rows below still say.
 * a session ticket or unknown post-handshake type from the peer is ignored, not
   alerted — `crates/zero-security/src/tls13/client.rs:925` against
   `RL/conn.go:1387-1398` (§5);
-* a KeyUpdate body longer than one byte is accepted —
-  `crates/zero-security/src/tls13/client.rs:905` against `RL/conn.go:1237-1238` (§5);
 * a fallback session has a 300 s idle deadline where Go has none —
   `crates/zero-runtime/src/relay.rs:39`, `:47` against `RL/tls.go:271-286`, `:442` (§6);
-* `burstBytesPerSec` below `bytesPerSec` is used as written instead of being raised —
-  `crates/zero-runtime/src/throttle.rs:60-66`, documented at
-  `crates/reality/src/fallback.rs:102-105`, against `RL/tls.go:127-130` (§6);
 * both readers accept standard base64 as well as unpadded base64url for
   `privateKey` — `crates/zero-config/src/xray_json.rs:6581-6590` against
   `XC/infra/conf/transport_internet.go:850-855`: a superset, so no valid Xray config
@@ -966,9 +961,12 @@ The record stream that both ends use after the handshake (`Tls13Stream`,
 * **Post-handshake handshake messages**: a KeyUpdate rolls the read secret and
   is answered with a not-requesting KeyUpdate when the peer set
   `update_requested`, rolling the write secret as well — the same behaviour as
-  `RL/conn.go:1401-1436`. NewSessionTicket and unknown types are ignored
-  silently, where Go alerts on a ticket from a client and on any unexpected
-  type.
+  `RL/conn.go:1401-1436`. The body is exactly one byte and its value is 0 or
+  1, as Go's `keyUpdateMsg` unmarshal requires
+  (`RL/handshake_messages.go:1141-1151`); a body of any other shape is an
+  alert, as it is in Go (`RL/conn.go:1248-1250`). NewSessionTicket and unknown
+  types are ignored silently, where Go alerts on a ticket from a client and on
+  any unexpected type.
 * **During the handshake**, `read_encrypted_handshake` skips CCS records
   (`RB/server.rs`) and refuses anything that is not app-data. The loop is not
   unbounded in time: the whole inbound handshake runs under
@@ -994,7 +992,7 @@ all of them.
 | The budget is filed per ALPN | **PORTED** | Go keys it under `dest + " " + sni + " " + alpn` and the accepting connection picks it up by the ALPN it offered (`RL/tls.go:396-403`); the port files it under the same index — 0 for no ALPN, 2 for h2 first, 1 otherwise — and the client is handed the answer that matches (`RB/server.rs`, `alpn_index`) |
 | Empty-record handling | **PORTED** | Go counts them against `MaxUselessRecords` (32 by default, `RL/conn.go:803-811`); the port counts them against the same budget |
 | Session-ticket tolerance | **DIVERGENT** | Go never issues one (`XC/…/reality/config.go:32`) and alerts if a client sends one; the port ignores any post-handshake type it does not know |
-| KeyUpdate | **PORTED** | `RL/conn.go:1401-1436` vs `ZS/client.rs`; the port accepts `mlen >= 1` where Go requires exactly one byte, which is a widening, not a disagreement on the reply |
+| KeyUpdate | **PORTED** | `RL/conn.go:1401-1436` vs `ZS/client.rs`; the body is exactly one byte and its value is 0 or 1, as Go's `keyUpdateMsg` unmarshal requires (`RL/handshake_messages.go:1141-1151`), and a body of any other shape is an alert (`RL/conn.go:1248-1250`) |
 | Replay / session-id cache | **PORTED (both absent)** | `RL/cache.go:14-43` is an x509 cache only; no cache exists in `crates/reality` |
 
 **Proved by.** `OR:1519-1601`
@@ -1247,7 +1245,11 @@ scripted to release its answer only after the relay's write to it has failed —
 removing the grace period makes that test fail.
 
 **Status: PORTED** for dialling, the PROXY header, the hello replay and the rate
-limits, with three named differences:
+limits, with two named differences. The burst is clamped up to the rate, as Go
+does (`RL/tls.go:127-130`): a bucket whose capacity is smaller than its refill
+rate can never hold a second's worth of credit, so the limit would bite sooner
+than the rate says. Both throttles do it (`ZR/throttle.rs`, `RB/fallback.rs`),
+and both are pinned by a test:
 
 1. **When the target is dialled.** Rust dials on fallback only
    (`ZR/server.rs:2395-2431`); Go dials on every connection (`RL/tls.go:168`). For a
@@ -1262,11 +1264,7 @@ limits, with three named differences:
    fallback copies have no timeout at all (`RL/tls.go:271-286`, `:442`). A prober
    that opens a session and says nothing therefore sees it closed after five minutes
    by a Zray server and held open indefinitely by an Xray one.
-3. **Burst is not clamped up to the rate.** Go raises `burstBytesPerSec` to
-   `bytesPerSec` when it is smaller (`RL/tls.go:127-130`); Rust uses the configured
-   burst as given (`ZR/throttle.rs:60-66`), so a config with
-   `burstBytesPerSec < bytesPerSec` behaves differently — a smaller allowance in
-   Rust.
+
 
 **Proved by.** The fallback path is exercised by the differential suite in the
 failure direction: `OR:1214-1301` (a client with the wrong public key must not get a

@@ -1005,7 +1005,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
             if body_at + mlen > payload.len() {
                 return Ok(()); // incomplete trailing message: mimicry, not an error
             }
-            if mtype == msg::KEY_UPDATE && mlen >= 1 {
+            if mtype == msg::KEY_UPDATE {
+                // Go's `keyUpdateMsg` unmarshal reads one byte and requires
+                // the body to be *empty* afterwards
+                // (`RL/handshake_messages.go:1141-1151`), so a body of any
+                // other length is refused rather than accepted. It also
+                // accepts only 0 and 1 (`updateRequested`). A refused message
+                // is an alert in Go (`RL/conn.go:1248-1250`:
+                // `alertDecodeError`).
+                if mlen != 1 || payload[body_at] > 1 {
+                    return Err(alert_failure(&[0x15, 0x32]));
+                }
                 let next = next_traffic_secret(self.suite.hash, &self.read_secret);
                 self.read_secret.zeroize();
                 self.read_secret = next;
@@ -1393,6 +1403,37 @@ mod tests {
         let mut body = vec![0u8; u16::from_be_bytes([header[3], header[4]]) as usize];
         peer.read_exact(&mut body).await.unwrap();
         crypter.open(&header, &body).unwrap()
+    }
+
+    /// A KeyUpdate whose body is not exactly one byte is refused, as Go
+    /// refuses it.
+    ///
+    /// Go's `keyUpdateMsg` unmarshal reads one byte and requires the body to
+    /// be empty afterwards (`RL/handshake_messages.go:1141-1151`), and a
+    /// refused message is an alert (`RL/conn.go:1248-1250`). The port used to
+    /// accept a body of any length, which a peer could use to say anything
+    /// about itself.
+    #[tokio::test]
+    async fn a_key_update_with_the_wrong_body_length_is_refused() {
+        let suite = CipherSuite::TLS_AES_128_GCM_SHA256;
+        let (server_app, client_app) = (vec![1u8; 32], vec![2u8; 32]);
+        for body in [
+            vec![msg::KEY_UPDATE, 0, 0, 0],       // empty
+            vec![msg::KEY_UPDATE, 0, 0, 2, 0, 0], // two bytes
+            vec![msg::KEY_UPDATE, 0, 0, 1, 2],    // a value Go does not have
+        ] {
+            let (mut peer, io) = tokio::io::duplex(64 * 1024);
+            let mut stream = Tls13Stream::new(io, suite, server_app.clone(), client_app.clone());
+            let mut peer_write = RecordCrypter::new(suite, &server_app);
+            let wire = peer_write.seal(&body, CONTENT_HANDSHAKE).unwrap().bytes;
+            peer.write_all(&wire).await.unwrap();
+
+            let error = stream.read(&mut [0u8; 4]).await.unwrap_err();
+            assert!(
+                error.to_string().contains("alert"),
+                "a KeyUpdate of {body:?} was answered with {error}"
+            );
+        }
     }
 
     /// RFC 8446 §4.6.3: the KeyUpdate answer is sealed under the old write

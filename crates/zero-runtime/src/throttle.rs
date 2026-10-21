@@ -31,6 +31,22 @@ pub struct Limit {
     pub burst: u64,
 }
 
+/// The credit a throttle's bucket can hold: the burst, or a second's worth
+/// when no burst is named.
+///
+/// A burst *below* the rate is raised to the rate, as Go does
+/// (`RL/tls.go:127-130`): a bucket whose capacity is smaller than its refill
+/// rate can never hold a second's worth of credit, so the limit would bite
+/// sooner than the rate says.
+fn capacity_of(limit: &Limit) -> f64 {
+    let burst = if limit.burst == 0 {
+        limit.bytes_per_sec
+    } else {
+        limit.burst
+    };
+    burst.max(limit.bytes_per_sec) as f64
+}
+
 pub struct Throttle<S> {
     inner: S,
     limit: Limit,
@@ -44,7 +60,7 @@ pub struct Throttle<S> {
 
 impl<S> Throttle<S> {
     pub fn new(inner: S, limit: Limit) -> Self {
-        let capacity = Self::capacity_of(&limit);
+        let capacity = capacity_of(&limit);
         Self {
             inner,
             limit,
@@ -57,12 +73,13 @@ impl<S> Throttle<S> {
 
     /// The credit that can build up: the burst, or a second's worth when no
     /// burst is named.
+    ///
+    /// A burst *below* the rate is raised to the rate, as Go does
+    /// (`RL/tls.go:127-130`): a bucket whose capacity is smaller than its
+    /// refill rate can never hold a second's worth of credit, so the limit
+    /// would bite sooner than the rate says.
     fn capacity_of(limit: &Limit) -> f64 {
-        if limit.burst == 0 {
-            limit.bytes_per_sec as f64
-        } else {
-            limit.burst as f64
-        }
+        capacity_of(limit)
     }
 
     fn capacity(&self) -> f64 {
@@ -156,6 +173,45 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// A burst below the rate is raised to the rate, as Go does.
+    ///
+    /// Go clamps it (`RL/tls.go:127-130`): a bucket whose capacity is
+    /// smaller than its refill rate can never hold a second's worth of
+    /// credit, so the limit would bite sooner than the rate says.
+    #[test]
+    fn a_burst_below_the_rate_is_raised_to_it() {
+        let below = Limit {
+            after_bytes: 0,
+            bytes_per_sec: 64 * 1024,
+            burst: 1024,
+        };
+        assert_eq!(
+            capacity_of(&below),
+            64.0 * 1024.0,
+            "a burst of 1024 with a rate of 64 KiB holds a second's worth"
+        );
+        let above = Limit {
+            after_bytes: 0,
+            bytes_per_sec: 64 * 1024,
+            burst: 128 * 1024,
+        };
+        assert_eq!(
+            capacity_of(&above),
+            128.0 * 1024.0,
+            "a burst above the rate is used as written"
+        );
+        let unset = Limit {
+            after_bytes: 0,
+            bytes_per_sec: 64 * 1024,
+            burst: 0,
+        };
+        assert_eq!(
+            capacity_of(&unset),
+            64.0 * 1024.0,
+            "no burst named is a second's worth"
+        );
+    }
+
     async fn time_to_read(total: usize, limit: Limit) -> Duration {
         let (mut writer, reader) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
@@ -192,16 +248,16 @@ mod tests {
 
     #[tokio::test]
     async fn after_the_free_part_the_rate_is_held() {
-        // 1000 free bytes, then 4000 more at 2000 per second with a 500 byte
-        // burst: 500 go at once and the other 3500 take about 1.75 seconds.
+        // 1000 free bytes, then 4000 more at 2000 per second with a 2000
+        // byte burst: 2000 go at once and the other 2000 take about a second.
         let limit = Limit {
             after_bytes: 1000,
             bytes_per_sec: 2000,
-            burst: 500,
+            burst: 2000,
         };
         let elapsed = time_to_read(5000, limit).await;
         assert!(
-            elapsed >= Duration::from_millis(1500) && elapsed < Duration::from_secs(4),
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(3),
             "{elapsed:?}"
         );
     }
