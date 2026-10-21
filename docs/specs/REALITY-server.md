@@ -1505,7 +1505,55 @@ _Unit reminder for operators:_ `maxTimeDiff` is **milliseconds** in JSON (both
 implementations), and `afterBytes` / `bytesPerSec` / `burstBytesPerSec` are **bytes
 and bytes per second**, with `0` meaning "unlimited" rather than "none".
 
-## 8. How to prove parity
+## 8. What a handshake costs
+
+The port's handshake is *not* faster than Xray's, and the benchmark says so.
+This section records the measurement, because the claim is easy to make and
+was easy to believe until it was measured.
+
+`bench/reality-handshake` runs the same client against three servers on
+loopback: the official `xray` binary, this workspace's `zray` binary on the
+same config, and the `reality` crate's `handshake_or_fallback` in this
+process. 600 handshakes per server, three rounds, the rounds interleaved.
+
+On 2026-10-21, against Xray 26.3.27:
+
+| server | handshakes/s | mean | p50 | p99 | server CPU/handshake |
+|---|---:|---:|---:|---:|---:|
+| `xray` | 394 | 2.54 ms | 2.43 ms | 3.58 ms | 0.88 ms |
+| `zray` | 18 | 56.2 ms | 55.9 ms | 60.9 ms | 1.17 ms |
+| `zray-inproc` | 920 | 1.09 ms | 1.00 ms | 1.83 ms | not separable |
+
+The server's *CPU* is close to Xray's — 1.17 ms against 0.88 ms — and the
+in-process crate is faster than Xray on both counts. The `zray` row's
+latency is the problem, and it is not computation: 56 ms of latency on
+1.17 ms of CPU is *waiting*.
+
+The wait is the camouflage site. The port dials it **twice** per
+connection — once to ask it with the visitor's own hello, and once more to
+ask for the flight — and each dial is a TCP connect and a full TLS
+handshake with the site. Xray dials it **once**, on the visitor's own
+connection, and reads the site's records as they arrive while the
+handshake runs.
+
+So the port pays two site round trips where Xray pays one, and pays them
+serially. The fix is Go's `MirrorConn`: one connection to the site, the
+visitor's hello forwarded to it, the visitor's Finished forwarded back, and
+the site's records read off that one connection as they arrive. The
+`reality` crate's own handshake against a test site takes 80 ms, and the
+in-process row — which does not dial the site at all — is the faster one.
+
+### The commands
+
+```bash
+cd Zray-Core
+cargo build --release -p reality-handshake-bench -p zray-cli
+ZRAY_XRAY_BINARY=/usr/bin/xray \
+  ZRAY_BINARY="$PWD/target/release/zray" \
+  ./target/release/reality-handshake-bench
+```
+
+## 9. How to prove parity
 
 A Zray-to-Zray handshake proves that Zray agrees with itself, which is worth
 nothing to an operator whose clients run Xray. The proof is therefore always a
