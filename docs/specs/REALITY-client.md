@@ -782,21 +782,28 @@ random `Referer`s and `padding` cookies (`XC/reality.go:183-275`) — this
 client **aborts the connection** when the certificate's HMAC does not verify
 (`ZS/reality.rs`: `FailureKind::RealityFallback`).
 
-**Proved by.** Two tests, one on each side of the protocol:
+**Proved by.** Three tests, on three sides of the protocol:
 
 * `reality::server::tests::a_client_the_server_never_authenticated_writes_no_application_data`
 drives a client that believes a public key the server has never held, and
 checks two things: the client refuses, and it wrote *one* record — the
-ClientHello;
-* `xray_oracle::this_clients_refusal_matches_the_official_servers_fallback`
-does the same against the *official* Xray server, so the refusal is
-measured against the implementation it is diverging from. Not even the Finished: a TLS 1.3 client verifies the server's
+ClientHello. Not even the Finished: a TLS 1.3 client verifies the server's
 certificate before it sends its own Finished, so a client that refuses the
 certificate stops there, and anything a tunnel would carry comes after
 that. The property is over-determined — the server refuses the client for
 the same reason the client refuses the server — so it holds under any
-single failure; removing both checks at once is what makes the test
-fail. The reason is in the
+single failure; removing both checks at once is what makes the test fail;
+* `xray_oracle::this_clients_refusal_matches_the_official_servers_fallback`
+does the same against the *official* Xray server, so the refusal is
+measured against the implementation it is diverging from;
+* `xray_oracle::the_zray_binary_serves_a_reality_inbound_from_a_config_file`
+runs the *binary* — not the runtime in process — with a configuration
+file, which is how an operator runs it. Every other test starts the
+runtime in process with a configuration it builds itself, so a file the
+binary cannot read, or a REALITY block it silently drops, would show up
+nowhere else.
+
+The reason is in the
 protocol itself: sending proxy traffic into a fallback connection leaks the
 tunnel, and the certificate check is the only place the fallback is
 detectable. A crawler would have to reproduce Xray's behaviour *exactly* to
