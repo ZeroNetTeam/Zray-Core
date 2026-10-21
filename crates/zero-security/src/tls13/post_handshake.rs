@@ -636,6 +636,124 @@ pub enum SiteTrust {
     Unverified,
 }
 
+/// The same, recording the leaf certificate the site showed.
+///
+/// The certificate is the site's, or the port's own — and a client that is
+/// shown the port's learns that the site is not behind it. A caller that
+/// wants to know which one it got records it.
+pub async fn observe_all_recording<S>(
+    io: S,
+    server_name: &str,
+    recorded: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) -> Result<SiteShapes, Failure>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    observe_all_with_verifier(
+        io,
+        server_name,
+        std::sync::Arc::new(RecordingVerifier(recorded)),
+    )
+    .await
+}
+
+/// The same, with the caller's own certificate verifier.
+///
+/// A verifier that accepts anything and keeps the leaf it was shown is
+/// [`RecordingVerifier`]; the caller can then tell the site's certificate
+/// from the port's own.
+async fn observe_all_with_verifier<S>(
+    io: S,
+    server_name: &str,
+    verifier: std::sync::Arc<dyn rustls::client::danger::ServerCertVerifier>,
+) -> Result<SiteShapes, Failure>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let params = TlsParams::new(server_name)
+        .with_profile(FingerprintProfile::Chrome)
+        .with_insecure(true)
+        .with_verifier(verifier);
+    let (tap, taps) = tap_with_flight(io);
+    let mut stream = crate::tls::connect(tap, &params).await?;
+    let mut sink = [0u8; 512];
+    let _ = tokio::time::timeout(LISTEN, async {
+        // The site's flight is read, and the read stops once the flight is
+        // complete — which is when the site sends its first
+        // application-data record, its session ticket.
+        loop {
+            let complete = !taps
+                .post_handshake
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty();
+            if complete {
+                break;
+            }
+            match tokio::time::timeout(READ_SLICE, stream.read(&mut sink)).await {
+                Ok(Ok(n)) if n > 0 => continue,
+                _ => break,
+            }
+        }
+    })
+    .await;
+    let take = |list: &Arc<Mutex<Vec<u16>>>| list.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let answer = {
+        let hello = taps.server_hello.lock().unwrap_or_else(|p| p.into_inner());
+        parse_site_answer(&hello)
+    };
+    Ok(SiteShapes {
+        answer,
+        flight: take(&taps.flight),
+        post_handshake: take(&taps.post_handshake),
+    })
+}
+
+/// A verifier that accepts anything and keeps the leaf it was shown.
+#[derive(Debug)]
+struct RecordingVerifier(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl rustls::client::danger::ServerCertVerifier for RecordingVerifier {
+    fn verify_server_cert(
+        &self,
+        leaf: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let mut kept = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if kept.is_empty() {
+            kept.extend_from_slice(leaf.as_ref());
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Handshake with the site behind `io` as a browser asking for `server_name`
 /// and return the wire sizes of every record it sent: its first flight, then
 /// what followed the handshake.

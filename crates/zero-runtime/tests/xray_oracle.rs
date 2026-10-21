@@ -2634,6 +2634,120 @@ async fn the_official_server_answers_the_same_fingerprints_the_port_does() {
     }
 }
 
+/// A plain client is relayed to the camouflage site, and sees the site.
+///
+/// This is the behaviour a REALITY server exists for: a peer that cannot
+/// authenticate must be handed to the site, so that what a censor sees is
+/// the site and not a server that refuses. The differential suite covers
+/// the *wrong key* — a client that tries REALITY and fails — and this
+/// covers the other case, a client that never tries: a plain TLS
+/// connection, as a browser or a scanner would make.
+///
+/// The site's certificate is what the client must see. The port's own
+/// certificate is a different one, and a client that saw it would learn
+/// that the site is not behind this port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn a_plain_client_is_handed_to_the_camouflage_site() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the camouflage site never listened");
+
+    let (private_key, _public_key) = oracle_x25519_keypair(&binary);
+    let (server_settings, _) = protocol_settings("vless", 0);
+    let mut server_stream = transport("tcp");
+    server_stream["security"] = json!("reality");
+    server_stream["realitySettings"] = reality_server_settings(&private_key, decoy);
+    let server_port = free_port();
+    spawn_zray(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "reality-in",
+            "listen": "127.0.0.1",
+            "port": server_port,
+            "protocol": "vless",
+            "settings": server_settings,
+            "streamSettings": server_stream,
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }));
+    let server = SocketAddr::new("127.0.0.1".parse().unwrap(), server_port);
+    assert!(
+        wait_for(server).await,
+        "the Zray REALITY server never listened"
+    );
+
+    // A plain TLS connection, with no REALITY tag in it: a browser's hello.
+    // The certificate policy records the leaf the client is shown, which is
+    // the site's own — the port's is a different certificate.
+    let shown = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outcome = zero_security::tls13::post_handshake::observe_all_recording(
+        TcpStream::connect(server).await.unwrap(),
+        REALITY_SNI,
+        shown.clone(),
+    )
+    .await;
+
+    // The site's own flight came back, so the site answered the client.
+    let shapes = outcome.expect("the site answered the plain client");
+    assert!(
+        !shapes.flight.is_empty(),
+        "the plain client got no flight at all"
+    );
+    // And the certificate the client was shown is the site's, not the
+    // port's: the port's own is a temporary Ed25519 one, and a client that
+    // saw it would learn that the site is not behind this port.
+    let site_shown = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let site = TcpStream::connect(decoy).await.unwrap();
+    zero_security::tls13::post_handshake::observe_all_recording(
+        site,
+        REALITY_SNI,
+        site_shown.clone(),
+    )
+    .await
+    .expect("the site answered");
+    assert!(
+        !shown.lock().unwrap().is_empty(),
+        "the plain client was shown no certificate at all"
+    );
+    assert_eq!(
+        *shown.lock().unwrap(),
+        *site_shown.lock().unwrap(),
+        "the plain client was shown the port's certificate, not the site's"
+    );
+    // And it is not the port's own: a REALITY client is shown the port's
+    // temporary Ed25519 certificate, and that is a different certificate
+    // from the site's. A plain client that saw the port's own would learn
+    // that the site is not behind this port.
+    //
+    // The port's own certificate is a different one: it is the temporary
+    // Ed25519 certificate REALITY answers a real client with, and the
+    // site's is the site's own. A plain client that saw the port's own
+    // would learn that the site is not behind this port.
+    //
+    // The port's own certificate is not observable from a plain client, so
+    // the test compares the *shape* instead: the site's leaf is a real
+    // certificate, whose SubjectPublicKeyInfo is not a 32-byte Ed25519
+    // key, while the port's temporary one is.
+    let leaf = shown.lock().unwrap().clone();
+    assert!(
+        !leaf.is_empty(),
+        "the plain client was shown no certificate"
+    );
+    let parts =
+        zero_security::tls13::cert::parse_leaf(&leaf).expect("the site's leaf certificate parses");
+    assert_ne!(
+        parts.spki_key.len(),
+        32,
+        "the plain client was shown the port's temporary Ed25519 certificate, \
+         not the site's"
+    );
+}
+
 /// The port's server accepts an Xray client with any fingerprint.
 ///
 /// The fingerprint is what makes the client's hello look like a browser's,
