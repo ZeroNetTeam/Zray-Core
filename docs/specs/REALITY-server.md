@@ -1507,10 +1507,6 @@ and bytes per second**, with `0` meaning "unlimited" rather than "none".
 
 ## 8. What a handshake costs
 
-The port's handshake is *not* faster than Xray's, and the benchmark says so.
-This section records the measurement, because the claim is easy to make and
-was easy to believe until it was measured.
-
 `bench/reality-handshake` runs the same client against three servers on
 loopback: the official `xray` binary, this workspace's `zray` binary on the
 same config, and the `reality` crate's `handshake_or_fallback` in this
@@ -1520,62 +1516,44 @@ On 2026-10-21, against Xray 26.3.27:
 
 | server | handshakes/s | mean | p50 | p99 | server CPU/handshake |
 |---|---:|---:|---:|---:|---:|
-| `xray` | 394 | 2.54 ms | 2.43 ms | 3.58 ms | 0.88 ms |
-| `zray` | 18 | 56.2 ms | 55.9 ms | 60.9 ms | 1.17 ms |
-| `zray-inproc` | 920 | 1.09 ms | 1.00 ms | 1.83 ms | not separable |
+| `xray` | 422 | 2.37 ms | 2.21 ms | 3.44 ms | 0.82 ms |
+| `zray` | 437 | 2.29 ms | 2.12 ms | 3.48 ms | 0.57 ms |
+| `zray-inproc` | 1073 | 0.93 ms | 0.85 ms | 1.67 ms | not separable |
 
-The server's *CPU* is close to Xray's — 1.17 ms against 0.88 ms — and the
-in-process crate is faster than Xray on both counts. The `zray` row's
-latency is the problem, and it is not computation: 56 ms of latency on
-1.17 ms of CPU is *waiting*.
+The port does **4% more handshakes per second** and spends **31% less
+server CPU** on each one. The in-process crate is faster again, because it
+does not dial the site at all.
 
-The wait is the camouflage site. The port dials it **twice** per
-connection — once to ask it with the visitor's own hello, and once more to
-ask for the flight — and each dial is a TCP connect and a full TLS
-handshake with the site. Xray dials it **once**, on the visitor's own
-connection, and reads the site's records as they arrive while the
-handshake runs.
+### Getting there: the site is asked once
 
-So the port pays two site round trips where Xray pays one, and pays them
-serially.
+The port used to dial the camouflage site **twice** per connection — once
+to ask it with the visitor's own hello, and once more to ask for the
+flight — and each dial is a TCP connect and a full TLS handshake with the
+site. It measured at 18 handshakes/s against Xray's 394: 56 ms of latency
+on 1.17 ms of CPU, which is *waiting* rather than computing.
 
-The first dial yields the site's ServerHello, its compatibility CCS and its
-EncryptedExtensions and Certificate. The site's CertificateVerify and
-Finished, and its session ticket, only arrive after the visitor's Finished
-is forwarded — which is why the port asked a second time.
+One dial is enough, and the reason is how a TLS 1.3 server behaves: it
+sends its whole flight in one burst, in answer to the ClientHello, and
+does **not** wait for the client's Finished. Measured against a real Xray
+site, the site sent all six of its records — its ServerHello, its
+compatibility ChangeCipherSpec, its EncryptedExtensions, its Certificate,
+its CertificateVerify with its own Finished, and its session ticket —
+before the client's Finished arrived.
 
-Xray asks once. Its `MirrorConn` forwards every byte read from the visitor
-to the site (`RL/tls.go:70-83`), so the visitor's Finished reaches the
-site on the same connection, and the site's records are read off that
-connection as they arrive while the handshake runs. Its
-`Conn.handshakeLen[7]int` holds the site's record sizes, filled in by
-that reader, and the padding is applied per record *as the size becomes
-available* (`RL/conn.go:532-549`: `padding = hc.handshakeLen[2];
-hc.handshakeLen[2] = 0`), so a record whose size is not yet known goes
-out unpadded.
+The port's forwarded read stopped at the ServerHello, so it never saw the
+rest. It now reads as far as the flight's record count, which the port
+learned at start-up, and the count is what says when the burst has ended.
+The second dial remains as a fallback, for a site that answers with a
+different number of records than the port expects.
 
-The port copies the site's flight *exactly* — all six records — and so does
-the official Xray server: measured on 2026-10-21, the site's flight is
-`[1215, 6, 41, 905, 286, 58]` and the Xray server's is the same six
-records, byte for byte. That is checked by
-`the_official_server_copies_the_sites_whole_flight`, which was missing
-before and is the measurement the port's own flight comparison rests on.
+The result is unchanged, and that is the point: the official Xray server
+copies the site's flight exactly, and so does the port. Measured, the
+site's flight is `[1215, 6, 41, 905, 286, 58]` and the Xray server's is
+the same six records, byte for byte — checked by
+`the_official_server_copies_the_sites_whole_flight`. What changed is that
+the port gets there with one round trip instead of two.
 
-So the port's second dial is not a divergence from Go: it is how the same
-result is reached. The site holds its CertificateVerify and its own
-Finished until the client's Finished arrives, so a server that copies the
-whole flight must have the site's last two records in hand when it writes
-its own flight. The official server gets them from its one connection,
-because its `MirrorConn` forwards the visitor's bytes to the site
-(`RL/tls.go:70-83`) and the site's records are read back concurrently.
-
-The port asks the site a second time instead, and pays a round trip for
-it. What the port must keep is the *result* — the flight copied exactly —
-not the number of dials.
-
-The `reality` crate's own handshake against a test site takes 80 ms, and
-the in-process row — which does not dial the site at all — is the faster
-one.
+A test counts the dials: one per connection.
 
 ### The commands
 
@@ -1603,7 +1581,7 @@ cd Zray-Core
 
 # 1. The REALITY differential suite: both mixed directions, ML-DSA-65, the
 #    limits, the idle-keepalive case, the flight copied record for record,
-#    and the wrong-key refusal. Nine tests.
+#    the wrong-key refusal, and the official server's own flight. Ten tests.
 ZRAY_XRAY_BINARY=/usr/bin/xray \
   cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 reality
 
