@@ -1239,6 +1239,85 @@ async fn vless_over_reality_grpc_matches_the_oracle() {
     xray_client_to_zray_reality_server(&binary, "grpc", None, None).await;
 }
 
+/// The `zray` binary, started from a config *file* with a REALITY inbound,
+/// serves an Xray client.
+///
+/// Every other test in this file starts the runtime in process, with a
+/// configuration it builds itself. That is not how an operator runs it: the
+/// binary reads a file, and the file is where a REALITY inbound's settings
+/// actually live. A file the binary cannot read, or a REALITY block it
+/// silently drops, would show up nowhere else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn the_zray_binary_serves_a_reality_inbound_from_a_config_file() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the camouflage site never listened");
+
+    let (private_key, public_key) = oracle_x25519_keypair(&binary);
+    let (server_settings, _) = protocol_settings("vless", 0);
+    let mut server_stream = transport("tcp");
+    server_stream["security"] = json!("reality");
+    server_stream["realitySettings"] = reality_server_settings(&private_key, decoy);
+    let server_port = free_port();
+    let config = json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "reality-in",
+            "listen": "127.0.0.1",
+            "port": server_port,
+            "protocol": "vless",
+            "settings": server_settings,
+            "streamSettings": server_stream,
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    });
+
+    // The file, and the binary reading it.
+    let path = std::env::temp_dir().join(format!("zray-reality-{}.json", std::process::id()));
+    std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap())
+        .expect("the configuration file is written");
+    // The binary is another crate's, so cargo does not hand this test its
+    // path; it is built by the same workspace and sits beside the other
+    // build output.
+    let zray = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/zray");
+    assert!(
+        zray.exists(),
+        "the zray binary is not built: {zray:?}. Run `cargo build -p zray-cli`."
+    );
+    let mut child = Command::new(&zray)
+        .arg("run")
+        .arg("-config")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the zray binary starts");
+    let server = SocketAddr::new("127.0.0.1".parse().unwrap(), server_port);
+    assert!(
+        wait_for(server).await,
+        "the Zray binary never listened on the REALITY inbound"
+    );
+
+    // And an Xray client through it.
+    let echo = echo_service().await;
+    let socks_port = free_port();
+    let _client = spawn_xray_reality_client(&binary, socks_port, server_port, &public_key, None);
+    let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    assert!(wait_for(socks).await, "the Xray client never listened");
+    proxied_echo(socks, echo, 9)
+        .await
+        .expect("the payload came back through the binary's REALITY inbound");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&path);
+}
+
 /// REALITY over XHTTP, end to end.
 ///
 /// The third carrier Xray allows for REALITY. It is the hardest of the
