@@ -2313,6 +2313,81 @@ mod tests {
         );
     }
 
+    /// A client whose key the server never held writes no application data.
+    ///
+    /// The certificate's HMAC is computed with the server's key, so a client
+    /// that believes a public key the server has never held sees an HMAC
+    /// that does not verify — and the handshake is a *fallback*: the server
+    /// is really the camouflage site, and anything the client sends now goes
+    /// to a party the client does not control.
+    ///
+    /// So the client must not send anything. It sends the ClientHello and
+    /// the Finished, which a TLS handshake requires, and nothing else: the
+    /// tunnel's bytes must never reach a connection the client has not
+    /// authenticated. This is the property the port's client has instead of
+    /// Xray's spidering — Xray crawls the site over the same connection
+    /// (`XC/reality.go:183-275`), and the port refuses instead.
+    #[tokio::test]
+    async fn a_client_the_server_never_authenticated_writes_no_application_data() {
+        let site = TestSite::start();
+        let (mut server_params, mut client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        server_params.decoy = Some(Arc::clone(&site.dialer) as Arc<dyn DecoyDialer>);
+        // The client believes a public key the server has never held.
+        let other = [9u8; 32];
+        let other_public =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(other)).to_bytes();
+        client_params.public_key = other_public;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        // The tap is on the *client's* end, so it records what the client
+        // wrote — the hello and the handshake, and nothing a tunnel would
+        // carry.
+        let (client_end, seen) = zero_security::tls13::post_handshake::tap_with_flight(client_io);
+        let server_end = server_io;
+        let server = tokio::spawn(async move {
+            let result = handshake(server_end, &server_params).await;
+            // The server refuses the client too, for the same reason.
+            assert!(
+                result.is_err(),
+                "the server accepted an unauthenticated client"
+            );
+        });
+        let client = tokio::spawn(async move {
+            let outcome = zero_security::reality_connect(client_end, &client_params).await;
+            assert!(
+                outcome.is_err(),
+                "the client accepted a certificate whose HMAC does not verify"
+            );
+        });
+        client.await.unwrap();
+        server.await.unwrap();
+        // What the client wrote: the ClientHello, and nothing else.
+        //
+        // Not even the Finished: a TLS 1.3 client verifies the server's
+        // certificate before it sends its own Finished, so a client that
+        // refuses the certificate stops there. Anything a tunnel would
+        // carry comes after that, and so never leaves.
+        let written = seen.sent_bytes.lock().unwrap().clone();
+        assert!(!written.is_empty(), "the client wrote nothing at all");
+        let mut records = Vec::new();
+        let mut at = 0usize;
+        while at + 5 <= written.len() {
+            let kind = written[at];
+            let len = u16::from_be_bytes([written[at + 3], written[at + 4]]) as usize;
+            records.push((kind, len));
+            at += 5 + len;
+        }
+        assert_eq!(
+            records.len(),
+            1,
+            "the client wrote {records:?}, and a tunnel's bytes would be more"
+        );
+        assert_eq!(
+            records[0].0, 0x16,
+            "the one record the client wrote is a handshake record"
+        );
+    }
+
     /// The port answers with the suite the *site* chose.
     ///
     /// The site's ServerHello names the suite, and REALITY's fork of the
