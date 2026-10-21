@@ -785,6 +785,12 @@ pub struct Tls13Stream<S> {
     /// (`RL/tls.go:425-427`), so that a REALITY server puts up with exactly
     /// as many of them as the site it borrows its name from.
     max_useless_records: u64,
+    /// Whether this end is the client.
+    ///
+    /// Go refuses a session ticket that arrives *from* a client
+    /// (`RL/handshake_client_tls13.go:855-858`) and accepts one from a
+    /// server, so the two ends answer the same message differently.
+    is_client: bool,
 }
 
 impl<S> Tls13Stream<S> {
@@ -810,7 +816,17 @@ impl<S> Tls13Stream<S> {
             direct_write: false,
             useless_records: 0,
             max_useless_records: MAX_USELESS_RECORDS,
+            is_client: true,
         }
+    }
+
+    /// Say that this end is the *server*, so a session ticket arriving from
+    /// the peer is refused rather than ignored.
+    ///
+    /// The REALITY server in the `reality` crate terminates the handshake
+    /// itself and then hands the record layer on, so it has to say so.
+    pub fn set_server_side(&mut self) {
+        self.is_client = false;
     }
 
     pub fn suite(&self) -> CipherSuite {
@@ -1035,7 +1051,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
                     self.write = RecordCrypter::new(self.suite, &self.write_secret);
                 }
             }
-            // NewSessionTicket and unknown types: no resumption, ignored.
+            if mtype == msg::NEW_SESSION_TICKET {
+                // A ticket from a *client* is refused: the client is the one
+                // that receives tickets (`RL/handshake_client_tls13.go:855-858`).
+                // A ticket from a server is ordinary, and this end does no
+                // resumption, so it is ignored.
+                if !self.is_client {
+                    return Err(alert_failure(&[0x15, 0x10]));
+                }
+            } else if mtype != msg::KEY_UPDATE {
+                // An unexpected type is an alert in Go
+                // (`RL/conn.go:1394-1398`: `alertUnexpectedMessage`).
+                return Err(alert_failure(&[0x15, 0x10]));
+            }
             at = body_at + mlen;
         }
         Ok(())
@@ -1298,6 +1326,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn brotli(data: &[u8]) -> Vec<u8> {
@@ -1434,6 +1463,53 @@ mod tests {
                 "a KeyUpdate of {body:?} was answered with {error}"
             );
         }
+    }
+
+    /// A session ticket from a *client* is refused, and one from a server is
+    /// ignored.
+    ///
+    /// Go refuses a ticket arriving from a client
+    /// (`RL/handshake_client_tls13.go:855-858`) and accepts one from a
+    /// server, so the two ends answer the same message differently. The port
+    /// used to ignore both, which is wrong on the server side: a client that
+    /// offers a ticket is talking a protocol the server does not accept.
+    #[tokio::test]
+    async fn a_session_ticket_is_refused_from_a_client_and_ignored_from_a_server() {
+        let suite = CipherSuite::TLS_AES_128_GCM_SHA256;
+        let (server_app, client_app) = (vec![1u8; 32], vec![2u8; 32]);
+
+        // From a client: refused.
+        let (mut peer, io) = tokio::io::duplex(64 * 1024);
+        let mut stream = Tls13Stream::new(io, suite, server_app.clone(), client_app.clone());
+        stream.set_server_side();
+        let mut peer_write = RecordCrypter::new(suite, &server_app);
+        let ticket: [u8; 8] = [msg::NEW_SESSION_TICKET, 0, 0, 4, 0, 0, 0, 0];
+        let wire = peer_write.seal(&ticket, CONTENT_HANDSHAKE).unwrap().bytes;
+        peer.write_all(&wire).await.unwrap();
+        // The read is bounded: a ticket that is *ignored* rather than
+        // refused would leave it waiting for a record that never comes, and
+        // the test would hang instead of failing.
+        let error = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut [0u8; 4]))
+            .await
+            .expect("a ticket from a client must be refused, not left waiting")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("alert"),
+            "a ticket from a client was answered with {error}"
+        );
+
+        // From a server: ignored, so the session carries on.
+        let (mut peer, io) = tokio::io::duplex(64 * 1024);
+        let mut stream = Tls13Stream::new(io, suite, server_app.clone(), client_app.clone());
+        let mut peer_write = RecordCrypter::new(suite, &server_app);
+        let mut wire = peer_write.seal(&ticket, CONTENT_HANDSHAKE).unwrap().bytes;
+        // A ticket does not roll the read secret, so the record after it is
+        // still under the old key.
+        wire.extend_from_slice(&peer_write.seal(b"hi", CONTENT_APPDATA).unwrap().bytes);
+        peer.write_all(&wire).await.unwrap();
+        let mut got = [0u8; 2];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hi", "a ticket from a server is ignored");
     }
 
     /// RFC 8446 §4.6.3: the KeyUpdate answer is sealed under the old write

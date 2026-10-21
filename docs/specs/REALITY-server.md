@@ -84,9 +84,6 @@ What is *not* closed is what the rows below still say.
 * the ML-DSA-65 extension uses OID 1.3 at a computed offset instead of Go's
   placeholder OID 0.0 at a fixed one — `crates/reality/src/server.rs:835-843`
   against `RL/handshake_server_tls13.go:82`; invisible to both clients (§3, §4);
-* a session ticket or unknown post-handshake type from the peer is ignored, not
-  alerted — `crates/zero-security/src/tls13/client.rs:925` against
-  `RL/conn.go:1387-1398` (§5);
 * a fallback session has a 300 s idle deadline where Go has none —
   `crates/zero-runtime/src/relay.rs:39`, `:47` against `RL/tls.go:271-286`, `:442` (§6);
 * both readers accept standard base64 as well as unpadded base64url for
@@ -965,8 +962,11 @@ The record stream that both ends use after the handshake (`Tls13Stream`,
   1, as Go's `keyUpdateMsg` unmarshal requires
   (`RL/handshake_messages.go:1141-1151`); a body of any other shape is an
   alert, as it is in Go (`RL/conn.go:1248-1250`). NewSessionTicket and unknown
-  types are ignored silently, where Go alerts on a ticket from a client and on
-  any unexpected type.
+  types are answered as Go answers them: a session ticket arriving from a
+  *client* is refused (`RL/handshake_client_tls13.go:855-858`) and one from a
+  server is ignored, and an unexpected type is an alert
+  (`RL/conn.go:1394-1398`). The stream knows which end it is, so the two
+  answers differ as they do in Go.
 * **During the handshake**, `read_encrypted_handshake` skips CCS records
   (`RB/server.rs`) and refuses anything that is not app-data. The loop is not
   unbounded in time: the whole inbound handshake runs under

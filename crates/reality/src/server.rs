@@ -641,6 +641,10 @@ where
         let _ = log.log_application_secrets(&hello.random, &client_app, &server_app);
     }
     let mut stream = Tls13Stream::new(io, hello.suite, client_app, server_app);
+    // This end is the server, so a session ticket arriving from the client is
+    // refused rather than ignored, as Go refuses it
+    // (`RL/handshake_client_tls13.go:855-858`).
+    stream.set_server_side();
     if let Some(budget) = shapes.budget {
         // How long this server puts up with a run of records that advance
         // nothing is how long the site it borrows its name from does, which
