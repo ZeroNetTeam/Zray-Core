@@ -324,6 +324,7 @@ impl RealityServerConfig {
     /// in.
     pub fn server_params(&self) -> RealityServerParams {
         RealityServerParams {
+            site_writes: None,
             private_key: self.private_key,
             server_names: self.server_names.clone(),
             short_ids: self.short_ids.clone(),
