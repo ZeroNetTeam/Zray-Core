@@ -107,18 +107,23 @@ What is *not* closed is what the rows below still say.
   as Go's `MirrorConn` does (`RL/tls.go:70-83`). So the answer is the site's
   reply to the visitor. What is *not* forwarded is the client's Finished,
   which is why the site's encrypted flight is asked for separately (§3, §6);
-* the ML-DSA-65 extension uses OID 1.3 at a computed offset instead of Go's
-  placeholder OID 0.0 at a fixed one — `crates/reality/src/server.rs` against
-  `RL/handshake_server_tls13.go:82`. Invisible to both clients, and provably
-  so: Go's client reads the certificate's *first* extension's value
-  positionally (`XC/transport/internet/reality/reality.go:92-96`,
-  `certs[0].Extensions[0].Value`), and so does the port
-  (`ZS/cert.rs`, `first_extension`), so neither looks at the OID. What the
-  two differ in is the extension's *content*: Go's holds 3309 dummy bytes
-  where the port's holds the ML-DSA-65 signature, which is also 3309 bytes
-  (`server::tests::the_mldsa65_certificate_is_the_size_go_makes_it`). The
-  two OIDs encode to the same length, so the extension — and with it the
-  certificate — is the same size either way (§3, §4);
+* the certificate is not byte-for-byte Go's — Go builds an Ed25519
+  self-signed certificate with an *empty* name
+  (`RL/handshake_server_tls13.go:81-85`) and one extra extension, whose OID
+  is the placeholder `{0,0}` and whose value is 3309 dummy bytes; the port
+  builds one with the *hostname* as a common name and one extra extension
+  under OID 1.3, whose value is the ML-DSA-65 signature
+  (`crates/reality/src/server.rs`). The certificates are the same *size* —
+  the signature is 3309 bytes and the two OIDs encode to the same length
+  (`server::tests::the_mldsa65_certificate_is_the_size_go_makes_it`) — and
+  neither client can see the difference: Go's client reads the certificate's
+  *first* extension's value positionally
+  (`XC/transport/internet/reality/reality.go:92-96`,
+  `certs[0].Extensions[0].Value`) and so does the port (`ZS/cert.rs`,
+  `first_extension`), so neither looks at the OID, and neither looks at the
+  name. Go writes the signature at a fixed offset into its placeholder
+  (`RL/handshake_server_tls13.go:157`: `cert[126:]`); the port puts it in
+  the extension's value, and the *value* is the contract (§3, §4);
 
 > The crate split matters for reading the rest: the server handshake now lives in
 > `crates/reality/src/server.rs` (it was moved there out of
