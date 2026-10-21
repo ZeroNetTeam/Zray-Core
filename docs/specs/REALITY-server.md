@@ -88,8 +88,14 @@ What is *not* closed is what the rows below still say.
   client whose first known suite is also the decoy's preference, and differ
   for one where it is not;
 * the ML-DSA-65 extension uses OID 1.3 at a computed offset instead of Go's
-  placeholder OID 0.0 at a fixed one — `crates/reality/src/server.rs:835-843`
-  against `RL/handshake_server_tls13.go:82`; invisible to both clients (§3, §4);
+  placeholder OID 0.0 at a fixed one — `crates/reality/src/server.rs` against
+  `RL/handshake_server_tls13.go:82`. Invisible to both clients, and provably
+  so: Go's client reads the certificate's *first* extension's value
+  positionally (`XC/transport/internet/reality/reality.go:92-96`,
+  `certs[0].Extensions[0].Value`), and so does the port
+  (`ZS/cert.rs`, `first_extension`), so neither looks at the OID. Go's
+  extension holds 3309 dummy bytes where the port's holds the signature
+  itself, which is why the port's certificate is smaller (§3, §4);
 * a fallback session has a 300 s idle deadline where Go has none —
   `crates/zero-runtime/src/relay.rs:39`, `:47` against `RL/tls.go:271-286`, `:442` (§6);
 * both readers accept standard base64 as well as unpadded base64url for
