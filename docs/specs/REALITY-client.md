@@ -775,6 +775,20 @@ the target sent one — `RL/tls.go:176-180`).
 
 ## 8. Fallback path (server rejects / proxies to the real site)
 
+**What this port does differently.** It does not spider. Where Xray, on a
+handshake that completed but was not verified, crawls the real site over the
+same connection — an HTTP/2 client from `spiderX`, following links, with
+random `Referer`s and `padding` cookies (`XC/reality.go:183-275`) — this
+client **aborts the connection** when the certificate's HMAC does not verify
+(`ZS/reality.rs`: `FailureKind::RealityFallback`). The reason is in the
+protocol itself: sending proxy traffic into a fallback connection leaks the
+tunnel, and the certificate check is the only place the fallback is
+detectable. A crawler would have to reproduce Xray's behaviour *exactly* to
+be indistinguishable, and one that is subtly different is a fingerprint in
+its own right; refusing is both safer and harder to tell apart, because a
+refused connection looks like a network failure. `spiderX` and `spiderY` are
+parsed and ignored.
+
 If any §4 check fails, the REALITY server never writes its own handshake; the TCP stream
 becomes a direct pipe client↔`dest` (`RL/tls.go:281-296` upload side, `:443-457`
 download side, with optional rate limiting). From the client's view:
