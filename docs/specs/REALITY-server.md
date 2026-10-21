@@ -1574,6 +1574,18 @@ that payload came back through the tunnel — the only assertion that can tell "
 server authenticated" apart from "the server quietly handed the connection to the
 decoy".
 
+One case is not mixed, and is here for a different reason: a Zray client
+through a Zray REALITY server, end to end, with a real Xray binary serving
+the camouflage site
+(`a_zray_client_through_a_zray_reality_server_carries_a_payload`). The
+objective is a server *both* an Xray client and a Zray client can use, and
+the Zray-to-Zray path was not covered anywhere: the `reality` crate's own
+tests drive a client against a server in the same process, against a test
+site, without the runtime's config compiler, its listener, its VLESS
+framing or a real camouflage site. The camouflage site is still a real Xray
+binary, so the site's flight is a real one and the port's copy of it is
+exercised.
+
 ### The commands
 
 ```bash
@@ -1581,7 +1593,8 @@ cd Zray-Core
 
 # 1. The REALITY differential suite: both mixed directions, ML-DSA-65, the
 #    limits, the idle-keepalive case, the flight copied record for record,
-#    the wrong-key refusal, and the official server's own flight. Ten tests.
+#    the wrong-key refusal, the official server's own flight, and a Zray
+#    client through a Zray server. Eleven tests.
 ZRAY_XRAY_BINARY=/usr/bin/xray \
   cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 reality
 

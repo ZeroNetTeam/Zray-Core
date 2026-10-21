@@ -2560,6 +2560,91 @@ async fn the_official_server_copies_the_sites_whole_flight() {
     );
 }
 
+/// A Zray client through a Zray REALITY server, end to end.
+///
+/// The differential suite puts an Xray binary on one side of every mixed
+/// run, which is the right thing to measure against the original. But the
+/// objective is a server both an Xray client and a Zray client can use, and
+/// the Zray-to-Zray path was not covered anywhere: the `reality` crate's
+/// own tests drive a client against a server in this process, against a
+/// test site, without the runtime's config compiler, its listener, its
+/// VLESS framing or a real camouflage site.
+///
+/// This runs the whole of it, with a real Xray binary serving the
+/// camouflage site, so the site's flight is a real one and the port's copy
+/// of it is exercised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn a_zray_client_through_a_zray_reality_server_carries_a_payload() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the camouflage site never listened");
+
+    // The key pair both ends share.
+    let (private_key, public_key) = oracle_x25519_keypair(&binary);
+
+    // The server: this workspace's runtime, with a REALITY inbound.
+    let (server_settings, _) = protocol_settings("vless", 0);
+    let mut server_stream = transport("tcp");
+    server_stream["security"] = json!("reality");
+    server_stream["realitySettings"] = reality_server_settings(&private_key, decoy);
+    let server_port = free_port();
+    spawn_zray(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "reality-in",
+            "listen": "127.0.0.1",
+            "port": server_port,
+            "protocol": "vless",
+            "settings": server_settings,
+            "streamSettings": server_stream,
+        }],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }));
+    assert!(
+        wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), server_port)).await,
+        "the Zray REALITY server never listened"
+    );
+
+    // The client: this workspace's runtime too, with a SOCKS inbound and a
+    // REALITY outbound aimed at that server.
+    let (_, client_settings) = protocol_settings("vless", server_port);
+    let mut client_stream = transport("tcp");
+    client_stream["security"] = json!("reality");
+    client_stream["realitySettings"] = reality_client_settings(&public_key);
+    let socks_port = free_port();
+    spawn_zray(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": socks_port,
+            "protocol": "socks",
+        }],
+        "outbounds": [{
+            "tag": "out",
+            "protocol": "vless",
+            "settings": client_settings,
+            "streamSettings": client_stream,
+        }],
+    }));
+    let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    assert!(
+        wait_for(socks).await,
+        "the Zray SOCKS inbound never listened"
+    );
+
+    // And a payload that must come back through the tunnel.
+    let echo = echo_service().await;
+    proxied_echo(socks, echo, 7)
+        .await
+        .expect("the payload came back through the Zray-to-Zray tunnel");
+}
+
 /// An official Xray client with a SOCKS inbound, tunnelling VLESS over REALITY
 /// to `port`.
 fn spawn_xray_reality_client(
