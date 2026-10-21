@@ -1537,11 +1537,32 @@ connection, and reads the site's records as they arrive while the
 handshake runs.
 
 So the port pays two site round trips where Xray pays one, and pays them
-serially. The fix is Go's `MirrorConn`: one connection to the site, the
-visitor's hello forwarded to it, the visitor's Finished forwarded back, and
-the site's records read off that one connection as they arrive. The
-`reality` crate's own handshake against a test site takes 80 ms, and the
-in-process row — which does not dial the site at all — is the faster one.
+serially.
+
+The first dial yields the site's ServerHello, its compatibility CCS and its
+EncryptedExtensions and Certificate. The site's CertificateVerify and
+Finished, and its session ticket, only arrive after the visitor's Finished
+is forwarded — which is why the port asked a second time.
+
+Xray asks once. Its `MirrorConn` forwards every byte read from the visitor
+to the site (`RL/tls.go:70-83`), so the visitor's Finished reaches the
+site on the same connection, and the site's records are read off that
+connection as they arrive while the handshake runs. Its
+`Conn.handshakeLen[7]int` holds the site's record sizes, filled in by
+that reader, and the padding is applied per record *as the size becomes
+available* (`RL/conn.go:532-549`: `padding = hc.handshakeLen[2];
+hc.handshakeLen[2] = 0`), so a record whose size is not yet known goes
+out unpadded.
+
+One thing the port does that Go does not, and should keep: it copies the
+site's flight *exactly*, and the differential test compares the two by
+list equality. So the restructuring has to preserve that — either the port
+learns the last two records' sizes before it writes its own flight, or it
+learns them and uses them for the next connection.
+
+The `reality` crate's own handshake against a test site takes 80 ms, and
+the in-process row — which does not dial the site at all — is the faster
+one.
 
 ### The commands
 
