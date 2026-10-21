@@ -187,6 +187,8 @@ pub struct Tap<S> {
     /// The first record *this* end wrote, kept whole: the ClientHello, when
     /// this end is the client.
     sent_first: Arc<Mutex<Vec<u8>>>,
+
+
     /// Every byte this end wrote, in order.
     sent_bytes: Arc<Mutex<Vec<u8>>>,
     /// The client's Finished has gone out, so what arrives now is
@@ -300,6 +302,7 @@ pub struct Taps {
     /// The first record this end wrote whole — the ClientHello, when this
     /// end is the client.
     pub sent_first: Arc<Mutex<Vec<u8>>>,
+
     /// Every byte this end wrote, in order, up to [`MAX_SENT_BYTES`].
     ///
     /// A caller that hands this stream to somebody else — the REALITY
@@ -382,6 +385,47 @@ pub fn parse_site_answer(record: &[u8]) -> Option<SiteAnswer> {
         });
     }
     None
+}
+
+#[cfg(test)]
+mod flight_end_tests {
+    use super::*;
+
+    /// The probe stops when the site's flight is complete.
+    ///
+    /// A site has nothing more to say until the client speaks again, so a
+    /// probe that reads until the site falls silent waits out the whole
+    /// listen time on every connection. On the accepting path that is a
+    /// per-connection cost, and it is a large one.
+    #[tokio::test]
+    async fn the_probe_stops_when_the_flight_is_complete() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            // A real TLS 1.3 server, so the probe's handshake completes and
+            // the site sends its flight and its ticket.
+            let config = crate::server::server_config(
+                include_bytes!("../../../zero-runtime/tests/fixtures/loopback-cert.pem"),
+                include_bytes!("../../../zero-runtime/tests/fixtures/loopback-key.pem"),
+                &["h2".into()],
+            )
+            .expect("the site's certificate loads");
+            let mut stream = server;
+            let _ = crate::server::accept(&mut stream, config).await;
+        });
+        let started = std::time::Instant::now();
+        let _ = observe_all_with(client, "example.test", SiteTrust::Unverified).await;
+        let elapsed = started.elapsed();
+        server.await.unwrap();
+        // The site sends its flight and its ticket and then has nothing more
+        // to say, so a probe that reads until the site falls silent waits out
+        // the whole listen time on every connection. On the accepting path
+        // that is a per-connection cost, and a large one.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "the probe waited {elapsed:?}, which is the listen time and not the \
+             cost of reading a flight"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -607,8 +651,43 @@ where
     let mut stream = crate::tls::connect(tap, &params).await?;
     let mut sink = [0u8; 512];
     let _ = tokio::time::timeout(LISTEN, async {
-        // Whatever the site says is read only so its records keep arriving.
-        while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
+        // The site's flight is read, and then the read stops as soon as the
+        // flight is complete — which is when the site sends its first
+        // application-data record, its session ticket.
+        //
+        // Reading until the site falls silent instead would wait out the
+        // whole listen time on every connection: a site has nothing more
+        // to say until the client speaks again, so the read would block.
+        // On the accepting path that is a cost per connection rather than
+        // once at start-up, which is not a cost worth paying.
+        loop {
+            // The flight ends at the site's first application-data record —
+            // its session ticket — and the records after it are the
+            // post-handshake ones. The read stops once the flight is
+            // complete *and* one more record has come, so the ticket is
+            // counted.
+            // The site's flight ends at its first application-data record —
+            // its session ticket — and the records after it are the
+            // post-handshake ones. The read stops once the flight is
+            // complete *and* one more record has come, so the ticket is
+            // counted rather than cut off.
+            // The site sends its session ticket after the handshake, and
+            // the tap files that one under the post-handshake records. So
+            // the read stops once the ticket has arrived — which is a
+            // moment, not the site's silence.
+            let complete = !taps
+                .post_handshake
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty();
+            if complete {
+                break;
+            }
+            match stream.read(&mut sink).await {
+                Ok(n) if n > 0 => continue,
+                _ => break,
+            }
+        }
     })
     .await;
     let take = |list: &Arc<Mutex<Vec<u16>>>| list.lock().unwrap_or_else(|p| p.into_inner()).clone();
