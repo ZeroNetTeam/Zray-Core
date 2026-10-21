@@ -439,7 +439,7 @@ where
     // (`RL/handshake_server_tls13.go:100-128`).
     let mut site_answer = None;
     if let Some(decoy) = params.decoy.as_deref() {
-        match read_live_shapes(decoy, &hello.sni, &hello.alpn).await {
+        match read_live_shapes(decoy, &hello.sni, &hello.alpn, &client_hello).await {
             Ok(Some((flight, after, answer))) => {
                 if let Some(flight) = flight {
                     shapes.flight = Some(flight);
@@ -722,6 +722,7 @@ async fn read_live_shapes(
     decoy: &dyn DecoyDialer,
     server_name: &str,
     alpn: &[String],
+    client_hello: &[u8],
 ) -> Result<
     Option<(
         Option<Arc<[u16]>>,
@@ -730,10 +731,25 @@ async fn read_live_shapes(
     )>,
     String,
 > {
-    let site = decoy.dial().await?;
-    // The site is asked with the protocols the client offered, so the answer
-    // is the one that client would have got.
+    // The protocols the probe offers the site, so the flight is the one the
+    // client would have got.
     let protocols: Vec<&str> = alpn.iter().map(String::as_str).collect();
+    let site = decoy.dial().await?;
+    // The *client's* hello is what the site is asked, verbatim, so the
+    // site's answer — its cipher suite and its key-share group — is its
+    // reply to the visitor. Go does the same, by forwarding the client's
+    // bytes through the `MirrorConn` (`RL/tls.go:70-83`).
+    //
+    // The *flight* is a different question: the site sends its encrypted
+    // records only after the client's Finished, and the client sends that
+    // on the visitor's own connection, not on this one. So the flight is
+    // asked for separately, with a handshake of the port's own.
+    let answer =
+        zero_security::tls13::post_handshake::observe_with_the_clients_hello(site, client_hello)
+            .await
+            .map_err(|error| error.to_string())?
+            .answer;
+    let site = decoy.dial().await?;
     let observed = zero_security::tls13::post_handshake::observe_all_with_alpn(
         site,
         server_name,
@@ -751,7 +767,7 @@ async fn read_live_shapes(
     let flight = (!observed.flight.is_empty()).then(|| Arc::from(observed.flight.as_slice()));
     let after = (!observed.post_handshake.is_empty())
         .then(|| Arc::from(observed.post_handshake.as_slice()));
-    Ok(Some((flight, after, observed.answer)))
+    Ok(Some((flight, after, answer)))
 }
 
 fn derive_auth_key(shared: &[u8; 32], salt: &[u8]) -> [u8; 32] {
@@ -1976,11 +1992,14 @@ mod tests {
         let (mut server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
         server_params.decoy = Some(Arc::clone(&site.dialer) as Arc<dyn DecoyDialer>);
 
+        // The client's own hello, which is what the site is asked.
+        let client_hello = client_hello_record(client_params.clone()).await;
         // What the site chose, read the way the port reads it.
-        let (_, _, answer) = read_live_shapes(site.dialer.as_ref(), "example.test", &[])
-            .await
-            .expect("the site was reached")
-            .expect("the site answered");
+        let (_, _, answer) =
+            read_live_shapes(site.dialer.as_ref(), "example.test", &[], &client_hello)
+                .await
+                .expect("the site was reached")
+                .expect("the site answered");
         let answer = answer.expect("the site's ServerHello was read");
         assert_eq!(answer.group, 0x001d, "the test site chose X25519");
 
@@ -1997,6 +2016,33 @@ mod tests {
         );
     }
 
+    /// The site is asked with the *client's own* hello, verbatim.
+    ///
+    /// Go forwards the client's bytes to the site through the `MirrorConn`
+    /// (`RL/tls.go:70-83`), so the site's answer — its cipher suite and its
+    /// key-share group — is its reply to the visitor. The port does the
+    /// same, which is why the suite and the group it answers with are the
+    /// ones the site would have answered the visitor with.
+    #[tokio::test]
+    async fn the_site_is_asked_with_the_clients_own_hello() {
+        let site = TestSite::start();
+        let (_server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let client_hello = client_hello_record(client_params).await;
+
+        // The site is asked, and the answer comes back: the site saw a
+        // ClientHello it could answer, which it could not have done with
+        // anything but a real hello.
+        let (_, _, answer) =
+            read_live_shapes(site.dialer.as_ref(), "example.test", &[], &client_hello)
+                .await
+                .expect("the site was reached")
+                .expect("the site answered");
+        assert!(
+            answer.is_some(),
+            "the site answered the client's hello, so its ServerHello was read"
+        );
+    }
+
     /// The records the site sends after the handshake are read off the same
     /// connection as the flight.
     ///
@@ -2006,10 +2052,13 @@ mod tests {
     #[tokio::test]
     async fn the_post_handshake_records_are_read_off_the_site_too() {
         let site = TestSite::start();
-        let (flight, after, _answer) = read_live_shapes(site.dialer.as_ref(), "example.test", &[])
-            .await
-            .expect("the site was reached")
-            .expect("the site answered");
+        let (_server_params, client_params) = reality_pair(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let client_hello = client_hello_record(client_params).await;
+        let (flight, after, _answer) =
+            read_live_shapes(site.dialer.as_ref(), "example.test", &[], &client_hello)
+                .await
+                .expect("the site was reached")
+                .expect("the site answered");
         assert!(
             flight.is_some(),
             "the site's flight was read off the connection"
@@ -2073,6 +2122,50 @@ mod tests {
 
     /// One handshake against `server_params`, and the sizes of the records the
     /// client received before it sent its Finished — the server's flight.
+    /// The ClientHello the client writes, in full.
+    ///
+    /// It is the client's own bytes, which is what the port forwards to the
+    /// site — the same thing Go's `MirrorConn` does (`RL/tls.go:70-83`).
+    async fn client_hello_record(client_params: zero_security::RealityParams) -> Vec<u8> {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (tapped, taps) = zero_security::tls13::post_handshake::tap_with_flight(client_io);
+        // The server end is read and dropped: the client's hello goes out
+        // into the duplex, and the server never answers, so the client
+        // stops after the hello.
+        let server = tokio::spawn(async move {
+            // The server end keeps reading: a ClientHello with a hybrid
+            // share is larger than one read, and a client whose write
+            // blocks would never finish.
+            let mut server_io = server_io;
+            let mut sink = [0u8; 4096];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut server_io, &mut sink).await {
+                    Ok(n) if n > 0 => continue,
+                    _ => break,
+                }
+            }
+        });
+        let client = tokio::spawn(async move {
+            let _ = zero_security::reality_connect(tapped, &client_params).await;
+        });
+        // The hello is bounded: a client that never writes one is a
+        // failure, not a hang.
+        let hello = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let written = taps.sent_first.lock().unwrap().clone();
+                if !written.is_empty() {
+                    break written;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the client wrote a hello");
+        client.abort();
+        server.abort();
+        hello
+    }
+
     /// The key-share group and the cipher suite in the ServerHello the
     /// client was answered with.
     async fn server_hello_choice(

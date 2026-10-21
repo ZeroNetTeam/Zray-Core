@@ -34,7 +34,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
-use zero_core::Failure;
+use zero_core::{Failure, Stage};
 
 use super::record::CONTENT_APPDATA;
 use crate::fingerprint::FingerprintProfile;
@@ -178,6 +178,9 @@ pub struct Tap<S> {
     first: FirstRecord,
     /// Where the captured ServerHello is kept.
     server_hello: Arc<Mutex<Vec<u8>>>,
+    /// The first record *this* end wrote, kept whole: the ClientHello, when
+    /// this end is the client.
+    sent_first: Arc<Mutex<Vec<u8>>>,
     /// The client's Finished has gone out, so what arrives now is
     /// post-handshake rather than part of the server's flight.
     finished_sent: bool,
@@ -237,6 +240,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tap<S> {
         if let Poll::Ready(Ok(count)) = result {
             let finished_sent = &mut this.finished_sent;
             let written = &this.written;
+            let sent_first = &this.sent_first;
+            // The first record this end wrote is kept whole: it is the
+            // ClientHello, which a test may want to forward somewhere.
+            if sent_first
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+            {
+                let mut kept = sent_first.lock().unwrap_or_else(|p| p.into_inner());
+                if kept.is_empty() {
+                    kept.extend_from_slice(&buf[..count]);
+                }
+            }
             this.sent.feed(&buf[..count], |content_type, wire_len| {
                 *finished_sent |= content_type == CONTENT_APPDATA;
                 let mut written = written.lock().unwrap_or_else(|p| p.into_inner());
@@ -267,6 +283,9 @@ pub struct Taps {
     pub written: Arc<Mutex<Vec<u16>>>,
     /// The site's first record whole — its ServerHello.
     pub server_hello: Arc<Mutex<Vec<u8>>>,
+    /// The first record this end wrote whole — the ClientHello, when this
+    /// end is the client.
+    pub sent_first: Arc<Mutex<Vec<u8>>>,
 }
 
 /// Read the cipher suite and the key-share group out of a site's
@@ -422,6 +441,7 @@ pub fn tap_with_flight<S>(io: S) -> (Tap<S>, Taps) {
         post_handshake: Arc::new(Mutex::new(Vec::new())),
         written: Arc::new(Mutex::new(Vec::new())),
         server_hello: Arc::new(Mutex::new(Vec::new())),
+        sent_first: Arc::new(Mutex::new(Vec::new())),
     };
     let tap = Tap {
         inner: io,
@@ -433,6 +453,7 @@ pub fn tap_with_flight<S>(io: S) -> (Tap<S>, Taps) {
         sizes: Arc::clone(&taps.post_handshake),
         written: Arc::clone(&taps.written),
         server_hello: Arc::clone(&taps.server_hello),
+        sent_first: Arc::clone(&taps.sent_first),
     };
     (tap, taps)
 }
@@ -525,6 +546,67 @@ where
     let answer = {
         let hello = taps.server_hello.lock().unwrap_or_else(|p| p.into_inner());
         parse_site_answer(&hello)
+    };
+    Ok(SiteShapes {
+        answer,
+        flight: take(&taps.flight),
+        post_handshake: take(&taps.post_handshake),
+    })
+}
+
+/// Ask the site by sending the *client's* own hello, and read its answer.
+///
+/// Go does not probe the site at all: it forwards the client's bytes to it
+/// through the `MirrorConn` (`RL/tls.go:70-83`), so the site's answer is
+/// its reply to the visitor's own hello — the same suite, the same group
+/// and the same flight the visitor would have got had the site been the
+/// server. Asking with a hello of the probe's own gives the site's answer
+/// to *that* hello, which is usually the same and not always.
+///
+/// `hello` is the client's ClientHello record, verbatim. The site answers
+/// it the way it answers any client.
+///
+/// The answer is *not* a completed handshake: the port cannot finish one
+/// with the site, because the client — not the port — holds the ECDHE
+/// private key. What is read is the site's ServerHello, which names the
+/// suite and the group, and the sizes of the records that follow.
+pub async fn observe_with_the_clients_hello<S>(io: S, hello: &[u8]) -> Result<SiteShapes, Failure>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut tap, taps) = tap_with_flight(io);
+    // The client's hello goes to the site first, and the site's answer is
+    // read off the same connection.
+    tokio::io::AsyncWriteExt::write_all(&mut tap, hello)
+        .await
+        .map_err(|error| Failure::from_io(&error, Stage::TlsStarted))?;
+    tokio::io::AsyncWriteExt::flush(&mut tap)
+        .await
+        .map_err(|error| Failure::from_io(&error, Stage::TlsStarted))?;
+    // The site's ServerHello is all that is wanted here, and it is the
+    // site's *first* record — so the read stops as soon as it has arrived.
+    // The site would go on to wait for the client's Finished, which never
+    // comes on this connection, so waiting the full listen time would only
+    // add to every connection's cost.
+    let mut sink = [0u8; 512];
+    let _ = tokio::time::timeout(LISTEN, async {
+        while taps
+            .server_hello
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+        {
+            match tokio::io::AsyncReadExt::read(&mut tap, &mut sink).await {
+                Ok(n) if n > 0 => continue,
+                _ => break,
+            }
+        }
+    })
+    .await;
+    let take = |list: &Arc<Mutex<Vec<u16>>>| list.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let answer = {
+        let server_hello = taps.server_hello.lock().unwrap_or_else(|p| p.into_inner());
+        parse_site_answer(&server_hello)
     };
     Ok(SiteShapes {
         answer,

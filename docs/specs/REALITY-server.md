@@ -58,7 +58,7 @@ is the one that fails without it.
 | A unix-socket camouflage target (§7) | the target is dialled as a socket, and an unauthenticated visitor is handed to it | `crates/zero-runtime/tests/reality_unix_target.rs` |
 | The site is dialled for every connection, and its shapes read off that connection (§1, §3) | the flight and the post-handshake records the client sees are the site's, read live, as Go's are | `server::tests::the_flight_is_read_off_the_site_on_every_connection` and `server::tests::the_post_handshake_records_are_read_off_the_site_too` |
 | The site's shapes are filed per ALPN, and the client is handed the ones that match (§3, §5) | the site is asked three ways, and a client gets the answer for the ALPN it offered | `server::tests::the_alpn_index_is_go_s_bucket` and `server::tests::a_client_gets_the_shapes_filed_under_its_alpn` |
-| The cipher suite and the key-share group are the site's (§3) | the server answers with the suite and the group the site chose, read off the site's ServerHello, as Go does | `server::tests::the_sites_suite_and_group_are_the_ones_answered_with` |
+| The cipher suite and the key-share group are the site's (§3) | the server answers with the suite and the group the site chose, read off the site's ServerHello, as Go does — and the site is asked with the client's own hello, forwarded verbatim, so the answer is the site's reply to the visitor | `server::tests::the_sites_suite_and_group_are_the_ones_answered_with` |
 
 What is *not* closed is what the rows below still say.
 
@@ -79,12 +79,10 @@ What is *not* closed is what the rows below still say.
   the two answers need not agree (§1, §3, §6);
 * the cipher suite and the key-share group are the *site's*, taken from its
   ServerHello, as Go takes them (`RL/handshake_server_tls13.go:100-128`) —
-  but the site is asked with a hello of the port's own rather than the
-  client's, because the port does not forward the client's hello to it the
-  way Go's `MirrorConn` does (`RL/tls.go:70-83`). The suite and the group
-  are therefore the ones the site would have chosen for the port's offer,
-  which is the same as the client's offer in the common case and not the
-  same in every case (§3, §6);
+  and the site is asked with the *client's own* hello, forwarded verbatim,
+  as Go's `MirrorConn` does (`RL/tls.go:70-83`). So the answer is the site's
+  reply to the visitor. What is *not* forwarded is the client's Finished,
+  which is why the site's encrypted flight is asked for separately (§3, §6);
 * the ML-DSA-65 extension uses OID 1.3 at a computed offset instead of Go's
   placeholder OID 0.0 at a fixed one — `crates/reality/src/server.rs` against
   `RL/handshake_server_tls13.go:82`. Invisible to both clients, and provably
