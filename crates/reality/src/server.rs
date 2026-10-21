@@ -79,6 +79,11 @@ pub struct RealityServerParams {
     /// that it did. `None` records nothing, which is what production does:
     /// the cost is one branch per connection, and the recorder observes the
     /// real path rather than a test's own dialer.
+    ///
+    /// This is a test hook and not a feature: Xray's `show` prints the
+    /// client's fields and the record lengths (`RL/tls.go:238-256`), never
+    /// what was forwarded to the site, and this should not become a way to
+    /// log it either.
     pub site_writes: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
