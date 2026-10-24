@@ -211,8 +211,25 @@ where
         // The handshake is what puts the records in the middle of it, where
         // the site counts them. A site that objects ends the handshake, and
         // that is the answer.
+        //
+        // A site can also object *after* the handshake completes: it answers
+        // the client's Finished and then sends the alert, which the client's
+        // handshake path has no reason to read. Go's probe does not rely on
+        // the handshake to carry the alert — it watches the connection in a
+        // goroutine and treats an alert *or* a close as the objection
+        // (`RL/record_detect.go:143-152`) — so a probe that stopped at the
+        // handshake's return value read every real TLS site as tolerating
+        // every run, and every REALITY listener behind one as tolerating
+        // them too. Asking the stream once more is the same question, in the
+        // order a completed handshake leaves it in.
+
         match crate::tls::connect(wrapped, &params).await {
-            Ok(_) => continue,
+            Ok(mut stream) => {
+                if site_objects(&mut stream).await {
+                    return Some(budget);
+                }
+                continue;
+            }
             Err(_) => return Some(budget),
         }
     }
