@@ -122,6 +122,15 @@ pub struct HelloParams {
     pub session_id: [u8; 32],
     /// Include the optional X25519MLKEM768 key share.
     pub hybrid_kem: bool,
+    /// Offer the standalone X25519 key share next to the hybrid one.
+    ///
+    /// Every browser profile sends both. The hybrid share embeds its own
+    /// X25519 public key (the trailing 32 bytes), and REALITY authenticates
+    /// against exactly that when the group is selected, so a hello can carry
+    /// the protocol with the hybrid share alone — the shape
+    /// `server::tests::a_hello_with_only_the_hybrid_share_authenticates`
+    /// drives. It is a wire-shape switch for tests, not a browser profile.
+    pub standalone_x25519: bool,
     /// The `legacy_version` field: 0x0303 as every TLS 1.3 client writes it.
     /// Another 0x03xx value is read the same by servers, which take the
     /// field as "TLS 1.2 or later", and unrecognised by a filter that picks
@@ -137,6 +146,7 @@ impl HelloParams {
             fingerprint: FingerprintProfile::Chrome,
             session_id: [0u8; 32],
             hybrid_kem: false,
+            standalone_x25519: true,
             legacy_version: 0x0303,
         }
     }
@@ -404,9 +414,18 @@ pub fn build(params: &HelloParams) -> (Vec<u8>, ClientKeypair) {
             shares.extend_from_slice(mlkem_public_bytes);
             shares.extend_from_slice(&keypair.public);
         }
-        put_u16(&mut shares, 0x001d);
-        put_u16(&mut shares, 32);
-        shares.extend_from_slice(&keypair.public);
+        if params.standalone_x25519 {
+            put_u16(&mut shares, 0x001d);
+            put_u16(&mut shares, 32);
+            shares.extend_from_slice(&keypair.public);
+        }
+        // A hello with neither share offers no usable key exchange; the
+        // hybrid share is what carries REALITY when the classic one is
+        // omitted, so the two switches cannot both be off on a REALITY client.
+        debug_assert!(
+            params.standalone_x25519 || keypair.mlkem.is_some(),
+            "a key share must carry an X25519 public key"
+        );
         let mut body = Vec::with_capacity(2 + shares.len());
         put_u16(&mut body, shares.len() as u16); // client_shares length
         body.extend_from_slice(&shares);

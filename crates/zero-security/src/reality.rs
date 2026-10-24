@@ -49,6 +49,15 @@ pub struct RealityParams {
     /// refuse it by relaying the connection to the decoy site rather than by
     /// reporting an error. See `reality_compat::RealityGeneration`.
     pub hybrid_kem: bool,
+    /// Offer the standalone X25519 key share next to the hybrid one.
+    ///
+    /// Off means the hello carries the hybrid group alone. REALITY's auth key
+    /// is derived from the X25519 public key embedded in that share, so the
+    /// protocol still works; the shape exists because the server side accepts
+    /// it and a client that only sends the hybrid share is a real ClientHello
+    /// (see `tls13::hello::HelloParams::standalone_x25519`). It is a parity
+    /// switch, not a config option.
+    pub standalone_x25519: bool,
     /// The concrete uTLS corpus entry the config named, when it named one
     /// rather than a browser family. Carried so the compatibility record can
     /// check the X25519 constraint against the exact shape going on the wire.
@@ -85,6 +94,7 @@ impl RealityParams {
             fingerprint,
             mldsa65_verify: None,
             hybrid_kem: crate::reality_compat::RealityGeneration::default().offers_hybrid_kem(),
+            standalone_x25519: true,
             fingerprint_name: None,
             hello_version: None,
         }
@@ -110,6 +120,13 @@ impl RealityParams {
 
     pub fn with_hybrid_kem(mut self, enabled: bool) -> Self {
         self.hybrid_kem = enabled;
+        self
+    }
+
+    /// Drop the standalone X25519 key share, leaving the hybrid group as the
+    /// only X25519 carrier. Only meaningful with [`Self::hybrid_kem`] on.
+    pub fn without_standalone_x25519(mut self) -> Self {
+        self.standalone_x25519 = false;
         self
     }
 
@@ -388,6 +405,7 @@ where
     let mut hello_params = tls13::HelloParams::new(params.server_name.to_string());
     hello_params.fingerprint = params.fingerprint;
     hello_params.hybrid_kem = compatibility.protocol_generation.offers_hybrid_kem();
+    hello_params.standalone_x25519 = params.standalone_x25519;
     if let Some(version) = params.hello_version {
         hello_params.legacy_version = version;
     }
