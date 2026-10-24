@@ -13,7 +13,7 @@ Citations are relative to the repository that holds them:
 |-----|------|------------|
 | **RL** | `Zray-Stuff/ZeroNetTeam/.research/xtls-reality/` | `github.com/xtls/reality` at `9234c772ba8f181f31c3e81dc2b4177322e5a9a9` (2026-03-22) — the Go fork of `crypto/tls` that *is* the REALITY server, and the revision Xray-core 26.3.27 pins |
 | **XC** | `~/.cache/paru/clone/xray/src/Xray-core-26.3.27/` | Xray-core 26.3.27: the wiring that turns JSON into an **RL** config |
-| **RB** | `Zray-Core/crates/reality/src/` | the Rust port: `server.rs` (the handshake), `keys.rs`, `config.rs` (the settings reader), `fallback.rs` (the relay, moved here but not yet wired into the runtime); its integration tests are `crates/reality/tests/{config,fallback}.rs` |
+| **RB** | `Zray-Core/crates/reality/src/` | the Rust port: `server.rs` (the handshake), `keys.rs`, `config.rs` (the settings reader), `fallback.rs` (the relay the runtime calls); its integration tests are `crates/reality/tests/{config,fallback}.rs` |
 | **ZS** | `Zray-Core/crates/zero-security/src/tls13/` | the Rust TLS 1.3 substrate the REALITY server is built on (`record.rs`, `kdf.rs`, `client.rs` = the post-handshake stream) |
 | **ZR** | `Zray-Core/crates/zero-runtime/src/` | where the port becomes an inbound: `server.rs` (wiring, fallback relay), `relay.rs`, `throttle.rs` |
 | **ZC** | `Zray-Core/crates/zero-config/src/` | `realitySettings` parsing (`model.rs`, `xray_json.rs`) |
@@ -54,7 +54,9 @@ is the one that fails without it.
 | The fallback relay written twice (§6) | the runtime calls `reality::fallback::relay`; one implementation | `--test fallback` 8/8, `--test loopback_tls_interop` 26/26, `the_reality_server_limits_hold_against_the_oracles_client` |
 | A failed direction cancelling the other (§6) | the surviving direction gets a 250 ms grace to deliver what the peer already sent | `crates/reality/tests/fallback.rs::the_targets_answer_survives_the_write_to_the_target_failing` + the oracle's `the_record_size_limit_is_the_oracles_at_the_edges`, 20/20 runs |
 | `show` and `masterKeyLog` (§7) | both switches are read, and the handshake acts on them: a line per connection, and the traffic secrets in Go's order | `server::tests::the_show_switch_reports_what_the_client_sent` and `server::tests::the_key_log_writes_the_handshakes_traffic_secrets`; the key log's shape is compared against the official server's, over the official client, by `the_key_log_has_the_shape_the_officials_server_writes` |
-| The decoy's tolerance for records that advance nothing (§5) | the site is probed at start-up, and the answer is applied to the connections this server accepts | `ZS/ccs_probe.rs`; `server::tests::the_server_puts_up_with_what_the_site_puts_up_with` |
+| The decoy's tolerance for records that advance nothing (§5) | the site is probed at start-up, and the answer is applied to the connections this server accepts | `ZS/ccs_probe.rs`; `server::tests::the_server_puts_up_with_what_the_site_puts_up_with`; the end-to-end measurement is `crates/zero-runtime/tests/reality_useless_records.rs::the_useless_record_budget_is_the_sites` |
+| A site that objects *after* the handshake (§5) | Go's probe watches the connection for the site's alert or close while the handshake runs (`RL/record_detect.go:143-152`); the port's probe read only the handshake's return value, so every site looked unlimited. It now asks the stream once more (`ZS/ccs_probe.rs::probe_budget` → `site_objects`), and the port answers with the site's real bound | `crates/zero-runtime/tests/reality_useless_records.rs` — the site's 16 is learned instead of `UNLIMITED` |
+| The PROXY header on every dial to the site (§7) | Go prefixes *every* dial to `dest` with `xver`'s header, the start-up shape and budget probes included (`RL/tls.go:174-180`, `RL/record_detect.go:37,71`); the port wrote it on the fallback relay only, so a site behind a PROXY-aware front refused its probes and the listener kept its own shapes. The probe dials now go through the same `DirectPolicy.proxy_protocol` path (`ZR/server.rs::learn_post_handshake`) | `crates/zero-runtime/tests/reality_xver_oracle.rs` asserts no dial reaches the target without the header |
 | A unix-socket camouflage target (§7) | the target is dialled as a socket, and an unauthenticated visitor is handed to it | `crates/zero-runtime/tests/reality_unix_target.rs` |
 | The site is dialled for every connection, and its shapes read off that connection (§1, §3) | the flight and the post-handshake records the client sees are the site's, read live, as Go's are | `server::tests::the_flight_is_read_off_the_site_on_every_connection` and `server::tests::the_post_handshake_records_are_read_off_the_site_too` |
 | The site's shapes are filed per ALPN, and the client is handed the ones that match (§3, §5) | the site is asked three ways, and a client gets the answer for the ALPN it offered | `server::tests::the_alpn_index_is_go_s_bucket` and `server::tests::a_client_gets_the_shapes_filed_under_its_alpn` |
@@ -67,6 +69,14 @@ What is *not* closed is what the rows below still say.
 
 *DIVERGENT (present but different):*
 
+* the useless-record bound the server answers with. The port asks the site how
+  many records that advance nothing it tolerates and applies that number; the
+  official server usually answers with the REALITY fork's default instead,
+  because the fork applies the learned bound only inside its
+  wait-for-the-site's-shapes loop and that loop breaks without it once the
+  shapes are known (§5). Measured: with the same stock TLS decoy (which
+  tolerates 16), the port closes at 17 and the official server at 33. The port
+  is the closer of the two to the site it borrows its name from;
 * a site that cannot be reached is a fallback to the cached flight, where Go
   closes the connection (`RL/tls.go:168-172`) — a site that is down for a
   moment is not a reason for a REALITY listener to be down, but it is a
@@ -1048,10 +1058,10 @@ all of them.
 | Behaviour | Status | Evidence |
 |---|---|---|
 | Default budget of 32 consecutive useless records | **PORTED** | `RL/common.go:70`, `RL/conn.go:827-839`; the port counts the same kinds of records against the same default (`ZS/client.rs`, `MAX_USELESS_RECORDS`) |
-| Per-decoy learned budget (CCS probe) | **PORTED** | `RL/record_detect.go:137-185`, `RL/tls.go:425-427`; the port probes the decoy at start-up (`ZS/ccs_probe.rs`, `ZR/server.rs`) and applies the answer to the connections it accepts (`RB/server.rs`, `Tls13Stream::set_max_useless_records`) |
+| Per-decoy learned budget (CCS probe) | **PORTED** | `RL/record_detect.go:137-185`, `RL/tls.go:425-427`; the port probes the decoy at start-up (`ZS/ccs_probe.rs`, `ZR/server.rs`) and applies the answer to the connections it accepts (`RB/server.rs`, `Tls13Stream::set_max_useless_records`). The probe watches the stream after the handshake for the site's alert or close, as Go watches it during the handshake (`probe_budget` → `site_objects`); reading only the handshake's return value made every site look unlimited |
 | The budget is filed per ALPN | **PORTED** | Go keys it under `dest + " " + sni + " " + alpn` and the accepting connection picks it up by the ALPN it offered (`RL/tls.go:396-403`); the port files it under the same index — 0 for no ALPN, 2 for h2 first, 1 otherwise — and the client is handed the answer that matches (`RB/server.rs`, `alpn_index`) |
 | Empty-record handling | **PORTED** | Go counts them against `MaxUselessRecords` (32 by default, `RL/conn.go:803-811`); the port counts them against the same budget |
-| Session-ticket tolerance | **DIVERGENT** | Go never issues one (`XC/…/reality/config.go:32`) and alerts if a client sends one; the port ignores any post-handshake type it does not know |
+| Session-ticket tolerance | **PORTED** | Go never issues one (`XC/…/reality/config.go:32`) and alerts if a *client* sends one; the port's server-side stream does the same (`RB/server.rs`, `Tls13Stream::set_server_side`), refusing a ticket from a client and ignoring one from a server (`ZS/client.rs::a_session_ticket_is_refused_from_a_client_and_ignored_from_a_server`) |
 | KeyUpdate | **PORTED** | `RL/conn.go:1401-1436` vs `ZS/client.rs`; the body is exactly one byte and its value is 0 or 1, as Go's `keyUpdateMsg` unmarshal requires (`RL/handshake_messages.go:1141-1151`), and a body of any other shape is an alert (`RL/conn.go:1248-1250`) |
 | Replay / session-id cache | **PORTED (both absent)** | `RL/cache.go:14-43` is an x509 cache only; no cache exists in `crates/reality` |
 
@@ -1065,21 +1075,41 @@ Go limits quoted in the comment. `ZS/post_handshake.rs:226-248` pins the read-si
 rules locally (only post-Finished application-data records count, and alerts are not
 record sizes).
 
-**Not proven, in either direction.** No test sends a long run of empty records or
-CCS records *to* a Zray REALITY server, so nothing exercises the 256-record bound or
-the absence of a 32-record budget; and no test compares a Zray server's tolerance
-with its decoy's. Both need a raw-socket client that completes a REALITY handshake
-and then sends N empty records, run against a Zray inbound and against an Xray one
-behind the same decoy, comparing the record count at which each closes. This is
-the clearest remaining divergence in §5 and the one a censor could measure: an
-observer who spams ChangeCipherSpec records at both the real site and a REALITY
-server learns nothing from Go's REALITY (the tolerance is copied from the site), but
-after 257 empty records against a Zray server it has learned that the ceiling is 256
-rather than whatever the site it claims to be would have allowed.
+**Proved at the edge, against a real site.** `reality_useless_records.rs`
+(`crates/zero-runtime/tests/`) completes a REALITY handshake, sends a run of empty
+application-data records and then a VLESS request under it, and measures the count at
+which the connection stops carrying the request. It measures three things, in this
+order: the camouflage site's own answer (Go's probe, run directly on the site); the
+port's answer; and the official server's answer, on the same site. Measured on
+2026-10-24 against Xray 26.3.27 and a stock Go TLS decoy: **the site tolerates 16**
+(the Go toolchain the decoy was built with has `maxUselessRecords = 16`), **the port
+answers with the site's 16** — it carries a run of 16 and closes at 17 — and **the
+official REALITY server answers with 32**, the REALITY fork's default
+(`RL/common.go:70`), carrying 32 and closing at 33.
+
+That difference is Go's, not the port's, and it is a divergence worth naming: the
+REALITY fork applies the learned bound inside its *wait-for-the-site's-shapes* loop
+(`RL/tls.go:396-421`), and that loop breaks without applying it as soon as the site's
+shapes are already known — which they are, because the official server starts
+learning them when the listener starts. The learned bound is therefore applied to a
+connection only when the shapes arrived late (the loop's 5 s sleep). The port applies
+the site's answer as soon as it has it, so at the edge it is the closer of the two to
+the site it borrows its name from. Two secondary differences are also Go's: the
+official server's own CCS probe verifies the site's certificate (its `uTLS` client
+has no `InsecureSkipVerify`), so a self-signed decoy is never measured by it, while
+the port's probe is deliberately unverified (the same choice the shape probe makes);
+and the port's probe asks each run on a fresh connection, where Go sends the runs
+cumulatively on one.
+
+The old 256-record ceiling is gone: a run at 33 closes the connection, and the test
+fails if the port is still carrying it while the site would have closed it.
 
 _Note to the operator:_ `maxUselessRecords` is not configurable from `realitySettings`
 in either implementation — Go derives it from the decoy, and the Rust port does not
-have one.
+have one. A connection that arrives before the start-up probe has finished for its
+ALPN bucket answers with the default (32), exactly as Go did before it learned.
+
+**Proved:** `crates/zero-runtime/tests/reality_useless_records.rs::the_useless_record_budget_is_the_sites`.
 
 
 ## 6. Fallback
@@ -1382,10 +1412,21 @@ per behaviour: `a_prober_meets_the_version_one_proxy_header_then_its_own_hello`
 those tests do *not* do: they call the moved module, not the inbound, so they pin
 the bytes rather than the wiring of the copy the runtime runs.
 
-**Not proved against the oracle.** No differential test drives `xver` 1 or 2 against
-a real decoy that inspects the header, and none compares a Zray fallback session's
-lifetime with an Xray one. Both are covered by the local tests named above and by
-reading the Go source; the difference in point 2 is the one a censor could measure.
+**Proved against the oracle.** `crates/zero-runtime/tests/reality_xver_oracle.rs`
+puts a recording target between each server and a real TLS site, gives both servers
+`dest` = that target with `xver` 1 and then 2, drives an unauthenticated visitor
+through each, and compares the headers byte for byte: version, family, source
+address and port (the visitor's), destination address and port (the inbound's), and
+the visitor's own ClientHello immediately behind it. Both servers' headers are
+identical, and the test asserts that **every** dial either server made to `dest`
+carried one — the port's start-up shape and budget probes included, which is what Go
+does (`RL/tls.go:174-180`, `RL/record_detect.go:37,71`) and what a site behind a
+PROXY-aware front requires before it will answer a probe at all.
+
+What is still not compared is a fallback session's *lifetime*: Zray closes a silent
+flow at its idle limit, Go copies until one side closes. The local tests named above
+pin the bytes and the idle limit; the difference in point 2 below is the one a
+censor could measure.
 
 
 ## 7. Config surface
@@ -1659,10 +1700,12 @@ cd Zray-Core
 #    the wrong-key refusal, the official server's own flight, and a Zray
 #    client through a Zray server.
 #
-#    The filter is `reality`, which matches ten of them. Two more are
-#    REALITY tests whose names do not carry the word — the site's answer
-#    to the client's own hello, and the official server's own flight — so
-#    they are named here as well.
+#    The filter is `reality`, which matches fifteen of them. Three more
+#    are REALITY tests whose names do not carry the word — the site's
+#    answer to the client's own hello, the official server's own flight,
+#    and the fragmentation case — and the two newest live in files of
+#    their own (`reality_useless_records.rs`, `reality_xver_oracle.rs`),
+#    so they are named here as well.
 ZRAY_XRAY_BINARY=/usr/bin/xray \
   cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 reality
 ZRAY_XRAY_BINARY=/usr/bin/xray \
@@ -1671,6 +1714,17 @@ ZRAY_XRAY_BINARY=/usr/bin/xray \
 ZRAY_XRAY_BINARY=/usr/bin/xray \
   cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 \
   the_official_server_copies_the_sites_whole_flight
+ZRAY_XRAY_BINARY=/usr/bin/xray \
+  cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 \
+  fragmenting_xray_client_with_mldsa_matches_the_oracle
+
+# 1b. The two parity measurements that have files of their own: the server's
+#     tolerance for useless records against the site's (and the official
+#     server's), and the `xver` PROXY header against a target that inspects it.
+ZRAY_XRAY_BINARY=/usr/bin/xray \
+  cargo test -p zero-runtime --test reality_useless_records -- --ignored --test-threads=1
+ZRAY_XRAY_BINARY=/usr/bin/xray \
+  cargo test -p zero-runtime --test reality_xver_oracle -- --ignored --test-threads=1
 
 # 2. One direction at a time (each test runs both, so these isolate a case,
 #    not a direction).
@@ -1728,22 +1782,20 @@ back on every connection would pass direction 1 perfectly.
 ### What actually passed, when this was written
 
 `cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 reality`
-with `ZRAY_XRAY_BINARY=/usr/bin/xray`, run in this workspace:
-**7 passed, 0 failed, 17 filtered out, 20.31 s** — `a_wrong_reality_public_key_is_refused_rather_than_silently_relayed`,
-`an_idle_reality_flow_with_keepalive_probes_survives_the_servers_empty_record_limit`,
-`reality_with_the_mldsa65_binding_matches_the_oracle`,
-`the_reality_server_limits_hold_against_the_oracles_client`,
-`vless_over_reality_raw_tcp_matches_the_oracle`,
-`vless_vision_over_reality_matches_the_oracle`,
-`zerov1_runs_through_an_xray_reality_vision_hop`.
+with `ZRAY_XRAY_BINARY=/usr/bin/xray`, run in this workspace on 2026-10-24:
+**15 passed, 0 failed, 30 filtered out, 27.2 s**, all of them named in the command
+block above. The file holds **45** tests in total. The two files of their own pass
+too: `reality_useless_records.rs` **1 passed in 4.8 s** (three consecutive runs) and
+`reality_xver_oracle.rs` **1 passed in 0.7 s** (six consecutive runs).
 
 The neighbouring numbers, measured the same way, because they are easy to
-misremember: `cargo test -p reality` passes **29** lib tests plus **12**
-integration tests in two files (`tests/config.rs`: 2, `tests/fallback.rs`: 10), i.e.
-41 across the crate's targets; `cargo test -p zero-runtime --test loopback_tls_interop`
-passes **26** in ~0.6 s on three consecutive runs, though one run of it under load
-failed `tide_carries_udp_datagrams` (a UDP timing test — flaky under load, not a
-REALITY result; it has since passed three times out of three).
+misremember: `cargo test -p reality` passes **66** lib tests plus **19**
+integration tests in two files (`tests/config.rs`: 8, `tests/fallback.rs`: 11), i.e.
+**85** across the crate's targets, plus **1** doctest;
+`cargo test -p zero-runtime --test loopback_tls_interop` passes **26** in ~0.6 s on
+three consecutive runs, though one run of it under load failed
+`tide_carries_udp_datagrams` (a UDP timing test — flaky under load, not a REALITY
+result; it has since passed three times out of three).
 
 ### Two harness bugs that had to be fixed first, and why they matter here
 
@@ -1770,60 +1822,71 @@ REALITY result; it has since passed three times out of three).
   allocates large stack frames, measure the budget per phase and then choose
   caching, a dedicated thread, or boxing.
 
-### Interop cases that are still unproven
+### Interop cases
 
-Each of these is a real difference named in an earlier section, with no differential
-test behind it. In rough order of how much they matter:
+Each of these was a real difference named in an earlier section. The list is kept,
+with the test that closed it, because a closed gap and a never-tested one read the
+same in prose. What is still open is named at the end.
 
 1. **A hello that offers only `X25519MLKEM768`, with no standalone `X25519`.**
-   `RB/server.rs:665-671` authenticates against the hybrid's X25519 half, matching
+   `RB/server.rs` authenticates against the hybrid's X25519 half, matching
    `RL/tls.go:221-228`, but no oracle test drives such a client: uTLS's Chrome
    fingerprints send both shares, so the Zray-side fallback choice is only covered
-   by reading (§1, §2).
-2. **A ClientHello without `supported_versions: 0x0304`** that still names a TLS 1.3
-   cipher suite: Go hands it to the decoy (`RL/tls.go:211`), Rust authenticates it
-   (§1 divergence 2). A one-line probe test would settle it.
-3. **Duplicate key shares** — Go takes the first, Rust the last (§2 divergence 1).
-   Only a crafted hello can show it.
-4. **A pre-1.3 record between 16641 and 18432 bytes** — Go reads it, Rust falls back
-   (§1 divergence 4). Harmless, but it is a measurable difference in behaviour at the
-   edge of the record limit.
-5. **First-flight record sizes** (§3 divergence 3): nothing compares the wire lengths
-   a Zray server emits with the decoy's, so the largest fingerprinting gap in the
-   port has no test. The pieces are all there (`spawn_decoy`, `OR:520-550`;
-   `RecordWalker`, `ZS/post_handshake.rs:44-73`).
-6. **A decoy whose certificate record is smaller than REALITY's** (§3 point 5):
-   Xray closes an authenticated connection, Zray completes it. A test with a small
-   decoy certificate — the fixtures already have an oversized one
-   (`OR:39-42`) — would pin both behaviours and is the direct expression of the
-   record-length rule.
-7. **The useless-record budget** (§5): no test sends a run of empty records or CCS
-   records *to* a Zray REALITY server, so neither the absence of the 32-record budget
-   nor the 256-record bound is exercised, and no test compares a Zray server's
-   tolerance with its decoy's.
-8. **`xver` 1 and 2 against a decoy that inspects the header.** The byte layout is
-   pinned locally (`crates/reality/tests/fallback.rs:175-251`) and the field is
-   accepted in the differential run (`OR:2143`), but no Xray-side test asserts the
-   header arrived correctly formatted at the target.
-9. **A fallback session's lifetime** (§6 divergence 2): Zray's 300 s idle timeout
-   against Go's unbounded copy. A prober-measurable difference with no test.
-10. **A fragmenting client with ML-DSA-65.** The binding hashes the reassembled
-    ClientHello (§4), and the Rust server is tested with a fragmenting client
-    *without* ML-DSA (`RB/server.rs:1169-1199`); the oracle ML-DSA test uses a
-    client that is not fragmenting. If the two implementations reassembled
-    differently, only the combination would show it.
-11. **Vision *and* ML-DSA-65 together.** `OR:1197-1210` covers Vision over REALITY
-    and `OR:2115-2125` covers ML-DSA-65, but not both in one connection.
-12. **`masterKeyLog` on a REALITY inbound** (§7): the switch is implemented, and
-    the file's shape — the labels, their order, the field count, the field
-    lengths — is compared against the file an official Xray REALITY server
-    writes, over the same official client (`the_key_log_has_the_shape_the_
-    officials_server_writes`). What is still missing is a test that decrypts a
-    captured session with either file, and a comparison of the secret *values*
-    for one handshake, which would need both servers to share a handshake.
+   by reading (§1, §2). **Open** — it needs a crafted, fully handshaking client, not
+   a probe.
+2. **A ClientHello without `supported_versions: 0x0304` that still names a TLS 1.3
+   cipher suite.** Go hands it to the decoy (`RL/tls.go:211`); the port does too
+   (`server::tests::a_hello_without_supported_versions_is_not_tls13_enough`), and
+   the official client shapes all offer TLS 1.3
+   (`every_official_client_hello_shape_still_offers_tls13`). **Closed.**
+3. **Duplicate key shares.** Go takes the first share of a group and the port does
+   the same, in one test that seals against the first and then against the second
+   (`server::tests::the_first_share_of_a_duplicated_group_is_the_one_that_counts`).
+   **Closed.**
+4. **A pre-1.3 record between 16641 and 18432 bytes.** The port applies Go's
+   pre-negotiation bound (18432) exactly, and the differential
+   `the_record_size_limit_is_the_oracles_at_the_edges` drives both servers at 18432
+   and 18433 and asserts neither answers with a REALITY handshake. **Closed.**
+5. **First-flight record sizes.** `reality_flight_record_sizes_match_the_camouflage_site`
+   compares the sizes the client receives with the site's own flight, record for
+   record, through a real Xray client. **Closed.**
+6. **A decoy whose certificate record is smaller than REALITY's.**
+   `reality_refuses_a_client_the_sites_flight_is_too_small_for` and
+   `server::tests::a_site_flight_too_small_for_the_certificate_is_refused` pin that
+   the port refuses the handshake rather than completing it. **Closed.**
+7. **The useless-record budget.** `reality_useless_records.rs` measures the site's
+   answer, the port's and the official server's, at the edge, and pins the port to
+   the site's number; §5 names the divergence that falls out (the official server
+   answers with its default because of when the fork applies the learned bound).
+   **Closed**, with the divergence recorded above.
+8. **`xver` 1 and 2 against a decoy that inspects the header.**
+   `reality_xver_oracle.rs` compares both servers' headers byte for byte through a
+   recording target and asserts every dial carries one. **Closed** — and it found
+   that the port's probes did not, which is fixed (§7).
+9. **A fallback session's lifetime.** Zray closes a silent fallback flow at its idle
+   limit; Go copies until one side closes. The local tests pin the limit and the
+   bytes (`crates/reality/tests/fallback.rs::a_visitor_that_says_nothing_is_closed_at_the_idle_limit`),
+   but no differential test compares the two lifetimes. **Open**, and slow to test:
+   it needs a visitor held silent for the whole idle window.
+10. **A fragmenting client with ML-DSA-65.**
+    `fragmenting_xray_client_with_mldsa_matches_the_oracle` drives a real Xray client
+    that fragments its ClientHello (Xray 26.3.27's `streamSettings.finalmask`; the
+    bare `streamSettings.fragment` key is silently ignored by this release) with
+    `mldsa65Verify` through a Zray server with `mldsa65Seed`, and asserts payload
+    comes back. The test also records the ClientHello's record count from a relay so
+    it cannot pass on an unfragmented hello. **Closed.**
+11. **Vision and ML-DSA-65 together.**
+    `vision_over_reality_with_mldsa_matches_the_oracle` runs both features in both
+    directions. **Closed.**
+12. **`masterKeyLog` values.** The shape of the file is compared with the official
+    server's by `the_key_log_has_the_shape_the_officials_server_writes`; the
+    *values* are compared against the official client's own key log in
+    `the_key_log_writes_the_secrets_the_official_client_derives`, where the two
+    files describe one handshake and every shared label must match to the byte.
+    **Closed.**
 
-A useful discipline for whoever writes these: for cases 1–4, the test is a raw
-socket that writes a hand-built ClientHello (no TLS stack) and asserts the *decoy*
-answered — the same shape as `OR:819-849` — because the interesting property is the
-fallback, not the bytes.
-
+What remains open is named in items 1 and 9. Two differences found while closing
+these are recorded with their measurements rather than as gaps: the useless-record
+bound (§5) and the PROXY header on every dial to the site (§7). A third difference
+recorded earlier still stands: a site that cannot be reached is a fallback to the
+cached shapes here, where Go closes the connection.
