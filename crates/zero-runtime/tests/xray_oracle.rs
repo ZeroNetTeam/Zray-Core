@@ -4450,3 +4450,246 @@ async fn the_key_log_writes_the_secrets_the_official_client_derives() {
         "not every shared handshake carried every required label"
     );
 }
+
+// ── A ClientHello that carries the hybrid share alone (§9 item 1) ──────────
+
+/// The eight bytes a `shortIds` entry names, hex-decoded (the form REALITY
+/// seals into the session id), so a client built by hand authorises the same
+/// way a configured one does.
+fn reality_short_id_bytes() -> [u8; 8] {
+    let mut out = [0u8; 8];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&REALITY_SHORT_ID[index * 2..index * 2 + 2], 16)
+            .expect("the short id is hex");
+    }
+    out
+}
+
+/// The 16 bytes of the one VLESS user this file uses.
+fn uuid_bytes() -> [u8; 16] {
+    let hex: String = UUID.chars().filter(|c| *c != '-').collect();
+    let mut out = [0u8; 16];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).expect("the UUID is hex");
+    }
+    out
+}
+
+/// A VLESS TCP request header followed by `payload`.
+fn vless_request(target: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 16 + 1 + 1 + 2 + 1 + 16 + payload.len());
+    out.push(zero_protocol::vless::VERSION);
+    out.extend_from_slice(&uuid_bytes());
+    out.push(0); // no addons
+    out.push(zero_protocol::vless::CMD_TCP);
+    out.extend_from_slice(&target.port().to_be_bytes());
+    match target.ip() {
+        std::net::IpAddr::V4(ip) => {
+            out.push(zero_protocol::vless::ADDR_IPV4);
+            out.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            out.push(zero_protocol::vless::ADDR_IPV6);
+            out.extend_from_slice(&ip.octets());
+        }
+    }
+    out.extend_from_slice(payload);
+    out
+}
+
+/// The key-share groups a ClientHello record offers, in the order it lists
+/// them. The record is the one the client wrote: five header bytes, then the
+/// handshake message.
+fn client_hello_key_share_groups(record: &[u8]) -> Vec<u16> {
+    let message = &record[5..];
+    assert_eq!(
+        message[0], 0x01,
+        "the first handshake message is a ClientHello"
+    );
+    let body = &message[4..];
+    let mut at = 2 + 32; // legacy_version, random
+    at += 1 + body[at] as usize; // legacy_session_id
+    let suites = u16::from_be_bytes([body[at], body[at + 1]]) as usize;
+    at += 2 + suites;
+    at += 1 + body[at] as usize; // compression_methods
+    let extensions = u16::from_be_bytes([body[at], body[at + 1]]) as usize;
+    at += 2;
+    let end = at + extensions;
+    while at + 4 <= end {
+        let kind = u16::from_be_bytes([body[at], body[at + 1]]);
+        let length = u16::from_be_bytes([body[at + 2], body[at + 3]]) as usize;
+        let extension = &body[at + 4..at + 4 + length];
+        if kind == 0x0033 {
+            let total = u16::from_be_bytes([extension[0], extension[1]]) as usize;
+            let mut cursor = 2;
+            let mut groups = Vec::new();
+            while cursor + 4 <= 2 + total {
+                let group = u16::from_be_bytes([extension[cursor], extension[cursor + 1]]);
+                let key_len =
+                    u16::from_be_bytes([extension[cursor + 2], extension[cursor + 3]]) as usize;
+                groups.push(group);
+                cursor += 4 + key_len;
+            }
+            return groups;
+        }
+        at += 4 + length;
+    }
+    panic!("the hello offered no key_share extension");
+}
+
+/// One REALITY handshake with a chosen hello shape, then a VLESS request to
+/// `target` under it. Returns the key-share groups the hello actually put on
+/// the wire, and the echoed payload when the tunnel carried.
+async fn reality_tunnel_with_hello(
+    server: SocketAddr,
+    public_key: &str,
+    target: SocketAddr,
+    shape: impl FnOnce(zero_security::RealityParams) -> zero_security::RealityParams,
+) -> (Vec<u16>, Result<Vec<u8>, String>) {
+    let key = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(public_key)
+            .expect("the oracle's public key is base64url")
+            .try_into()
+            .expect("the oracle's public key is 32 bytes")
+    };
+    let params = shape(zero_security::RealityParams::from_config(
+        std::sync::Arc::from(REALITY_SNI),
+        key,
+        &reality_short_id_bytes(),
+    ));
+    let tcp = TcpStream::connect(server)
+        .await
+        .unwrap_or_else(|error| panic!("the REALITY server never listened on {server}: {error}"));
+    let (tapped, taps) = zero_security::tls13::post_handshake::tap_with_flight(tcp);
+    let mut stream = zero_security::reality_connect(tapped, &params)
+        .await
+        .unwrap_or_else(|error| panic!("the REALITY handshake was refused: {error}"));
+    let written = taps
+        .sent_bytes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let groups = client_hello_key_share_groups(&written);
+
+    let payload = b"the hybrid share carries REALITY".to_vec();
+    let carried = async {
+        stream
+            .write_all(&vless_request(target, &payload))
+            .await
+            .map_err(|error| error.to_string())?;
+        stream.flush().await.map_err(|error| error.to_string())?;
+        let mut header = [0u8; 2];
+        stream
+            .read_exact(&mut header)
+            .await
+            .map_err(|error| error.to_string())?;
+        if header != [0, 0] {
+            return Err(format!("unexpected VLESS response header {header:?}"));
+        }
+        let mut echoed = vec![0u8; payload.len()];
+        stream
+            .read_exact(&mut echoed)
+            .await
+            .map_err(|error| error.to_string())?;
+        if echoed != payload {
+            return Err(format!("the echo came back altered: {echoed:?}"));
+        }
+        Ok(echoed)
+    };
+    let carried = tokio::time::timeout(Duration::from_secs(8), carried)
+        .await
+        .map_err(|_| "the tunnel went silent".to_string())
+        .and_then(|result| result);
+    (groups, carried)
+}
+
+/// A ClientHello with the hybrid `X25519MLKEM768` share and *no* standalone
+/// `X25519` share still authenticates, against both servers.
+///
+/// REALITY's auth key is derived from the X25519 public key the hybrid share
+/// embeds (ML-KEM-768's 1184 encapsulation-key bytes, then the 32-byte X25519
+/// key: `RL/tls.go:221-228`), so the classic share is not needed to carry the
+/// protocol. §9 item 1 of `docs/specs/REALITY-server.md` names this as the one
+/// intake shape no oracle test drove — uTLS's browser fingerprints always send
+/// both shares. This drives it end to end: the client hello's groups are
+/// asserted on the wire (so the test cannot pass on a hello that quietly kept
+/// the classic share), and the same client then carries a VLESS request
+/// through a Zray inbound and through an official Xray one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn a_hello_with_only_the_hybrid_share_authenticates() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!(
+        "oracle: {} (REALITY hybrid-only hello)",
+        oracle_version(&binary)
+    );
+
+    let echo = echo_service().await;
+    let (private_key, public_key) = oracle_x25519_keypair(&binary);
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the REALITY decoy never listened");
+
+    let config = |port: u16| {
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "relay-in",
+                "listen": "127.0.0.1",
+                "port": port,
+                "protocol": "vless",
+                "settings": {"clients": [{"id": UUID}], "decryption": "none"},
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": reality_server_settings(&private_key, decoy),
+                },
+            }],
+            "outbounds": [oracle_loopback_freedom()],
+        })
+    };
+
+    let oracle_port = free_port();
+    let _oracle = spawn_oracle(&binary, config(oracle_port));
+    let zray_port = free_port();
+    let _zray = spawn_zray(config(zray_port));
+    let servers = [
+        (
+            "official",
+            SocketAddr::new("127.0.0.1".parse().unwrap(), oracle_port),
+        ),
+        (
+            "port",
+            SocketAddr::new("127.0.0.1".parse().unwrap(), zray_port),
+        ),
+    ];
+    for (_, address) in servers {
+        assert!(wait_for(address).await, "a REALITY server never listened");
+    }
+
+    for (name, address) in servers {
+        let (groups, carried) = reality_tunnel_with_hello(address, &public_key, echo, |params| {
+            params.without_standalone_x25519()
+        })
+        .await;
+        assert!(
+            groups.contains(&0x11ec),
+            "the {name} test hello did not offer X25519MLKEM768: {groups:?}"
+        );
+        assert!(
+            !groups.contains(&0x001d),
+            "the {name} test hello still offered the standalone X25519 share, so nothing was \
+             proved about the hybrid-only shape: {groups:?}"
+        );
+        carried.unwrap_or_else(|error| {
+            panic!(
+                "the hybrid-only hello did not carry a payload through the {name} server: {error}"
+            )
+        });
+    }
+}
