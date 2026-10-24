@@ -774,8 +774,44 @@ async fn xray_client_to_zray_reality_server_with_client(
     client_extra: Value,
     expect_through: bool,
 ) {
+    xray_client_to_zray_reality_server_with_client_stream(
+        binary,
+        carrier,
+        flow,
+        mldsa,
+        server_extra,
+        client_extra,
+        json!({}),
+        expect_through,
+        false,
+    )
+    .await;
+}
+
+/// The same again, with `client_stream_extra` merged into the Xray client's
+/// `streamSettings` — where Xray keeps transport-level switches such as
+/// `finalmask` — and, when `probe` is set, a relay between the client and the
+/// Zray server that hands back the first bytes the client wrote.
+///
+/// The probe is needed because Xray accepts a `streamSettings` key it does not
+/// know without a word: a test that only asserted payload came back would pass
+/// just as happily with its transport settings dropped. `zero-config`'s own
+/// preset records the same trap for a bare `streamSettings.fragment`
+/// (`crates/zero-config/src/presets.rs`, `apply_fragment`).
+async fn xray_client_to_zray_reality_server_with_client_stream(
+    binary: &str,
+    carrier: &str,
+    flow: Option<&str>,
+    mldsa: Option<&(String, String)>,
+    server_extra: Value,
+    client_extra: Value,
+    client_stream_extra: Value,
+    expect_through: bool,
+    probe: bool,
+) -> Arc<Mutex<Vec<u8>>> {
     let echo = echo_service().await;
     let relay_port = free_port();
+    let server_port = if probe { free_port() } else { relay_port };
     let socks_port = free_port();
     let (private_key, public_key) = oracle_x25519_keypair(binary);
     let (mut server_settings, mut client_settings) = protocol_settings("vless", relay_port);
@@ -794,6 +830,15 @@ async fn xray_client_to_zray_reality_server_with_client(
     let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
     assert!(wait_for(decoy).await, "the REALITY decoy never listened");
 
+    // With the probe in place the client dials the relay and the server
+    // listens one port over; without it the server listens where the client
+    // dials, as it always has.
+    let written = if probe {
+        client_write_probe(relay_port, server_port).await
+    } else {
+        Arc::new(Mutex::new(Vec::new()))
+    };
+
     let mut zray_stream = transport(carrier);
     zray_stream["security"] = json!("reality");
     zray_stream["realitySettings"] = reality_server_settings(&private_key, decoy);
@@ -811,13 +856,16 @@ async fn xray_client_to_zray_reality_server_with_client(
     for (key, value) in client_extra.as_object().into_iter().flatten() {
         oracle_stream["realitySettings"][key] = value.clone();
     }
+    for (key, value) in client_stream_extra.as_object().into_iter().flatten() {
+        oracle_stream[key] = value.clone();
+    }
 
     spawn_zray(json!({
         "log": {"loglevel": "warning"},
         "inbounds": [{
             "tag": "relay-in",
             "listen": "127.0.0.1",
-            "port": relay_port,
+            "port": server_port,
             "protocol": "vless",
             "settings": server_settings,
             "streamSettings": zray_stream,
@@ -845,6 +893,7 @@ async fn xray_client_to_zray_reality_server_with_client(
         }),
     );
 
+    assert!(wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), server_port)).await);
     assert!(wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), relay_port)).await);
     assert!(wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port)).await);
 
@@ -878,7 +927,7 @@ async fn xray_client_to_zray_reality_server_with_client(
         .ok()
         .flatten();
         assert!(outcome.is_none(), "a client outside the limits got through");
-        return;
+        return written;
     }
     let mut stream = socks_connect(
         SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port),
@@ -888,6 +937,7 @@ async fn xray_client_to_zray_reality_server_with_client(
     .unwrap();
     round_trip(&mut stream, &payload(13, 64)).await;
     round_trip(&mut stream, &payload(14, 96 * 1024)).await;
+    written
 }
 
 /// Zray client → Xray server.
@@ -2360,6 +2410,97 @@ async fn reality_with_the_mldsa65_binding_matches_the_oracle() {
     xray_client_to_zray_reality_server(&binary, "tcp", None, Some(&keys)).await;
 }
 
+/// Vision and the ML-DSA-65 binding on one connection, in both directions.
+///
+/// Each is covered alone — `vless_vision_over_reality_matches_the_oracle` and
+/// `reality_with_the_mldsa65_binding_matches_the_oracle` — but not together,
+/// which is the gap §9.11 of `docs/specs/REALITY-server.md` names. They meet
+/// on the server's first flight: ML-DSA-65 replaces the signature in it, so
+/// the flight is a different size, and Vision's padding is read by length from
+/// the records after the handshake. A port that mixed up the two would pass
+/// both of the single-feature tests and still desynchronise here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn vision_over_reality_with_mldsa_matches_the_oracle() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!(
+        "oracle: {} (Vision over REALITY + ML-DSA-65)",
+        oracle_version(&binary)
+    );
+    let keys = oracle_mldsa65_keypair(&binary);
+    let flow = Some("xtls-rprx-vision");
+    zray_client_to_xray_reality_server(&binary, "tcp", flow, Some(&keys)).await;
+    xray_client_to_zray_reality_server(&binary, "tcp", flow, Some(&keys)).await;
+}
+
+/// An unmodified Xray client that fragments its ClientHello *and* carries the
+/// ML-DSA-65 binding, against a Zray REALITY server.
+///
+/// The two features are covered apart today: the `reality` crate reassembles a
+/// fragmented hello (`fragmented_client_hello_is_reassembled_and_accepted`),
+/// and `reality_with_the_mldsa65_binding_matches_the_oracle` runs the binding
+/// over a hello that fits in one record. §9.10 of
+/// `docs/specs/REALITY-server.md` names the gap: the ML-DSA-65 signature is
+/// over the *reassembled* ClientHello, so an implementation that signed only
+/// what the first record held would pass both existing tests and fail every
+/// real client that fragments. Only the combination shows it.
+///
+/// Xray 26.3.27 reads ClientHello fragmentation from
+/// `streamSettings.finalmask.tcp[]`, which is where `zero-config`'s own preset
+/// writes it; a bare `streamSettings.fragment` is accepted without a word and
+/// fragments nothing, and that is exactly how this test could pass while
+/// testing nothing. So the bytes the client actually wrote are recorded by a
+/// relay and checked: the hello has to arrive in more than one TLS record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn fragmenting_xray_client_with_mldsa_matches_the_oracle() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!(
+        "oracle: {} (REALITY + ML-DSA-65, fragmenting ClientHello)",
+        oracle_version(&binary)
+    );
+    let keys = oracle_mldsa65_keypair(&binary);
+    let fragment = json!({
+        "finalmask": {"tcp": [{
+            "type": "fragment",
+            "settings": {
+                "packets": "tlshello",
+                "length": "100-200",
+                "delay": "10-20",
+            },
+        }]},
+    });
+    let written = xray_client_to_zray_reality_server_with_client_stream(
+        &binary,
+        "tcp",
+        None,
+        Some(&keys),
+        json!({}),
+        json!({}),
+        fragment,
+        true,
+        true,
+    )
+    .await;
+    let bytes = written.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let records = client_hello_record_lengths(&bytes).unwrap_or_else(|| {
+        panic!(
+            "the relay did not see a complete ClientHello ({} bytes recorded)",
+            bytes.len()
+        )
+    });
+    assert!(
+        records.len() > 1,
+        "the ClientHello arrived in one TLS record ({records:?}), so the \
+         fragment settings did not reach Xray and this test would have \
+         proved nothing about reassembly"
+    );
+}
+
 /// A relay that forwards one port to another and notes, per connection, the
 /// wire sizes of the records the server sent back before the client's own
 /// encrypted record — the server's flight.
@@ -2428,6 +2569,85 @@ async fn latest_flight(flights: &Arc<Mutex<Vec<Vec<u16>>>>) -> Option<Vec<u16>> 
             return Some(flight);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+/// A relay in front of the Zray server that keeps the first bytes the client
+/// writes, and forwards them.
+///
+/// Fragmentation is a client-side shape: the server's socket only ever sees
+/// the reassembled stream, so a test that wants to know the fragmenter ran has
+/// to watch the wire. Recording here rather than in the harness proper keeps
+/// the ordinary REALITY tests on their direct TCP path.
+async fn client_write_probe(listen: u16, target: u16) -> Arc<Mutex<Vec<u8>>> {
+    let listen = SocketAddr::new("127.0.0.1".parse().unwrap(), listen);
+    let target = SocketAddr::new("127.0.0.1".parse().unwrap(), target);
+    let listener = TcpListener::bind(listen).await.unwrap();
+    let written: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&written);
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            let recorder = Arc::clone(&recorder);
+            tokio::spawn(async move {
+                let Ok(mut server) = TcpStream::connect(target).await else {
+                    return;
+                };
+                let (mut from_client, mut to_client) = client.split();
+                let (mut from_server, mut to_server) = server.split();
+                let upstream = async {
+                    let mut buffer = vec![0u8; 4096];
+                    loop {
+                        let read = match from_client.read(&mut buffer).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => read,
+                        };
+                        {
+                            let mut written = recorder.lock().unwrap_or_else(|p| p.into_inner());
+                            let room = 16 * 1024 - written.len();
+                            written.extend_from_slice(&buffer[..read.min(room)]);
+                        }
+                        if to_server.write_all(&buffer[..read]).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                let downstream = tokio::io::copy(&mut from_server, &mut to_client);
+                let _ = tokio::join!(upstream, downstream);
+            });
+        }
+    });
+    written
+}
+
+/// The body lengths of the TLS records one ClientHello arrived in.
+///
+/// `None` while the recorded bytes do not hold a complete ClientHello yet. An
+/// Xray client with the `tlshello` fragment mask writes the hello's body as
+/// several handshake records, each 100–200 bytes; an unfragmented client
+/// writes one record of about 1.7 KB (measured against Xray 26.3.27). So the
+/// count of records is exactly the property the fragment settings claim.
+fn client_hello_record_lengths(bytes: &[u8]) -> Option<Vec<usize>> {
+    let mut at = 0;
+    let mut handshake = Vec::new();
+    let mut lengths = Vec::new();
+    while let Some(header) = bytes.get(at..at + 5) {
+        if header[0] != 22 {
+            return None;
+        }
+        let length = usize::from(header[3]) << 8 | usize::from(header[4]);
+        let body = bytes.get(at + 5..at + 5 + length)?;
+        handshake.extend_from_slice(body);
+        lengths.push(length);
+        at += 5 + length;
+        if handshake.len() >= 4 {
+            let declared = usize::from(handshake[1]) << 16
+                | usize::from(handshake[2]) << 8
+                | usize::from(handshake[3]);
+            if handshake[0] == 1 && handshake.len() >= declared + 4 {
+                return Some(lengths);
+            }
+        }
     }
     None
 }
@@ -3953,16 +4173,22 @@ async fn the_key_log_has_the_shape_the_officials_server_writes() {
     );
 }
 
-/// One line of a key log, read as far as its shape goes.
+/// One line of a key log: the label, the client random and the secret, all in
+/// hex. The lengths are kept next to the values because the shape test asks
+/// only about those, while the value comparison needs the bytes themselves.
 struct KeyLogLine {
     label: String,
+    /// The client random, in hex.
+    random: String,
+    /// The secret, in hex.
+    secret: String,
     /// The length of the client random, in hex characters.
     random_len: usize,
     /// The length of the secret, in hex characters.
     secret_len: usize,
 }
 
-/// Read a key log file into its lines' shapes.
+/// Read a key log file into its lines.
 fn read_key_log(path: &std::path::Path) -> Vec<KeyLogLine> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -3978,9 +4204,249 @@ fn read_key_log(path: &std::path::Path) -> Vec<KeyLogLine> {
             );
             KeyLogLine {
                 label: fields[0].to_string(),
+                random: fields[1].to_string(),
+                secret: fields[2].to_string(),
                 random_len: fields[1].len(),
                 secret_len: fields[2].len(),
             }
         })
         .collect()
+}
+
+/// The key log's lines keyed by client random and then by label, which is the
+/// form the secret-value comparison needs: the two files describe the same
+/// handshake only if they name the same client random.
+fn key_log_by_random(
+    lines: &[KeyLogLine],
+) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> {
+    let mut by_random: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, String>,
+    > = std::collections::BTreeMap::new();
+    for line in lines {
+        by_random
+            .entry(line.random.clone())
+            .or_default()
+            .insert(line.label.clone(), line.secret.clone());
+    }
+    by_random
+}
+
+/// The secrets this port's REALITY server derives are the secrets the official
+/// client derives, for the same handshake.
+///
+/// The key-log *shape* test next door can be passed by a server that writes
+/// four well-shaped lines and derives none of them the way Go does; a key log
+/// is only useful as a debugging aid when its secrets actually open the
+/// traffic. Xray's REALITY client takes `masterKeyLog` too
+/// (`Xray-core/infra/conf/transport_internet.go:659,781`;
+/// `transport/internet/reality/config.go:61-73` installs it as Go's
+/// `tls.Config.KeyLogWriter`), so one connection through one handshake makes
+/// both ends write their own view of it: the port's inbound to file A, the
+/// official client to file B. Matching the lines by client random pairs the
+/// two views, and every label both files carry must be byte-identical.
+///
+/// TLS 1.3 derives all four traffic secrets on both sides, so both files are
+/// expected to carry all four: the client's log holds its view of
+/// CLIENT/SERVER_HANDSHAKE_TRAFFIC_SECRET and CLIENT/SERVER_TRAFFIC_SECRET_0,
+/// and so does the server's. A label one file omits is a finding, not a
+/// difference of perspective, and this test fails on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn the_key_log_writes_the_secrets_the_official_client_derives() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!(
+        "oracle: {} (REALITY masterKeyLog values)",
+        oracle_version(&binary)
+    );
+
+    let echo = echo_service().await;
+    let decoy_port = free_port();
+    let _decoy = spawn_decoy(&binary, decoy_port);
+    let decoy = SocketAddr::new("127.0.0.1".parse().unwrap(), decoy_port);
+    assert!(wait_for(decoy).await, "the REALITY decoy never listened");
+
+    let directory = std::env::temp_dir().join(format!(
+        "zray-keylog-values-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let server_log = directory.join("server.log");
+    let client_log = directory.join("client.log");
+
+    // ── The port's REALITY inbound, logging its handshakes ──────────────
+    let (private_key, public_key) = oracle_x25519_keypair(&binary);
+    let (server_settings, _) = protocol_settings("vless", 0);
+    let mut server_stream = transport("tcp");
+    server_stream["security"] = json!("reality");
+    let mut server_reality = reality_server_settings(&private_key, decoy);
+    server_reality["masterKeyLog"] = json!(server_log.to_str().unwrap());
+    server_stream["realitySettings"] = server_reality;
+
+    let server_port = free_port();
+    spawn_zray(json!({
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "reality-in",
+            "listen": "127.0.0.1",
+            "port": server_port,
+            "protocol": "vless",
+            "settings": server_settings,
+            "streamSettings": server_stream,
+        }],
+        "outbounds": [{"protocol": "freedom"}],
+    }));
+    let server_address = SocketAddr::new("127.0.0.1".parse().unwrap(), server_port);
+    assert!(
+        wait_for(server_address).await,
+        "this port's REALITY server never listened"
+    );
+
+    // ── The official Xray client, logging the same handshake ────────────
+    let (_, client_settings) = protocol_settings("vless", server_port);
+    let mut client_stream = transport("tcp");
+    client_stream["security"] = json!("reality");
+    let mut client_reality = reality_client_settings(&public_key);
+    client_reality["masterKeyLog"] = json!(client_log.to_str().unwrap());
+    client_stream["realitySettings"] = client_reality;
+
+    let socks_port = free_port();
+    let _client = spawn_oracle(
+        &binary,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "port": socks_port,
+                "protocol": "socks",
+                "settings": {"udp": false},
+            }],
+            "outbounds": [{
+                "tag": "proxy",
+                "protocol": "vless",
+                "settings": client_settings,
+                "streamSettings": client_stream,
+            }],
+        }),
+    );
+    let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+    assert!(wait_for(socks).await, "the official client never listened");
+
+    // One round trip through one REALITY handshake.
+    proxied_echo(socks, echo, 7)
+        .await
+        .expect("the payload came back through the official client's tunnel");
+
+    // Give both ends a moment to flush what the handshake produced.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let server_lines = read_key_log(&server_log);
+    let client_lines = read_key_log(&client_log);
+    let _ = std::fs::remove_dir_all(&directory);
+
+    eprintln!(
+        "oracle: the port wrote {} key-log lines, the official client {}",
+        server_lines.len(),
+        client_lines.len()
+    );
+    assert!(
+        !server_lines.is_empty(),
+        "this port's REALITY server wrote no key log at {server_log:?}"
+    );
+    assert!(
+        !client_lines.is_empty(),
+        "the official client wrote no key log at {client_log:?}; it logged {} lines",
+        client_lines.len()
+    );
+
+    let server = key_log_by_random(&server_lines);
+    let client = key_log_by_random(&client_lines);
+    let handshakes: Vec<&String> = server
+        .keys()
+        .filter(|random| client.contains_key(*random))
+        .collect();
+    assert!(
+        !handshakes.is_empty(),
+        "no single handshake appears in both key logs; the server logged client randoms {:?}, the client {:?}",
+        server.keys().collect::<Vec<_>>(),
+        client.keys().collect::<Vec<_>>()
+    );
+    eprintln!(
+        "oracle: {} handshake(s) carried by both logs, labels {:?}",
+        handshakes.len(),
+        client[handshakes[0]].keys().collect::<Vec<_>>()
+    );
+
+    // Every handshake both files describe has to agree, label for label.
+    for random in &handshakes {
+        let server_labels: std::collections::BTreeSet<&String> = server[*random].keys().collect();
+        let client_labels: std::collections::BTreeSet<&String> = client[*random].keys().collect();
+        let server_only: Vec<&String> = server_labels.difference(&client_labels).copied().collect();
+        let client_only: Vec<&String> = client_labels.difference(&server_labels).copied().collect();
+        assert!(
+            server_only.is_empty() && client_only.is_empty(),
+            "the two key logs disagree on the labels of client random {random}: \
+             only the server's log has {server_only:?}, only the client's has {client_only:?}"
+        );
+        for (label, server_secret) in &server[*random] {
+            let client_secret = &client[*random][label];
+            assert_eq!(
+                server_secret, client_secret,
+                "the port and the official client derived different {label} values for \
+                 client random {random}"
+            );
+        }
+    }
+
+    // The labels TLS 1.3 always logs, on either side, must be there and equal.
+    const REQUIRED_LABELS: [&str; 4] = [
+        "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+        "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+        "CLIENT_TRAFFIC_SECRET_0",
+        "SERVER_TRAFFIC_SECRET_0",
+    ];
+    let mut compared = 0;
+    for random in &handshakes {
+        let mut secret_hex_lens = Vec::new();
+        for label in REQUIRED_LABELS {
+            let server_secret = server[*random].get(label).unwrap_or_else(|| {
+                panic!("this port's log holds no {label} for client random {random}")
+            });
+            let client_secret = client[*random].get(label).unwrap_or_else(|| {
+                panic!("the official client's log holds no {label} for client random {random}")
+            });
+            secret_hex_lens.push(server_secret.len());
+            assert_eq!(
+                server_secret, client_secret,
+                "the port and the official client derived different {label} values for \
+                 client random {random}: port {server_secret}, official client {client_secret}"
+            );
+            compared += 1;
+        }
+        // All four are HKDF outputs of the negotiated cipher suite's hash, so
+        // they share a length: 32 bytes (64 hex, SHA-256) for the suite this
+        // chrome hello negotiates, 48 (96 hex) under SHA-384. A log where they
+        // disagree, or where none is a TLS 1.3 hash length, is a finding.
+        assert!(
+            secret_hex_lens.windows(2).all(|pair| pair[0] == pair[1]),
+            "the four secrets of client random {random} have different lengths: {secret_hex_lens:?}"
+        );
+        assert!(
+            matches!(secret_hex_lens[0], 64 | 96),
+            "the secrets of client random {random} are {} hex characters, not the 64 (SHA-256) or 96 (SHA-384) of a TLS 1.3 hash",
+            secret_hex_lens[0]
+        );
+    }
+    assert_eq!(
+        compared,
+        handshakes.len() * REQUIRED_LABELS.len(),
+        "not every shared handshake carried every required label"
+    );
 }
