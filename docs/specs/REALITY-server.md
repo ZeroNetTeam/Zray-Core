@@ -490,6 +490,17 @@ authenticate against the same point.
    shortId (`RB/server.rs`). Because every failure is silent, the difference is
    observable only in timing and in the server's own logs.
 
+**The hybrid-only shape is driven end to end.** A ClientHello whose `key_share`
+lists `X25519MLKEM768` and no standalone `X25519` — the one intake shape a browser
+fingerprint never sends — authenticates against both servers and carries a VLESS
+payload through them:
+`a_hello_with_only_the_hybrid_share_authenticates` (`OR`) checks the groups on the
+wire (so it cannot pass on a hello that kept the classic share) and then round-trips
+a payload through a Zray inbound and an official Xray one. The client-side switch
+that produces the shape is `zero_security::RealityParams::without_standalone_x25519`
+(a parity switch, not a config option; `tls13::hello::HelloParams::standalone_x25519`
+is the wire half).
+
 **Proved by.** `OR:1177-1187` and `OR:2115-2125`
 (`reality_with_the_mldsa65_binding_matches_the_oracle`) drive an unmodified Xray
 client through a Zray REALITY server and back; the tag is the only thing that can
@@ -1423,10 +1434,19 @@ carried one — the port's start-up shape and budget probes included, which is w
 does (`RL/tls.go:174-180`, `RL/record_detect.go:37,71`) and what a site behind a
 PROXY-aware front requires before it will answer a probe at all.
 
-What is still not compared is a fallback session's *lifetime*: Zray closes a silent
-flow at its idle limit, Go copies until one side closes. The local tests named above
-pin the bytes and the idle limit; the difference in point 2 below is the one a
-censor could measure.
+**The fallback session's lifetime is measured, not assumed.**
+`crates/zero-runtime/tests/reality_fallback_lifetime.rs` gives both servers the same
+settings and a silent recording target, sends each an unauthenticated but well-formed
+TLS ClientHello (fully consumed before the relay, then silence — the flow §9 names),
+and times the close. Measured on 2026-10-24 against Xray 26.3.27: **the port closes
+at +300.002 s on both the visitor and the target side** (its
+`DEFAULT_IDLE_TIMEOUT`), while **the official server is still open at +330.046 s on
+both sides** — its inbound `connIdle` policy does not reach the REALITY fallback,
+which runs inside the TLS layer before the VLESS inbound arms the policy timer. So
+the unbounded-copy reading of `RL/tls.go:451-452` survives measurement. The test's
+module docs record the shape this claim is exact for: a visitor that leaves copied
+bytes behind keeps re-arming the idle timer (the port then closes one to two periods
+after its last byte), which is the local test's mechanism, not a different limit.
 
 
 ## 7. Config surface
@@ -1717,6 +1737,9 @@ ZRAY_XRAY_BINARY=/usr/bin/xray \
 ZRAY_XRAY_BINARY=/usr/bin/xray \
   cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 \
   fragmenting_xray_client_with_mldsa_matches_the_oracle
+ZRAY_XRAY_BINARY=/usr/bin/xray \
+  cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 \
+  a_hello_with_only_the_hybrid_share_authenticates
 
 # 1b. The two parity measurements that have files of their own: the server's
 #     tolerance for useless records against the site's (and the official
@@ -1725,6 +1748,9 @@ ZRAY_XRAY_BINARY=/usr/bin/xray \
   cargo test -p zero-runtime --test reality_useless_records -- --ignored --test-threads=1
 ZRAY_XRAY_BINARY=/usr/bin/xray \
   cargo test -p zero-runtime --test reality_xver_oracle -- --ignored --test-threads=1
+# Takes ~5.5 minutes: it waits out the real 300 s fallback idle limit on two servers.
+ZRAY_XRAY_BINARY=/usr/bin/xray \
+  cargo test -p zero-runtime --test reality_fallback_lifetime -- --ignored --test-threads=1
 
 # 2. One direction at a time (each test runs both, so these isolate a case,
 #    not a direction).
@@ -1783,10 +1809,12 @@ back on every connection would pass direction 1 perfectly.
 
 `cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 reality`
 with `ZRAY_XRAY_BINARY=/usr/bin/xray`, run in this workspace on 2026-10-24:
-**15 passed, 0 failed, 30 filtered out, 27.2 s**, all of them named in the command
-block above. The file holds **45** tests in total. The two files of their own pass
-too: `reality_useless_records.rs` **1 passed in 4.8 s** (three consecutive runs) and
-`reality_xver_oracle.rs` **1 passed in 0.7 s** (six consecutive runs).
+**15 passed, 0 failed, 31 filtered out, 26.6 s**, all of them named in the command
+block above. The file holds **46** tests in total. The three files of their own pass
+too: `reality_useless_records.rs` **1 passed in 4.8 s** (three consecutive runs),
+`reality_xver_oracle.rs` **1 passed in 0.7 s** (six consecutive runs), and
+`reality_fallback_lifetime.rs` **1 passed in 330.2 s** (once; it waits out the
+300 s idle limit on both servers).
 
 The neighbouring numbers, measured the same way, because they are easy to
 misremember: `cargo test -p reality` passes **66** lib tests plus **19**
@@ -1830,10 +1858,11 @@ same in prose. What is still open is named at the end.
 
 1. **A hello that offers only `X25519MLKEM768`, with no standalone `X25519`.**
    `RB/server.rs` authenticates against the hybrid's X25519 half, matching
-   `RL/tls.go:221-228`, but no oracle test drives such a client: uTLS's Chrome
-   fingerprints send both shares, so the Zray-side fallback choice is only covered
-   by reading (§1, §2). **Open** — it needs a crafted, fully handshaking client, not
-   a probe.
+   `RL/tls.go:221-228`. The shape is now driven end to end by
+   `a_hello_with_only_the_hybrid_share_authenticates` (§2): a client with
+   `RealityParams::without_standalone_x25519` offers the hybrid group alone, the
+   test asserts the offered groups on the wire, and the payload comes back through
+   both a Zray REALITY inbound and an official Xray one. **Closed.**
 2. **A ClientHello without `supported_versions: 0x0304` that still names a TLS 1.3
    cipher suite.** Go hands it to the decoy (`RL/tls.go:211`); the port does too
    (`server::tests::a_hello_without_supported_versions_is_not_tls13_enough`), and
@@ -1864,10 +1893,14 @@ same in prose. What is still open is named at the end.
    recording target and asserts every dial carries one. **Closed** — and it found
    that the port's probes did not, which is fixed (§7).
 9. **A fallback session's lifetime.** Zray closes a silent fallback flow at its idle
-   limit; Go copies until one side closes. The local tests pin the limit and the
-   bytes (`crates/reality/tests/fallback.rs::a_visitor_that_says_nothing_is_closed_at_the_idle_limit`),
-   but no differential test compares the two lifetimes. **Open**, and slow to test:
-   it needs a visitor held silent for the whole idle window.
+   limit; Go copies until one side closes. `reality_fallback_lifetime.rs` now times
+   both on the same settings and a silent target: the port closes at +300.002 s on
+   both sides, the official server is still open at +330.046 s (its inbound
+   `connIdle` does not reach the fallback path). The local test
+   (`crates/reality/tests/fallback.rs::a_visitor_that_says_nothing_is_closed_at_the_idle_limit`)
+   still pins the mechanism with a shortened timeout. **Closed** — the claim
+   survives measurement, and the test takes ~5.5 minutes because it has to wait out
+   the real limit.
 10. **A fragmenting client with ML-DSA-65.**
     `fragmenting_xray_client_with_mldsa_matches_the_oracle` drives a real Xray client
     that fragments its ClientHello (Xray 26.3.27's `streamSettings.finalmask`; the
@@ -1885,8 +1918,9 @@ same in prose. What is still open is named at the end.
     files describe one handshake and every shared label must match to the byte.
     **Closed.**
 
-What remains open is named in items 1 and 9. Two differences found while closing
-these are recorded with their measurements rather than as gaps: the useless-record
-bound (§5) and the PROXY header on every dial to the site (§7). A third difference
-recorded earlier still stands: a site that cannot be reached is a fallback to the
-cached shapes here, where Go closes the connection.
+Nothing on this list remains open. Two differences found while closing it are
+recorded with their measurements rather than as gaps: the useless-record bound (§5)
+and the PROXY header on every dial to the site (§7). The differences that remain are
+the intentional ones named at the top of this document — the cached-shape fallback
+for a site that cannot be reached, the probe-shaped flight, and the certificate's
+contents — not untested behaviour.
