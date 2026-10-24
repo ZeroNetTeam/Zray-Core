@@ -9149,6 +9149,22 @@ fn learn_post_handshake(
             let shapes = Arc::clone(&params.post_handshake);
             let resolver = Arc::clone(resolver);
             let destination = Destination::tcp(address.clone(), port);
+            // Go prefixes *every* dial to the site with the PROXY header when
+            // `xver` asks for one, the start-up probes included
+            // (`RL/tls.go:174-180`, `RL/record_detect.go:37,71`): a site behind
+            // a PROXY-aware front must see the listener as a client that
+            // announces itself, or it refuses the probes and the listener ends
+            // up with its own flight and budget instead of the site's.
+            let probe_stream = {
+                let mut stream = zero_config::StreamSettings::default();
+                if reality.fallback_xver != 0 {
+                    stream.direct = Some(Arc::new(zero_config::DirectPolicy {
+                        proxy_protocol: reality.fallback_xver,
+                        ..Default::default()
+                    }));
+                }
+                stream
+            };
             runtime.spawn(async move {
                 // The site is asked three ways, as Go asks it
                 // (`RL/record_detect.go:21-62`): with no ALPN, with http/1.1,
@@ -9160,7 +9176,7 @@ fn learn_post_handshake(
                     let learned = timeout(Duration::from_secs(15), async {
                         let site = outbound::connect_direct_with_resolver(
                             &destination,
-                            &zero_config::StreamSettings::default(),
+                            &probe_stream,
                             &resolver,
                         )
                         .await?;
@@ -9213,7 +9229,7 @@ fn learn_post_handshake(
                             || async {
                                 outbound::connect_direct_with_resolver(
                                     &destination,
-                                    &zero_config::StreamSettings::default(),
+                                    &probe_stream,
                                     &resolver,
                                 )
                                 .await
@@ -9232,7 +9248,12 @@ fn learn_post_handshake(
                     .await;
                     match budget {
                         Ok(Some(budget)) => {
-                            debug!(%name, budget, "REALITY target's record budget learned");
+                            debug!(
+                                %name,
+                                alpn = ?alpn.protocols,
+                                budget,
+                                "REALITY target's record budget learned"
+                            );
                             shapes.set_budget(&name, alpn.index, budget);
                         }
                         Ok(None) => debug!(
