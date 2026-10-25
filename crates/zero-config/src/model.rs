@@ -26,6 +26,10 @@ pub enum Transport {
     /// packet-up and stream-up split modes implemented by the carrier; HTTP/3
     /// supports stream-one, stream-up, and packet-up request streams.
     Xhttp(WebSocketConfig),
+    /// mKCP: a reliable stream over UDP (Xray's `network: "kcp"`/`"mkcp"`).
+    /// Xray replaced its KCP implementation in 24.9.30; this is that protocol,
+    /// not the kcp-go one that older clients speak.
+    Kcp(KcpSettings),
 }
 
 impl Transport {
@@ -36,6 +40,7 @@ impl Transport {
             Transport::HttpUpgrade(_) => "httpupgrade",
             Transport::Grpc(_) => "grpc",
             Transport::Xhttp(_) => "xhttp",
+            Transport::Kcp(_) => "kcp",
         }
     }
 
@@ -71,8 +76,114 @@ impl Transport {
                 supports_reality: settings.xhttp_http_version != XhttpHttpVersion::Http3,
                 supports_vision: false,
             },
+            // mKCP is its own byte-stream layer over UDP. TLS rides on top of
+            // it as an ordinary stream, but REALITY needs to own the TCP
+            // handshake and Vision needs a directly spliceable connection, so
+            // neither is available; Xray refuses REALITY over mKCP too.
+            Transport::Kcp(_) => CarrierCapabilities {
+                preserves_direct_stream: false,
+                supports_reality: false,
+                supports_vision: false,
+            },
         }
     }
+}
+
+/// Xray's `kcpSettings`, the mKCP tunables.
+///
+/// Defaults are Xray's, so a bare `"network": "kcp"` behaves identically on
+/// both. The two fields Xray removed in 24.9.30 — `header` and `seed` — are
+/// not represented: obfuscation is now requested with a `finalmask.udp` mask
+/// ([`KcpMask`]), and the configuration parser refuses the old keys instead of
+/// silently sending traffic no peer would understand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KcpSettings {
+    /// Largest segment, including the 18-byte header, as Xray's `mtu` means
+    /// it: a segment of at most this size is handed to one datagram.
+    pub mtu: u32,
+    /// Retransmission tick, in milliseconds.
+    pub tti: u32,
+    /// Sender capacity in MiB/s, translated to an in-flight segment count.
+    pub uplink_capacity: u32,
+    /// Receiver capacity in MiB/s, translated to a reorder window size.
+    pub downlink_capacity: u32,
+    /// Xray's `congestion`: adapt the send window to observed loss. Off by
+    /// default, and off in Xray unless the config asks for it.
+    pub congestion: bool,
+    /// Bytes of receiver reorder memory. Xray parses `readBufferSize` (MiB)
+    /// into this and its KCP code never reads it back; kept so a config that
+    /// sets it round-trips.
+    pub read_buffer: u32,
+    /// Bytes accepted into the send window before a write blocks (Xray's
+    /// `writeBufferSize`, MiB).
+    pub write_buffer: u32,
+    /// `finalmask.udp` layers applied to every datagram, outermost first.
+    /// Empty means raw KCP segments, which is what Xray sends when no mask is
+    /// configured.
+    pub masks: Arc<[KcpMask]>,
+}
+
+impl Default for KcpSettings {
+    fn default() -> Self {
+        Self {
+            mtu: 1350,
+            tti: 50,
+            uplink_capacity: 5,
+            downlink_capacity: 20,
+            congestion: false,
+            read_buffer: 2 * 1024 * 1024,
+            write_buffer: 2 * 1024 * 1024,
+            masks: Arc::from([]),
+        }
+    }
+}
+
+impl KcpSettings {
+    /// The limits Xray's config builder enforces, with the same wording, so a
+    /// configuration that starts there starts here. The MTU is Xray's own
+    /// unchecked value, except for the header size: a segment needs the
+    /// 18-byte header plus at least one byte of payload.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(10..=5000).contains(&self.tti) {
+            return Err(format!("invalid mKCP TTI: {}", self.tti));
+        }
+        if self.mtu < 19 {
+            return Err(format!("invalid mKCP MTU: {}", self.mtu));
+        }
+        Ok(())
+    }
+}
+
+/// One Xray `finalmask.udp` layer for the mKCP carrier.
+///
+/// These are the mask types `udpmaskLoader` registers for a UDP carrier
+/// (`infra/conf/transport_internet.go:1244-1254`) that make sense around KCP
+/// segments: the two mKCP frames and the six fixed-header shapes. They are
+/// what replaced the old `kcpSettings.header`/`seed` obfuscation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KcpMask {
+    /// `mkcp-original`: the pre-finalmask frame (FNV-1a prefix, length, XOR
+    /// chain), byte-identical to the old default obfuscation.
+    Original,
+    /// `mkcp-aes128gcm`: AES-128-GCM with the key `SHA256(password)[0..16]`.
+    Aes128Gcm(Arc<str>),
+    /// A `header-*` prefix. `domain` is the `header-dns` query name; the
+    /// other kinds ignore it.
+    Header {
+        kind: KcpHeader,
+        domain: Option<Arc<str>>,
+    },
+}
+
+/// The fixed-prefix shapes Xray's `header-*` UDP masks produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KcpHeader {
+    Srtp,
+    Utp,
+    Wechat,
+    Dtls,
+    Wireguard,
+    Dns,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

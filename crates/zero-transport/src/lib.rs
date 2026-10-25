@@ -10,6 +10,7 @@ pub mod httpupgrade;
 mod huffman;
 pub mod hysteria2;
 pub mod juicity;
+pub mod kcp;
 pub mod masque;
 pub mod masquerade;
 pub mod naive;

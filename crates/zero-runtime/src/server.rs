@@ -518,7 +518,7 @@ impl InboundRuntime {
             _ => None,
         };
         let transport = match &inbound.transport {
-            zero_config::Transport::Raw => None,
+            zero_config::Transport::Raw | zero_config::Transport::Kcp(_) => None,
             zero_config::Transport::WebSocket(w)
             | zero_config::Transport::HttpUpgrade(w)
             | zero_config::Transport::Grpc(w)
@@ -2018,6 +2018,24 @@ impl Server {
                 continue;
             }
 
+            if let zero_config::Transport::Kcp(settings) = &inbound.transport {
+                // mKCP is a UDP carrier: one socket, one session table, no
+                // TCP listener and no `accept_transport` step.
+                let socket = UdpSocket::bind(addr).await?;
+                let listener =
+                    zero_transport::kcp::Listener::from_socket(socket, crate::outbound::kcp_options(settings))
+                        .map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+                        })?;
+                info!(tag = %inbound.tag, %addr, protocol = inbound.protocol.kind(), "listening");
+                let me = Arc::clone(&self);
+                let id = InboundId(idx as u32);
+                handles_vec.push(tokio::spawn(async move {
+                    me.serve_kcp_loop(listener, id, addr).await;
+                }));
+                continue;
+            }
+
             if let zero_config::Transport::Xhttp(settings) = &inbound.transport {
                 if settings.xhttp_http_version == zero_config::XhttpHttpVersion::Http3 {
                     let zero_config::InboundSecurity::Tls(tls) = &inbound.security else {
@@ -2220,6 +2238,121 @@ impl Server {
                     backoff_ms = (backoff_ms * 2).min(1000);
                 }
             }
+        }
+    }
+
+    /// Accept mKCP conversations forever. There is no handshake at the carrier
+    /// layer, so each accepted conversation is served straight away and TLS
+    /// (when configured) is terminated inside it.
+    async fn serve_kcp_loop(
+        self: Arc<Self>,
+        mut listener: zero_transport::kcp::Listener,
+        id: InboundId,
+        local: SocketAddr,
+    ) {
+        loop {
+            match listener.accept().await {
+                Ok(connection) => {
+                    let peer = connection.peer_addr();
+                    let me = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        me.serve_kcp_connection(connection, peer, id, local).await;
+                    });
+                }
+                // The socket's reader task is gone: the listener was closed,
+                // and retrying would spin. The drain path drops the task.
+                Err(error) if error.kind() == std::io::ErrorKind::NotConnected => break,
+                Err(error) => {
+                    debug!(%error, "mKCP listener could not accept");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+    }
+
+    /// Everything one mKCP conversation goes through above the carrier:
+    /// certificate TLS when the inbound asks for it, then the protocol.
+    async fn serve_kcp_connection(
+        self: Arc<Self>,
+        connection: zero_transport::kcp::Connection,
+        peer: SocketAddr,
+        id: InboundId,
+        local: SocketAddr,
+    ) {
+        let stats = Arc::clone(&self.stats);
+        stats.accepted.fetch_add(1, Ordering::Relaxed);
+        let _active = ActiveGuard::new(Arc::clone(&stats));
+        let state = self.state.load_full();
+        let index = id.0 as usize;
+        let (Some(inbound), Some(compiled)) =
+            (state.config.inbounds.get(index), state.inbounds.get(index))
+        else {
+            stats.failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+
+        let mut conn = ConnInfo::default();
+        let secured: zero_core::BoxStream = match &inbound.security {
+            zero_config::InboundSecurity::None => boxed(connection),
+            zero_config::InboundSecurity::Tls(_) => {
+                let config = match &compiled.tls {
+                    Some(Ok(config)) => Arc::clone(config),
+                    Some(Err(error)) => {
+                        stats.failed.fetch_add(1, Ordering::Relaxed);
+                        debug!(%peer, %error, "inbound TLS configuration failed");
+                        return;
+                    }
+                    None => {
+                        stats.failed.fetch_add(1, Ordering::Relaxed);
+                        debug!(%peer, "inbound TLS configuration is missing");
+                        return;
+                    }
+                };
+                match timeout(handshake_timeout(), zero_security::server::accept(connection, config))
+                    .await
+                {
+                    Ok(Ok(stream)) => {
+                        let session = stream.get_ref().1;
+                        conn.server_name = session.server_name().map(Arc::from);
+                        conn.alpn = session.alpn_protocol().map(Arc::from);
+                        boxed(stream)
+                    }
+                    Ok(Err(error)) => {
+                        stats.failed.fetch_add(1, Ordering::Relaxed);
+                        debug!(%peer, %error, "inbound TLS handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        stats.failed.fetch_add(1, Ordering::Relaxed);
+                        debug!(%peer, "inbound TLS handshake timed out");
+                        return;
+                    }
+                }
+            }
+            // The configuration compiler refuses REALITY over mKCP, the way
+            // Xray does; reaching here means a hand-built config slipped past.
+            zero_config::InboundSecurity::Reality(_) => {
+                stats.failed.fetch_add(1, Ordering::Relaxed);
+                debug!(%peer, "REALITY cannot ride an mKCP inbound");
+                return;
+            }
+        };
+        conn.local = Some(local);
+
+        if let Err(e) = self
+            .handle(
+                secured,
+                peer,
+                id,
+                InboundSession {
+                    state,
+                    conn,
+                },
+            )
+            .await
+        {
+            stats.failed.fetch_add(1, Ordering::Relaxed);
+            debug!(%peer, error = %e, "session failed");
         }
     }
 
@@ -2577,7 +2710,13 @@ impl Server {
         compiled: &InboundRuntime,
     ) -> Result<Option<AcceptedTransport>, String> {
         let transport = &inbound.transport;
-        if matches!(transport, zero_config::Transport::Raw) {
+        if matches!(
+            transport,
+            zero_config::Transport::Raw | zero_config::Transport::Kcp(_)
+        ) {
+            // An mKCP session is already the carrier the protocol reads from;
+            // it was completed by `serve_kcp_connection`, either with TLS on
+            // top or bare.
             return Ok(Some((secured, None)));
         }
         let cfg = compiled
@@ -2607,7 +2746,9 @@ impl Server {
                     .await
                     .map(|(first, more)| (first, Some(more)))
                     .map_err(|error| format!("gRPC upgrade: {error}")),
-                zero_config::Transport::Raw | zero_config::Transport::Xhttp(_) => {
+                zero_config::Transport::Raw
+                | zero_config::Transport::Kcp(_)
+                | zero_config::Transport::Xhttp(_) => {
                     unreachable!("handled above")
                 }
             }
@@ -8557,7 +8698,7 @@ fn preserve_stream_host(stream: &mut zero_config::StreamSettings, host: &str) {
         }
     }
     match &mut stream.transport {
-        zero_config::Transport::Raw => {}
+        zero_config::Transport::Raw | zero_config::Transport::Kcp(_) => {}
         zero_config::Transport::WebSocket(config)
         | zero_config::Transport::HttpUpgrade(config)
         | zero_config::Transport::Grpc(config)
@@ -9287,7 +9428,7 @@ fn with_vless_response(stream: zero_core::BoxStream) -> zero_core::BoxStream {
 /// leave from (`sendThrough`, used when it is of the destination's family).
 /// Without the mark, a gateway's own traffic is caught again by the very
 /// rule that sent the client's here.
-async fn bind_outbound_udp(
+pub(crate) async fn bind_outbound_udp(
     ipv4: bool,
     sockopt: Option<&zero_config::Sockopt>,
 ) -> Result<UdpSocket, String> {

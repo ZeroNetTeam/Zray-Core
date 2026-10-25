@@ -774,6 +774,39 @@ async fn xhttp_over_http2_carries_payload_intact() {
     round_trip(&mut stream, &payload(4, 128 * 1024)).await;
 }
 
+/// mKCP with certificate TLS: unlike every TCP carrier, the TLS session is a
+/// stream *inside* the carrier, not the socket underneath it. A mistake there
+/// still passes Zray↔Zray if both ends make it, which is why the oracle suite
+/// has the same case against a real Xray.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mkcp_carries_payload_under_certificate_tls() {
+    let transport = json!({
+        "network": "kcp",
+        "kcpSettings": {"tti": 20},
+    });
+    let tunnel = tunnel("vless", true, transport).await;
+    let mut stream = socks_connect(tunnel.socks, tunnel.echo).await.unwrap();
+    round_trip(&mut stream, &payload(31, 64)).await;
+    round_trip(&mut stream, &payload(32, 256 * 1024)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn mkcp_keeps_concurrent_flows_separate() {
+    let transport = json!({"network": "kcp", "kcpSettings": {"tti": 20}});
+    let tunnel = tunnel("vless", true, transport).await;
+    let flows = (0..16u8).map(|seed| {
+        let socks = tunnel.socks;
+        let echo = tunnel.echo;
+        tokio::spawn(async move {
+            let mut stream = socks_connect(socks, echo).await.unwrap();
+            round_trip(&mut stream, &payload(seed, 32 * 1024)).await;
+        })
+    });
+    for flow in futures::future::join_all(flows).await {
+        flow.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn xhttp_over_http2_keeps_concurrent_flows_separate() {
     // HTTP/2 multiplexes every flow onto one connection, so a stream-id

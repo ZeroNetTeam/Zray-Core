@@ -481,3 +481,49 @@ proxy is set, since the proxy cannot resolve them; run them without the
 proxy variables.
 
 **Pinned by.** `zero-runtime` `an_environment_proxy_speaks_tls_only_when_its_url_says_so`.
+
+## mKCP (`network: "kcp"` / `"mkcp"`)
+
+Zray carries Xray's mKCP on both ends: an outbound dials it and an inbound
+listens for it, for any TCP-framed protocol (VLESS, VMess, Trojan,
+Shadowsocks) and with TLS inside it. It is the same protocol Xray has spoken
+since 24.9.30 — a reliable ordered stream over UDP: 24-byte segment header,
+conversation id, send/receive windows, per-number acknowledgements, fast
+retransmit, RFC 6298 round-trip estimation, keepalive and terminate commands.
+The wire is pinned against the official binary in both directions:
+`vless_over_mkcp_matches_the_oracle` (64 B and 96 KiB),
+`vmess_over_mkcp_matches_the_oracle`, `trojan_over_mkcp_matches_the_oracle`,
+`mkcp_with_certificate_tls_matches_the_oracle`, and the in-process
+`vless_over_mkcp_carries_payload_intact` /
+`mkcp_keeps_concurrent_flows_separate`.
+
+`kcpSettings` mirrors Xray 26.3.27: `mtu`, `tti`, `uplinkCapacity`,
+`downlinkCapacity`, `congestion`, `readBufferSize` and `writeBufferSize`, with
+Xray's defaults and its MiB reading of the two buffer fields. `congestion`
+really switches the congestion window on or off, as it does in Xray; it is off
+by default, also as in Xray.
+
+**Obfuscation has moved, and the old keys are refused.** Xray removed
+`kcpSettings.header` and `kcpSettings.seed` in 24.9.30; a config that still sets
+either is refused here with Xray's migration message, not silently sent
+unobfuscated. The replacement is `streamSettings.finalmask.udp`, and Zray
+understands the layers that make sense around KCP segments:
+`mkcp-original`, `mkcp-aes128gcm` (`settings.password`), and the fixed-prefix
+`header-srtp`, `header-utp`, `header-wechat`, `header-dtls`, `header-wireguard`
+and `header-dns` shapes. They stack outermost-first, exactly as Xray applies
+them. `header-custom`, `sudoku`, `xdns` and `xicmp` masks are not implemented
+and are refused by name rather than ignored.
+
+**Not carried, on purpose.** REALITY and Vision are refused over mKCP, as Xray
+refuses them: REALITY authenticates inside a TCP ClientHello and Vision splices
+the security stream, neither of which a UDP carrier provides. TLS itself is
+fine, because it is just a stream inside KCP.
+
+Two small divergences: no forward error correction (Xray dropped FEC in the
+24.9.30 rewrite), and an MTU below 19 bytes is refused at parse time where Xray
+does not validate the value at all (a segment could not hold its own header).
+
+**Pinned by.** `zero-runtime/tests/xray_oracle.rs` (the oracle tests above),
+`zero-config` (`kcp_settings_*`, removed-key refusals, mask parsing),
+`zero-transport`'s KCP tests, and `zero-discovery`'s share-link test for
+`type=kcp` links (which refuse `seed`/`headerType` the same way).

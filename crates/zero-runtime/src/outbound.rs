@@ -701,6 +701,11 @@ pub(crate) fn tls_params(stream: &StreamSettings, fallback_host: &str) -> Option
                 p = p.with_alpn(&t.alpn.iter().map(|a| a.to_string()).collect::<Vec<_>>());
             } else if matches!(stream.transport, Transport::Grpc(_)) {
                 p = p.with_alpn(&["h2"]);
+            } else if matches!(stream.transport, Transport::Kcp(_)) {
+                // Xray's TLS config defaults to this pair for any carrier that
+                // does not narrow it. KCP has no HTTP layer of its own, so it
+                // is the plain Xray default.
+                p = p.with_alpn(&["h2", "http/1.1"]);
             } else if matches!(
                 &stream.transport,
                 Transport::Xhttp(x) if x.xhttp_http_version == XhttpHttpVersion::Http2
@@ -1144,7 +1149,9 @@ async fn connect_resolved(
     }
     let t_resolve = t0.elapsed();
 
-    let out = if reuses_h2_stream_one(outbound) {
+    let out = if matches!(&outbound.stream.transport, Transport::Kcp(_)) {
+        connect_kcp(outbound, destination, &address, &addrs).await?
+    } else if reuses_h2_stream_one(outbound) {
         connect_xhttp_stream_one(outbound, destination, &address, &addrs).await?
     } else {
         let t1 = std::time::Instant::now();
@@ -1177,6 +1184,101 @@ async fn connect_resolved(
             });
     }
     Ok(out)
+}
+
+/// One mKCP session to `outbound`'s server, with TLS and the protocol header
+/// on top.
+///
+/// This is the one carrier whose order is inverted: Xray wraps TLS *around*
+/// the KCP stream (`transport/internet/kcp/dialer.go:99`), because KCP is what
+/// produces a byte stream from UDP in the first place. So there is no
+/// `build_stack` here; the socket is bound and connected first, then security,
+/// then the protocol's first flight.
+async fn connect_kcp(
+    outbound: &Outbound,
+    destination: &Destination,
+    address: &zero_core::Address,
+    addrs: &[SocketAddr],
+) -> Result<BoxStream, Failure> {
+    let Transport::Kcp(settings) = &outbound.stream.transport else {
+        return Err(Failure::new(FailureKind::LocalPolicy, Stage::RequestSent)
+            .with_detail("connect_kcp called for a non-mKCP carrier"));
+    };
+    let target = *addrs.first().ok_or_else(|| {
+        Failure::new(FailureKind::DnsNoData, Stage::Resolving)
+            .with_detail("the mKCP server has no address")
+    })?;
+    let socket = crate::server::bind_outbound_udp(
+        target.is_ipv4(),
+        Some(&outbound.stream.sockopt),
+    )
+    .await
+    .map_err(|error| {
+        Failure::new(FailureKind::LocalPolicy, Stage::SocketConnected)
+            .with_detail(format!("mKCP socket: {error}"))
+    })?;
+    let connection = zero_transport::kcp::dial_socket(socket, target, kcp_options(settings))
+        .await
+        .map_err(|error| {
+            Failure::new(FailureKind::LocalPolicy, Stage::SocketConnected)
+                .with_detail(format!("mKCP session: {error}"))
+        })?;
+    let fallback_host = address.host_string();
+    let secured = secure(outbound, boxed(connection), &fallback_host, None).await?;
+    finish_protocol(outbound, destination, secured).await
+}
+
+/// The protocol layer of [`finish_stack`] for a carrier that is already
+/// established (and already carries its security layer).
+async fn finish_protocol(
+    outbound: &Outbound,
+    destination: &Destination,
+    stream: BoxStream,
+) -> Result<BoxStream, Failure> {
+    let header = protocol_header(outbound, destination)?;
+    match &outbound.protocol {
+        OutboundProtocol::Vmess(v) => wrap_vmess(stream, v, destination).await,
+        OutboundProtocol::Vless(v) => send_vless(stream, v, destination, &header).await,
+        _ => Ok(with_header(stream, header)),
+    }
+}
+
+/// The runtime tunables of a parsed `kcpSettings`, including the
+/// `finalmask.udp` layers that obfuscate every datagram.
+pub(crate) fn kcp_options(
+    settings: &zero_config::KcpSettings,
+) -> zero_transport::kcp::Options {
+    use zero_config::{KcpHeader, KcpMask};
+    use zero_transport::kcp::{HeaderKind, Mask};
+    zero_transport::kcp::Options {
+        mtu: settings.mtu,
+        tti: settings.tti,
+        uplink_capacity: settings.uplink_capacity,
+        downlink_capacity: settings.downlink_capacity,
+        congestion: settings.congestion,
+        read_buffer: settings.read_buffer,
+        write_buffer: settings.write_buffer,
+        masks: settings
+            .masks
+            .iter()
+            .map(|mask| match mask {
+                KcpMask::Original => Mask::Original,
+                KcpMask::Aes128Gcm(password) => Mask::Aes128Gcm(password.clone()),
+                KcpMask::Header { kind, domain } => Mask::Header {
+                    kind: match kind {
+                        KcpHeader::Srtp => HeaderKind::Srtp,
+                        KcpHeader::Utp => HeaderKind::Utp,
+                        KcpHeader::Wechat => HeaderKind::Wechat,
+                        KcpHeader::Dtls => HeaderKind::Dtls,
+                        KcpHeader::Wireguard => HeaderKind::Wireguard,
+                        KcpHeader::Dns => HeaderKind::Dns,
+                    },
+                    domain: domain.clone(),
+                },
+            })
+            .collect::<Vec<_>>()
+            .into(),
+    }
 }
 
 /// The name Cloudflare serves its one shared ECH list under. Every site on
@@ -2602,6 +2704,11 @@ async fn finish_stack(
     let header = protocol_header(outbound, destination)?;
 
     match &stream.transport {
+        // mKCP is established by `connect_kcp`: socket, session and TLS are
+        // all built before this point, because TLS rides *inside* mKCP rather
+        // than outside it. Nothing here can build it over an existing stream.
+        Transport::Kcp(_) => Err(Failure::new(FailureKind::LocalPolicy, Stage::RequestSent)
+            .with_detail("mKCP must be established by connect_kcp, not built over TCP")),
         Transport::Raw => {
             let s = secured;
             if let OutboundProtocol::Vmess(v) = &outbound.protocol {

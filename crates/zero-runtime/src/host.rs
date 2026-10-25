@@ -325,6 +325,20 @@ fn listener_differs(old: &Inbound, new: &Inbound) -> bool {
         zero_config::Transport::Xhttp(settings)
             if settings.xhttp_http_version == zero_config::XhttpHttpVersion::Http3
     );
+    // An mKCP inbound binds a UDP socket with its own session table and
+    // tunables; none of that can be swapped under a running listener, and an
+    // inbound that switches between mKCP and a TCP carrier must rebind.
+    let old_kcp = match &old.transport {
+        zero_config::Transport::Kcp(settings) => Some(settings.clone()),
+        _ => None,
+    };
+    let new_kcp = match &new.transport {
+        zero_config::Transport::Kcp(settings) => Some(settings.clone()),
+        _ => None,
+    };
+    if old_kcp != new_kcp {
+        return true;
+    }
     // A QUIC endpoint holds its certificate from when it was made. Compared
     // in memory only: the text holds key material and is never printed.
     if quic

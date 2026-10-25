@@ -227,6 +227,22 @@ async fn wait_for(address: SocketAddr) -> bool {
     false
 }
 
+/// Wait until the server side of `carrier` is up.
+///
+/// A TCP carrier can be probed by connecting. A UDP carrier cannot: there is
+/// no handshake to observe, and a probe would just be a stray datagram. Give
+/// the process its startup time instead; the first real round trip retries
+/// through the carrier's own acknowledgements, so a slightly late bind heals
+/// as long as the process is alive.
+async fn wait_for_carrier(carrier: &str, address: SocketAddr) -> bool {
+    if carrier.contains("kcp") {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        true
+    } else {
+        wait_for(address).await
+    }
+}
+
 /// Drive a SOCKS5 CONNECT to the point where the server's reply code is
 /// known, leaving the caller to decide what a refusal means.
 ///
@@ -439,6 +455,72 @@ fn transport(name: &str) -> Value {
             "httpupgradeSettings": {"path": "/tunnel", "host": "oracle.example"}
         }),
         "grpc" => json!({"network": "grpc", "grpcSettings": {"serviceName": "TunnelService"}}),
+        "kcp" => json!({
+            "network": "kcp",
+            "kcpSettings": {
+                "mtu": 1350,
+                "tti": 50,
+                "uplinkCapacity": 5,
+                "downlinkCapacity": 20
+            }
+        }),
+        // The same carrier under both `finalmask.udp` layers mKCP has,
+        // outermost first. Xray stacks them, so this exercises the layer
+        // order as well as each frame.
+        "mkcp-mask" => json!({
+            "network": "mkcp",
+            "kcpSettings": {"mtu": 1350, "tti": 50},
+            "finalmask": {"udp": [
+                {"type": "mkcp-original"},
+                {"type": "mkcp-aes128gcm", "settings": {"password": "an-oracle-mask"}}
+            ]}
+        }),
+        // Each mKCP obfuscation on its own, then the two `header-*` shapes
+        // stacked over `mkcp-original` so the header is the outer layer.
+        "mkcp-original" => json!({
+            "network": "kcp",
+            "kcpSettings": {"mtu": 1350, "tti": 50},
+            "finalmask": {"udp": [{"type": "mkcp-original"}]}
+        }),
+        "mkcp-aes128gcm" => json!({
+            "network": "kcp",
+            "kcpSettings": {"mtu": 1350, "tti": 50},
+            "finalmask": {"udp": [
+                {"type": "mkcp-aes128gcm", "settings": {"password": "an-oracle-password"}}
+            ]}
+        }),
+        "mkcp-header-srtp" => json!({
+            "network": "kcp",
+            "kcpSettings": {"mtu": 1350, "tti": 50},
+            "finalmask": {"udp": [
+                {"type": "header-srtp"},
+                {"type": "mkcp-original"}
+            ]}
+        }),
+        "mkcp-header-dns" => json!({
+            "network": "kcp",
+            "kcpSettings": {"mtu": 1350, "tti": 50},
+            "finalmask": {"udp": [
+                {"type": "header-dns", "settings": {"domain": "www.example.com"}},
+                {"type": "mkcp-original"}
+            ]}
+        }),
+        // Every fixed header at once, so a wrong size or a wrong layer order
+        // anywhere in the stack breaks the round trip instead of hiding.
+        "mkcp-header-all" => json!({
+            "network": "kcp",
+            "kcpSettings": {"mtu": 1350, "tti": 50},
+            "finalmask": {"udp": [
+                {"type": "header-srtp"},
+                {"type": "header-utp"},
+                {"type": "header-wechat"},
+                {"type": "header-dtls"},
+                {"type": "header-wireguard"},
+                {"type": "header-dns", "settings": {"domain": "www.example.com"}},
+                {"type": "mkcp-original"},
+                {"type": "mkcp-aes128gcm", "settings": {"password": "an-oracle-password"}}
+            ]}
+        }),
         "xhttp" => json!({
             "network": "xhttp",
             "xhttpSettings": {"path": "/tunnel", "mode": "stream-one", "host": "oracle.example"}
@@ -988,7 +1070,7 @@ async fn zray_client_to_xray_server_mux(binary: &str, protocol: &str, carrier: &
 
     let relay = SocketAddr::new("127.0.0.1".parse().unwrap(), relay_port);
     assert!(
-        wait_for(relay).await,
+        wait_for_carrier(carrier, relay).await,
         "the oracle never listened on {relay}; is {protocol}/{carrier} supported by this build?"
     );
     assert!(wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port)).await);
@@ -1054,7 +1136,11 @@ async fn xray_client_to_zray_server_mux(binary: &str, protocol: &str, carrier: &
         }),
     );
 
-    assert!(wait_for(SocketAddr::new("127.0.0.1".parse().unwrap(), relay_port)).await);
+    assert!(wait_for_carrier(
+        carrier,
+        SocketAddr::new("127.0.0.1".parse().unwrap(), relay_port)
+    )
+    .await);
     let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
     assert!(
         wait_for(socks).await,
@@ -1227,6 +1313,206 @@ differential!(
     "httpupgrade"
 );
 differential!(vless_over_grpc_matches_the_oracle, "vless", "grpc");
+differential!(vless_over_mkcp_matches_the_oracle, "vless", "kcp");
+differential!(vmess_over_mkcp_matches_the_oracle, "vmess", "kcp");
+differential!(trojan_over_mkcp_matches_the_oracle, "trojan", "kcp");
+differential!(
+    vless_over_masked_mkcp_matches_the_oracle,
+    "vless",
+    "mkcp-mask"
+);
+differential!(
+    vless_over_mkcp_with_mkcp_original_matches_the_oracle,
+    "vless",
+    "mkcp-original"
+);
+differential!(
+    vless_over_mkcp_with_aes128gcm_matches_the_oracle,
+    "vless",
+    "mkcp-aes128gcm"
+);
+differential!(
+    vless_over_mkcp_with_header_srtp_matches_the_oracle,
+    "vless",
+    "mkcp-header-srtp"
+);
+differential!(
+    vless_over_mkcp_with_header_dns_matches_the_oracle,
+    "vless",
+    "mkcp-header-dns"
+);
+differential!(
+    vless_over_mkcp_with_every_header_masks_the_oracle,
+    "vless",
+    "mkcp-header-all"
+);
+
+/// mKCP under certificate TLS, both directions.
+///
+/// This is the ordering that makes mKCP unlike every TCP carrier: TLS is a
+/// stream *inside* KCP, not the socket underneath it. A port that puts TLS
+/// below the carrier still passes Zray↔Zray and cannot connect to Xray.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an Xray binary; see the module documentation"]
+async fn mkcp_with_certificate_tls_matches_the_oracle() {
+    let binary = oracle_binary().unwrap_or_else(|reason| {
+        panic!("the oracle comparison cannot run: {reason}");
+    });
+    eprintln!(
+        "oracle: {} (vless over mkcp + tls)",
+        oracle_version(&binary)
+    );
+
+    let kcp_settings = json!({
+        "mtu": 1300,
+        "tti": 20,
+        "uplinkCapacity": 10,
+        "downlinkCapacity": 20
+    });
+
+    // Zray client -> Xray server.
+    {
+        let echo = echo_service().await;
+        let relay_port = free_port();
+        let socks_port = free_port();
+        let (server_settings, client_settings) = protocol_settings("vless", relay_port);
+        let _oracle = spawn_oracle(
+            &binary,
+            json!({
+                "log": {"loglevel": "debug"},
+                "inbounds": [{
+                    "tag": "in",
+                    "listen": "127.0.0.1",
+                    "port": relay_port,
+                    "protocol": "vless",
+                    "settings": server_settings,
+                    "streamSettings": {
+                        "network": "mkcp",
+                        "kcpSettings": kcp_settings,
+                        "security": "tls",
+                        "tlsSettings": {"certificates": [{
+                            "certificate": [DECOY_CERTIFICATE],
+                            "key": [DECOY_PRIVATE_KEY],
+                        }]},
+                    },
+                }],
+                "outbounds": [oracle_loopback_freedom()],
+            }),
+        );
+        spawn_zray(json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "port": socks_port,
+                "protocol": "socks",
+            }],
+            "outbounds": [{
+                "tag": "proxy",
+                "protocol": "vless",
+                "settings": client_settings,
+                "streamSettings": {
+                    "network": "mkcp",
+                    "kcpSettings": kcp_settings,
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "zray.test",
+                        "certificates": [{"usage": "verify", "certificate": [LOOPBACK_CA]}],
+                    },
+                },
+            }],
+        }));
+        let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+        assert!(wait_for(socks).await);
+        // No handshake at the carrier layer to observe, so give the server a
+        // moment and let the first connection retry if it was early.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let mut tunnel = None;
+        for _ in 0..5 {
+            match socks_connect(socks, echo).await {
+                Ok(stream) => {
+                    tunnel = Some(stream);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+        let mut tunnel = tunnel.expect("Zray never reached the Xray mKCP server");
+        round_trip(&mut tunnel, &payload(31, 64)).await;
+        round_trip(&mut tunnel, &payload(32, 96 * 1024)).await;
+    }
+
+    // Xray client -> Zray server.
+    {
+        let echo = echo_service().await;
+        let relay_port = free_port();
+        let socks_port = free_port();
+        let (server_settings, client_settings) = protocol_settings("vless", relay_port);
+        spawn_zray(json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "tag": "in",
+                "listen": "127.0.0.1",
+                "port": relay_port,
+                "protocol": "vless",
+                "settings": server_settings,
+                "streamSettings": {
+                    "network": "mkcp",
+                    "kcpSettings": kcp_settings,
+                    "security": "tls",
+                    "tlsSettings": {"certificates": [{
+                        "certificate": [DECOY_CERTIFICATE],
+                        "key": [DECOY_PRIVATE_KEY],
+                    }]},
+                },
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+        }));
+        let _oracle = spawn_oracle(
+            &binary,
+            json!({
+                "log": {"loglevel": "debug"},
+                "inbounds": [{
+                    "tag": "socks-in",
+                    "listen": "127.0.0.1",
+                    "port": socks_port,
+                    "protocol": "socks",
+                    "settings": {"udp": false},
+                }],
+                "outbounds": [{
+                    "tag": "proxy",
+                    "protocol": "vless",
+                    "settings": client_settings,
+                    "streamSettings": {
+                        "network": "mkcp",
+                        "kcpSettings": kcp_settings,
+                        "security": "tls",
+                        "tlsSettings": {
+                            "serverName": "zray.test",
+                            "pinnedPeerCertSha256": LOOPBACK_CERT_SHA256,
+                        },
+                    },
+                }],
+            }),
+        );
+        let socks = SocketAddr::new("127.0.0.1".parse().unwrap(), socks_port);
+        assert!(wait_for(socks).await);
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let mut tunnel = None;
+        for _ in 0..5 {
+            match socks_connect(socks, echo).await {
+                Ok(stream) => {
+                    tunnel = Some(stream);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+        let mut tunnel = tunnel.expect("Xray never reached the Zray mKCP server");
+        round_trip(&mut tunnel, &payload(33, 64)).await;
+        round_trip(&mut tunnel, &payload(34, 96 * 1024)).await;
+    }
+}
 
 /// Mux.cool with TCP streams, both ways round. Each end pads a session's
 /// first small writes with keep-alive frames that carry data, and relies on

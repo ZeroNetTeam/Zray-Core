@@ -307,6 +307,19 @@ fn grpc() -> Value {
     json!({"network": "grpc", "grpcSettings": {"serviceName": "TunnelService"}})
 }
 
+fn kcp() -> Value {
+    // Small windows keep the test fast; the values are still Xray's shape.
+    json!({
+        "network": "kcp",
+        "kcpSettings": {
+            "mtu": 1350,
+            "tti": 20,
+            "uplinkCapacity": 10,
+            "downlinkCapacity": 20,
+        },
+    })
+}
+
 fn xhttp(mode: &str, version: &str) -> Value {
     // `httpVersion` belongs inside `xhttpSettings`; at the top level of
     // `streamSettings` it is silently ignored and the version falls back to an
@@ -370,6 +383,38 @@ async fn vless_over_websocket_carries_payload_intact() {
     round_trip(&mut stream, &payload(9, 64)).await;
     // Larger than one WebSocket frame, so frame reassembly is exercised.
     round_trip(&mut stream, &payload(10, 256 * 1024)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vless_over_mkcp_carries_payload_intact() {
+    let tunnel = tunnel("vless", kcp()).await;
+    let mut stream = socks_connect(tunnel.socks, tunnel.echo).await.unwrap();
+    round_trip(&mut stream, &payload(41, 64)).await;
+    // Several windows' worth, so acknowledgements, retransmission and the
+    // reorder buffer all run.
+    round_trip(&mut stream, &payload(42, 256 * 1024)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vmess_over_mkcp_carries_payload_intact() {
+    let tunnel = tunnel("vmess", kcp()).await;
+    let mut stream = socks_connect(tunnel.socks, tunnel.echo).await.unwrap();
+    round_trip(&mut stream, &payload(43, 64)).await;
+    round_trip(&mut stream, &payload(44, 128 * 1024)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trojan_over_mkcp_carries_payload_intact() {
+    let tunnel = tunnel("trojan", kcp()).await;
+    let mut stream = socks_connect(tunnel.socks, tunnel.echo).await.unwrap();
+    round_trip(&mut stream, &payload(45, 64)).await;
+    round_trip(&mut stream, &payload(46, 64 * 1024)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mkcp_keeps_concurrent_flows_separate() {
+    let tunnel = tunnel("vless", kcp()).await;
+    concurrent_flows(&tunnel, 32, 16 * 1024).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -7848,6 +7848,7 @@ dependencies = [
 name = "zero-transport"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm 0.10.3",
  "base64 0.22.1",
  "blake2 0.10.6",
  "bytes",
@@ -7865,6 +7866,7 @@ dependencies = [
  "ring",
  "rustls",
  "sha1 0.10.7",
+ "sha2 0.10.9",
  "tokio",
  "tokio-rustls",
  "tracing",

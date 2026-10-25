@@ -1232,6 +1232,45 @@ fn build_stream(q: &BTreeMap<String, String>, host: &str) -> Result<StreamSettin
             }
             Transport::Xhttp(config)
         }
+        "kcp" | "mkcp" => {
+            // A link can name the tunables Xray's `kcpSettings` still has.
+            // `headerType` and `seed` are the removed obfuscation keys; a
+            // link that still carries them is refused with what replaced
+            // them, rather than silently dialling with no obfuscation.
+            for key in ["seed", "headertype"] {
+                if q.get(key).is_some_and(|value| !value.trim().is_empty()) {
+                    return Err(format!(
+                        "{key}: The feature mkcp header & seed has been removed and migrated to \
+                         finalmask/udp \"mkcp-original\" and \"mkcp-aes128gcm\""
+                    ));
+                }
+            }
+            let mut kcp = KcpSettings::default();
+            let field = |key: &str, target: &mut u32| -> Result<(), String> {
+                match q.get(key).filter(|value| !value.trim().is_empty()) {
+                    None => Ok(()),
+                    Some(value) => {
+                        *target = value
+                            .trim()
+                            .parse()
+                            .map_err(|_| format!("{key} must be a whole number"))?;
+                        Ok(())
+                    }
+                }
+            };
+            field("mtu", &mut kcp.mtu)?;
+            field("tti", &mut kcp.tti)?;
+            field("uplinkcapacity", &mut kcp.uplink_capacity)?;
+            field("downlinkcapacity", &mut kcp.downlink_capacity)?;
+            if q.get("congestion").is_some_and(|value| !value.trim().is_empty()) {
+                kcp.congestion = matches!(
+                    q.get("congestion").map(|value| value.trim()),
+                    Some("1" | "true" | "yes")
+                );
+            }
+            kcp.validate()?;
+            Transport::Kcp(kcp)
+        }
         other => return Err(format!("unsupported transport type {other:?}")),
     };
 

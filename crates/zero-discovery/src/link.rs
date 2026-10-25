@@ -131,7 +131,9 @@ impl Candidate {
                     ws.host.as_deref()
                 }
                 Transport::Xhttp(xhttp) => xhttp.host.as_deref().or(Some(xhttp.path.as_ref())),
-                Transport::Raw => None,
+                // mKCP has no HTTP layer and no host header; the wire name is
+                // the TLS server name when there is one, and nothing otherwise.
+                Transport::Raw | Transport::Kcp(_) => None,
             })
             .filter(|name| !name.is_empty())
             .unwrap_or_default()

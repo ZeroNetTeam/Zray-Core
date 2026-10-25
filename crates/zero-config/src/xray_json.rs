@@ -782,6 +782,7 @@ fn validate_inbound_transport(transport: &Transport, path: &str) -> R<()> {
             | Transport::HttpUpgrade(_)
             | Transport::Grpc(_)
             | Transport::Xhttp(_)
+            | Transport::Kcp(_)
     ) {
         Ok(())
     } else {
@@ -800,6 +801,7 @@ fn parse_inbound_transport(v: &Value, path: &str) -> R<Transport> {
             v.get("httpupgradeSettings"),
         ))),
         "grpc" => Ok(Transport::Grpc(parse_grpc(v.get("grpcSettings")))),
+        "kcp" | "mkcp" => Ok(Transport::Kcp(parse_kcp(v, path)?)),
         "xhttp" | "splithttp" => {
             let config = parse_xhttp(xhttp_settings(v), v, path)?;
             if matches!(
@@ -4323,6 +4325,7 @@ fn parse_stream(v: &Value, path: &str, out: &mut ParseOutput) -> R<StreamSetting
         "ws" => Transport::WebSocket(parse_ws(v.get("wsSettings"))),
         "httpupgrade" => Transport::HttpUpgrade(parse_ws(v.get("httpupgradeSettings"))),
         "grpc" => Transport::Grpc(parse_grpc(v.get("grpcSettings"))),
+        "kcp" | "mkcp" => Transport::Kcp(parse_kcp(v, path)?),
         "xhttp" | "splithttp" => Transport::Xhttp(parse_xhttp(xhttp_settings(v), v, path)?),
         other => {
             return Err(format!(
@@ -4541,6 +4544,10 @@ fn parse_stream(v: &Value, path: &str, out: &mut ParseOutput) -> R<StreamSetting
         .unwrap_or_default();
 
     let evasion = match v.get("finalmask") {
+        // An mKCP stream has already taken its `finalmask.udp` layers into
+        // the transport; there is no TCP connection underneath for a
+        // fragment, noise or keepalive mask to shape.
+        _ if matches!(transport, Transport::Kcp(_)) => Evasion::default(),
         Some(f) => parse_finalmask(f, path)?,
         None => Evasion::default(),
     };
@@ -4901,6 +4908,172 @@ pub(crate) fn grpc_paths(service: &str) -> (String, Option<String>) {
     let mut names = ending.split('|');
     let single = names.next().unwrap_or(ending);
     (join(single), names.next().map(join))
+}
+
+/// `kcpSettings` and the `finalmask.udp` layers of one mKCP stream.
+///
+/// Every field is optional; absent means Xray's default. `header` and `seed`
+/// are removed features in current Xray (`KCPConfig.Build`,
+/// `infra/conf/transport_internet.go:110`) and are refused here with the same
+/// instruction it gives: obfuscation lives in `finalmask.udp` now.
+fn parse_kcp(stream: &Value, path: &str) -> R<KcpSettings> {
+    let mut kcp = KcpSettings::default();
+    if let Some(settings) = stream.get("kcpSettings").filter(|value| !value.is_null()) {
+        if settings.get("header").is_some() {
+            return Err(removed_kcp_obfuscation(path, "header"));
+        }
+        if settings.get("seed").is_some_and(|value| !value.is_null()) {
+            return Err(removed_kcp_obfuscation(path, "seed"));
+        }
+        let field = |name: &str| -> R<Option<u32>> {
+            match settings.get(name) {
+                None | Some(Value::Null) => Ok(None),
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|number| u32::try_from(number).ok())
+                    .map(Some)
+                    .ok_or_else(|| {
+                        format!(
+                            "{path}.streamSettings.kcpSettings.{name} must be a non-negative 32-bit integer"
+                        )
+                    }),
+            }
+        };
+        if let Some(value) = field("mtu")? {
+            kcp.mtu = value;
+        }
+        if let Some(value) = field("tti")? {
+            kcp.tti = value;
+        }
+        if let Some(value) = field("uplinkCapacity")? {
+            kcp.uplink_capacity = value;
+        }
+        if let Some(value) = field("downlinkCapacity")? {
+            kcp.downlink_capacity = value;
+        }
+        if let Some(value) = settings.get("congestion").filter(|value| !value.is_null()) {
+            kcp.congestion = value.as_bool().ok_or_else(|| {
+                format!("{path}.streamSettings.kcpSettings.congestion must be true or false")
+            })?;
+        }
+        // Xray reads these as mebibytes (`KCPConfig.Build`): a positive value
+        // is that many MiB, zero is its 512 KiB floor, absent is 2 MiB.
+        if let Some(value) = field("readBufferSize")? {
+            kcp.read_buffer = buffer_size(value);
+        }
+        if let Some(value) = field("writeBufferSize")? {
+            kcp.write_buffer = buffer_size(value);
+        }
+    }
+    kcp.masks = parse_mkcp_masks(stream.get("finalmask"), path)?.into();
+    kcp.validate()
+        .map_err(|error| format!("{path}.streamSettings.kcpSettings: {error}"))?;
+    Ok(kcp)
+}
+
+fn buffer_size(mebibytes: u32) -> u32 {
+    if mebibytes > 0 {
+        mebibytes.saturating_mul(1024 * 1024)
+    } else {
+        512 * 1024
+    }
+}
+
+/// Xray's error for the two obfuscation keys it removed, naming what replaced
+/// them so a config can be migrated rather than guessed at. The wording is
+/// `errors.PrintRemovedFeatureError`'s, which is what the pinned binary
+/// prints.
+fn removed_kcp_obfuscation(path: &str, key: &str) -> String {
+    format!(
+        "{path}.streamSettings.kcpSettings.{key}: The feature mkcp header & seed has been removed \
+         and migrated to finalmask/udp header-* & mkcp-original & mkcp-aes128gcm. \
+         Please update your config(s) according to release note and documentation."
+    )
+}
+
+/// The `finalmask.udp` layers that apply to an mKCP datagram, outermost
+/// first. A type that is not a mask for KCP is refused: those masks belong to
+/// a different carrier, and applying nothing is not what the config asked for.
+fn parse_mkcp_masks(finalmask: Option<&Value>, path: &str) -> R<Vec<KcpMask>> {
+    let mut masks = Vec::new();
+    let Some(udp) = finalmask
+        .filter(|value| !value.is_null())
+        .and_then(|value| value.get("udp"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(masks);
+    };
+    for (index, entry) in udp.iter().enumerate() {
+        let here = format!("{path}.streamSettings.finalmask.udp[{index}]");
+        let entry_type = entry.get("type").and_then(Value::as_str).unwrap_or("");
+        match entry_type {
+            "mkcp-original" => masks.push(KcpMask::Original),
+            "mkcp-aes128gcm" => {
+                let password = entry
+                    .get("settings")
+                    .and_then(|settings| settings.get("password"))
+                    .and_then(Value::as_str)
+                    .filter(|password| !password.is_empty())
+                    .ok_or_else(|| {
+                        format!("{here}.settings.password is required for \"mkcp-aes128gcm\"")
+                    })?;
+                masks.push(KcpMask::Aes128Gcm(password.into()));
+            }
+            "header-srtp" | "header-utp" | "header-wechat" | "header-dtls"
+            | "header-wireguard" => {
+                let kind =
+                    kcp_header_kind(entry_type).expect("every name in this arm has a KcpHeader");
+                masks.push(KcpMask::Header { kind, domain: None });
+            }
+            "header-dns" => {
+                // `Dns.Build` defaults an absent or empty domain to
+                // `www.baidu.com`; the transport does the same for `None`.
+                let domain = match entry.get("settings") {
+                    None | Some(Value::Null) => None,
+                    Some(settings) => match settings.get("domain") {
+                        None | Some(Value::Null) => None,
+                        Some(value) => Some(
+                            value
+                                .as_str()
+                                .filter(|domain| !domain.is_empty())
+                                .ok_or_else(|| {
+                                    format!("{here}.settings.domain must be a string")
+                                })?
+                                .to_owned(),
+                        ),
+                    },
+                };
+                masks.push(KcpMask::Header {
+                    kind: KcpHeader::Dns,
+                    domain: domain.map(Into::into),
+                });
+            }
+            "header-custom" => {
+                return Err(format!(
+                    "{here}.type: the \"header-custom\" mask is not implemented"
+                ))
+            }
+            other => {
+                return Err(format!(
+                    "{here}.type: {other:?} is not an mKCP mask; use \"mkcp-original\", \
+                     \"mkcp-aes128gcm\", or one of the \"header-*\" masks"
+                ))
+            }
+        }
+    }
+    Ok(masks)
+}
+
+fn kcp_header_kind(name: &str) -> Option<KcpHeader> {
+    Some(match name {
+        "header-srtp" => KcpHeader::Srtp,
+        "header-utp" => KcpHeader::Utp,
+        "header-wechat" => KcpHeader::Wechat,
+        "header-dtls" => KcpHeader::Dtls,
+        "header-wireguard" => KcpHeader::Wireguard,
+        "header-dns" => KcpHeader::Dns,
+        _ => return None,
+    })
 }
 
 fn parse_grpc(v: Option<&Value>) -> WebSocketConfig {
@@ -5309,6 +5482,16 @@ fn parse_finalmask(v: &Value, path: &str) -> R<Evasion> {
                         entry.get("settings"),
                         &format!("{path}.finalmask.udp[{i}]"),
                     )?)
+                }
+                // The mKCP masks are taken by `parse_kcp` for a stream whose
+                // `network` is "kcp"/"mkcp". Anywhere else there is no KCP
+                // session for them to wrap.
+                "mkcp-original" | "mkcp-aes128gcm" | "header-srtp" | "header-utp"
+                | "header-wechat" | "header-dtls" | "header-wireguard" | "header-dns" => {
+                    return Err(format!(
+                        "{path}.finalmask.udp[{i}].type: the {ty:?} mask wraps mKCP datagrams and \
+                         requires \"network\": \"kcp\""
+                    ))
                 }
                 "mkcp-legacy" | "header-custom" | "sudoku" | "xdns" | "xicmp" | "realm" => {
                     return Err(format!(
@@ -7337,6 +7520,227 @@ mod tests {
             panic!("expected XHTTP transport")
         };
         assert_eq!(settings.xhttp_mode, XhttpMode::StreamUp);
+    }
+
+    #[test]
+    fn mkcp_settings_and_finalmask_layers_are_compiled() {
+        let stream = serde_json::json!({
+            "network": "mkcp",
+            "kcpSettings": {
+                "mtu": 1300,
+                "tti": 20,
+                "uplinkCapacity": 10,
+                "downlinkCapacity": 40,
+                "congestion": true,
+                "readBufferSize": 3,
+                "writeBufferSize": 0
+            },
+            "finalmask": {"udp": [
+                {"type": "mkcp-original"},
+                {"type": "mkcp-aes128gcm", "settings": {"password": "shared-secret"}}
+            ]}
+        });
+
+        let transport = parse_inbound_transport(&stream, "inbounds[0]").unwrap();
+        let Transport::Kcp(kcp) = transport else {
+            panic!("expected an mKCP transport")
+        };
+        assert_eq!(kcp.mtu, 1300);
+        assert_eq!(kcp.tti, 20);
+        assert_eq!(kcp.uplink_capacity, 10);
+        assert_eq!(kcp.downlink_capacity, 40);
+        assert!(kcp.congestion);
+        // Xray measures both buffers in MiB and floors a zero at 512 KiB.
+        assert_eq!(kcp.read_buffer, 3 * 1024 * 1024);
+        assert_eq!(kcp.write_buffer, 512 * 1024);
+        assert_eq!(
+            &*kcp.masks,
+            [
+                KcpMask::Original,
+                KcpMask::Aes128Gcm("shared-secret".into())
+            ]
+        );
+
+        // The outbound parser reads the same block the same way.
+        let parsed = parse_stream(&stream, "outbounds[0]", &mut ParseOutput::default()).unwrap();
+        let Transport::Kcp(outbound) = parsed.transport else {
+            panic!("expected an mKCP transport")
+        };
+        assert_eq!(outbound, kcp);
+        // The UDP layers are the carrier's, not TCP evasion.
+        assert!(parsed.evasion.is_empty());
+
+        // A bare `network: "kcp"` gets Xray's defaults.
+        let bare = parse_inbound_transport(&serde_json::json!({"network": "kcp"}), "inbounds[0]")
+            .unwrap();
+        let Transport::Kcp(bare) = bare else {
+            panic!("expected an mKCP transport")
+        };
+        assert_eq!(bare, KcpSettings::default());
+        assert!(bare.masks.is_empty());
+    }
+
+    #[test]
+    fn removed_mkcp_obfuscation_names_the_finalmask_replacement() {
+        for (key, value) in [
+            ("header", serde_json::json!({"type": "srtp"})),
+            ("seed", serde_json::json!("a shared seed")),
+        ] {
+            let mut kcp_settings = serde_json::Map::new();
+            kcp_settings.insert(key.to_string(), value);
+            let stream = serde_json::json!({
+                "network": "kcp",
+                "kcpSettings": kcp_settings
+            });
+            for error in [
+                parse_inbound_transport(&stream, "inbounds[0]").unwrap_err(),
+                parse_stream(&stream, "outbounds[0]", &mut ParseOutput::default()).unwrap_err(),
+            ] {
+                assert!(error.contains(key), "the error should name the key: {error}");
+                assert!(
+                    error.contains("finalmask"),
+                    "the error should name the replacement: {error}"
+                );
+                assert!(
+                    error.contains("mkcp-original") && error.contains("mkcp-aes128gcm"),
+                    "the error should name both masks: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mkcp_masks_are_refused_where_there_is_no_mkcp_session() {
+        // The masks wrap mKCP datagrams; on a raw TCP carrier there is
+        // nothing for them to seal.
+        let stream = serde_json::json!({
+            "network": "raw",
+            "finalmask": {"udp": [{"type": "mkcp-original"}]}
+        });
+        let error = parse_stream(&stream, "outbounds[0]", &mut ParseOutput::default()).unwrap_err();
+        assert!(error.contains("requires \"network\": \"kcp\""), "{error}");
+
+        // A password is the whole configuration of the AES mask.
+        let stream = serde_json::json!({
+            "network": "kcp",
+            "finalmask": {"udp": [{"type": "mkcp-aes128gcm"}]}
+        });
+        let error = parse_inbound_transport(&stream, "inbounds[0]").unwrap_err();
+        assert!(error.contains("password"), "{error}");
+
+        // And an unrelated UDP mask cannot ride an mKCP session silently.
+        let stream = serde_json::json!({
+            "network": "kcp",
+            "finalmask": {"udp": [{"type": "salamander", "settings": {"password": "abcd"}}]}
+        });
+        let error = parse_inbound_transport(&stream, "inbounds[0]").unwrap_err();
+        assert!(error.contains("not an mKCP mask"), "{error}");
+    }
+
+    #[test]
+    fn mkcp_header_masks_are_compiled() {
+        let stream = serde_json::json!({
+            "network": "mkcp",
+            "finalmask": {"udp": [
+                {"type": "header-srtp"},
+                {"type": "header-utp"},
+                {"type": "header-wechat"},
+                {"type": "header-dtls"},
+                {"type": "header-wireguard"},
+                {"type": "header-dns", "settings": {"domain": "example.com"}},
+                {"type": "header-dns"}
+            ]}
+        });
+        let transport = parse_inbound_transport(&stream, "inbounds[0]").unwrap();
+        let Transport::Kcp(kcp) = transport else {
+            panic!("expected an mKCP transport")
+        };
+        assert_eq!(
+            &*kcp.masks,
+            [
+                KcpMask::Header {
+                    kind: KcpHeader::Srtp,
+                    domain: None
+                },
+                KcpMask::Header {
+                    kind: KcpHeader::Utp,
+                    domain: None
+                },
+                KcpMask::Header {
+                    kind: KcpHeader::Wechat,
+                    domain: None
+                },
+                KcpMask::Header {
+                    kind: KcpHeader::Dtls,
+                    domain: None
+                },
+                KcpMask::Header {
+                    kind: KcpHeader::Wireguard,
+                    domain: None
+                },
+                KcpMask::Header {
+                    kind: KcpHeader::Dns,
+                    domain: Some("example.com".into())
+                },
+                // Xray's `Dns.Build` leaves the empty name to the transport,
+                // which defaults it to `www.baidu.com`.
+                KcpMask::Header {
+                    kind: KcpHeader::Dns,
+                    domain: None
+                }
+            ]
+        );
+
+        // The outbound parser reads the same block the same way.
+        let parsed = parse_stream(&stream, "outbounds[0]", &mut ParseOutput::default()).unwrap();
+        let Transport::Kcp(outbound) = parsed.transport else {
+            panic!("expected an mKCP transport")
+        };
+        assert_eq!(outbound, kcp);
+
+        // A header mask outside mKCP has no session to wrap.
+        let raw = serde_json::json!({
+            "network": "raw",
+            "finalmask": {"udp": [{"type": "header-srtp"}]}
+        });
+        let error =
+            parse_stream(&raw, "outbounds[0]", &mut ParseOutput::default()).unwrap_err();
+        assert!(error.contains("requires \"network\": \"kcp\""), "{error}");
+
+        // An unknown type, an unimplemented one, and a bad DNS setting are
+        // refused rather than silently dropped.
+        for (mask, needle) in [
+            (serde_json::json!({"type": "header-nonesuch"}), "not an mKCP mask"),
+            (serde_json::json!({"type": "header-custom"}), "not implemented"),
+            (
+                serde_json::json!({"type": "header-dns", "settings": {"domain": 7}}),
+                "domain must be a string",
+            ),
+        ] {
+            let stream = serde_json::json!({
+                "network": "kcp",
+                "finalmask": {"udp": [mask]}
+            });
+            let error = parse_inbound_transport(&stream, "inbounds[0]").unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        }
+    }
+
+    #[test]
+    fn removed_mkcp_obfuscation_uses_xray_wording() {
+        let stream = serde_json::json!({
+            "network": "kcp",
+            "kcpSettings": {"seed": "shared"}
+        });
+        let error = parse_inbound_transport(&stream, "inbounds[0]").unwrap_err();
+        assert!(
+            error.ends_with(
+                "The feature mkcp header & seed has been removed and migrated to \
+                 finalmask/udp header-* & mkcp-original & mkcp-aes128gcm. \
+                 Please update your config(s) according to release note and documentation."
+            ),
+            "{error}"
+        );
     }
 
     /// Xray's `lengths` list: leading zeros are empty records, the last
